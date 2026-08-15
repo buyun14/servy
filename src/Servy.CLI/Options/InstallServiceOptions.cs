@@ -7,46 +7,46 @@ namespace Servy.CLI.Options
     /// Command options for <c>install</c> command.
     /// Installs a new Windows service with specified parameters.
     /// </summary>
-    [Verb("install", HelpText = "Install a Windows service.")]
+    [Verb("install", HelpText = "安装 Windows 服务。")]
     public class InstallServiceOptions : GlobalOptionsBase
     {
-        private const string SecurityWarningPrefix = " SECURITY WARNING: Use the ";
-        private const string SecurityWarningSuffixParams = " environment variable instead to avoid exposing sensitive parameters in OS process listings.";
-        private const string SecurityWarningSuffixCreds = " environment variable instead to avoid exposing credentials in OS process listings.";
-        private const string EnvVarEscapingRecipe = "Enter variables in the format varName=varValue separated by semicolons (;). Use \\= to escape '=', \\\" to escape '\"', \\; to escape ';', \\\\ to escape '\\', and %% to escape '%' (collapses to a single '%'). Supports environment variable expansion, example: VAR1=%ProgramData%\\MyApp; VAR2=%VAR1%\\bin.";
+        private const string SecurityWarningPrefix = " 安全警告：请改用 ";
+        private const string SecurityWarningSuffixParams = " 环境变量，以避免在操作系统进程列表中暴露敏感参数。";
+        private const string SecurityWarningSuffixCreds = " 环境变量，以避免在操作系统进程列表中暴露凭据。";
+        private const string EnvVarEscapingRecipe = "以 varName=varValue 的格式输入变量，用分号（;）分隔。使用 \\= 转义 '='，\\\" 转义 '\"'，\\; 转义 ';'，\\\\ 转义 '\\'，%% 转义 '%'（折叠为单个 '%'）。支持环境变量展开，例如：VAR1=%ProgramData%\\MyApp; VAR2=%VAR1%\\bin。";
 
         /// <summary>
         /// Gets or sets the service name.
         /// This option is required and specifies the unique name of the service to install.
         /// </summary>
-        [Option('n', "name", Required = true, HelpText = "Unique service name to install.")]
+        [Option('n', "name", Required = true, HelpText = "要安装的服务的唯一名称。")]
         public string? ServiceName { get; set; }
 
         /// <summary>
         /// Gets or sets the service display name.
         /// </summary>
-        [Option("displayName", HelpText = "The human-readable name shown in the Windows Services console (services.msc). If left empty, the service name will be used instead.")]
+        [Option("displayName", HelpText = "在 Windows 服务控制台（services.msc）中显示的人类可读名称。如果留空，则改用服务名称。")]
         public string? ServiceDisplayName { get; set; }
 
         /// <summary>
         /// Gets or sets the service description.
         /// Optional descriptive text about the service.
         /// </summary>
-        [Option('d', "description", HelpText = "Description of the service.")]
+        [Option('d', "description", HelpText = "服务的描述。")]
         public string? ServiceDescription { get; set; }
 
         /// <summary>
         /// Gets or sets the path to the executable process to run as service.
         /// This option is required.
         /// </summary>
-        [Option('p', "path", Required = true, HelpText = "Path to the executable process. Supports environment variable expansion, example: %JAVA_HOME%\\bin\\java.exe")]
+        [Option('p', "path", Required = true, HelpText = "可执行进程的路径。支持环境变量展开，例如：%JAVA_HOME%\\bin\\java.exe")]
         public string? ProcessPath { get; set; }
 
         /// <summary>
         /// Gets or sets the working directory for the service process.
         /// Optional.
         /// </summary>
-        [Option("startupDir", HelpText = "Startup directory for the process. Supports environment variable expansion, example: %PROGRAMDATA%\\MyApp")]
+        [Option("startupDir", HelpText = "进程的启动目录。支持环境变量展开，例如：%PROGRAMDATA%\\MyApp")]
         public string? StartupDirectory { get; set; }
 
         /// <summary>
@@ -59,7 +59,7 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("params", HelpText = "Additional parameters for the process. Supports environment variable expansion, example: --params=\"--data %ProgramData%\\MyApp --bin %MY_VAR%\\bin\"." + SecurityWarningPrefix + AppConfig.ProcessParametersEnvVarName + SecurityWarningSuffixParams)]
+        [Option("params", HelpText = "进程的附加参数。支持环境变量展开，例如：--params=\"--data %ProgramData%\\MyApp --bin %MY_VAR%\\bin\"。" + SecurityWarningPrefix + AppConfig.ProcessParametersEnvVarName + SecurityWarningSuffixParams)]
         public string? ProcessParameters { get; set; }
 
         /// <summary>
@@ -72,7 +72,7 @@ namespace Servy.CLI.Options
         /// <item><description>Disabled - Service is disabled and cannot be started.</description></item>
         /// </list>
         /// </summary>
-        [Option("startupType", HelpText = "Service startup type. Options: Automatic, AutomaticDelayedStart, Manual, Disabled.")]
+        [Option("startupType", HelpText = "服务启动类型。选项：Automatic、AutomaticDelayedStart、Manual、Disabled。")]
         public string? ServiceStartType { get; set; }
 
         /// <summary>
@@ -87,59 +87,59 @@ namespace Servy.CLI.Options
         /// <item><description>RealTime</description></item>
         /// </list>
         /// </summary>
-        [Option("priority", HelpText = "Process priority level. Options: Idle, BelowNormal, Normal, AboveNormal, High, RealTime.")]
+        [Option("priority", HelpText = "进程优先级级别。选项：Idle、BelowNormal、Normal、AboveNormal、High、RealTime。")]
         public string? ProcessPriority { get; set; }
 
         /// <summary>
         /// Gets or sets the logical CPUs the process may run on (e.g., '0-3,8' or '0xFF00').
         /// </summary>
-        [Option('a', "cpuAffinity", Required = false, HelpText = "Logical CPUs the process may run on (e.g., '0-3,8' or '0xFF00').")]
+        [Option('a', "cpuAffinity", Required = false, HelpText = "进程可以运行的逻辑 CPU（例如：'0-3,8' 或 '0xFF00'）。")]
         public string? CpuAffinity { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether to enable the console user interface for the service.
         /// </summary>
-        [Option("enableConsoleUI", HelpText = "Enable console user interface for the service. When enabled, stdout/stderr redirection is disabled.")]
+        [Option("enableConsoleUI", HelpText = "为服务启用控制台用户界面。启用后，标准输出/标准错误重定向将被禁用。")]
         public bool EnableConsoleUI { get; set; }
 
         /// <summary>
         /// Gets or sets the file path to capture standard output logs.
         /// Optional.
         /// </summary>
-        [Option("stdout", HelpText = "Path to stdout log file.")]
+        [Option("stdout", HelpText = "标准输出日志文件的路径。")]
         public string? StdoutPath { get; set; }
 
         /// <summary>
         /// Gets or sets the file path to capture standard error logs.
         /// Optional.
         /// </summary>
-        [Option("stderr", HelpText = "Path to stderr log file.")]
+        [Option("stderr", HelpText = "标准错误日志文件的路径。")]
         public string? StderrPath { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether size-based log rotation is enabled.
         /// This option is deprecated and is kept for backward compatibility. Use --enableSizeRotation instead.
         /// </summary>
-        [Option("enableRotation", HelpText = "Deprecated. Enable size-based log rotation. This option is kept only for backward compatibility. Use --enableSizeRotation instead.")]
+        [Option("enableRotation", HelpText = "已弃用。启用基于大小的日志轮转。此选项仅为向后兼容而保留。请改用 --enableSizeRotation。")]
         public bool EnableRotation { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether size-based log rotation is enabled.
         /// </summary>
-        [Option("enableSizeRotation", HelpText = "Enable size-based log rotation.")]
+        [Option("enableSizeRotation", HelpText = "启用基于大小的日志轮转。")]
         public bool EnableSizeRotation { get; set; }
 
         /// <summary>
         /// Gets or sets the rotation size in megabytes (MB) for log files.
         /// Must be >= 1 MB if rotation is enabled.
         /// </summary>
-        [Option("rotationSize", HelpText = "Log rotation size in Megabytes (MB). Must be between 1 and 10240 MB.")]
+        [Option("rotationSize", HelpText = "日志轮转大小（兆字节 MB）。必须介于 1 到 10240 MB 之间。")]
         public string? RotationSize { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether date-based log rotation is enabled based on the date interval specified by --dateRotationType.
         /// </summary>
-        [Option("enableDateRotation", HelpText = "Enable date-based log rotation based on the date interval specified by --dateRotationType. When both size-based and date-based rotation are enabled, size rotation takes precedence.")]
+        [Option("enableDateRotation", HelpText = "根据 --dateRotationType 指定的日期间隔启用基于日期的日志轮转。当同时启用基于大小和基于日期的轮转时，大小轮转优先。")]
         public bool EnableDateRotation { get; set; }
 
         /// <summary>
@@ -152,14 +152,14 @@ namespace Servy.CLI.Options
         /// <item><description>None - Disables date-based rotation; use when only size rotation is desired.</description></item>
         /// </list>
         /// </summary>
-        [Option("dateRotationType", HelpText = "Date rotation type. Options: Daily, Weekly, Monthly, None (None disables date-based rotation; use when only size rotation is desired).")]
+        [Option("dateRotationType", HelpText = "日期轮转类型。选项：Daily、Weekly、Monthly、None（None 禁用基于日期的轮转；仅在只需要大小轮转时使用）。")]
         public string? DateRotationType { get; set; }
 
         /// <summary>
         /// Gets or sets the maximum number of rotated log files to keep.
         /// Set to 0 for unlimited.
         /// </summary>
-        [Option("maxRotations", HelpText = "Maximum rotated log files to keep. Must be between 0 and 10000. Set to 0 or leave empty for unlimited.")]
+        [Option("maxRotations", HelpText = "要保留的轮转日志文件最大数量。必须介于 0 到 10000 之间。设为 0 或留空表示无限制。")]
         public string? MaxRotations { get; set; }
 
         /// <summary>
@@ -169,27 +169,27 @@ namespace Servy.CLI.Options
         /// <para>Default is <see cref="AppConfig.DefaultUseLocalTimeForRotation"/> (<c>false</c>).</para>
         /// <para>When <c>true</c>, rotation occurs at local midnight. When <c>false</c>, rotation occurs at UTC midnight.</para>
         /// </remarks>
-        [Option("useLocalTimeForRotation", HelpText = "Use local server time for log rotation instead of UTC. Default is false.")]
+        [Option("useLocalTimeForRotation", HelpText = "日志轮转使用服务器本地时间而非 UTC。默认为 false。")]
         public bool UseLocalTimeForRotation { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether health monitoring is enabled.
         /// </summary>
-        [Option("enableHealth", HelpText = "Enable health monitoring.")]
+        [Option("enableHealth", HelpText = "启用运行状况监视。")]
         public bool EnableHealthMonitoring { get; set; }
 
         /// <summary>
         /// Gets or sets the heartbeat interval in seconds for health monitoring.
         /// Must be >= 5 seconds if health monitoring is enabled.
         /// </summary>
-        [Option("heartbeatInterval", HelpText = "Heartbeat interval in seconds. Must be between 5 and 86400 seconds.")]
+        [Option("heartbeatInterval", HelpText = "心跳间隔（秒）。必须介于 5 到 86400 秒之间。")]
         public string? HeartbeatInterval { get; set; }
 
         /// <summary>
         /// Gets or sets the maximum number of failed health checks before recovery action.
         /// Must be >= 1 if health monitoring is enabled.
         /// </summary>
-        [Option("maxFailedChecks", HelpText = "Maximum allowed failed health checks. Must be between 1 and 100000.")]
+        [Option("maxFailedChecks", HelpText = "允许的最大失败运行状况检查次数。必须介于 1 到 100000 之间。")]
         public string? MaxFailedChecks { get; set; }
 
         /// <summary>
@@ -202,27 +202,27 @@ namespace Servy.CLI.Options
         /// <item><description>RestartComputer - Restart the computer.</description></item>
         /// </list>
         /// </summary>
-        [Option("recoveryAction", HelpText = "Recovery action on failure. Options: None, RestartService, RestartProcess, RestartComputer. Restart service and restart computer actions are not available if the service runs under NT AUTHORITY\\NetworkService, NT AUTHORITY\\LocalService, or a user account without the required privileges. Only the restart process action will be available for these accounts.")]
+        [Option("recoveryAction", HelpText = "失败时的恢复操作。选项：None、RestartService、RestartProcess、RestartComputer。如果服务在 NT AUTHORITY\\NetworkService、NT AUTHORITY\\LocalService 或无所需权限的用户账户下运行，则“重启服务”和“重启计算机”操作不可用。对于这些账户，只有“重启进程”操作可用。")]
         public string? RecoveryAction { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether to run recovery action even if the process exits successfully.
         /// </summary>
-        [Option("recoveryOnCleanExit", HelpText = "Enable running recovery action even if the process exits successfully. Default is false.")]
+        [Option("recoveryOnCleanExit", HelpText = "即使进程正常退出也执行恢复操作。默认为 false。")]
         public bool RecoveryOnCleanExit { get; set; }
 
         /// <summary>
         /// Gets or sets the maximum number of restart attempts after failure.
         /// Must be >= 0 if health monitoring is enabled.
         /// </summary>
-        [Option("maxRestartAttempts", HelpText = "Maximum restart attempts on failure. Must be between 0 and 100000. Set to 0 for unlimited restart attempts.")]
+        [Option("maxRestartAttempts", HelpText = "失败时的最大重启尝试次数。必须介于 0 到 100000 之间。设为 0 表示无限制重启尝试。")]
         public string? MaxRestartAttempts { get; set; }
 
         /// <summary>
         /// Gets or sets the absolute URL used to send out-of-band diagnostic heartbeat pings (e.g., healthchecks.io).
         /// While the process is healthy, Servy periodically pings this endpoint to confirm service vitality.
         /// </summary>
-        [Option("heartbeatUrl", HelpText = "Absolute URL for out-of-band diagnostic heartbeat pings. Only used when health monitoring is enabled.")]
+        [Option("heartbeatUrl", HelpText = "带外诊断心跳 ping 的绝对 URL。仅在启用运行状况监视时使用。")]
         public string? HeartbeatUrl { get; set; }
 
         /// <summary>
@@ -230,28 +230,28 @@ namespace Servy.CLI.Options
         /// Value must be clamped between <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> and <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/>.
         /// Default is <see cref="AppConfig.DefaultHeartbeatUrlTimeoutSeconds"/>.
         /// </summary>
-        [Option("heartbeatUrlTimeoutSeconds", HelpText = "Timeout in seconds for external heartbeat URL requests. Must be between 2 and 30 seconds.")]
+        [Option("heartbeatUrlTimeoutSeconds", HelpText = "外部心跳 URL 请求的超时秒数。必须介于 2 到 30 秒之间。")]
         public string? HeartbeatUrlTimeoutSeconds { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether extended flags (/start, /fail) are appended to the heartbeat URL during service startup and failure events.
         /// Default is <see cref="AppConfig.DefaultEnableHeartbeatUrlFlags"/>.
         /// </summary>
-        [Option("enableHeartbeatUrlFlags", HelpText = "Append /start and /fail to the heartbeat URL on service start and failure.")]
+        [Option("enableHeartbeatUrlFlags", HelpText = "在服务启动和失败时向心跳 URL 追加 /start 和 /fail。")]
         public bool EnableHeartbeatUrlFlags { get; set; }
 
         /// <summary>
         /// Gets or sets the failure program path.
         /// Optional.
         /// </summary>
-        [Option("failureProgramPath", HelpText = "The failure program path. Configure a script or executable to run when the wrapped process exits with a non-zero exit code (recovery disabled) or after all recovery action retries have failed (recovery enabled). It is not run when the process fails to start; that path stops the service. Supports environment variable expansion, example: %JAVA_HOME%\\bin\\java.exe")]
+        [Option("failureProgramPath", HelpText = "失败处理程序的路径。配置在包装进程以非零退出代码退出（恢复已禁用）或所有恢复操作重试均失败（恢复已启用）时要运行的脚本或可执行文件。进程启动失败时不会运行；该情况只会停止服务。支持环境变量展开，例如：%JAVA_HOME%\\bin\\java.exe")]
         public string? FailureProgramPath { get; set; }
 
         /// <summary>
         /// Gets or sets the failure program startup directory.
         /// Optional. If not set, defaults to the service working directory.
         /// </summary>
-        [Option("failureProgramStartupDir", HelpText = "Specifies the directory in which the failure program will start. If not set, defaults to the service working directory. Supports environment variable expansion, example: %PROGRAMDATA%\\MyApp")]
+        [Option("failureProgramStartupDir", HelpText = "指定失败处理程序启动时所在的目录。如果未设置，默认为服务工作目录。支持环境变量展开，例如：%PROGRAMDATA%\\MyApp")]
         public string? FailureProgramStartupDir { get; set; }
 
         /// <summary>
@@ -264,7 +264,7 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("failureProgramParams", HelpText = "Additional parameters for the failure program." + SecurityWarningPrefix + AppConfig.FailureProgramParametersEnvVarName + SecurityWarningSuffixParams)]
+        [Option("failureProgramParams", HelpText = "失败处理程序的附加参数。" + SecurityWarningPrefix + AppConfig.FailureProgramParametersEnvVarName + SecurityWarningSuffixParams)]
         public string? FailureProgramParameters { get; set; }
 
         /// <summary>
@@ -277,14 +277,14 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("envVars", HelpText = "Environment variables for the process. " + EnvVarEscapingRecipe + SecurityWarningPrefix + AppConfig.EnvironmentVariablesEnvVarName + SecurityWarningSuffixParams)]
+        [Option("envVars", HelpText = "进程的环境变量。" + EnvVarEscapingRecipe + SecurityWarningPrefix + AppConfig.EnvironmentVariablesEnvVarName + SecurityWarningSuffixParams)]
         public string? EnvironmentVariables { get; set; }
 
         /// <summary>
         /// Gets or sets Windows service dependencies.
         /// Optional.
         /// </summary>
-        [Option("deps", HelpText = "Specify one or more Windows service names (not display names) that this service depends on separated with semicolons (;). Use service key names without spaces or special characters. Each dependency service must be installed and running before this service can start. If a dependency's start type is Automatic, Windows will try to start it automatically before this service. If a dependency fails to start or is disabled, this service will not start.")]
+        [Option("deps", HelpText = "指定此服务依赖的一个或多个 Windows 服务名称（不是显示名称），用分号（;）分隔。使用不含空格或特殊字符的服务键名。每个依赖服务必须先安装并运行，此服务才能启动。如果依赖项的启动类型为“自动”，Windows 将在此服务之前尝试自动启动它。如果依赖项启动失败或被禁用，此服务将无法启动。")]
         public string? ServiceDependencies { get; set; }
 
         /// <summary>
@@ -293,11 +293,11 @@ namespace Servy.CLI.Options
         /// </summary>
         [Option(
             "user",
-            HelpText = "The service account username (e.g., .\\username, DOMAIN\\username, or DOMAIN\\gMSA$). " +
-                       "If this option is not set, the service runs under Local System. " +
-                       "If the service runs under an account other than Local System, " +
-                       "you must grant Modify access to %ProgramData%\\Servy " +
-                       "for the account that runs the service."
+            HelpText = "服务账户用户名（例如：.\\username、DOMAIN\\username 或 DOMAIN\\gMSA$）。" +
+                       "如果未设置此选项，服务将在本地系统账户下运行。" +
+                       "如果服务在“本地系统”以外的账户下运行，" +
+                       "您必须授予 %ProgramData%\\Servy 的“修改”访问权限" +
+                       "给运行该服务的账户。"
         )]
         public string? User { get; set; }
 
@@ -310,21 +310,21 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("password", HelpText = "The service account password." + SecurityWarningPrefix + AppConfig.PasswordEnvVarName + SecurityWarningSuffixCreds)]
+        [Option("password", HelpText = "服务账户的密码。" + SecurityWarningPrefix + AppConfig.PasswordEnvVarName + SecurityWarningSuffixCreds)]
         public string? Password { get; set; }
 
         /// <summary>
         /// Gets or sets the pre-launch executable path.
         /// Optional.
         /// </summary>
-        [Option("preLaunchPath", HelpText = "The pre-launch executable path. Configure an optional script or executable to run before the main service starts. This is useful for preparing configurations, fetching secrets, or other setup tasks. If the pre-launch script fails, the service will not start unless you enable --preLaunchIgnoreFailure. Supports environment variable expansion, example: %JAVA_HOME%\\bin\\java.exe")]
+        [Option("preLaunchPath", HelpText = "预启动可执行文件路径。配置一个可选的、在主服务启动前运行的脚本或可执行文件。这有助于准备配置、获取机密或执行其他设置任务。如果预启动脚本失败，除非启用 --preLaunchIgnoreFailure，否则服务将不会启动。支持环境变量展开，例如：%JAVA_HOME%\\bin\\java.exe")]
         public string? PreLaunchPath { get; set; }
 
         /// <summary>
         /// Gets or sets the pre-launch startup directory.
         /// Optional. If not set, defaults to the service working directory.
         /// </summary>
-        [Option("preLaunchStartupDir", HelpText = "Specifies the directory in which the pre-launch executable will start. If not set, defaults to the service working directory. Supports environment variable expansion, example: %PROGRAMDATA%\\MyApp")]
+        [Option("preLaunchStartupDir", HelpText = "指定预启动可执行文件启动时所在的目录。如果未设置，默认为服务工作目录。支持环境变量展开，例如：%PROGRAMDATA%\\MyApp")]
         public string? PreLaunchStartupDir { get; set; }
 
         /// <summary>
@@ -337,7 +337,7 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("preLaunchParams", HelpText = "Additional parameters for the pre-launch executable." + SecurityWarningPrefix + AppConfig.PreLaunchParametersEnvVarName + SecurityWarningSuffixParams)]
+        [Option("preLaunchParams", HelpText = "预启动可执行文件的附加参数。" + SecurityWarningPrefix + AppConfig.PreLaunchParametersEnvVarName + SecurityWarningSuffixParams)]
         public string? PreLaunchParameters { get; set; }
 
         /// <summary>
@@ -350,28 +350,28 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("preLaunchEnv", HelpText = "Environment variables for the pre-launch executable. " + EnvVarEscapingRecipe + SecurityWarningPrefix + AppConfig.PreLaunchEnvironmentVariablesEnvVarName + SecurityWarningSuffixParams)]
+        [Option("preLaunchEnv", HelpText = "预启动可执行文件的环境变量。" + EnvVarEscapingRecipe + SecurityWarningPrefix + AppConfig.PreLaunchEnvironmentVariablesEnvVarName + SecurityWarningSuffixParams)]
         public string? PreLaunchEnvironmentVariables { get; set; }
 
         /// <summary>
         /// Gets or sets the file path to capture standard output logs.
         /// Optional.
         /// </summary>
-        [Option("preLaunchStdout", HelpText = "Path to stdout log file of the pre-launch executable.")]
+        [Option("preLaunchStdout", HelpText = "预启动可执行文件的标准输出日志文件的路径。")]
         public string? PreLaunchStdoutPath { get; set; }
 
         /// <summary>
         /// Gets or sets the file path to capture standard error logs.
         /// Optional.
         /// </summary>
-        [Option("preLaunchStderr", HelpText = "Path to stderr log file of the pre-launch executable.")]
+        [Option("preLaunchStderr", HelpText = "预启动可执行文件的标准错误日志文件的路径。")]
         public string? PreLaunchStderrPath { get; set; }
 
         /// <summary>
         /// Gets or sets the timeout for the pre-launch executable.
         /// Optional.
         /// </summary>
-        [Option("preLaunchTimeout", HelpText = "Timeout for the pre-launch executable. Must be between 0 and 86400 seconds. Set the timeout to 0 to run the pre-launch hook in fire-and-forget mode. When set to 0, the hook is started and the service is launched immediately without waiting for completion. Use this only for tasks that do not affect the service's ability to start or run correctly. Stdout/Stderr redirection and retries are not available in fire-and-forget mode.")]
+        [Option("preLaunchTimeout", HelpText = "预启动可执行文件的超时。必须介于 0 到 86400 秒之间。将超时设为 0 可在“即发即忘”模式下运行预启动钩子。设为 0 时，钩子启动后立即启动服务，无需等待其完成。仅对不影响服务正常启动或运行的任务使用。在“即发即忘”模式下，标准输出/标准错误重定向和重试不可用。")]
         public string? PreLaunchTimeout { get; set; }
 
         /// <summary>
@@ -379,28 +379,28 @@ namespace Servy.CLI.Options
         /// Must be greater or equal to 0.
         /// Optional.
         /// </summary>
-        [Option("preLaunchRetryAttempts", HelpText = "Number of retry attempts for the pre-launch executable if it fails. Must be between 0 and 100000.")]
+        [Option("preLaunchRetryAttempts", HelpText = "预启动可执行文件失败时的重试次数。必须介于 0 到 100000 之间。")]
         public string? PreLaunchRetryAttempts { get; set; }
 
         /// <summary>
         /// Gets or sets the pre-launch ignore failure flag.
         /// Optional.
         /// </summary>
-        [Option("preLaunchIgnoreFailure", HelpText = "Ignore failure and start service even if pre-launch executable fails.")]
+        [Option("preLaunchIgnoreFailure", HelpText = "即使预启动可执行文件失败，也忽略失败并启动服务。")]
         public bool PreLaunchIgnoreFailure { get; set; }
 
         /// <summary>
         /// Gets or sets the post-launch executable path.
         /// Optional.
         /// </summary>
-        [Option("postLaunchPath", HelpText = "The post-launch executable path. Configure an optional script or executable to run after the process starts successfully. Supports environment variable expansion, example: %JAVA_HOME%\\bin\\java.exe")]
+        [Option("postLaunchPath", HelpText = "启动后可执行文件路径。配置一个可选的、在进程成功启动后运行的脚本或可执行文件。支持环境变量展开，例如：%JAVA_HOME%\\bin\\java.exe")]
         public string? PostLaunchPath { get; set; }
 
         /// <summary>
         /// Gets or sets the post-launch startup directory.
         /// Optional. If not set, defaults to the service working directory.
         /// </summary>
-        [Option("postLaunchStartupDir", HelpText = "Specifies the directory in which the post-launch executable will start. If not set, defaults to the service working directory. Supports environment variable expansion, example: %PROGRAMDATA%\\MyApp")]
+        [Option("postLaunchStartupDir", HelpText = "指定启动后可执行文件启动时所在的目录。如果未设置，默认为服务工作目录。支持环境变量展开，例如：%PROGRAMDATA%\\MyApp")]
         public string? PostLaunchStartupDir { get; set; }
 
         /// <summary>
@@ -413,7 +413,7 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("postLaunchParams", HelpText = "Additional parameters for the post-launch executable." + SecurityWarningPrefix + AppConfig.PostLaunchParametersEnvVarName + SecurityWarningSuffixParams)]
+        [Option("postLaunchParams", HelpText = "启动后可执行文件的附加参数。" + SecurityWarningPrefix + AppConfig.PostLaunchParametersEnvVarName + SecurityWarningSuffixParams)]
         public string? PostLaunchParameters { get; set; }
 
         /// <summary>
@@ -421,7 +421,7 @@ namespace Servy.CLI.Options
         /// When enabled, environment variables and process parameters are recorded in the Servy.Service.log file.
         /// Not recommended for production environments, as these logs may contain sensitive information.
         /// </summary>
-        [Option("debug", HelpText = "Whether debug logs are enabled. When enabled, environment variables and process parameters are recorded in the Servy.Service.log file. Not recommended for production environments, as these logs may contain sensitive information.")]
+        [Option("debug", HelpText = "是否启用调试日志。启用后，环境变量和进程参数将记录到 Servy.Service.log 文件中。不建议在生产环境中启用，因为这些日志可能包含敏感信息。")]
         public bool EnableDebugLogs { get; set; }
 
         /// <summary>
@@ -429,7 +429,7 @@ namespace Servy.CLI.Options
         /// Must be >= 1 second.
         /// Optional. Defaults to 10 seconds.
         /// </summary>
-        [Option("startTimeout", HelpText = "Timeout in seconds to wait for the process to start successfully before considering the startup as failed. Must be between 1 and 86400 seconds. Defaults to 10 seconds.")]
+        [Option("startTimeout", HelpText = "等待进程成功启动的超时秒数，超过后视为启动失败。必须介于 1 到 86400 秒之间。默认为 10 秒。")]
         public string? StartTimeout { get; set; }
 
         /// <summary>
@@ -437,21 +437,21 @@ namespace Servy.CLI.Options
         /// Must be >= 1 second.
         /// Optional. Defaults to 5 seconds.
         /// </summary>
-        [Option("stopTimeout", HelpText = "Timeout in seconds to wait for the process to exit. Must be between 1 and 86400 seconds. Defaults to 5 seconds.")]
+        [Option("stopTimeout", HelpText = "等待进程退出的超时秒数。必须介于 1 到 86400 秒之间。默认为 5 秒。")]
         public string? StopTimeout { get; set; }
 
         /// <summary>
         /// Gets or sets the pre-stop executable path.
         /// Optional.
         /// </summary>
-        [Option("preStopPath", HelpText = "The pre-stop executable path. Configure an optional script or executable to run before the main service stops. This can be used for graceful shutdown tasks such as notifying external systems or draining resources. The pre-stop process runs synchronously and extends the service stop timeout while it is running. Set the timeout to 0 to run the pre-stop process in fire-and-forget mode. Supports environment variable expansion, example: %JAVA_HOME%\\bin\\java.exe")]
+        [Option("preStopPath", HelpText = "停止前可执行文件路径。配置一个可选的、在主服务停止前运行的脚本或可执行文件。这可用于优雅关停任务，例如通知外部系统或排空资源。停止前进程同步运行，并在运行期间延长服务停止超时。将超时设为 0 可在“即发即忘”模式下运行停止前进程。支持环境变量展开，例如：%JAVA_HOME%\\bin\\java.exe")]
         public string? PreStopPath { get; set; }
 
         /// <summary>
         /// Gets or sets the pre-stop startup directory.
         /// Optional. If not set, defaults to the service working directory.
         /// </summary>
-        [Option("preStopStartupDir", HelpText = "Specifies the directory in which the pre-stop executable will start. If not set, defaults to the service working directory. Supports environment variable expansion, example: %PROGRAMDATA%\\MyApp")]
+        [Option("preStopStartupDir", HelpText = "指定停止前可执行文件启动时所在的目录。如果未设置，默认为服务工作目录。支持环境变量展开，例如：%PROGRAMDATA%\\MyApp")]
         public string? PreStopStartupDir { get; set; }
 
         /// <summary>
@@ -464,35 +464,35 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("preStopParams", HelpText = "Additional parameters for the pre-stop executable." + SecurityWarningPrefix + AppConfig.PreStopParametersEnvVarName + SecurityWarningSuffixParams)]
+        [Option("preStopParams", HelpText = "停止前可执行文件的附加参数。" + SecurityWarningPrefix + AppConfig.PreStopParametersEnvVarName + SecurityWarningSuffixParams)]
         public string? PreStopParameters { get; set; }
 
         /// <summary>
         /// Gets or sets the timeout for the pre-stop executable.
         /// Optional.
         /// </summary>
-        [Option("preStopTimeout", HelpText = "Timeout for the pre-stop executable. Set the timeout to 0 to run the pre-stop process in fire-and-forget mode. Must be between 0 and 86400 seconds.")]
+        [Option("preStopTimeout", HelpText = "停止前可执行文件的超时。将超时设为 0 可在“即发即忘”模式下运行停止前进程。必须介于 0 到 86400 秒之间。")]
         public string? PreStopTimeout { get; set; }
 
         /// <summary>
         /// Gets or sets a flag to log pre-stop failure as error.
         /// Optional.
         /// </summary>
-        [Option("preStopLogAsError", HelpText = "Log pre-stop failure as error.")]
+        [Option("preStopLogAsError", HelpText = "将停止前失败记录为错误。")]
         public bool PreStopLogAsError { get; set; }
 
         /// <summary>
         /// Gets or sets the post-stop executable path.
         /// Optional.
         /// </summary>
-        [Option("postStopPath", HelpText = "The post-stop executable path. Configure an optional script or executable to run after the wrapped process and all of its child processes have exited. The post-stop process is started in fire-and-forget mode and does not block service shutdown. Supports environment variable expansion, example: %JAVA_HOME%\\bin\\java.exe")]
+        [Option("postStopPath", HelpText = "停止后可执行文件路径。配置一个可选的、在包装进程及其所有子进程退出后运行的脚本或可执行文件。停止后进程以“即发即忘”模式启动，不会阻塞服务关闭。支持环境变量展开，例如：%JAVA_HOME%\\bin\\java.exe")]
         public string? PostStopPath { get; set; }
 
         /// <summary>
         /// Gets or sets the post-stop startup directory.
         /// Optional. If not set, defaults to the service working directory.
         /// </summary>
-        [Option("postStopStartupDir", HelpText = "Specifies the directory in which the post-stop executable will start. If not set, defaults to the service working directory. Supports environment variable expansion, example: %PROGRAMDATA%\\MyApp")]
+        [Option("postStopStartupDir", HelpText = "指定停止后可执行文件启动时所在的目录。如果未设置，默认为服务工作目录。支持环境变量展开，例如：%PROGRAMDATA%\\MyApp")]
         public string? PostStopStartupDir { get; set; }
 
         /// <summary>
@@ -505,7 +505,7 @@ namespace Servy.CLI.Options
         /// variable instead.
         /// </remarks>
         [Sensitive]
-        [Option("postStopParams", HelpText = "Additional parameters for the post-stop executable." + SecurityWarningPrefix + AppConfig.PostStopParametersEnvVarName + SecurityWarningSuffixParams)]
+        [Option("postStopParams", HelpText = "停止后可执行文件的附加参数。" + SecurityWarningPrefix + AppConfig.PostStopParametersEnvVarName + SecurityWarningSuffixParams)]
         public string? PostStopParameters { get; set; }
     }
 }

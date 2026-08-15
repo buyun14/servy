@@ -18,7 +18,7 @@ namespace Servy.CLI.Options
         /// <value>
         /// <c>true</c> to enable quiet mode; otherwise, <c>false</c>.
         /// </value>
-        [Option('q', "quiet", Required = false, HelpText = "Suppress spinner and run in non-interactive mode.")]
+        [Option('q', "quiet", Required = false, HelpText = "抑制转圈动画并以非交互模式运行。")]
         public bool Quiet { get; set; }
     }
 }

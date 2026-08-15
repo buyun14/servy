@@ -1,7 +1,7 @@
 #Requires -Version 2.0
 <#
 .SYNOPSIS
-  Servy PowerShell module to manage Windows services using the Servy CLI.
+  使用 Servy CLI 管理 Windows 服务的 Servy PowerShell 模块。
 
 .DESCRIPTION
   PowerShell module to manage Windows services using the Servy CLI.
@@ -92,7 +92,7 @@ $script:ServyCliFound = Test-Path $script:ServyCliPath
 function Add-Arg {
   <#
     .SYNOPSIS
-        Adds a key-value argument or a standalone flag to a list of command-line arguments.
+        向命令行参数列表添加一个键值参数或独立标志。
 
     .DESCRIPTION
         This helper function appends a command-line argument in the form:
@@ -161,7 +161,7 @@ function Add-Arg {
 function Resolve-SecureParameter {
   <#
     .SYNOPSIS
-        Resolves a sensitive plain-text parameter by checking explicit CLI inputs first,
+        通过优先检查显式 CLI 输入来解析敏感的明文参数，
         then falling back to the system environment variables.
 
     .DESCRIPTION
@@ -190,7 +190,7 @@ function Resolve-SecureParameter {
 function Format-SecureLogMessage {
   <#
     .SYNOPSIS
-        Masks sensitive command-line arguments in log text.
+        在日志文本中屏蔽敏感的命令行参数。
 
     .DESCRIPTION
         This function parses raw stderr or stdout strings from the Servy CLI and scrubs
@@ -260,7 +260,7 @@ function Format-SecureLogMessage {
 function Invoke-ServyCli {
   <#
     .SYNOPSIS
-        Internal helper to execute the Servy CLI.
+        执行 Servy CLI 的内部辅助函数。
 
     .DESCRIPTION
         Builds and executes a Servy CLI command with the provided arguments.
@@ -307,11 +307,11 @@ function Invoke-ServyCli {
 
   # Validate command (single token)
   if ($Command -match '\s') {
-    throw "Command must be a single word without spaces: '$Command'"
+    throw "命令必须是单个单词且不含空格：'$Command'"
   }
 
   if ($script:ServyTimeoutSeconds -lt 1) {
-    throw "ServyTimeoutSeconds must be >= 1 (current: $($script:ServyTimeoutSeconds))"
+    throw "ServyTimeoutSeconds 必须 >= 1（当前值：$($script:ServyTimeoutSeconds)）"
   }
 
   # Build argument list
@@ -327,9 +327,8 @@ function Invoke-ServyCli {
   # Windows limit is 32,767 characters. We check against 32,000 to be safe
   # and account for the executable path length.
   if ($argString.Length -gt 32000) {
-    throw "$($ErrorContext): Command-line arguments exceed Windows maximum length ($($argString.Length) characters). " +
-    "To resolve this, shorten your environment variables/parameters or use the 'import' command " +
-    "with a configuration file instead."
+    throw "$($ErrorContext)：命令行参数超过 Windows 最大长度限制（$($argString.Length) 个字符）。" +
+    "要解决此问题，请缩短环境变量/参数，或改用带配置文件的 'import' 命令。"
   }
 
   $process = $null
@@ -354,9 +353,9 @@ function Invoke-ServyCli {
 
     if (-not (Test-Path $script:ServyCliPath)) {
         if ($script:ServyCliFound) {
-            throw "Servy CLI was located at module load time but is no longer present at '$($script:ServyCliPath)'. The file may have been moved or deleted; re-import the module to re-probe."
+            throw "加载模块时已定位到 Servy CLI，但 '$($script:ServyCliPath)' 现在已不存在。文件可能已被移动或删除；请重新导入模块以再次探测。"
         } else {
-            throw "Servy CLI was not found at any of the probed locations (local module folder, Program Files, system PATH). Install Servy or add servy-cli.exe to PATH, then re-import the module."
+            throw "在探测的所有位置（模块本地文件夹、Program Files、系统 PATH）均未找到 Servy CLI。请安装 Servy 或将 servy-cli.exe 添加到 PATH，然后重新导入模块。"
         }
     }
 
@@ -398,7 +397,7 @@ function Invoke-ServyCli {
                   $buf.CharCount += $EventArgs.Data.Length
               }
               elseif (-not $buf.Truncated) {
-                  [void]$buf.Lines.Add("... [Output truncated to prevent memory exhaustion] ...")
+                  [void]$buf.Lines.Add("…… [输出已截断，以防内存耗尽] ……")
                   $buf.Truncated = $true
               }
           }
@@ -415,7 +414,7 @@ function Invoke-ServyCli {
                   $buf.CharCount += $EventArgs.Data.Length
               }
               elseif (-not $buf.Truncated) {
-                  [void]$buf.Lines.Add("... [Error output truncated to prevent memory exhaustion] ...")
+                  [void]$buf.Lines.Add("…… [错误输出已截断，以防内存耗尽] ……")
                   $buf.Truncated = $true
               }
           }
@@ -425,12 +424,12 @@ function Invoke-ServyCli {
       $started = $process.Start()
     }
     catch [System.ComponentModel.Win32Exception] {
-      throw "Failed to start Servy CLI: $($_.Exception.Message) (Win32 error $($_.Exception.NativeErrorCode)). Path: '$($script:ServyCliPath)'"
+      throw "启动 Servy CLI 失败：$($_.Exception.Message)（Win32 错误 $($_.Exception.NativeErrorCode)）。路径：'$($script:ServyCliPath)'"
     }
 
     if (-not $started) {
-      throw "Failed to start Servy CLI process '$($script:ServyCliPath)'. " +
-      "Verify the file exists, is not locked, and the current user has execute permissions."
+      throw "启动 Servy CLI 进程 '$($script:ServyCliPath)' 失败。" +
+      "请确认文件存在、未被锁定，并且当前用户具有执行权限。"
     }
 
     # 3. Begin Async reading
@@ -461,13 +460,13 @@ function Invoke-ServyCli {
         if ($killed) { [void]$process.WaitForExit() }
       }
       catch {
-        Write-Warning "Failed to kill process: $_"
+        Write-Warning "终止进程失败：$_"
       }
 
       if ($killed) {
-          throw "Operation timed out after $($script:ServyTimeoutSeconds) seconds and was terminated."
+          throw "操作在 $($script:ServyTimeoutSeconds) 秒后超时并已被终止。"
       } else {
-          throw "Operation timed out after $($script:ServyTimeoutSeconds) seconds. WARNING: Failed to terminate the process (PID: $($process.Id)) - it may still be running."
+          throw "操作在 $($script:ServyTimeoutSeconds) 秒后超时。警告：未能终止进程（PID：$($process.Id)）——它可能仍在运行。"
       }
     } else {
       # CRITICAL: Since the process is confirmed dead, a parameterless WaitForExit()
@@ -542,16 +541,16 @@ function Invoke-ServyCli {
   if ($exitCode -ne 0) {
     # SECURITY: Scrub stderr before pushing to the session-persistent exit code exception
     $scrubbedStderrFinal = Format-SecureLogMessage -Text $stderr
-    $errorMessage = if ($null -ne $scrubbedStderrFinal -and $scrubbedStderrFinal.Trim() -ne "") { $scrubbedStderrFinal.TrimEnd() } else { "Unknown error" }
+    $errorMessage = if ($null -ne $scrubbedStderrFinal -and $scrubbedStderrFinal.Trim() -ne "") { $scrubbedStderrFinal.TrimEnd() } else { "未知错误" }
 
-    throw "$($ErrorContext): Servy CLI exited with code $exitCode. Details: $errorMessage"
+    throw "$($ErrorContext)：Servy CLI 以退出代码 $exitCode 结束。详细信息：$errorMessage"
   }
 }
 
 function Assert-Administrator {
   <#
     .SYNOPSIS
-        Verifies that the current PowerShell session is running with Administrator privileges.
+        验证当前 PowerShell 会话是否以管理员权限运行。
 
     .DESCRIPTION
         Checks the security principal of the current Windows identity. If the user is not in
@@ -570,7 +569,7 @@ function Assert-Administrator {
         $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-            throw "This operation requires Administrator privileges. Run PowerShell as Administrator."
+            throw "此操作需要管理员权限。请以管理员身份运行 PowerShell。"
         }
     }
     finally {
@@ -583,7 +582,7 @@ function Assert-Administrator {
 function Invoke-ServyServiceCommand {
   <#
     .SYNOPSIS
-        Executes a specific service management command via the Servy CLI.
+        通过 Servy CLI 执行特定的服务管理命令。
 
     .DESCRIPTION
         Wraps the Servy CLI to perform actions such as start, stop, or restart on a
@@ -627,7 +626,7 @@ function Invoke-ServyServiceCommand {
   $argsList = @()
   $argsList = Add-Arg $argsList "--name" $Name
 
-  Invoke-ServyCli -Command $Command -Quiet:$Quiet -Arguments $argsList -ErrorContext "Failed to $Command service '$Name'"
+  Invoke-ServyCli -Command $Command -Quiet:$Quiet -Arguments $argsList -ErrorContext "对服务 '$Name' 执行 $Command 失败"
 }
 
 # ----------------------------------------------------------------
@@ -637,7 +636,7 @@ function Invoke-ServyServiceCommand {
 function Set-ServyConfig {
   <#
     .SYNOPSIS
-        Configures module-level execution settings for the Servy CLI.
+        配置 Servy CLI 的模块级执行设置。
 
     .DESCRIPTION
         Updates internal module variables such as the execution timeout and
@@ -678,7 +677,7 @@ function Set-ServyConfig {
 function Get-ServyVersion {
   <#
     .SYNOPSIS
-        Displays the version of the Servy CLI.
+        显示 Servy CLI 的版本。
 
     .DESCRIPTION
         Wraps the Servy CLI `--version` command to show the current version
@@ -696,13 +695,13 @@ function Get-ServyVersion {
     [switch] $Quiet
   )
 
-  Invoke-ServyCli -Command "--version" -Quiet:$Quiet -ErrorContext "Failed to get Servy CLI version"
+  Invoke-ServyCli -Command "--version" -Quiet:$Quiet -ErrorContext "获取 Servy CLI 版本失败"
 }
 
 function Get-ServyHelp {
   <#
     .SYNOPSIS
-        Displays help information for the Servy CLI.
+        显示 Servy CLI 的帮助信息。
 
     .DESCRIPTION
         Wraps the Servy CLI `help` command to show usage information
@@ -732,10 +731,10 @@ function Get-ServyHelp {
   $argsList = @()
   if ($Command) {
     $argsList = Add-Arg $argsList "--help" -Flag
-    Invoke-ServyCli -Command $Command -Arguments $argsList -Quiet:$Quiet -ErrorContext "Failed to display Servy CLI help"
+    Invoke-ServyCli -Command $Command -Arguments $argsList -Quiet:$Quiet -ErrorContext "显示 Servy CLI 帮助失败"
   }
   else {
-    Invoke-ServyCli -Command "--help" -Quiet:$Quiet -ErrorContext "Failed to display Servy CLI help"
+    Invoke-ServyCli -Command "--help" -Quiet:$Quiet -ErrorContext "显示 Servy CLI 帮助失败"
   }
 
 }
@@ -743,7 +742,7 @@ function Get-ServyHelp {
 function Install-ServyService {
   <#
     .SYNOPSIS
-        Installs a new Windows service using Servy.
+        使用 Servy 安装新的 Windows 服务。
 
     .DESCRIPTION
         Wraps the Servy CLI `install` command to create a Windows service from any
@@ -1009,13 +1008,13 @@ function Install-ServyService {
     [ValidateNotNullOrEmpty()]
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Leaf) { $true }
-        else { throw "Executable not found: $_" }
+        else { throw "未找到可执行文件：$_" }
       })]
     [string] $Path,
 
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Container) { $true }
-        else { throw "Startup directory not found: $_" }
+        else { throw "未找到启动目录：$_" }
       })]
     [string] $StartupDir,
 
@@ -1100,13 +1099,13 @@ function Install-ServyService {
 
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Leaf) { $true }
-        else { throw "Failure program executable not found: $_" }
+        else { throw "未找到失败处理程序可执行文件：$_" }
       })]
     [string] $FailureProgramPath,
 
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Container) { $true }
-        else { throw "Failure program startup directory not found: $_" }
+        else { throw "未找到失败处理程序启动目录：$_" }
       })]
     [string] $FailureProgramStartupDir,
 
@@ -1134,13 +1133,13 @@ function Install-ServyService {
     # Pre-launch
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Leaf) { $true }
-        else { throw "Pre-launch executable not found: $_" }
+        else { throw "未找到预启动可执行文件：$_" }
       })]
     [string] $PreLaunchPath,
 
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Container) { $true }
-        else { throw "Pre-launch startup directory not found: $_" }
+        else { throw "未找到预启动启动目录：$_" }
       })]
     [string] $PreLaunchStartupDir,
 
@@ -1176,13 +1175,13 @@ function Install-ServyService {
     # Post-launch
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Leaf) { $true }
-        else { throw "Post-launch executable not found: $_" }
+        else { throw "未找到启动后可执行文件：$_" }
       })]
     [string] $PostLaunchPath,
 
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Container) { $true }
-        else { throw "Post-launch startup directory not found: $_" }
+        else { throw "未找到启动后启动目录：$_" }
       })]
     [string] $PostLaunchStartupDir,
 
@@ -1195,13 +1194,13 @@ function Install-ServyService {
     # Pre-stop
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Leaf) { $true }
-        else { throw "Pre-stop executable not found: $_" }
+        else { throw "未找到停止前可执行文件：$_" }
       })]
     [string] $PreStopPath,
 
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Container) { $true }
-        else { throw "Pre-stop startup directory not found: $_" }
+        else { throw "未找到停止前启动目录：$_" }
       })]
     [string] $PreStopStartupDir,
 
@@ -1216,13 +1215,13 @@ function Install-ServyService {
     # Post-stop
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Leaf) { $true }
-        else { throw "Post-stop executable not found: $_" }
+        else { throw "未找到停止后可执行文件：$_" }
       })]
     [string] $PostStopPath,
 
     [ValidateScript({
         if (Test-Path ([Environment]::ExpandEnvironmentVariables($_)) -PathType Container) { $true }
-        else { throw "Post-stop startup directory not found: $_" }
+        else { throw "未找到停止后启动目录：$_" }
       })]
     [string] $PostStopStartupDir,
 
@@ -1293,7 +1292,7 @@ function Install-ServyService {
 
   # 3. Handle standalone Flags/Switches separately
   if ($EnableConsoleUI)                         { $argsList = Add-Arg $argsList "--enableConsoleUI" -Flag }
-  if ($EnableRotation)                          { Write-Warning "-EnableRotation is deprecated. Use -EnableSizeRotation instead." }
+  if ($EnableRotation)                          { Write-Warning "-EnableRotation 已弃用。请改用 -EnableSizeRotation。" }
   if ($EnableRotation -or $EnableSizeRotation)  { $argsList = Add-Arg $argsList "--enableSizeRotation" -Flag }
   if ($EnableDateRotation)                      { $argsList = Add-Arg $argsList "--enableDateRotation" -Flag }
   if ($UseLocalTimeForRotation)                 { $argsList = Add-Arg $argsList "--useLocalTimeForRotation" -Flag }
@@ -1335,7 +1334,7 @@ function Install-ServyService {
           # If marshalling resulted in an empty string but the SecureString had data,
           # we treat this as a critical failure.
           elseif ($Password.Length -gt 0) {
-              throw "Password parameter was provided but marshalling produced an empty value; refusing to call CLI without the credential."
+              throw "已提供密码参数，但封送处理生成了空值；拒绝在缺少凭据的情况下调用 CLI。"
           }
       }
       finally {
@@ -1353,7 +1352,7 @@ function Install-ServyService {
 
   # 5. CLI Invocation with deterministic cleanup
   try {
-      Invoke-ServyCli -Command "install" -Arguments $argsList -Quiet:$Quiet -EnvironmentVariables $secureEnv -ErrorContext "Failed to install service '$Name'"
+      Invoke-ServyCli -Command "install" -Arguments $argsList -Quiet:$Quiet -EnvironmentVariables $secureEnv -ErrorContext "安装服务 '$Name' 失败"
   }
   finally {
       # Best effort: release our references so the GC can reclaim them sooner.
@@ -1371,7 +1370,7 @@ function Install-ServyService {
 function Uninstall-ServyService {
   <#
     .SYNOPSIS
-        Uninstalls a Windows service using Servy.
+        使用 Servy 卸载 Windows 服务。
 
     .DESCRIPTION
         Wraps the Servy CLI `uninstall` command.
@@ -1400,7 +1399,7 @@ function Uninstall-ServyService {
 function Start-ServyService {
   <#
     .SYNOPSIS
-        Starts a Windows service using Servy.
+        使用 Servy 启动 Windows 服务。
 
     .DESCRIPTION
         Wraps the Servy CLI `start` command to start a service by its name.
@@ -1430,7 +1429,7 @@ function Start-ServyService {
 function Stop-ServyService {
   <#
     .SYNOPSIS
-        Stops a Windows service using Servy.
+        使用 Servy 停止 Windows 服务。
 
     .DESCRIPTION
         Wraps the Servy CLI `stop` command to stop a service by its name.
@@ -1460,7 +1459,7 @@ function Stop-ServyService {
 function Restart-ServyService {
   <#
     .SYNOPSIS
-        Restarts a Windows service using Servy.
+        使用 Servy 重启 Windows 服务。
 
     .DESCRIPTION
         Wraps the Servy CLI `restart` command to restart a service by its name.
@@ -1490,7 +1489,7 @@ function Restart-ServyService {
 function Get-ServyServiceStatus {
   <#
     .SYNOPSIS
-        Retrieves the current status of a Windows service using Servy.
+        使用 Servy 获取 Windows 服务的当前状态。
 
     .DESCRIPTION
         Wraps the Servy CLI `status` command to get the status of a service by its name.
@@ -1520,7 +1519,7 @@ function Get-ServyServiceStatus {
 function Export-ServyServiceConfig {
     <#
     .SYNOPSIS
-        Exports a Servy Windows service configuration to a file.
+        将 Servy Windows 服务配置导出到文件。
 
     .DESCRIPTION
         Wraps the Servy CLI `export` command to export the configuration of a service
@@ -1580,13 +1579,13 @@ function Export-ServyServiceConfig {
     $argsList = Add-Arg $argsList "--config" $ConfigFileType
     $argsList = Add-Arg $argsList "--path" $Path
 
-    Invoke-ServyCli -Command "export" -Arguments $argsList -Quiet:$Quiet -ErrorContext "Failed to export configuration for service '$Name'"
+    Invoke-ServyCli -Command "export" -Arguments $argsList -Quiet:$Quiet -ErrorContext "导出服务 '$Name' 的配置失败"
 }
 
 function Import-ServyServiceConfig {
     <#
     .SYNOPSIS
-        Imports a Windows service configuration into Servy's database.
+        将 Windows 服务配置导入 Servy 的数据库。
 
     .DESCRIPTION
         Wraps the Servy CLI `import` command to import a service configuration file
@@ -1641,7 +1640,7 @@ function Import-ServyServiceConfig {
     $argsList = Add-Arg $argsList "--path" $Path
     if ($Install) { $argsList = Add-Arg $argsList "--install" -Flag }
 
-    Invoke-ServyCli -Command "import" -Arguments $argsList -Quiet:$Quiet -ErrorContext "Failed to import configuration from '$Path'"
+    Invoke-ServyCli -Command "import" -Arguments $argsList -Quiet:$Quiet -ErrorContext "从 '$Path' 导入配置失败"
 }
 
 # PS 2.0 Compatible Alias declaration

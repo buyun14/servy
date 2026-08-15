@@ -5,14 +5,14 @@ namespace Servy.CLI.Options
     /// <summary>
     /// Options for the <c>uninstall</c> command to uninstall a Windows service.
     /// </summary>
-    [Verb("uninstall", HelpText = "Uninstall a Windows service.")]
+    [Verb("uninstall", HelpText = "卸载 Windows 服务。")]
     public class UninstallServiceOptions : GlobalOptionsBase
     {
         /// <summary>
         /// Gets or sets the name of the service to uninstall.
         /// This option is required.
         /// </summary>
-        [Option('n', "name", Required = true, HelpText = "Name of the service to uninstall.")]
+        [Option('n', "name", Required = true, HelpText = "要卸载的服务名称。")]
         public string? ServiceName { get; set; }
     }
 }

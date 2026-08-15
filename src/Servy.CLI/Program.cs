@@ -73,7 +73,7 @@ namespace Servy.CLI
                     {
                         e.Cancel = true;          // first press: graceful cancellation
                         cts.Cancel();
-                        Console.Error.WriteLine("Cancelling... press Ctrl+C again to force exit.");
+                        Console.Error.WriteLine("正在取消... 再次按 Ctrl+C 强制退出。");
                     }
                     // second press: leave e.Cancel = false -> process terminates
                 };
@@ -95,7 +95,7 @@ namespace Servy.CLI
                     {
                         // Detect a mistyped or unrecognized command that does not start with a global flag dash
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Error.WriteLine($"Error: Unknown command '{firstArg}'. See '--help' for available options.");
+                        Console.Error.WriteLine($"错误：未知命令 '{firstArg}'。运行 '--help' 查看可用选项。");
                         Console.ResetColor();
 
                         return (int)CliExitCode.Error;
@@ -126,8 +126,8 @@ namespace Servy.CLI
                                      $"Minimum required: {AppConfig.MinRequiredSqliteVersion} (CVE-2025-6965 mitigation).");
 
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Error.WriteLine($"[CRITICAL] Vulnerable SQLite version detected: {detectedVersion}");
-                        Console.Error.WriteLine($"This version of Servy requires SQLite {AppConfig.MinRequiredSqliteVersion}+.");
+                        Console.Error.WriteLine($"[严重] 检测到存在漏洞的 SQLite 版本：{detectedVersion}");
+                        Console.Error.WriteLine($"此版本的 Servy 需要 SQLite {AppConfig.MinRequiredSqliteVersion} 或更高版本。");
                         Console.ResetColor();
 
                         // Exit with a CLI-specific sentinel instead of a SCM Win32 error code
@@ -284,13 +284,13 @@ namespace Servy.CLI
                 }
                 catch (OperationCanceledException)
                 {
-                    Console.Error.WriteLine("\nOperation cancelled by user.");
+                    Console.Error.WriteLine("\n操作已被用户取消。");
                     return (int)CliExitCode.Error;
                 }
                 catch (Exception ex)
                 {
                     Logger.Error("An unexpected error occurred in the main execution flow.", ex);
-                    Console.Error.WriteLine($"An unexpected error occurred: {ex.Message}");
+                    Console.Error.WriteLine($"发生意外错误：{ex.Message}");
                     return (int)CliExitCode.Error;
                 }
                 finally
