@@ -1,8 +1,19 @@
+title = "Custom Gitleaks configuration"
+
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Allowlist false positives for internal variable identifiers"
+[[allowlists]]
+description = "Ignore test fixtures and internal key files containing test/mock credentials"
+paths = [
+  '''tests/Servy\.Core\.UnitTests/Security/SecureDataTests\.cs''',
+  '''tests/Servy\.Infrastructure\.IntegrationTests/Data/ServiceRepositoryIntegrationTests\.cs''',
+  '''tests/Servy\.Core\.UnitTests/EnvironmentVariables/EnvironmentVariablesValidatorTests\.cs''',
+]
+
+[[allowlists]]
+description = "Ignore internal key fields on full line match"
+regexTarget = "line"
 regexes = [
   '''_v2EncryptionKey'''
 ]

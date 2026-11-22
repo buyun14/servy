@@ -1,3 +1,4 @@
+using Servy.Core.Config;
 using Servy.Core.Logging;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -25,14 +26,26 @@ namespace Servy.Core.Native
         /// </param>
         /// <exception cref="ArgumentException">Thrown if <paramref name="accountName"/> is null or whitespace.</exception>
         /// <exception cref="InvalidOperationException">
-        /// Thrown if the account cannot be resolved to a SID, or if an LSA operation
-        /// (LsaOpenPolicy / LsaEnumerateAccountRights / LsaAddAccountRights) fails -
-        /// e.g. access denied when the caller is not running elevated.
+        /// Thrown if the account cannot be resolved to a SID. LSA policy failures (including access
+        /// denied for a non-elevated caller) are logged as warnings and do not propagate.
         /// </exception>
         public static void Ensure(string accountName)
         {
+            if (ServiceAccounts.IsBuiltInServiceAccount(accountName)) return;
+
             var sid = AccountToSidOrThrow(accountName);
-            if (!HasLogonAsService(sid)) GrantLogonAsService(sid);
+
+            try
+            {
+                if (!HasDirectLogonAsServiceRight(sid))
+                {
+                    GrantLogonAsService(sid);
+                }
+            }
+            catch (InvalidOperationException ex)
+            {
+                Logger.Warn($"Could not verify or grant the direct 'Log on as a service' right for account '{accountName}'. If the privilege is assigned via Group Policy or group membership, or the caller is not elevated, this is expected and service creation will proceed. Details: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -45,7 +58,7 @@ namespace Servy.Core.Native
         /// Thrown if the account cannot be resolved to a SID, often due to a non-existent account
         /// or an unreachable Domain Controller.
         /// </exception>
-        private static SecurityIdentifier AccountToSidOrThrow(string account)
+        public static SecurityIdentifier AccountToSidOrThrow(string account)
         {
             if (string.IsNullOrWhiteSpace(account))
                 throw new ArgumentException("Account name cannot be empty.", nameof(account));
@@ -54,11 +67,7 @@ namespace Servy.Core.Native
             account = account.Trim();
 
             // Replace ".\" with machine name for local accounts
-            if (account.StartsWith(@".\", StringComparison.OrdinalIgnoreCase))
-            {
-                string machine = Environment.MachineName;
-                account = $"{machine}\\{account.Substring(2)}";
-            }
+            account = ServiceAccounts.ExpandLocalShorthand(account);
 
             try
             {
@@ -119,11 +128,14 @@ namespace Servy.Core.Native
         }
 
         /// <summary>
-        /// Checks whether the specified account already has the "Log on as a service" right.
+        /// Checks whether the specified account has the "Log on as a service" right assigned directly to its LSA account object.
         /// </summary>
+        /// <remarks>
+        /// Note: This method enumerates direct account rights only and does not evaluate indirect rights inherited through Windows group membership.
+        /// </remarks>
         /// <param name="sid">The security identifier of the account.</param>
-        /// <returns>True if the account has the right; otherwise false.</returns>
-        private static bool HasLogonAsService(SecurityIdentifier sid)
+        /// <returns>True if the account has a direct right assignment; otherwise false.</returns>
+        private static bool HasDirectLogonAsServiceRight(SecurityIdentifier sid)
         {
             IntPtr sidPtr = IntPtr.Zero;
             IntPtr policy = IntPtr.Zero;
@@ -133,11 +145,9 @@ namespace Servy.Core.Native
             {
                 policy = OpenPolicyOrThrow(POLICY_ACCESS.POLICY_LOOKUP_NAMES);
 
-                uint rightsCount = 0;
-
                 sidPtr = AllocAndCopySid(sid);
 
-                int status = LsaEnumerateAccountRights(policy, sidPtr, out rightsPtr, out rightsCount);
+                int status = LsaEnumerateAccountRights(policy, sidPtr, out rightsPtr, out uint rightsCount);
 
                 // STATUS_OBJECT_NAME_NOT_FOUND -> the account has *no* rights at all
                 if (status == STATUS_OBJECT_NAME_NOT_FOUND)
@@ -184,7 +194,6 @@ namespace Servy.Core.Native
                     int freeStatus = LsaFreeMemory(rightsPtr);
                     if (freeStatus != 0)
                     {
-                        // Defensive: Log the leak warning without throwing, preserving any primary exception
                         Logger.Warn($"LsaFreeMemory failed to release unmanaged account rights buffer. (NTSTATUS 0x{freeStatus:X})");
                     }
                 }
@@ -205,13 +214,10 @@ namespace Servy.Core.Native
 
             try
             {
-                // Request only the minimal rights required to add account privileges.
-                // POLICY_LOOKUP_NAMES: To resolve SIDs/Names.
-                // POLICY_CREATE_ACCOUNT: To create the account entry in LSA if it doesn't exist.
-                // POLICY_ASSIGN_PRIVILEGE: Required specifically by LsaAddAccountRights.
+                // Request only the rights LsaAddAccountRights documents:
+                // POLICY_LOOKUP_NAMES always, and POLICY_CREATE_ACCOUNT for an account that has no LSA entry yet.
                 uint accessMask = POLICY_ACCESS.POLICY_LOOKUP_NAMES |
-                                  POLICY_ACCESS.POLICY_CREATE_ACCOUNT |
-                                  POLICY_ACCESS.POLICY_ASSIGN_PRIVILEGE;
+                                  POLICY_ACCESS.POLICY_CREATE_ACCOUNT;
 
                 policy = OpenPolicyOrThrow(accessMask);
 

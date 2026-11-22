@@ -2,20 +2,26 @@ using Servy.Service.ProcessManagement;
 using Servy.Testing;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Management;
 
 namespace Servy.Service.IntegrationTests.ProcessManagement
 {
     /// <summary>
+    /// Collection that keeps <see cref="ProcessExtensionsIntegrationTests"/> from running in parallel
+    /// with any other collection, because its tests spawn and enumerate real OS process trees.
+    /// </summary>
+    [CollectionDefinition(Name, DisableParallelization = true)]
+    public class ProcessExtensionsIntegrationTestsCollection
+    {
+        /// <summary>Collection name; reference this instead of repeating the string literal.</summary>
+        public const string Name = "ProcessExtensionsIntegrationTests";
+    }
+
+    /// <summary>
     /// Integration tests for ProcessExtensions.
     /// These tests execute real OS processes and evaluate native Toolhelp32 enumerations.
     /// </summary>
-    [CollectionDefinition("ProcessExtensionsIntegrationTests", DisableParallelization = true)]
-    public class ProcessExtensionsIntegrationTestsCollection
-    {
-        // Enforces strict sequential isolation across the execution suite
-    }
-
-    [Collection("ProcessExtensionsIntegrationTests")]
+    [Collection(ProcessExtensionsIntegrationTestsCollection.Name)]
     public class ProcessExtensionsIntegrationTests : IDisposable
     {
         private readonly List<Process> _processesToCleanup = new List<Process>();
@@ -49,7 +55,6 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
                 string formatted = process.Format();
 
                 // Assert
-                Assert.NotNull(formatted);
                 Assert.Equal("(Exited Process)", formatted);
             }
         }
@@ -84,47 +89,37 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
         [Theory]
         [InlineData(-1)]
         [InlineData(0)]
-        public void GetChildren_InvalidPid_ReturnsEmptyList(int invalidPid)
+        public void GetChildren_InvalidPid_ThrowsArgumentOutOfRangeException(int invalidPid)
         {
-            // Arrange & Act
-            var children = ProcessExtensions.GetChildren(invalidPid, DateTime.Now);
-
-            // Assert
-            Assert.Empty(children);
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentOutOfRangeException>(() => ProcessExtensions.GetChildren(invalidPid, DateTime.Now));
         }
 
         [Fact]
-        public void GetChildren_InvalidStartTime_ReturnsEmptyList()
+        public void GetChildren_InvalidStartTime_ThrowsArgumentException()
         {
-            // Arrange & Act
-            var children = ProcessExtensions.GetChildren(123, DateTime.MinValue);
-
-            // Assert
-            Assert.Empty(children);
+            // Arrange, Act & Assert
+            // The guard runs before any snapshot, so the throw depends only on the argument:
+            // a positive PID with no process behind it reaches it without spawning a tree.
+            var ex = Assert.Throws<ArgumentException>(() => ProcessExtensions.GetChildren(111, DateTime.MinValue));
+            Assert.Equal("parentStartTime", ex.ParamName);
         }
 
         [Theory]
         [InlineData(-1)]
         [InlineData(0)]
-        public void GetAllDescendants_InvalidParameters_ReturnsEmptyList(int invalidPid)
+        public void GetAllDescendants_InvalidPid_ThrowsArgumentOutOfRangeException(int invalidPid)
         {
-            // Arrange & Act
-            var descendantsNullTime = ProcessExtensions.GetAllDescendants(invalidPid, DateTime.MinValue);
-            var descendantsValidTime = ProcessExtensions.GetAllDescendants(invalidPid, DateTime.Now);
-
-            // Assert
-            Assert.Empty(descendantsNullTime);
-            Assert.Empty(descendantsValidTime);
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentOutOfRangeException>(() => ProcessExtensions.GetAllDescendants(invalidPid, DateTime.MinValue));
         }
 
         [Fact]
-        public void GetAllDescendants_InvalidStartTime_ReturnsEmptyList()
+        public void GetAllDescendants_InvalidStartDate_ThrowsArgumentException()
         {
-            // Arrange & Act
-            var descendants = ProcessExtensions.GetAllDescendants(1, DateTime.MinValue);
-
-            // Assert
-            Assert.Empty(descendants);
+            // Arrange, Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => ProcessExtensions.GetAllDescendants(111, DateTime.MinValue));
+            Assert.Equal("parentStartTime", ex.ParamName);
         }
 
         [Fact]
@@ -149,8 +144,8 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
 
                 // 2. Immediate Child Verification: Verify the direct child is found and maps back to root
                 var directChild = children.FirstOrDefault(p =>
-                    p.ProcessName.Equals("powershell", StringComparison.OrdinalIgnoreCase) &&
-                    GetParentPidViaWmi(p) == root.Id);
+                    GetSafeProcessName(p).Equals("powershell", StringComparison.OrdinalIgnoreCase) &&
+                    GetSafeParentPid(p) == root.Id);
 
                 Assert.NotNull(directChild);
 
@@ -216,15 +211,19 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
             // Arrange
             var root = SpawnProcessTree(1);
 
-            // Act (Control) - Retrieve children using the genuine parent start time to verify tree visibility
-            var realChildren = WaitForProcessName(root, "powershell", ProcessExtensions.GetChildren);
+            List<Process> realChildren = new List<Process>();
+            List<Process> childrenWithReusedPid = new List<Process>();
 
-            // Act (Test Target) - Request children with a future parent start time to simulate PID reuse
-            var childrenWithReusedPid = ProcessExtensions.GetChildren(root.Id, DateTime.Now.AddHours(1));
-
-            // Assert
+            // Act & Assert - both fetches run inside the try, so the finally sees whatever was
+            // acquired even when the second snapshot throws
             try
             {
+                // Act (Control) - Retrieve children using the genuine parent start time to verify tree visibility
+                realChildren = WaitForProcessName(root, "powershell", ProcessExtensions.GetChildren);
+
+                // Act (Test Target) - Request children with a future parent start time to simulate PID reuse
+                childrenWithReusedPid = ProcessExtensions.GetChildren(root.Id, DateTime.Now.AddHours(1));
+
                 // Verify the Control state holds true (genuine children exist)
                 Assert.NotEmpty(realChildren);
 
@@ -238,6 +237,105 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
                 {
                     c.Dispose();
                 }
+                foreach (var c in childrenWithReusedPid)
+                {
+                    c.Dispose();
+                }
+            }
+        }
+
+        [Fact]
+        public void GetAllDescendants_UnresolvableIntermediateWithMappedSubtree_StillReturnsGrandchild()
+        {
+            // Arrange - synthetic tree root -> intermediate -> grandchild, where the intermediate
+            // cannot be resolved (exit race, access denied, or PID-reuse rejection) but the snapshot
+            // still maps its subtree. This is the #4406 re-queue branch.
+            const int rootPid = 1000;
+            const int intermediatePid = 2000;
+            const int grandchildPid = 3000;
+            var rootStartTime = DateTime.Now.AddMinutes(-5);
+
+            var byParent = new Dictionary<int, List<int>>
+            {
+                [rootPid] = new List<int> { intermediatePid },
+                [intermediatePid] = new List<int> { grandchildPid },
+            };
+
+            var resolvedWith = new Dictionary<int, DateTime>();
+            var grandchild = Process.GetCurrentProcess();
+
+            try
+            {
+                // Act
+                var descendants = ProcessExtensions.GetAllDescendants(rootPid, rootStartTime, byParent,
+                    (childPid, parentStartTime, snapshotTime) =>
+                    {
+                        resolvedWith[childPid] = parentStartTime;
+                        return childPid == grandchildPid ? grandchild : null;
+                    });
+
+                // Assert - the grandchild survives the unresolvable intermediate
+                Assert.Single(descendants);
+                Assert.Same(grandchild, descendants[0]);
+
+                // Assert - and it was validated against the GRANDPARENT's start time, the other half
+                // of the #4406 contract: the re-queue carries the parent's start time forward
+                Assert.Equal(rootStartTime, resolvedWith[intermediatePid]);
+                Assert.Equal(rootStartTime, resolvedWith[grandchildPid]);
+            }
+            finally
+            {
+                grandchild.Dispose();
+            }
+        }
+
+        [Fact]
+        public void GetAllDescendants_ChildMappedUnderTwoParents_ResolvesItOnlyOnce()
+        {
+            // Arrange - a synthetic map where the same child PID appears under two different
+            // parents (the shape a corrupted or racy Toolhelp32 snapshot can produce), so the
+            // walk would reach it twice without the visited-set cycle guard.
+            const int rootPid = 1000;
+            const int branchAPid = 2000;
+            const int branchBPid = 2001;
+            const int sharedChildPid = 3000;
+            var rootStartTime = DateTime.Now.AddMinutes(-5);
+
+            var byParent = new Dictionary<int, List<int>>
+            {
+                [rootPid] = new List<int> { branchAPid, branchBPid },
+                [branchAPid] = new List<int> { sharedChildPid },
+                [branchBPid] = new List<int> { sharedChildPid }, // same PID, second parent
+            };
+
+            var resolveCallCount = 0;
+            var sharedChild = Process.GetCurrentProcess();
+
+            try
+            {
+                // Act - both intermediates stay unresolved but keep their subtree, so each of
+                // them offers the shared child to the walk in turn
+                var descendants = ProcessExtensions.GetAllDescendants(rootPid, rootStartTime, byParent,
+                    (childPid, parentStartTime, snapshotTime) =>
+                    {
+                        if (childPid == sharedChildPid)
+                        {
+                            resolveCallCount++;
+                            return sharedChild;
+                        }
+
+                        return null;
+                    });
+
+                // Assert - the guard stopped the second visit, so the child was resolved once
+                // and is returned once rather than twice
+                Assert.Equal(1, resolveCallCount);
+                Assert.Single(descendants);
+                Assert.Same(sharedChild, descendants[0]);
+            }
+            finally
+            {
+                sharedChild.Dispose();
             }
         }
 
@@ -248,8 +346,8 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
         [Fact]
         public void TryResolveValidChild_ArgumentExceptionThrown_ReturnsNullSafely()
         {
-            // Arrange - Use an absolute out-of-bounds PID that can never belong to an active windows process allocation
-            int nonExistentPid = 999999;
+            // Arrange - Use a PID no process can hold (see TestProcessIds.NeverValid)
+            int nonExistentPid = TestProcessIds.NeverValid;
 
             // Act
             var result = TestReflection.InvokeNonPublicStatic(typeof(ProcessExtensions), "TryResolveValidChild", nonExistentPid, DateTime.Now, DateTime.UtcNow);
@@ -277,6 +375,71 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
             }
         }
 
+        [Fact]
+        public void TryResolveValidChild_SnapshotTakenBeforeProcessStarted_ReturnsNull()
+        {
+            // Arrange - The current process is alive and readable, so only the lifetime bounds can reject it.
+            // The parent time is 10 days old, so 'startedAfterParent' is true; the snapshot time is 10 days
+            // old, so only 'startedBeforeSnapshot' is false (a process that started after the snapshot
+            // cannot be the child the snapshot listed - it is a recycled PID).
+            using (var current = Process.GetCurrentProcess())
+            {
+                var oldParentTime = DateTime.Now.AddDays(-10);
+                var staleSnapshotTime = DateTime.UtcNow.AddDays(-10);
+
+                // Act
+                var rejected = TestReflection.InvokeNonPublicStatic(typeof(ProcessExtensions), "TryResolveValidChild", current.Id, oldParentTime, staleSnapshotTime);
+
+                // Control - the same parent time with a current snapshot time is accepted, so the null above
+                // can only come from the snapshot bound.
+                var accepted = TestReflection.InvokeNonPublicStatic(typeof(ProcessExtensions), "TryResolveValidChild", current.Id, oldParentTime, DateTime.UtcNow) as Process;
+
+                try
+                {
+                    // Assert
+                    Assert.Null(rejected);
+                    Assert.NotNull(accepted);
+                    Assert.Equal(current.Id, accepted.Id);
+                }
+                finally
+                {
+                    accepted?.Dispose();
+                }
+            }
+        }
+
+        [Fact]
+        public void TryResolveValidChild_AccessDeniedOnIdleProcess_CatchesWin32ExceptionAndReturnsNull()
+        {
+            // Arrange - PID 0, the System Idle pseudo-process, is enumerable and resolvable but
+            // refuses every property query with ERROR_ACCESS_DENIED, including for an elevated
+            // caller. PID 4 (System), which the Format sibling above uses, does NOT: on an elevated
+            // host its properties read back normally, so a test anchored on PID 4 skips itself
+            // instead of reaching the arm it names. Measured on this repo's Windows CI runner,
+            // where PID 0 was the only one of ~140 live processes to deny StartTime.
+            Process? idleProcess = null;
+            try { idleProcess = Process.GetProcessById(0); }
+            catch (ArgumentException) { /* Ignore */ }
+
+            Assert.SkipWhen(idleProcess is null, "PID 0 (Idle) is not resolvable on this host.");
+
+            using (idleProcess)
+            {
+                // Precondition: TryResolveValidChild reads StartTime before its lifetime checks, so that
+                // is the property that must actually be denied - otherwise this test exercises the
+                // lifetime-bounds path, not the Win32Exception fallback.
+                var denied = Record.Exception(() => _ = idleProcess.StartTime);
+                Assert.SkipWhen(!(denied is Win32Exception),
+                    $"StartTime on PID 0 did not raise Win32Exception (got {denied?.GetType().Name ?? "no exception"}).");
+
+                // Act
+                var result = TestReflection.InvokeNonPublicStatic(typeof(ProcessExtensions), "TryResolveValidChild", idleProcess.Id, DateTime.Now, DateTime.UtcNow);
+
+                // Assert
+                Assert.Null(result);
+            }
+        }
+
         #endregion
 
         #region Integration Test Helpers
@@ -284,6 +447,7 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
         /// <summary>
         /// Orchestrates a guaranteed strict PPID native tree using PowerShell.
         /// Uses Base64 EncodedCommands to allow infinite nesting depth without quote-escaping bugs.
+        /// Starts the root process up to <c>maxRetries</c> (8) times, with a linear 500 ms * attempt backoff (about 14 s in total), to withstand runner DLL loading failures (e.g. STATUS_DLL_INIT_FAILED / 0xC0000142) that persist for several seconds.
         /// </summary>
         private Process SpawnProcessTree(int depth)
         {
@@ -298,7 +462,7 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
                 return $@"
                     $psi = New-Object System.Diagnostics.ProcessStartInfo
                     $psi.FileName = 'powershell.exe'
-                    $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encodedInner}'
+                    $psi.Arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {encodedInner}'
                     $psi.UseShellExecute = $false
                     $psi.CreateNoWindow = $true
                     $p = [System.Diagnostics.Process]::Start($psi)
@@ -312,14 +476,43 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
             var psi = new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encodedRoot}",
+                Arguments = $"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {encodedRoot}",
                 CreateNoWindow = true,
                 UseShellExecute = false,
             };
 
-            var rootProcess = Process.Start(psi);
-            Assert.NotNull(rootProcess);
+            const int StatusDllInitFailed = unchecked((int)0xC0000142);
+            const int maxRetries = 8;
+            Process? rootProcess = null;
+            int? lastDllInitExitCode = null;
 
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                rootProcess = Process.Start(psi);
+                Assert.NotNull(rootProcess);
+
+                // Give the process a brief window to ensure it doesn't immediately exit due to runner DLL initialization failures (0xC0000142).
+                // WaitForExit returns as soon as the process dies and only costs the full window for a healthy start.
+                rootProcess.WaitForExit(250);
+
+                if (rootProcess.HasExited && rootProcess.ExitCode == StatusDllInitFailed)
+                {
+                    lastDllInitExitCode = rootProcess.ExitCode;
+                    rootProcess.Dispose();
+                    rootProcess = null;
+
+                    if (attempt < maxRetries)
+                    {
+                        Thread.Sleep(500 * attempt);
+                        continue;
+                    }
+                }
+
+                break;
+            }
+
+            Assert.True(rootProcess != null,
+                $"Root powershell.exe exited with 0x{lastDllInitExitCode:X8} (STATUS_DLL_INIT_FAILED) on all {maxRetries} start attempts.");
             _processesToCleanup.Add(rootProcess);
 
             return rootProcess;
@@ -360,10 +553,26 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
 
         private int GetParentPidViaWmi(Process process)
         {
-            using (var mo = new System.Management.ManagementObject($"win32_process.handle='{process.Id}'"))
+            using (var mo = new ManagementObject($"win32_process.handle='{process.Id}'"))
             {
                 mo.Get();
                 return Convert.ToInt32(mo["ParentProcessId"]);
+            }
+        }
+
+        private int GetSafeParentPid(Process process)
+        {
+            try
+            {
+                return GetParentPidViaWmi(process);
+            }
+            catch (ManagementException)
+            {
+                return -1;
+            }
+            catch (InvalidOperationException)
+            {
+                return -1;
             }
         }
 
@@ -393,19 +602,7 @@ namespace Servy.Service.IntegrationTests.ProcessManagement
 
         private void CleanupRoot(Process? root)
         {
-            try
-            {
-                if (root != null && !root.HasExited)
-                {
-                    root.Kill(entireProcessTree: true);
-                    root.WaitForExit(3000);
-                }
-            }
-            catch { }
-            finally
-            {
-                root?.Dispose();
-            }
+            Testing.TestProcessCleanup.KillAndDispose(root);
         }
 
         public void Dispose()

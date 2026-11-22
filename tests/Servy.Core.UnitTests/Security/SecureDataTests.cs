@@ -1,5 +1,6 @@
 using Moq;
 using Servy.Core.Config;
+using Servy.Core.Logging;
 using Servy.Core.Security;
 using Servy.Testing;
 using System.Security.Cryptography;
@@ -32,6 +33,19 @@ namespace Servy.Core.UnitTests.Security
         {
             // Arrange & Act & Assert
             Assert.Throws<ArgumentNullException>(() => new SecureData(null!));
+        }
+
+        [Fact]
+        public void Constructor_KeyProviderThrows_RethrowsOriginalException()
+        {
+            // Arrange
+            var mockProvider = new Mock<IProtectedKeyProvider>();
+            mockProvider.Setup(p => p.GetKey()).Throws(new InvalidOperationException("DPAPI unavailable"));
+
+            // Act & Assert: the constructor's cleanup catch must rethrow the original exception
+            // unchanged, not swallow it or replace it.
+            var ex = Assert.Throws<InvalidOperationException>(() => new SecureData(mockProvider.Object));
+            Assert.Equal("DPAPI unavailable", ex.Message);
         }
 
         [Fact]
@@ -81,6 +95,30 @@ namespace Servy.Core.UnitTests.Security
             }
         }
 
+        [Fact]
+        public void Encrypt_SamePlaintextTwice_UsesAFreshIvEachTime()
+        {
+            // Arrange
+            const string marker = "SERVY_ENC:v2:";
+            const string secret = "MySecret123";
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                // Act
+                var first = sp.Encrypt(secret);
+                var second = sp.Encrypt(secret);
+
+                // Assert
+                var firstIv = Convert.FromBase64String(first.Substring(marker.Length)).Take(16).ToArray();
+                var secondIv = Convert.FromBase64String(second.Substring(marker.Length)).Take(16).ToArray();
+
+                Assert.NotEqual(first, second);
+                Assert.NotEqual(firstIv, secondIv);
+                Assert.Contains(firstIv, b => b != 0);
+                Assert.Equal(secret, sp.Decrypt(first));
+                Assert.Equal(secret, sp.Decrypt(second));
+            }
+        }
+
         [Theory]
         [InlineData("SERVY_ENC:v1:")]
         [InlineData("SERVY_ENC:")]
@@ -93,27 +131,7 @@ namespace Servy.Core.UnitTests.Security
             using (var sp = new SecureData(_mockProvider.Object))
             {
                 var secret = "LegacySecret";
-
-                string rawV1Base64;
-                using (var aes = Aes.Create())
-                {
-                    aes.Key = _key;
-                    aes.IV = _iv;
-
-                    byte[] encryptedBytes;
-                    using (var ms = new MemoryStream())
-                    {
-                        using (var cs = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write))
-                        {
-                            byte[] input = Encoding.UTF8.GetBytes(secret);
-                            cs.Write(input, 0, input.Length);
-                        }
-                        encryptedBytes = ms.ToArray();
-                    }
-
-                    rawV1Base64 = Convert.ToBase64String(encryptedBytes);
-                }
-
+                var rawV1Base64 = SecureDataHelper.CreateLegacyV1Base64(_key, _iv, secret);
                 var fullCipherWithPrefix = prefix + rawV1Base64;
 
                 // Act
@@ -121,6 +139,29 @@ namespace Servy.Core.UnitTests.Security
 
                 // Assert
                 Assert.Equal(secret, decrypted);
+            }
+        }
+
+        [Fact]
+        public void Decrypt_UnmarkedStrictBase64_LegacyDecryptionFails_ReturnsRawInputAsPlaintext()
+        {
+            // Arrange
+            Assert.SkipUnless(AppConfig.AllowLegacyV1Decryption, "Legacy V1 decryption disabled");
+
+            // 10 raw bytes -> "AQIDBAUGBwgJCg==": strictly Base64 (length is a multiple of 4, every
+            // character is in the standard alphabet and the only padding is trailing), so the unmarked
+            // payload reaches DecryptV1 - but 10 bytes is not a whole number of AES blocks, so the
+            // CryptoStream read throws CryptographicException and the defensive fallback must catch it.
+            var corruptLegacyPayload = Convert.ToBase64String(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 });
+
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                // Act
+                var result = sp.Decrypt(corruptLegacyPayload);
+
+                // Assert
+                // The documented fallback returns the input unchanged rather than propagating the failure.
+                Assert.Equal(corruptLegacyPayload, result);
             }
         }
 
@@ -138,6 +179,7 @@ namespace Servy.Core.UnitTests.Security
                 // Act & Assert
                 var ex = Assert.Throws<ArgumentNullException>(() => sp.Decrypt(input!));
 
+                // Assert
                 // Verify the parameter name matches for extra precision
                 Assert.Equal("cipherText", ex.ParamName);
             }
@@ -153,56 +195,40 @@ namespace Servy.Core.UnitTests.Security
                 // Act & Assert
                 var ex = Assert.Throws<ArgumentException>(() => sp.Decrypt(input));
 
+                // Assert
                 // Verify the parameter name matches for extra precision
                 Assert.Equal("cipherText", ex.ParamName);
             }
         }
 
-        [Theory]
-        // Branch 1: !IsStrictBase64(payload) -> returns the raw plaintext payload string directly.
-        [InlineData("Plain_Legacy_Password_123!", false)]
-        // Branch 2: IsStrictBase64(payload) -> blocked while AllowLegacyV1Decryption is false; the catch
-        // fallback returns the input ciphertext verbatim, so the expectation is the input itself.
-        [InlineData(null, true)]
-        public void Decrypt_LegacyFormat_HandlesBothBranches(string? input, bool isBase64LegacyBranch)
+        [Fact]
+        public void Decrypt_UnmarkedStrictBase64_WhenLegacyDisabled_ThrowsSecureDataLegacyBlockedException()
         {
             // Arrange
-            var rawKey = _mockProvider.Object.GetKey();
-            var rawIv = _mockProvider.Object.GetIV();
+            Assert.SkipWhen(AppConfig.AllowLegacyV1Decryption, "Test targets disabled legacy v1 decryption policy.");
 
-            if (isBase64LegacyBranch)
-            {
-                Assert.SkipWhen(AppConfig.AllowLegacyV1Decryption,
-                    "This branch asserts the legacy-blocked fallback; legacy decryption is enabled.");
+            const string plaintextToEncrypt = "UnmarkedLegacyPayload";
+            string rawBase64Ciphertext = SecureDataHelper.CreateLegacyV1Base64(_key, _iv, plaintextToEncrypt);
 
-                const string plaintextToEncrypt = "DecryptedValueFromV1";
-
-                using (var ms = new MemoryStream())
-                {
-                    using (var aes = Aes.Create())
-                    {
-                        aes.Key = rawKey;
-                        aes.IV = rawIv;
-
-                        using (var encryptor = aes.CreateEncryptor())
-                        using (var cs = new CryptoStream(ms, encryptor, CryptoStreamMode.Write))
-                        using (var sw = new StreamWriter(cs, Encoding.UTF8))
-                        {
-                            sw.Write(plaintextToEncrypt);
-                        }
-                    }
-
-                    input = Convert.ToBase64String(ms.ToArray());
-                }
-            }
-
-            // Act
             using (var sp = new SecureData(_mockProvider.Object))
             {
-                var result = sp.Decrypt(input!);
+                // Act & Assert
+                var ex = Assert.Throws<SecureDataLegacyBlockedException>(() => sp.Decrypt(rawBase64Ciphertext));
+                Assert.Contains("Raw legacy ciphertext detected", ex.Message);
+            }
+        }
 
-                // Assert
-                Assert.Equal(input, result);
+        [Fact]
+        public void Decrypt_MarkedV1_WhenLegacyDisabled_ThrowsSecureDataLegacyBlockedException()
+        {
+            // Arrange
+            Assert.SkipWhen(AppConfig.AllowLegacyV1Decryption, "Test targets disabled legacy v1 decryption policy.");
+
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                // Act & Assert
+                var ex = Assert.Throws<SecureDataLegacyBlockedException>(() => sp.Decrypt("SERVY_ENC:v1:anything"));
+                Assert.Contains("Legacy v1 decryption is disabled in this version", ex.Message);
             }
         }
 
@@ -217,7 +243,8 @@ namespace Servy.Core.UnitTests.Security
                 // Act
                 var result = sp.Decrypt(input);
 
-                // Assert: Unmarked strings still return as-is for backward compatibility
+                // Assert
+                // Unmarked strings still return as-is for backward compatibility
                 Assert.Equal(input, result);
             }
         }
@@ -230,10 +257,47 @@ namespace Servy.Core.UnitTests.Security
             {
                 string input = "SERVY_ENC:NotBase64!";
 
-                // Act & Assert
+                // Act
                 // Since the string has a marker, it MUST succeed or fail loud.
                 // Returning a substring is no longer permitted as it masks integrity issues.
-                Assert.Throws<SecureDataIntegrityException>(() => sp.Decrypt(input));
+                var ex = Assert.Throws<SecureDataIntegrityException>(() => sp.Decrypt(input));
+
+                // Assert: a payload without a version tag is cut at 8 characters, never echoed whole (#1382)
+                Assert.Equal("Unsupported encryption version marker: 'NotBase6'", ex.Message);
+            }
+        }
+
+        [Fact]
+        public void Decrypt_MarkedUnknownVersionLongerThanTheSnippetCap_IsCutAtEightCharacters()
+        {
+            // Arrange: a 14-character tag in front of the colon, so the cap and not the colon decides the cut
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                string input = "SERVY_ENC:LongVersionTag:payload";
+
+                // Act
+                var ex = Assert.Throws<SecureDataIntegrityException>(() => sp.Decrypt(input));
+
+                // Assert
+                Assert.Equal("Unsupported encryption version marker: 'LongVers'", ex.Message);
+            }
+        }
+
+        [Fact]
+        public void Decrypt_MarkedUnknownVersionWithEmbeddedColon_ThrowsWithTruncatedSnippet()
+        {
+            // Arrange
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                // "v3:payload" carries an unrecognized version tag followed by a colon, so the
+                // snippet is capped at the tag. The "SERVY_ENC:NotBase64!" case has no
+                // colon at all and pins the other arm of that cap.
+                string input = "SERVY_ENC:v3:payload";
+
+                // Act & Assert
+                // The message must not echo the rest of the payload back to the caller.
+                var ex = Assert.Throws<SecureDataIntegrityException>(() => sp.Decrypt(input));
+                Assert.Contains("Unsupported encryption version marker: 'v3'", ex.Message);
             }
         }
 
@@ -264,8 +328,56 @@ namespace Servy.Core.UnitTests.Security
                 // It must throw an exception rather than returning tampered "junk".
                 var ex = Assert.Throws<SecureDataIntegrityException>(() => sp.Decrypt(tampered));
 
-                // Optional: Verify the error message relates to the integrity check
+                // Assert
+                // Verify the error message relates to the integrity check
                 Assert.Contains("HMAC integrity check failed", ex.Message);
+            }
+        }
+
+        [Fact]
+        public void Decrypt_V2ValidHmacButInvalidPadding_WrapsAesFailureAsIntegrityException()
+        {
+            // Arrange
+            // Every other v2 tamper test flips a byte of a genuine Encrypt output, so the HMAC check
+            // rejects the payload before AES runs. This payload carries a CORRECT HMAC over a block
+            // that is not PKCS7-padded, so it reaches DecryptCbc and fails there.
+            // The constants mirror SecureData's private HkdfSalt / HkdfV2EncInfo / HkdfV2HmacInfo.
+            var salt = Encoding.UTF8.GetBytes("Servy.Core.Security.v2.Salt");
+            var encKey = HKDF.DeriveKey(HashAlgorithmName.SHA256, _key, 32, salt, Encoding.UTF8.GetBytes("V2_AES_ENCRYPTION"));
+            var hmacKey = HKDF.DeriveKey(HashAlgorithmName.SHA256, _key, 32, salt, Encoding.UTF8.GetBytes("V2_HMAC_AUTHENTICATION"));
+
+            var iv = new byte[16];
+            byte[] ciphertext;
+            using (var aes = Aes.Create())
+            {
+                aes.Key = encKey;
+
+                // One all-zero block, unpadded: its decrypted last byte is 0x00, never a valid PKCS7 pad.
+                ciphertext = aes.EncryptCbc(new byte[16], iv, PaddingMode.None);
+            }
+
+            var signed = new byte[iv.Length + ciphertext.Length];
+            Buffer.BlockCopy(iv, 0, signed, 0, iv.Length);
+            Buffer.BlockCopy(ciphertext, 0, signed, iv.Length, ciphertext.Length);
+
+            var hmac = HMACSHA256.HashData(hmacKey, signed);
+            var combined = new byte[signed.Length + hmac.Length];
+            Buffer.BlockCopy(signed, 0, combined, 0, signed.Length);
+            Buffer.BlockCopy(hmac, 0, combined, signed.Length, hmac.Length);
+
+            var payload = "SERVY_ENC:v2:" + Convert.ToBase64String(combined);
+
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                // Act
+                var ex = Assert.Throws<SecureDataIntegrityException>(() => sp.Decrypt(payload));
+
+                // Assert
+                // Assert.Throws matches the exact type, so removing the wrap (which would let the raw
+                // CryptographicException through the outer rethrow) fails here; the message prefix
+                // separates this arm from the HMAC arm.
+                Assert.StartsWith("AES decryption failed:", ex.Message);
+                Assert.IsAssignableFrom<CryptographicException>(ex.InnerException);
             }
         }
 
@@ -302,6 +414,42 @@ namespace Servy.Core.UnitTests.Security
         }
 
         [Fact]
+        public void Decrypt_UnmarkedLegacyCiphertextContainingASlash_WhenLegacyDisabled_IsRefusedNotReturned()
+        {
+            // Arrange
+            Assert.SkipWhen(AppConfig.AllowLegacyV1Decryption, "Test targets disabled legacy v1 decryption policy.");
+
+            // "Z0Kq/vFmziq7aJ8//yXjhw==": uses '/', 'Z', 'z' and '0'
+            string rawBase64Ciphertext = SecureDataHelper.CreateLegacyV1Base64(_key, _iv, "LegacySecret1");
+            Assert.Contains('/', rawBase64Ciphertext);
+
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                // Act & Assert
+                Assert.Throws<SecureDataLegacyBlockedException>(() => sp.Decrypt(rawBase64Ciphertext));
+            }
+        }
+
+        [Theory]
+        [InlineData(32)]   // a whole HMAC, no room for the IV
+        [InlineData(47)]   // one byte below IV + HMAC
+        public void DecryptV2_PayloadShorterThanIvPlusHmac_ThrowsInsufficientLength(int length)
+        {
+            // Arrange
+            using (var sp = new SecureData(_mockProvider.Object))
+            {
+                var shortPayloadBase64 = Convert.ToBase64String(new byte[length]);
+
+                // Act
+                var ex = Assert.Throws<SecureDataIntegrityException>(() =>
+                    TestReflection.InvokeNonPublic(sp, "DecryptV2", new object[] { shortPayloadBase64 }));
+
+                // Assert
+                Assert.Contains("V2 payload length is insufficient.", ex.Message);
+            }
+        }
+
+        [Fact]
         public void DecryptV2_PayloadTooShort_Throws()
         {
             // Arrange
@@ -316,6 +464,7 @@ namespace Servy.Core.UnitTests.Security
                 var ex = Assert.Throws<SecureDataIntegrityException>(() =>
                     TestReflection.InvokeNonPublic(sp, "DecryptV2", new object[] { shortPayloadBase64 }));
 
+                // Assert
                 Assert.Contains("V2 payload length is insufficient.", ex.Message);
             }
         }
@@ -335,6 +484,7 @@ namespace Servy.Core.UnitTests.Security
             var exception = Assert.Throws<ObjectDisposedException>(() =>
                 sp.Encrypt("Sensitive Data"));
 
+            // Assert
             // Verify the exception mentions the correct class name
             Assert.Contains(nameof(SecureData), exception.ObjectName);
         }
@@ -350,6 +500,7 @@ namespace Servy.Core.UnitTests.Security
             var exception = Assert.Throws<ObjectDisposedException>(() =>
                 sp.Decrypt("SERVY_ENC:v2:dummy_payload"));
 
+            // Assert
             Assert.Contains(nameof(SecureData), exception.ObjectName);
         }
 
@@ -362,20 +513,22 @@ namespace Servy.Core.UnitTests.Security
 
             // Act 1: Should succeed before disposal
             var cipher = sp.Encrypt(plainText);
+
+            // Assert 1
             Assert.NotNull(cipher);
 
             // Act 2: Dispose
             sp.Dispose();
 
-            // Assert: Subsequent calls must fail
+            // Assert 2: Subsequent calls must fail
             Assert.Throws<ObjectDisposedException>(() => sp.Encrypt(plainText));
             Assert.Throws<ObjectDisposedException>(() => sp.Decrypt(cipher));
         }
 
         [Fact]
-        public void Dispose_ZeroesAllKeyMaterialAndHandlesIdempotency()
+        public void Dispose_ZeroesV2KeyMaterialAndHandlesIdempotency()
         {
-            // 1. Arrange: Setup Mock Provider with dummy key data
+            // Arrange: Setup Mock Provider with dummy key data
             var mockProvider = new Mock<IProtectedKeyProvider>();
             byte[] dummyKey = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
             byte[] dummyIv = { 10, 20, 30, 40, 50, 60, 70, 80 };
@@ -388,33 +541,27 @@ namespace Servy.Core.UnitTests.Security
             // To verify zeroing, we use Reflection to grab the internal byte arrays.
             // This is necessary because the fields are private and we need to check
             // the content of the memory after Dispose.
-            var v1Key = TestReflection.GetField<byte[]>(secureData, "_v1MasterKey");
-            var v1Iv = TestReflection.GetField<byte[]>(secureData, "_v1StaticIv");
+            // Only the two v2 sub-keys exist in shipped builds: _v1MasterKey and _v1StaticIv are
+            // assigned solely inside the AllowLegacyV1Decryption const-gated block in the constructor,
+            // so there is no v1 material to zero here. See #2193, #2215.
             var v2Enc = TestReflection.GetField<byte[]>(secureData, "_v2EncryptionKey");
             var v2Hmac = TestReflection.GetField<byte[]>(secureData, "_v2HmacKey");
 
             // Pre-condition check: Ensure keys are not zero before Dispose
-            if (AppConfig.AllowLegacyV1Decryption)
-            {
-                Assert.Contains(v1Key, b => b != 0);
-            }
             Assert.Contains(v2Enc, b => b != 0);
 
-            // 2. Act: First Dispose (Covers all null-checks and zeroing logic)
+            // Act 1: First Dispose (Covers all null-checks and zeroing logic)
             secureData.Dispose();
 
-            // 3. Assert: Verify all memory is zeroed
-            if (AppConfig.AllowLegacyV1Decryption)
-            {
-                Assert.All(v1Key, b => Assert.Equal(0, b));
-                Assert.All(v1Iv, b => Assert.Equal(0, b));
-            }
+            // Assert 1: Verify all memory is zeroed
             Assert.All(v2Enc, b => Assert.Equal(0, b));
             Assert.All(v2Hmac, b => Assert.Equal(0, b));
 
-            // 4. Act: Second Dispose (Covers the 'if (_disposed) return' branch)
+            // Act 2: Second Dispose (Covers the 'if (_disposed) return' branch)
             // This should not throw or cause any side effects
             var record = Record.Exception(() => secureData.Dispose());
+
+            // Assert 2
             Assert.Null(record);
 
             // Verify state remains disposed
@@ -453,10 +600,12 @@ namespace Servy.Core.UnitTests.Security
         [InlineData("SGVsbG82", true)]   // 0 padding
         [InlineData("SGVsbA==", true)]   // 2 padding
         [InlineData("YQ==", true)]       // Short valid string
+        [InlineData("ab+/", true)]       // the two non-alphanumeric characters of the alphabet
+        [InlineData("AZaz09+/", true)]   // first and last character of each range
         public void IsStrictBase64_ShouldCoverAllBranches(string? input, bool expected)
         {
             // Arrange & Act
-            // GetOptionName is a private static method; invoke it seamlessly via updated helper
+            // IsStrictBase64 is a private static method on SecureData
             var result = (bool)TestReflection.InvokeNonPublicStatic(typeof(SecureData), "IsStrictBase64", input!)!;
 
             // Assert
@@ -464,5 +613,61 @@ namespace Servy.Core.UnitTests.Security
         }
 
         #endregion
+    }
+
+    /// <summary>
+    /// Pins what <see cref="SecureData.Decrypt"/> writes to the log for a marked payload that is refused or fails its integrity check.
+    /// </summary>
+    [Collection(Logging.LoggerCollection.Name)]
+    public class SecureDataLoggingTests
+    {
+        private static SecureData CreateSut()
+        {
+            var provider = new Mock<IProtectedKeyProvider>();
+            provider.Setup(p => p.GetKey()).Returns(() => Enumerable.Range(0, 32).Select(i => (byte)i).ToArray());
+            provider.Setup(p => p.GetIV()).Returns(() => new byte[16]);
+            return new SecureData(provider.Object);
+        }
+
+        [Fact]
+        public void Decrypt_MarkedV1_WhenLegacyDisabled_LogsThePolicyWarningAndNoIntegrityError()
+        {
+            // Arrange
+            Assert.SkipWhen(AppConfig.AllowLegacyV1Decryption, "Test targets disabled legacy v1 decryption policy.");
+            using (var sp = CreateSut())
+            {
+                // Act
+                var log = LogCapture.Run(() =>
+                {
+                    Assert.Throws<SecureDataLegacyBlockedException>(() => sp.Decrypt("SERVY_ENC:v1:anything"));
+                }, LogLevel.Debug);
+
+                // Assert
+                Assert.Contains("Security block: Attempted to decrypt a v1 payload", log, StringComparison.Ordinal);
+                Assert.DoesNotContain("Integrity failure for marked payload", log, StringComparison.Ordinal);
+            }
+        }
+
+        [Fact]
+        public void Decrypt_TamperedV2_LogsTheIntegrityFailureAtErrorLevel()
+        {
+            // Arrange
+            using (var sp = CreateSut())
+            {
+                var encrypted = sp.Encrypt("MySecret123");
+                var data = Convert.FromBase64String(encrypted.Substring("SERVY_ENC:v2:".Length));
+                data[20] ^= 0x01;
+                var tampered = "SERVY_ENC:v2:" + Convert.ToBase64String(data);
+
+                // Act
+                var log = LogCapture.Run(() =>
+                {
+                    Assert.Throws<SecureDataIntegrityException>(() => sp.Decrypt(tampered));
+                }, LogLevel.Error);
+
+                // Assert
+                Assert.Contains("Integrity failure for marked payload.", log, StringComparison.Ordinal);
+            }
+        }
     }
 }

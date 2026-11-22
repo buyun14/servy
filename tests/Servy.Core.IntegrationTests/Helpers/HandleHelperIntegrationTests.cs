@@ -1,41 +1,38 @@
 using Servy.Core.Helpers;
+using Servy.Testing;
 using System.Diagnostics;
 
 namespace Servy.Core.IntegrationTests.Helpers
 {
     /// <summary>
-    /// Integration tests for the HandleHelper class.
-    /// These tests require handle64.exe/handle64a.exe to be present and the runner to be elevated.
+    /// Integration tests for <see cref="HandleHelper"/> against the real Windows Restart Manager: files held by this
+    /// process, by a child process, and an executable held by the process running it.
     /// </summary>
-    [Collection("ProcessIntegrationTests")]
-    public class HandleHelperIntegrationTests : HandleExeIntegrationTestBase, IDisposable
+    [Collection(ProcessIntegrationTestsCollection.Name)]
+    public class HandleHelperIntegrationTests : IDisposable
     {
         private readonly List<string> _tempFiles = new List<string>();
+        private readonly List<Process> _processes = new List<Process>();
 
         /// <summary>
-        /// Initializes the test class by inheriting from the shared tool extraction baseline.
-        /// </summary>
-        public HandleHelperIntegrationTests() : base()
-        {
-            try
-            {
-                // Cold-start driver check
-                HandleHelper.GetProcessesUsingFile(_handleExePath, Path.GetTempPath());
-            }
-            catch (TimeoutException)
-            {
-                Debug.WriteLine("WARNING: Initial handle.exe cold-start timed out while mounting kernel objects. Executing retry pass...");
-                Thread.Sleep(1000);
-
-                HandleHelper.GetProcessesUsingFile(_handleExePath, Path.GetTempPath());
-            }
-        }
-
-        /// <summary>
-        /// Cleans up any open file streams, temporary files, and the extracted executable.
+        /// Kills the child processes and deletes the temporary files the tests created.
         /// </summary>
         public void Dispose()
         {
+            foreach (var process in _processes)
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill();
+                        process.WaitForExit(TestTimeouts.ProcessKillerPerAttemptExitWaitSeconds * 1000);
+                    }
+                }
+                catch { /* Ignore cleanup errors */ }
+                finally { process.Dispose(); }
+            }
+
             foreach (var file in _tempFiles)
             {
                 if (File.Exists(file))
@@ -43,10 +40,6 @@ namespace Servy.Core.IntegrationTests.Helpers
                     try { File.Delete(file); } catch { /* Ignore cleanup errors */ }
                 }
             }
-
-            // DO NOT delete handle64.exe here.
-            // Deleting an executable while another test's constructor is initializing causes the IOException.
-            // Leaving it in the bin folder is completely safe for integration tests.
         }
 
         private string CreateTempFile()
@@ -57,152 +50,161 @@ namespace Servy.Core.IntegrationTests.Helpers
             return path;
         }
 
-        [Theory]
-        [InlineData(null, "C:\\temp\\file.txt")]
-        [InlineData("C:\\temp\\handle.exe", null)]
-        [InlineData("", "C:\\temp\\file.txt")]
-        [InlineData("C:\\temp\\handle.exe", "")]
-        [InlineData("   ", "C:\\temp\\file.txt")]
-        [InlineData("C:\\temp\\handle.exe", "   ")]
-        public void GetProcessesUsingFile_ShouldThrow_WhenPathsAreNullOrEmpty(string? handleExePath, string? filePath)
+        /// <summary>
+        /// Starts a PowerShell child that opens <paramref name="filePath"/> without sharing and keeps it open, and waits
+        /// until it reports that it holds the file.
+        /// </summary>
+        /// <param name="filePath">The file the child opens.</param>
+        /// <returns>The running child process.</returns>
+        private Process StartFileHolder(string filePath)
         {
-            // Arrange & Act & Assert
-            Assert.Throws<ArgumentException>(() => HandleHelper.GetProcessesUsingFile(handleExePath!, filePath!));
+            var psi = new ProcessStartInfo
+            {
+                FileName = TestProcessStarter.PowerShellPath,
+                Arguments = $"-NoProfile -NonInteractive -Command \"$fs = [System.IO.File]::Open('{filePath}', 'Open', 'Read', 'None'); Write-Output 'LOCKED'; while ($true) {{ Start-Sleep -Seconds 1 }}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            // A cold powershell.exe on a loaded runner occasionally stalls before its first line (#7128): the shared
+            // helper replaces a stalled or exited instance rather than waiting longer, and reports every attempt.
+            var (process, _) = TestProcessStarter.StartWithHandshake(
+                psi,
+                line => line.Contains("LOCKED"),
+                TimeSpan.FromSeconds(TestTimeouts.ProcessKillerFileLockTimeoutSeconds),
+                _processes.Add);
+
+            return process;
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public void GetProcessesUsingFile_NullOrBlankPath_ThrowsArgumentException(string? filePath)
+        {
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentException>(() => HandleHelper.GetProcessesUsingFile(filePath!));
         }
 
         [Fact]
-        public void GetProcessesUsingFile_ShouldNotReturnCurrentProcess_WhenNoProcessHoldsHandle()
+        public void GetProcessesUsingFile_NoProcessHoldsTheFile_DoesNotListThisProcess()
         {
             // Arrange
             string testFile = CreateTempFile();
-            int currentPid = Process.GetCurrentProcess().Id;
+            int currentPid = Environment.ProcessId;
 
             // Act
-            var results = HandleHelper.GetProcessesUsingFile(_handleExePath, testFile);
+            var results = HandleHelper.GetProcessesUsingFile(testFile);
 
             // Assert
-            // Symmetrical Hardening: Instead of asserting the entire system-wide list is empty (which causes flakes
-            // if an antivirus or indexer briefly hooks the file), verify specifically that the current test process
-            // is not returned as a handle holder.
+            // Not Assert.Empty: an antivirus or indexer may open a fresh file for a moment. What must hold is that
+            // a file this process wrote and closed is not reported as held by it.
             Assert.DoesNotContain(results, r => r.ProcessId == currentPid);
         }
 
         [Fact]
-        public void GetProcessesUsingFile_ShouldDetectCurrentProcess_WhenCurrentProcessHoldsHandle()
-        {
-            using (var self = Process.GetCurrentProcess())
-            {
-                // Arrange
-                string testFile = CreateTempFile();
-                int currentPid = self.Id;
-                string currentName = self.ProcessName;
-
-                // Lock the file using scoping blocks
-                using (var fs = new FileStream(testFile, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
-                {
-                    // Act
-                    List<HandleHelper.ProcessHandleInfo> results = null!;
-                    bool handleDetected = false;
-
-                    // Retry up to 5 times with a small delay to handle OS propagation latency
-                    const int maxRetries = 5;
-                    for (int i = 0; i < maxRetries; i++)
-                    {
-                        results = HandleHelper.GetProcessesUsingFile(_handleExePath, testFile);
-                        if (results.Any(p => p.ProcessId == currentPid))
-                        {
-                            handleDetected = true;
-                            break;
-                        }
-                        Thread.Sleep(50); // Small backoff window
-                    }
-
-                    // Assert
-                    Assert.True(handleDetected, $"Current process (PID {currentPid}) failed to be detected holding a handle to {testFile} after retries.");
-                    Assert.NotEmpty(results);
-
-                    var selfMatch = results.FirstOrDefault(p => p.ProcessId == currentPid);
-                    Assert.NotNull(selfMatch);
-
-                    // handle.exe output might include .exe or not, HandleHelper trims whitespace.
-                    Assert.Contains(currentName, selfMatch.ProcessName, StringComparison.OrdinalIgnoreCase);
-                }
-            }
-        }
-
-        [Fact]
-        public void GetProcessesUsingFile_ShouldHandleInvalidHandleExePath()
+        public void GetProcessesUsingFile_FileDoesNotExist_ReturnsEmptyList()
         {
             // Arrange
-            string testFile = CreateTempFile();
-            // A path that is guaranteed not to exist
-            string invalidExe = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}_missing.exe");
-
-            // Act & Assert
-            // We expect Win32Exception because Process.Start throws when the file is not found
-            // and UseShellExecute is set to false.
-            Assert.Throws<System.ComponentModel.Win32Exception>(() =>
-                HandleHelper.GetProcessesUsingFile(invalidExe, testFile));
-        }
-
-        [Fact]
-        public void GetProcessesUsingFile_ShouldWorkWithMultipleHandles()
-        {
-            using (var self = Process.GetCurrentProcess())
-            {
-                // Arrange
-                string testFile = CreateTempFile();
-
-                // Open multiple streams inside nested scopes to safely verify handle grouping symmetry
-                using (var fs1 = new FileStream(testFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var fs2 = new FileStream(testFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                {
-                    // Act
-                    var currentPid = self.Id;
-                    List<HandleHelper.ProcessHandleInfo> results = null!;
-                    List<HandleHelper.ProcessHandleInfo> selfHandles = null!;
-                    bool multiHandlesDetected = false;
-
-                    // Wrap the query inside a retry loop identical to its sibling test.
-                    // This absorbs underlying Windows kernel table sync latency before evaluating assertions.
-                    const int maxRetries = 5;
-                    for (int i = 0; i < maxRetries; i++)
-                    {
-                        results = HandleHelper.GetProcessesUsingFile(_handleExePath, testFile);
-                        selfHandles = results.Where(r => r.ProcessId == currentPid).ToList();
-
-                        // handle.exe returns one line per handle found.
-                        if (selfHandles.Count >= 2)
-                        {
-                            multiHandlesDetected = true;
-                            break;
-                        }
-
-                        Thread.Sleep(50); // Small backoff window
-                    }
-
-                    // Assert
-                    // Filter out potential concurrent background system handles (like security indexers) targeting our file
-                    Assert.True(multiHandlesDetected, $"Should have detected at least two handles owned by this running test process (PID {currentPid}). Total found self handles: {selfHandles?.Count ?? 0}, overall system handles found: {results?.Count ?? 0}");
-                }
-            }
-        }
-
-        [Fact]
-        public void GetProcessesUsingFile_NormalExecution_CompletesWell_UnderTimeout()
-        {
-            // Arrange
-            string testFile = CreateTempFile();
+            string missing = Path.Combine(Path.GetTempPath(), $"ServyMissing_{Guid.NewGuid():N}.tmp");
 
             // Act
-            var stopwatch = Stopwatch.StartNew();
-            var results = HandleHelper.GetProcessesUsingFile(_handleExePath, testFile);
-            stopwatch.Stop();
+            var results = HandleHelper.GetProcessesUsingFile(missing);
 
             // Assert
-            Assert.NotNull(results);
-            // Ensure we didn't block longer than the timeout if the exe is working
-            Assert.True(stopwatch.ElapsedMilliseconds < 5000, "Normal execution should be faster than timeout.");
+            Assert.Empty(results);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_ThisProcessHoldsTheFile_ListsThisProcessByExecutableName()
+        {
+            using (var self = Process.GetCurrentProcess())
+            {
+                // Arrange
+                string testFile = CreateTempFile();
+
+                using (new FileStream(testFile, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+                {
+                    // Act
+                    var results = HandleHelper.GetProcessesUsingFile(testFile);
+
+                    // Assert
+                    var match = Assert.Single(results, r => r.ProcessId == self.Id);
+                    Assert.Equal(self.ProcessName, match.ProcessName, ignoreCase: true);
+                }
+            }
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_TwoHandlesInThisProcess_ListsThisProcessOnce()
+        {
+            // Arrange
+            string testFile = CreateTempFile();
+            int currentPid = Environment.ProcessId;
+
+            using (new FileStream(testFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (new FileStream(testFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                // Act
+                var results = HandleHelper.GetProcessesUsingFile(testFile);
+
+                // Assert
+                // ProcessKiller kills each listed process tree; listing a process once per handle would kill it twice.
+                Assert.Single(results, r => r.ProcessId == currentPid);
+            }
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_HandleClosed_NoLongerListsThisProcess()
+        {
+            // Arrange
+            string testFile = CreateTempFile();
+            int currentPid = Environment.ProcessId;
+
+            using (new FileStream(testFile, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+            {
+                Assert.Contains(HandleHelper.GetProcessesUsingFile(testFile), r => r.ProcessId == currentPid);
+            }
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(testFile);
+
+            // Assert
+            Assert.DoesNotContain(results, r => r.ProcessId == currentPid);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_ChildProcessHoldsTheFile_ListsTheChild()
+        {
+            // Arrange
+            string testFile = CreateTempFile();
+            var holder = StartFileHolder(testFile);
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(testFile);
+
+            // Assert
+            var match = Assert.Single(results, r => r.ProcessId == holder.Id);
+            Assert.Equal("powershell", match.ProcessName, ignoreCase: true);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_RunningExecutable_ListsTheProcessRunningIt()
+        {
+            // Arrange
+            // The case Servy depends on: a running Servy.Service.exe holds its own image, which is what blocks the
+            // extraction of a new version. powershell.exe stands in for it.
+            string testFile = CreateTempFile();
+            var holder = StartFileHolder(testFile);
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(TestProcessStarter.PowerShellPath);
+
+            // Assert
+            Assert.Contains(results, r => r.ProcessId == holder.Id);
         }
     }
 }

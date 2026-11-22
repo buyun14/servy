@@ -1,4 +1,4 @@
-# chocolateyinstall.ps1 contains URLs and checksums for the latest release available on GitHub releases page.
+﻿# chocolateyinstall.ps1 contains URLs and checksums for the latest release available on GitHub releases page.
 # URLs and checksums are auto-updated on each new release on GitHub through choco.yml workflow.
 
 $ErrorActionPreference = 'Stop'
@@ -8,11 +8,11 @@ $installerType = 'exe'
 $checksumType  = 'sha256'
 $silentArgs    = '/VERYSILENT /NORESTART /SUPPRESSMSGBOXES /SP- /CLOSEAPPLICATIONS /NOCANCEL'
 
-$url64         = 'https://github.com/aelassas/servy/releases/download/v9.4/servy-9.4-x64-installer.exe'
-$checksum64    = '6DD204A4D1656976E49E8460F6C264DC3E9826C6722D8CE9C9544F659BEC860A'
+$url64         = 'https://github.com/aelassas/servy/releases/download/v10.9/servy-10.9-x64-installer.exe'
+$checksum64    = '1460FADB226A89934CCC5FE1372C1101D3AADB5046245635A5847451C81F9431'
 
-$urlArm64      = 'https://github.com/aelassas/servy/releases/download/v9.4/servy-9.4-arm64-installer.exe'
-$checksumArm64 = '05FBB8067964AD854C729C5045692F1F05738B3AAADFF6D830CFC883134474D4'
+$urlArm64      = 'https://github.com/aelassas/servy/releases/download/v10.9/servy-10.9-arm64-installer.exe'
+$checksumArm64 = 'EFE01444DA295B938E7415A83240CABC887D95C7D2F77A0467A58B6FC4748577'
 
 # Detect OS architecture dynamically
 $isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') -or ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')

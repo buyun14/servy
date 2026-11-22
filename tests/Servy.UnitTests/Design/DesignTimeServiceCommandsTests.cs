@@ -1,5 +1,5 @@
+using Servy.Core.DTOs;
 using Servy.Design;
-using Servy.Models;
 
 namespace Servy.UnitTests.Design
 {
@@ -10,11 +10,11 @@ namespace Servy.UnitTests.Design
         {
             // Arrange
             var commands = new DesignTimeServiceCommands();
-            var dummyConfig = new ServiceConfiguration();
+            var dummyDto = new ServiceDto();
             var ct = TestContext.Current.CancellationToken;
 
             // Act & Assert - Boolean returning methods
-            Assert.True(await commands.InstallServiceAsync(dummyConfig, ct));
+            Assert.True(await commands.InstallServiceAsync(dummyDto, cancellationToken: ct));
             Assert.True(await commands.UninstallServiceAsync("testService", ct));
             Assert.True(await commands.StartServiceAsync("testService", ct));
             Assert.True(await commands.StopServiceAsync("testService", ct));
@@ -31,6 +31,22 @@ namespace Servy.UnitTests.Design
             });
 
             Assert.Null(exception);
+        }
+
+        [Fact]
+        public void OpenRuntimeVariablesLinkAsync_CompletesSynchronously()
+        {
+            // Arrange
+            var commands = new DesignTimeServiceCommands();
+            var ct = TestContext.Current.CancellationToken;
+
+            // Act
+            // Capture the task instead of awaiting it: awaiting an already-completed task asserts nothing,
+            // while synchronous completion is the property the designer depends on.
+            var task = commands.OpenRuntimeVariablesLinkAsync(cancellationToken: ct);
+
+            // Assert
+            Assert.Equal(TaskStatus.RanToCompletion, task.Status);
         }
     }
 }

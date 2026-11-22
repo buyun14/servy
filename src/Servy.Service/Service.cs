@@ -1,27 +1,22 @@
-using Microsoft.Extensions.Configuration;
 using Servy.Core.Config;
-using Servy.Core.Data;
+using Servy.Core.DTOs;
 using Servy.Core.Enums;
 using Servy.Core.EnvironmentVariables;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
-using Servy.Core.Security;
-using Servy.Core.Services;
-using Servy.Infrastructure.Data;
-using Servy.Infrastructure.Helpers;
+using Servy.Core.NamedPipes;
+using Servy.Service.Bootstrap;
 using Servy.Service.CommandLine;
 using Servy.Service.Helpers;
+using Servy.Service.Native;
 using Servy.Service.ProcessManagement;
 using Servy.Service.StreamWriters;
 using Servy.Service.Timers;
 using Servy.Service.Validation;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.ServiceProcess;
-using System.Text;
 using System.Timers;
 using static Servy.Core.Native.NativeMethods;
 using ITimer = Servy.Service.Timers.ITimer;
@@ -33,11 +28,10 @@ namespace Servy.Service
         #region Synchronization Primitives
 
         /// <summary>
-        /// Ensures thread-safe, asynchronous access during file I/O operations.
-        /// This semaphore prevents concurrent read/write conflicts (such as updating persistent restart attempts on disk)
-        /// without blocking the thread pool or the Windows Service Control Manager (SCM).
+        /// Serializes the read-evaluate-write sequences on the persistent restart attempts counter (startup reset,
+        /// health-check increments) without blocking the thread pool or the Windows Service Control Manager (SCM).
         /// </summary>
-        private readonly SemaphoreSlim _fileSemaphore = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _restartAttemptsSemaphore = new SemaphoreSlim(1, 1);
 
         /// <summary>
         /// Acts as an asynchronous gatekeeper for health monitoring and recovery orchestration.
@@ -80,25 +74,25 @@ namespace Servy.Service
         /// <summary>
         /// The command-line argument used to signal that the service is running in a test context.
         /// When this flag is present in the startup arguments, certain environment-specific
-        /// initializations (like Win32 handle reflection) are bypassed.
+        /// initializations (like reading the native service status handle) are bypassed.
         /// </summary>
         public const string TestModeFlag = "servy_test";
 
         /// <summary>
-        /// The namespace in the assembly where the embedded service resources are located.
+        /// The <see cref="Exception.Data"/> key with which <see cref="StartProcess"/> marks a child process
+        /// start failure it has already logged, so that the catch in <see cref="OnStart(string[])"/> does not
+        /// log the same exception a second time. The exception itself is rethrown unchanged.
         /// </summary>
-        private const string ResourcesNamespace = "Servy.Service.Resources";
-
-        /// <summary>
-        /// The base file name (without extension) of the embedded Servy Restarter executable.
-        /// </summary>
-        private const string ServyRestarterExeFileName = "Servy.Restarter";
+        private const string StartFailureLoggedKey = "Servy.StartFailureLogged";
 
         #endregion
 
         #region Static Fields
 
-        private static readonly HttpClient SharedPingClient = new HttpClient();
+        private static readonly HttpClient SharedPingClient = new HttpClient(new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(AppConfig.HeartbeatConnectionLifetimeMinutes)
+        });
 
         #endregion
 
@@ -109,12 +103,15 @@ namespace Servy.Service
         /// <summary>Additional time, in milliseconds, used for Service Control Manager (SCM) operations.</summary>
         private readonly int _scmAdditionalTimeMs = AppConfig.DefaultScmAdditionalTimeMs;
 
-        private readonly SecureData? _secureData;
         private readonly Helpers.IServiceHelper _serviceHelper;
         private IServyLogger? _logger;
         private readonly IStreamWriterFactory _streamWriterFactory;
         private readonly ITimerFactory _timerFactory;
         private readonly IProcessFactory _processFactory;
+        /// <summary>Seam over the console and Service Control Manager native calls; the production implementation forwards each one unchanged.</summary>
+        private readonly IScmNative _scmNative;
+        /// <summary>Seam over the machine-touching and process-global start-up calls of the production constructor; the production implementation forwards each one unchanged. Null on the injection constructors, which perform no production setup.</summary>
+        private readonly IServiceBootstrapEnvironment? _bootstrapEnvironment;
         private readonly IPathValidator _pathValidator;
         private string? _serviceName;
         private string? _realExePath;
@@ -132,20 +129,17 @@ namespace Servy.Service
         private int _maxRestartAttempts = AppConfig.DefaultMaxRestartAttempts; // Maximum number of restart attempts
         private List<EnvironmentVariable> _environmentVariables = new List<EnvironmentVariable>();
         private bool _recoveryActionEnabled = false;
-        private string? _restartAttemptsFile;
+        private string? _restartAttemptsServiceName;
         private bool _preLaunchEnabled = false;
         private StartOptions? _options;
         private CancellationTokenSource? _cancellationSource;
-        private readonly IServiceRepository _serviceRepository;
+        private readonly INamedPipesService? _namedPipesService;
         private readonly List<Hook> _trackedHooks = new List<Hook>();
         private IntPtr _serviceHandle;
         private uint _checkPoint = 0;
-        private volatile bool _disposed = false; // Tracks whether Dispose has been called
+        private volatile bool _disposed = false; // Tracks whether teardown has completed; ExecuteTeardown sets it, so it is true after a plain SCM stop as well as after Dispose
         private volatile bool _isTearingDown = false;
         private volatile bool _isRebooting = false;
-        private readonly IProcessKiller _processKiller;
-        private readonly IAppDbContext? _dbContext;
-        private readonly ProtectedKeyProvider? _protectedKeyProvider;
 
         #endregion
 
@@ -166,9 +160,11 @@ namespace Servy.Service
         /// </summary>
         /// <remarks>
         /// This constructor is intended for the Windows Service Control Manager (SCM).
-        /// It performs full subsystem initialization, including logging, database connectivity,
-        /// and cryptographic setup.
+        /// It performs the production start-up: logger initialization, event source registration and
+        /// loading <c>appsettings.service.json</c>. The wrapper opens no database and sets up no
+        /// cryptography; it reads its configuration through the Servy host named pipe.
         /// </remarks>
+        [ExcludeFromCodeCoverage]
         public Service() : this(
             new Helpers.ServiceHelper(new CommandLineProvider(), new Core.Helpers.ProcessHelper()),
             new EventLogLogger(AppConfig.EventSource),
@@ -176,7 +172,8 @@ namespace Servy.Service
             new TimerFactory(),
             new ProcessFactory(),
             new PathValidator(),
-            new ProcessKiller()
+            new NamedPipesService(),
+            new ServiceBootstrapEnvironment()
           )
         {
         }
@@ -190,16 +187,15 @@ namespace Servy.Service
         /// <param name="timerFactory">The timer factory.</param>
         /// <param name="processFactory">The process factory.</param>
         /// <param name="pathValidator">The path validator.</param>
-        /// <param name="serviceRepository">The service repository.</param>
-        /// <param name="processKiller">The process killer.</param>
+        /// <param name="namedPipesService">The named pipe service instance to use for asynchronous IPC communications.</param>
         /// <remarks>
         /// <b>NOTE:</b> This constructor is primarily intended for <b>Unit Testing</b> and <b>Inversion of Control (IoC)</b> containers.
         /// <para>
         /// Unlike the production constructors, this version <b>DOES NOT</b>:
         /// <list type="bullet">
         /// <item><description>Initialize the global <see cref="Logger"/> utility.</description></item>
-        /// <item><description>Setup the <see cref="SecureData"/> cryptographic subsystem.</description></item>
-        /// <item><description>Initialize the database schema or embedded resources.</description></item>
+        /// <item><description>Ensure the event log source exists.</description></item>
+        /// <item><description>Load <c>appsettings.service.json</c> (the <c>Timing:*</c> settings and the logging configuration).</description></item>
         /// </list>
         /// The caller is responsible for ensuring any required global state is initialized prior to use.
         /// </para>
@@ -211,9 +207,40 @@ namespace Servy.Service
             ITimerFactory timerFactory,
             IProcessFactory processFactory,
             IPathValidator pathValidator,
-            IServiceRepository serviceRepository,
-            IProcessKiller processKiller
+            INamedPipesService namedPipesService
             ) // allow injection
+            : this(serviceHelper, logger, streamWriterFactory, timerFactory, processFactory, pathValidator, namedPipesService, new ScmNative())
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Service"/> class with full dependency injection,
+        /// including the console and Service Control Manager native seam.
+        /// </summary>
+        /// <param name="serviceHelper">The service helper.</param>
+        /// <param name="logger">The logger wrapper.</param>
+        /// <param name="streamWriterFactory">The stream writer factory.</param>
+        /// <param name="timerFactory">The timer factory.</param>
+        /// <param name="processFactory">The process factory.</param>
+        /// <param name="pathValidator">The path validator.</param>
+        /// <param name="namedPipesService">The named pipe service instance to use for asynchronous IPC communications.</param>
+        /// <param name="scmNative">The console and Service Control Manager native seam.</param>
+        /// <exception cref="ArgumentNullException">Any argument is <see langword="null"/>.</exception>
+        /// <remarks>
+        /// This overload exists so a test can observe the native calls the SCM path makes. The public
+        /// constructors pass <see cref="ScmNative"/>, whose members forward unchanged, so production
+        /// behaviour is identical either way.
+        /// </remarks>
+        internal Service(
+            Helpers.IServiceHelper serviceHelper,
+            IServyLogger logger,
+            IStreamWriterFactory streamWriterFactory,
+            ITimerFactory timerFactory,
+            IProcessFactory processFactory,
+            IPathValidator pathValidator,
+            INamedPipesService namedPipesService,
+            IScmNative scmNative
+            )
         {
             ServiceName = AppConfig.EventSource;
             AutoLog = false; // Servy owns its event-log output via LoggerConfigurator
@@ -224,13 +251,14 @@ namespace Servy.Service
             _timerFactory = timerFactory ?? throw new ArgumentNullException(nameof(timerFactory));
             _processFactory = processFactory ?? throw new ArgumentNullException(nameof(processFactory));
             _pathValidator = pathValidator ?? throw new ArgumentNullException(nameof(pathValidator));
-            _serviceRepository = serviceRepository ?? throw new ArgumentNullException(nameof(serviceRepository));
-            _processKiller = processKiller ?? throw new ArgumentNullException(nameof(processKiller));
+            _namedPipesService = namedPipesService ?? throw new ArgumentNullException(nameof(namedPipesService));
+            _scmNative = scmNative ?? throw new ArgumentNullException(nameof(scmNative));
             _options = null;
         }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="Service"/> class with core dependencies and performs production setup.
+        /// Initializes a new instance of the <see cref="Service"/> class with core dependencies and performs
+        /// production setup through the supplied bootstrap environment.
         /// </summary>
         /// <param name="serviceHelper">The service helper instance to use.</param>
         /// <param name="logger">The logger instance to use for logging.</param>
@@ -238,20 +266,24 @@ namespace Servy.Service
         /// <param name="timerFactory">Factory to create timers for health monitoring.</param>
         /// <param name="processFactory">Factory to create process wrappers for launching and managing child processes.</param>
         /// <param name="pathValidator">Path Validator.</param>
-        /// <param name="processKiller">Helper used to terminate processes (and process trees) during teardown.</param>
+        /// <param name="namedPipesService">The named pipe service instance to use for asynchronous IPC communications.</param>
+        /// <param name="bootstrapEnvironment">The seam over the machine-touching and process-global start-up calls.</param>
+        /// <exception cref="ArgumentNullException">Any argument is <see langword="null"/>.</exception>
         /// <remarks>
-        /// This is the primary <b>Production Constructor</b>. It automatically initializes the
-        /// <see cref="Logger"/>, validates the Windows Event Source, loads configuration from
-        /// <c>appsettings.json</c>, and initializes the <see cref="SecureData"/> and database systems.
+        /// This overload exists so a test can construct the production start-up path without touching the
+        /// event log, ProgramData or the process-global logger. The public constructor passes
+        /// <see cref="ServiceBootstrapEnvironment"/>, whose members forward unchanged, so production
+        /// behaviour is identical either way.
         /// </remarks>
-        public Service(
+        internal Service(
             Helpers.IServiceHelper serviceHelper,
             IServyLogger logger,
             IStreamWriterFactory streamWriterFactory,
             ITimerFactory timerFactory,
             IProcessFactory processFactory,
             IPathValidator pathValidator,
-            IProcessKiller processKiller
+            INamedPipesService namedPipesService,
+            IServiceBootstrapEnvironment bootstrapEnvironment
             )
         {
             _serviceHelper = serviceHelper ?? throw new ArgumentNullException(nameof(serviceHelper));
@@ -260,96 +292,45 @@ namespace Servy.Service
             _timerFactory = timerFactory ?? throw new ArgumentNullException(nameof(timerFactory));
             _processFactory = processFactory ?? throw new ArgumentNullException(nameof(processFactory));
             _pathValidator = pathValidator ?? throw new ArgumentNullException(nameof(pathValidator));
-            _processKiller = processKiller ?? throw new ArgumentNullException(nameof(processKiller));
+            _namedPipesService = namedPipesService ?? throw new ArgumentNullException(nameof(namedPipesService));
+            _bootstrapEnvironment = bootstrapEnvironment ?? throw new ArgumentNullException(nameof(bootstrapEnvironment));
+            _scmNative = new ScmNative();
             _options = null;
 
-            Logger.Initialize("Servy.Service.log");
+            // Each service logs in its own folder, the only log folder its service account can write
+            _bootstrapEnvironment.InitializeLogger(AppConfig.ServyServiceLogFileName, GetLogDirectory(_serviceHelper.GetArgs()));
 
             try
             {
                 ServiceName = AppConfig.EventSource;
 
                 // Ensure event source exists
-                Helper.EnsureEventSourceExists();
+                _bootstrapEnvironment.EnsureEventSourceExists();
 
-                // Load configuration from appsettings.json
-                var config = new ConfigurationBuilder()
-                    .SetBasePath(AppFoldersHelper.GetAppDirectory())
-                    .AddJsonFile("appsettings.service.json", optional: true, reloadOnChange: false)
-                    .Build();
+                // Load configuration from appsettings.service.json
+                var config = _bootstrapEnvironment.BuildConfiguration();
 
-                var connectionString = config.GetConnectionString("DefaultConnection") ?? AppConfig.DefaultConnectionString;
-                var aesKeyFilePath = config["Security:AESKeyFilePath"] ?? AppConfig.DefaultAESKeyPath;
-                var aesIVFilePath = config["Security:AESIVFilePath"] ?? AppConfig.DefaultAESIVPath;
-
-                if (int.TryParse(config["Timing:WaitChunkMs"], out var waitChunkMs) && waitChunkMs > 0)
+                if (int.TryParse(config["Timing:WaitChunkMs"], NumberStyles.Integer, CultureInfo.InvariantCulture, out var waitChunkMs) && waitChunkMs > 0)
                 {
                     _waitChunkMs = waitChunkMs;
                 }
-                else
-                {
-                    _waitChunkMs = AppConfig.DefaultWaitChunkMs;
-                }
 
-                if (int.TryParse(config["Timing:ScmAdditionalTimeMs"], out var scmAdditionalTimeMs) && scmAdditionalTimeMs > 0)
+                if (int.TryParse(config["Timing:ScmAdditionalTimeMs"], NumberStyles.Integer, CultureInfo.InvariantCulture, out var scmAdditionalTimeMs) && scmAdditionalTimeMs > 0)
                 {
                     _scmAdditionalTimeMs = scmAdditionalTimeMs;
                 }
-                else
-                {
-                    _scmAdditionalTimeMs = AppConfig.DefaultScmAdditionalTimeMs;
-                }
 
                 // Centralized logging bootstrapper
-                LoggerConfigurator.ConfigureFromAppSettings(config, instanceLogger: _logger);
+                _bootstrapEnvironment.ConfigureLogging(config, instanceLogger: _logger);
+                CoreSettingsLoader.WarnAboutIgnoredSettings(config, AppConfig.ServyServiceSettingsFileName, _logger);
 
                 var isEventLogEnabled = ConfigParser.ParseBool(config["EnableEventLog"], AppConfig.DefaultEnableEventLog, "EnableEventLog");
                 AutoLog = isEventLogEnabled;
 
                 // --- Log Service-specific timing configurations ---
-                Logger.Debug("Servy Service Context Configuration Loaded:" + Environment.NewLine +
+                _bootstrapEnvironment.ReportDebug("Servy Service Context Configuration Loaded:",
                     $"  WaitChunkMs: {_waitChunkMs}" + Environment.NewLine +
                     $"  ScmAdditionalTimeMs: {_scmAdditionalTimeMs}");
-
-                // CVE-2025-6965 Mitigation: Validate SQLite version before opening connection
-                if (!DatabaseValidator.IsSqliteVersionSafe(out var detectedVersion))
-                {
-                    Logger.Error($"[FATAL] Vulnerable SQLite version detected: {detectedVersion}. " +
-                                 $"Minimum required: {AppConfig.MinRequiredSqliteVersion} (CVE-2025-6965 mitigation).");
-
-                    Environment.ExitCode = AppConfig.ServiceSpecificErrorCode;
-                    Environment.Exit(Environment.ExitCode);
-                }
-
-                // Initialize database and helpers
-                _dbContext = new AppDbContext(connectionString);
-                DatabaseInitializer.InitializeDatabase(_dbContext, SQLiteDbInitializer.Initialize);
-
-                var dapperExecutor = new DapperExecutor(_dbContext);
-                _protectedKeyProvider = new ProtectedKeyProvider(aesKeyFilePath, aesIVFilePath);
-                _secureData = new SecureData(_protectedKeyProvider);
-                var xmlSerializer = new XmlServiceSerializer();
-                var jsonSerializer = new JsonServiceSerializer();
-
-                _serviceRepository = new ServiceRepository(dapperExecutor, _secureData, xmlSerializer, jsonSerializer);
-
-                // Copy service executable from embedded resources
-                var asm = Assembly.GetExecutingAssembly();
-                var sh = new Core.Helpers.ServiceHelper(_serviceRepository);
-                var resourceHelper = new ResourceHelper(sh, _processKiller);
-
-                if (!resourceHelper.CopyEmbeddedResourceForceSync(asm, ResourcesNamespace, ServyRestarterExeFileName, "exe"))
-                {
-                    _logger?.Error($"Failed copying embedded resource: {ServyRestarterExeFileName}.exe");
-                }
-
-#if DEBUG
-                // Copy debug symbols from embedded resources (only in debug builds)
-                if (!resourceHelper.CopyEmbeddedResourceForceSync(asm, ResourcesNamespace, ServyRestarterExeFileName, "pdb"))
-                {
-                    _logger?.Error($"Failed copying embedded resource: {ServyRestarterExeFileName}.pdb");
-                }
-#endif
 
                 // Enable Shutdown Notifications
                 CanShutdown = true;
@@ -357,10 +338,10 @@ namespace Servy.Service
             catch (Exception ex)
             {
                 // Without Logger.Initialize in the constructor, this would be lost.
-                Logger.Error("Fatal error during service construction.", ex);
+                _bootstrapEnvironment.LogError("Fatal error during service construction.", ex);
 
-                // If the environment exit code was successfully set to a custom error
-                // (like 13 from ProtectedKeyProvider), preserve it. Otherwise, set a generic service failure code.
+                // If a non-zero environment exit code was already set, preserve it.
+                // Otherwise, set a generic service failure code.
                 if (Environment.ExitCode == 0)
                 {
                     Environment.ExitCode = AppConfig.ServiceSpecificErrorCode; // ERROR_SERVICE_SPECIFIC_ERROR
@@ -368,11 +349,29 @@ namespace Servy.Service
 
                 // By explicitly calling Environment.Exit here, we guarantee the SCM registers
                 // the custom exit code immediately, completely preventing the 1053 timeout hang.
-                Environment.Exit(Environment.ExitCode);
+                TerminateProcess(Environment.ExitCode);
             }
         }
 
+        /// <summary>
+        /// Gets the folder the wrapper writes its log in: the log folder of the service named on its command line,
+        /// <c>logs\services\&lt;ServiceName&gt;\</c> (<see cref="ServiceLogPaths.GetFolderPath"/>).
+        /// </summary>
+        /// <param name="args">The wrapper's command line, as <see cref="Helpers.IServiceHelper.GetArgs"/> returns it;
+        /// element 1 is the service name, as <see cref="CommandLine.StartOptionsParser.Parse"/> reads it.</param>
+        /// <returns>
+        /// The service's log folder, or <see cref="AppConfig.ServiceLogsFolderPath"/> when the command line names no
+        /// service; such a wrapper fails to start in <see cref="OnStart(string[])"/> anyway.
+        /// </returns>
+        internal static string GetLogDirectory(string[]? args)
+        {
+            var serviceName = args != null && args.Length > 1 ? args[1] : null;
+            return string.IsNullOrWhiteSpace(serviceName) ? AppConfig.ServiceLogsFolderPath : ServiceLogPaths.GetFolderPath(serviceName!);
+        }
+
         #endregion
+
+        #region Lifecycle (OnStart / OnStop / OnShutdown / OnCustomCommand / Dispose)
 
         /// <summary>
         /// Called when the Windows service is started.
@@ -380,9 +379,12 @@ namespace Servy.Service
         /// runs the optional pre-launch process (if configured), and starts the monitored service process.
         /// Also sets up health monitoring for the service.
         /// <para>
-        /// This method now resets the restart attempt counter at startup to ensure that
-        /// previous restart limits do not persist across service restarts (including
-        /// restarts triggered by <c>Servy.Restarter.exe</c>).
+        /// When recovery is enabled, this method schedules a background evaluation of the persistent
+        /// restart-attempt counter (see <see cref="ConditionalResetRestartAttemptsAsync"/>). The counter is
+        /// deliberately preserved across reboots and across rapid crash-restart cycles - including restarts
+        /// triggered by <c>Servy.Restarter.exe</c> - so that recovery quotas such as <c>MaxRestartAttempts</c>
+        /// remain meaningful; it is reset to zero only once the service has run stably past the detection
+        /// window. With recovery disabled, the counter is not touched at startup.
         /// </para>
         /// </summary>
         /// <param name="args">Command-line arguments passed to the service by the Service Control Manager.</param>
@@ -390,8 +392,7 @@ namespace Servy.Service
         {
             try
             {
-                _ = FreeConsole();
-                _ = SetConsoleCtrlHandler(null, true);
+                _scmNative.DetachConsole();
 
                 // Check if we are running in a test context to bypass environment-specific hooks
                 bool isTestMode = args.Length > 0 &&
@@ -399,7 +400,7 @@ namespace Servy.Service
 
                 // Load startup options
                 var fullArgs = _serviceHelper.GetArgs();
-                var options = _serviceHelper.ParseOptions(_serviceRepository, fullArgs);
+                var options = _serviceHelper.ParseOptions(_namedPipesService!, fullArgs);
 
                 if (options == null)
                 {
@@ -410,8 +411,9 @@ namespace Servy.Service
 
                 // PROMOTE LOGGER IMMEDIATELY
                 // Now every log from this point forward (including validation errors) is prefixed.
-                // DO NOT DISPOSE the root logger, as the scoped logger relies on its unmanaged resources
-                // (EventLog handles, FileStreams) to function.
+                // DO NOT DISPOSE the root logger: the scoped logger delegates every write back to it,
+                // and EventLogLogger.Dispose() clears the _isInitialized flag that its write path
+                // checks first, so disposing the root would silence the scoped logger.
                 _logger = _logger?.CreateScoped(options.ServiceName!);
 
                 // Log and Validate using the new scoped _logger
@@ -428,8 +430,8 @@ namespace Servy.Service
 
                 if (!isTestMode)
                 {
-                    // NO REFLECTION NEEDED: Access the underlying Service Status Handle directly
-                    _serviceHandle = ServiceHandle;
+                    // ServiceBase exposes the status handle directly; the native SetServiceStatus calls below need it.
+                    _serviceHandle = GetNativeServiceHandle();
 
                     if (_serviceHandle != IntPtr.Zero)
                     {
@@ -445,7 +447,7 @@ namespace Servy.Service
                 _serviceHelper.EnsureValidStartupDirectory(options, _logger);
 
                 _serviceName = options.ServiceName;
-                _recoveryActionEnabled = options.EnableHealthMonitoring && options.HeartbeatIntervalInSeconds > 0 && options.MaxFailedChecks > 0 && options.RecoveryAction != RecoveryAction.None;
+                _recoveryActionEnabled = IsRecoveryEnabled(options);
                 _maxRestartAttempts = options.MaxRestartAttempts;
                 _maxFailedChecks = options.MaxFailedChecks;
                 _recoveryAction = options.RecoveryAction;
@@ -456,8 +458,8 @@ namespace Servy.Service
                     _serviceHelper.RequestAdditionalTime(this, ClampTimeout(_options.StartTimeoutInSeconds + AppConfig.ScmStartupRequestBufferSeconds), _logger);
                 }
 
-                // Set up attempts file
-                SetupAttemptsFile(options);
+                // Set up the persistent restart attempts counter
+                SetupRestartAttempts(options);
 
                 // Set up service logging
                 HandleLogWriters(options);
@@ -494,7 +496,9 @@ namespace Servy.Service
                 // Run pre-launch process if configured
                 if (!StartPreLaunchProcess(options))
                 {
-                    // Abort if pre-launch fails and service is not allowed to start
+                    // Abort if pre-launch fails and service is not allowed to start.
+                    // A stop requested during the wait is not a failure and keeps exit code 0.
+                    if (!_isTearingDown) ExitCode = AppConfig.ServiceSpecificErrorCode; // ERROR_SERVICE_SPECIFIC_ERROR
                     Stop();
                     return;
                 }
@@ -502,11 +506,10 @@ namespace Servy.Service
                 // Start the monitored main process
                 StartMonitoredProcess(options, capturedToken);
 
-                // Reset restart attempts on service start to avoid blocking recovery
+                // Evaluate the restart attempts counter in the background; it is reset only after a stable run
                 if (_recoveryActionEnabled)
                 {
-                    var token = _cancellationSource?.Token ?? CancellationToken.None;
-                    _ = Task.Run(() => ConditionalResetRestartAttemptsAsync(options, token), token)
+                    _ = Task.Run(() => ConditionalResetRestartAttemptsAsync(options, capturedToken), capturedToken)
                         .ContinueWith(t =>
                         {
                             if (t.IsFaulted)
@@ -522,21 +525,20 @@ namespace Servy.Service
                 // Final step: Inform SCM we are running and specifically that we accept PRESHUTDOWN
                 if (_serviceHandle != IntPtr.Zero)
                 {
-                    // Capture the cancellation token tied to the service's current lifecycle
-                    var token = _cancellationSource?.Token ?? CancellationToken.None;
-
                     // By wrapping this in a Task.Delay, we allow ServiceBase's internal OnStart()
                     // sequence to complete and report SERVICE_RUNNING first. We then safely overwrite
                     // the state to include SERVICE_ACCEPT_PRESHUTDOWN, bypassing .NET's internal limitations.
+                    // Note this REPLACES the accepted-controls mask rather than adding to it: SERVICE_ACCEPT_SHUTDOWN,
+                    // set by CanShutdown = true, is dropped, so OnShutdown becomes a fallback path only (see its remarks).
                     _ = Task.Run(async () =>
                     {
                         try
                         {
                             // 1. Wait, but respect cancellation if Stop() races us
-                            await Task.Delay(AppConfig.PreShutdownRegistrationDelayMs, token);
+                            await Task.Delay(AppConfig.PreShutdownRegistrationDelayMs, capturedToken);
 
                             // 2. Validate state before touching the native handle
-                            if (token.IsCancellationRequested || _isTearingDown || _disposed || _serviceHandle == IntPtr.Zero)
+                            if (capturedToken.IsCancellationRequested || _isTearingDown || _disposed || _serviceHandle == IntPtr.Zero)
                             {
                                 _logger?.Info("Skipping PRESHUTDOWN registration: Service is already tearing down.");
                                 return;
@@ -553,9 +555,9 @@ namespace Servy.Service
                                 dwWaitHint = 0
                             };
 
-                            if (!SetServiceStatus(_serviceHandle, ref status))
+                            if (!_scmNative.SetServiceStatus(_serviceHandle, ref status))
                             {
-                                int error = Marshal.GetLastWin32Error();
+                                int error = _scmNative.GetLastWin32Error();
                                 _logger?.Error($"Failed to register PRESHUTDOWN support via native Win32. Error: {error}");
                             }
                             else
@@ -573,203 +575,318 @@ namespace Servy.Service
                             // 4. Prevent unobserved task exceptions from crashing the finalizer thread
                             _logger?.Error("Unexpected error during PRESHUTDOWN registration.", ex);
                         }
-                    }, token); // Pass token to Task.Run to prevent execution if already cancelled
+                    }, capturedToken); // Pass capturedToken to Task.Run to prevent execution if already cancelled
                 }
             }
             catch (Exception ex)
             {
-                _logger?.Error("Exception in OnStart.", ex);
+                // A child process start failure was already logged by StartProcess.
+                if (!ex.Data.Contains(StartFailureLoggedKey)) _logger?.Error("Exception in OnStart.", ex);
                 if (ExitCode == 0) ExitCode = AppConfig.ServiceSpecificErrorCode; // ERROR_SERVICE_SPECIFIC_ERROR
                 Stop();
             }
         }
 
         /// <summary>
-        /// Initializes the path to the restart attempts file for the current service,
-        /// located under the %ProgramData%\Servy\recovery directory.
-        /// The filename is unique per service based on its name to prevent conflicts
-        /// when multiple services are managed by Servy on the same machine.
+        /// Exposes the protected <see cref="OnStart(string[])"/> method for testing purposes.
+        /// Starts the service using the <see cref="TestModeFlag"/> to bypass environment-specific
+        /// initializations like reading the native service status handle.
+        /// </summary>
+        public void StartForTest()
+        {
+            // Passing the TestModeFlag ensures that the service logic runs without
+            // attempting to hook into the Windows Service Control Manager.
+            OnStart(new string[] { TestModeFlag });
+        }
+
+        /// <summary>
+        /// Called when the service receives a Stop command from the Service Control Manager (SCM).
+        /// Triggers the standardized teardown sequence.
+        /// </summary>
+        protected override void OnStop()
+        {
+            ExecuteTeardown(TeardownReason.Stop);
+
+            // Flush logs right before returning control to SCM
+            FlushAndShutdownLogger();
+
+            base.OnStop();
+        }
+
+        /// <summary>
+        /// Handles custom control commands sent to the service by the Service Control Manager (SCM).
+        /// Specifically intercepts the Pre-Shutdown signal to begin an orchestrated teardown.
+        /// </summary>
+        /// <param name="command">The control code sent by the SCM.</param>
+        protected override void OnCustomCommand(int command)
+        {
+            if (command == SERVICE_CONTROL_PRESHUTDOWN)
+            {
+                if (_isRebooting)
+                {
+                    _logger?.Info("Pre-Shutdown bypassed: System reboot initiated by recovery logic.");
+                    // Signal stopped immediately so the OS doesn't wait for us
+                    UpdateServiceStatus(SERVICE_STOPPED, 0);
+                    FlushAndShutdownLogger();
+                    return;
+                }
+
+                _logger?.Info("Pre-Shutdown received. Starting orchestrated teardown...");
+
+                if (_serviceHandle == IntPtr.Zero)
+                {
+                    _logger?.Error("Service handle is null! SCM notification impossible. Falling back to synchronous teardown.");
+
+                    // Log the completion intention right before the logger is destroyed
+                    _logger?.Info("Pre-Shutdown fallback path entered. Initiating synchronous teardown before Environment.Exit.");
+                    try
+                    {
+                        ExecuteTeardown(TeardownReason.PreShutdown);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.Error($"Fallback teardown failed: {ex.Message}");
+                    }
+                    finally
+                    {
+                        var code = Environment.ExitCode != 0 ? Environment.ExitCode : 1;
+                        FlushAndShutdownLogger();
+                        TerminateProcess(code);
+                    }
+                    return;
+                }
+
+                // 1. Immediately tell SCM we are transitioning to a stop state and need a 30s window.
+                // This moves the service into the STOP_PENDING state in the eyes of the OS.
+                UpdateServiceStatus(SERVICE_STOP_PENDING, AppConfig.PreShutdownWaitHintMs);
+
+                Task<bool> stopTask = Task.Run(() => ExecuteTeardown(TeardownReason.PreShutdown));
+
+                // 2. Wait in pulses.
+                // We increment the checkpoint each pulse to prove to the SCM that we haven't hung.
+                // This loop is guaranteed to terminate because the underlying teardown logic
+                // (SafeKillProcess) enforces an absolute, stopwatch-backed timeout limit.
+                bool teardownSucceeded = false;
+                try
+                {
+                    while (!stopTask.Wait(AppConfig.PreShutdownPulseIntervalMs))
+                    {
+                        _checkPoint++;
+                        UpdateServiceStatus(SERVICE_STOP_PENDING, AppConfig.PreShutdownWaitHintMs);
+                    }
+                    teardownSucceeded = stopTask.Status == TaskStatus.RanToCompletion && stopTask.Result;
+                }
+                catch (AggregateException ex)
+                {
+                    _logger?.Error($"Teardown task faulted during pre-shutdown wait: {ex.Flatten().InnerException?.Message}", ex);
+                }
+
+                // 3. Final Signal: Inform the SCM that the service has successfully reached the STOPPED state.
+                if (teardownSucceeded)
+                {
+                    _logger?.Info("Pre-Shutdown handling complete. Setting SERVICE_STOPPED.");
+                }
+                else
+                {
+                    _logger?.Error("Pre-Shutdown teardown reported failure; signaling SERVICE_STOPPED with non-zero exit code so SCM records the failure.");
+                    if (ExitCode == 0) ExitCode = AppConfig.ServiceSpecificErrorCode; // ERROR_SERVICE_SPECIFIC_ERROR
+                }
+                UpdateServiceStatus(SERVICE_STOPPED, 0);
+
+                // 4. SHUTDOWN LOGGER LAST
+                FlushAndShutdownLogger();
+
+                return;
+            }
+
+            base.OnCustomCommand(command);
+        }
+
+        /// <summary>
+        /// Called when the system is shutting down.
+        /// Mimics the Stop command to ensure child processes and hooks are cleaned up before the OS terminates the process.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Fallback path, not the normal one. This requires <see cref="ServiceBase.CanShutdown"/> to be set to
+        /// <see langword="true"/> in the service constructor, but once the native PRESHUTDOWN registration in
+        /// <c>OnStart</c> succeeds it publishes <c>SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN</c>, which
+        /// drops the <c>SERVICE_ACCEPT_SHUTDOWN</c> bit that <see cref="ServiceBase.CanShutdown"/> had set - and
+        /// the SCM does not send <c>SERVICE_CONTROL_SHUTDOWN</c> to a service registered for preshutdown anyway.
+        /// The shutdown teardown normally runs from <c>OnCustomCommand</c> instead.
+        /// </para>
+        /// <para>
+        /// This handler therefore fires only where that registration did not take effect: test mode (the service
+        /// handle stays <see cref="IntPtr.Zero"/>), an early stop that cancels the
+        /// <see cref="AppConfig.PreShutdownRegistrationDelayMs"/> delay (500 ms) before the
+        /// native call, a failing <c>SetServiceStatus</c>, or after <c>ServiceBase</c> re-publishes its own status
+        /// in answer to <c>SERVICE_CONTROL_INTERROGATE</c>. Do not remove it, or those paths lose their cleanup.
+        /// </para>
+        /// </remarks>
+        protected override void OnShutdown()
+        {
+            if (_isRebooting)
+            {
+                _logger?.Info("Shutdown bypassed: System reboot initiated by recovery logic.");
+                FlushAndShutdownLogger();
+                return;
+            }
+
+            ExecuteTeardown(TeardownReason.Shutdown);
+
+            // Save final logs before the OS kills the process
+            FlushAndShutdownLogger();
+
+            base.OnShutdown();
+        }
+
+        /// <summary>
+        /// Releases the unmanaged resources used by the <see cref="Service"/> and optionally releases the managed resources.
+        /// </summary>
+        /// <param name="disposing">
+        /// <c>true</c> to release both managed and unmanaged resources;
+        /// <c>false</c> to release only unmanaged resources.
+        /// </param>
+        /// <remarks>
+        /// This method follows the standard .NET Dispose pattern. It ensures that
+        /// <see cref="ExecuteTeardown(TeardownReason)"/> is called to gracefully
+        /// stop background processes and cleanup orchestration state before the
+        /// object is destroyed.
+        /// </remarks>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                // 1. Reuse existing orchestration logic to stop the service
+                // This is called while managed resources are still valid.
+                ExecuteTeardown(TeardownReason.Stop);
+
+                // 2. Catch-all for test environments and manual disposal
+                FlushAndShutdownLogger();
+            }
+
+            // 3. Call the base class implementation to complete the chain
+            base.Dispose(disposing);
+        }
+
+        #endregion
+
+        #region Restart Attempts Persistence
+
+        /// <summary>
+        /// Remembers which service's restart attempts counter this instance reads and writes. The counter lives in
+        /// <c>Servy.db</c> and is read and written through the Servy host service
+        /// (<see cref="INamedPipesService.GetRestartAttemptsAsync"/> and <see cref="INamedPipesService.UpdateRestartAttemptsAsync"/>);
+        /// the service account has no access to the database itself.
         /// </summary>
         /// <param name="options">The service startup options containing the service name.</param>
-        private void SetupAttemptsFile(StartOptions options)
+        private void SetupRestartAttempts(StartOptions options)
         {
-            SecurityHelper.CreateSecureDirectory(AppConfig.RecoveryFolderPath, breakInheritance: false); // ensures folder exists
-
-            string safeServiceName = MakeFilenameSafe(options.ServiceName!);
-            _restartAttemptsFile = Path.Combine(AppConfig.RecoveryFolderPath, $"{safeServiceName}_restartAttempts.dat");
+            _restartAttemptsServiceName = options.ServiceName;
         }
 
         /// <summary>
-        /// Sanitizes a string to be safe for use as a filename by replacing
-        /// all invalid filename characters with underscores ('_'). Handles DOS reserved device names
-        /// and prevents filename namespace collisions.
+        /// Internal unprotected read logic. Assumes _restartAttemptsSemaphore is held by the caller.
         /// </summary>
-        /// <param name="name">The original string to sanitize.</param>
-        /// <returns>A sanitized string safe for use as a filename.</returns>
-        public static string MakeFilenameSafe(string name)
+        /// <param name="ct">The cancellation token.</param>
+        /// <returns>The counter and the time it was last written; 0 attempts and no time when it was never written.</returns>
+        private async Task<RestartAttemptsDto> ReadAttemptsInternalAsync(CancellationToken ct)
         {
-            // If null or empty, treat the base name as an underscore but still
-            // append the short hash to satisfy the unique signature layout requirement
-            if (string.IsNullOrEmpty(name))
+            var state = await _namedPipesService!.GetRestartAttemptsAsync(_restartAttemptsServiceName!, ct) ?? new RestartAttemptsDto();
+            if (state.Attempts < 0)
             {
-                return $"_{ComputeShortHash(string.Empty)}";
-            }
-
-            // 1. Strip trailing spaces, tabs, and periods as Windows ignores these on disk handles (Issue #2069 mitigation)
-            string sanitized = name.TrimEnd(' ', '.', '\t');
-
-            // Explicit guard against directory traversal sequences or inputs that normalize to empty/dots
-            if (string.IsNullOrEmpty(sanitized))
-            {
-                sanitized = "_";
-            }
-
-            // 2. Replace invalid character markers
-            var invalidChars = Path.GetInvalidFileNameChars();
-            foreach (var c in invalidChars)
-            {
-                sanitized = sanitized.Replace(c, '_');
-            }
-
-            // 3. Prevent Reserved DOS Name collisions and User-supplied namespace overlaps (Issue #2118 & #2080)
-            int firstDotIndex = sanitized.IndexOf('.');
-            string leadingSegment = firstDotIndex >= 0 ? sanitized.Substring(0, firstDotIndex) : sanitized;
-
-            // Isolate the base word by stripping all leading underscores
-            string baseSegment = leadingSegment.TrimStart('_');
-
-            // Only escape if the underlying base keyword is an actual hardware reserved name
-            if (ReservedNames.ReservedDeviceNames.Contains(baseSegment))
-            {
-                // Count how many leading underscores the user already had in their input segment
-                int existingUnderscores = leadingSegment.Length - baseSegment.Length;
-
-                // Prepend exactly one more underscore than what currently exists to break the collision chain
-                string protectionPrefix = new string('_', existingUnderscores + 1);
-
-                sanitized = protectionPrefix + baseSegment + (firstDotIndex >= 0 ? sanitized.Substring(firstDotIndex) : string.Empty);
-            }
-
-            // 4. Collision Insurance: Append a deterministic short hash of the ORIGINAL raw name input string.
-            // This guarantees unique on-disk allocations for variations such as "MyService", "MyService ", and "MyService."
-            string shortHash = ComputeShortHash(name);
-
-            return $"{sanitized}_{shortHash}";
-        }
-
-        /// <summary>
-        /// Computes a deterministic 6-character hex string hash from an input value.
-        /// </summary>
-        private static string ComputeShortHash(string input)
-        {
-            using (var sha256 = SHA256.Create())
-            {
-                byte[] bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(input));
-                // 3 bytes maps cleanly to a highly unique 6-character hex identifier
-                return BitConverter.ToString(bytes, 0, 3).Replace("-", "").ToLowerInvariant();
-            }
-        }
-
-        /// <summary>
-        /// Internal unprotected read logic. Assumes _fileSemaphore is held by the caller.
-        /// </summary>
-        private async Task<int> ReadAttemptsInternalAsync(CancellationToken ct)
-        {
-            if (!File.Exists(_restartAttemptsFile))
-            {
-                _logger?.Warn("Restart attempts file not found. Initializing counter to 0.");
+                _logger?.Warn("Invalid restart attempts counter received. Resetting counter to 0.");
                 await WriteAttemptsInternalAsync(0, ct);
-                return 0;
+                return new RestartAttemptsDto();
             }
 
-            string content = (await File.ReadAllTextAsync(_restartAttemptsFile, ct)).Trim();
-
-            if (int.TryParse(content, out var attempts) && attempts >= 0)
-                return attempts;
-
-            _logger?.Warn("Corrupt or invalid content found in restart attempts file. Resetting counter to 0.");
-            await WriteAttemptsInternalAsync(0, ct);
-            return 0;
+            return state;
         }
 
         /// <summary>
-        /// Internal unprotected write logic. Assumes _fileSemaphore is held by the caller.
+        /// Internal unprotected write logic. Assumes _restartAttemptsSemaphore is held by the caller.
         /// </summary>
         /// <param name="attempts">The number of restart attempts to persist.</param>
         /// <param name="ct">The cancellation token.</param>
+        /// <remarks>
+        /// The Servy host stamps the write with the current UTC time; writing the unchanged count therefore anchors the
+        /// counter to the current OS session.
+        /// </remarks>
         private async Task WriteAttemptsInternalAsync(int attempts, CancellationToken ct)
         {
-            await Helper.WriteFileAtomicAsync(
-                _restartAttemptsFile!,
-                async (fs, ct) =>
-                {
-                    // Use BOM-less UTF8 and leaveOpen to allow the atomic helper
-                    // to manage the final FileStream lifecycle.
-                    using (var sw = new StreamWriter(fs, new UTF8Encoding(false), bufferSize: 1024, leaveOpen: true))
-                    {
-                        // Pass the 'ct' to the WriteAsync overload
-                        await sw.WriteAsync(attempts.ToString(CultureInfo.InvariantCulture).AsMemory(), ct);
-                    }
-                },
-                ct);
+            await _namedPipesService!.UpdateRestartAttemptsAsync(_restartAttemptsServiceName!, attempts, ct);
         }
 
         /// <summary>
-        /// Ensures the restart attempts tracking file exists and retrieves the current counter value safely.
+        /// Retrieves the current restart attempts counter safely.
         /// </summary>
-        private async Task<int> EnsureRestartAttemptsFileAsync(CancellationToken ct = default)
+        /// <param name="ct">The cancellation token.</param>
+        /// <returns>The counter; 0 when the service is shutting down; <see langword="null"/> when it cannot be read.</returns>
+        private async Task<int?> GetRestartAttemptsAsync(CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(_restartAttemptsFile)) return 0;
+            if (string.IsNullOrWhiteSpace(_restartAttemptsServiceName)) return 0;
 
-            await _fileSemaphore.WaitAsync(ct);
+            var acquired = false;
             try
             {
-                return await ReadAttemptsInternalAsync(ct);
+                await _restartAttemptsSemaphore.WaitAsync(ct);
+                acquired = true;
+                return (await ReadAttemptsInternalAsync(ct)).Attempts;
             }
             catch (OperationCanceledException)
             {
                 // Graceful exit: the service is likely shutting down
                 return 0;
             }
+            catch (ObjectDisposedException)
+            {
+                // Teardown disposed the semaphore while we were waiting
+                return 0;
+            }
             catch (Exception ex)
             {
-                _logger?.Warn($"Error reading restart attempts file: {ex.Message}. Resetting counter to 0.");
-                return 0;
+                _logger?.Error($"The restart attempts counter of '{_restartAttemptsServiceName}' is unreadable ({ex.Message}); the MaxRestartAttempts cap cannot be enforced.");
+                return null;
             }
             finally
             {
-                _fileSemaphore.Release();
+                if (acquired) ReleaseSafe(_restartAttemptsSemaphore);
             }
         }
 
         /// <summary>
-        /// Asynchronously saves the current number of restart attempts to the persistent tracking file.
+        /// Asynchronously saves the current number of restart attempts through the Servy host.
         /// </summary>
         /// <param name="attempts">The restart attempts count to persist.</param>
-        /// <param name="ct">A cancellation token to observe while waiting for the semaphore or I/O.</param>
+        /// <param name="ct">A cancellation token to observe while waiting for the semaphore or the host.</param>
         /// <returns>A task representing the asynchronous save operation.</returns>
-        private async Task SaveRestartAttemptsAsync(int attempts, CancellationToken ct = default)
+        private async Task SaveRestartAttemptsAsync(int attempts, CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(_restartAttemptsFile)) return;
+            if (string.IsNullOrWhiteSpace(_restartAttemptsServiceName)) return;
 
-            // Pass the CancellationToken to WaitAsync to prevent hangs during service shutdown
-            await _fileSemaphore.WaitAsync(ct);
+            var acquired = false;
             try
             {
+                // Pass the CancellationToken to WaitAsync to prevent hangs during service shutdown
+                await _restartAttemptsSemaphore.WaitAsync(ct);
+                acquired = true;
                 await WriteAttemptsInternalAsync(attempts, ct);
             }
             catch (OperationCanceledException)
             {
                 // Graceful exit if the service is stopping; no logging required
             }
+            catch (ObjectDisposedException)
+            {
+                // Teardown disposed the semaphore while we were waiting
+            }
             catch (Exception ex)
             {
-                // Include the path in the error message to assist with field troubleshooting
-                _logger?.Error($"Failed to save restart attempts to '{_restartAttemptsFile}': {ex.Message}");
+                _logger?.Error($"Failed to save the restart attempts counter of '{_restartAttemptsServiceName}': {ex.Message}");
             }
             finally
             {
-                _fileSemaphore.Release();
+                if (acquired) ReleaseSafe(_restartAttemptsSemaphore);
             }
         }
 
@@ -785,9 +902,10 @@ namespace Servy.Service
         /// <list type="number">
         /// <item>
         /// <description>
-        /// <b>Reboot Detection:</b> Compares the last write time of the restart file against the system boot time
-        /// (calculated via <see cref="Environment.TickCount64"/>). If the file was modified before the current OS session,
-        /// the count is maintained because the service is likely starting due to a "Restart Computer" recovery action.
+        /// <b>Reboot Detection:</b> Compares the time the counter was last written (kept with it in <c>Servy.db</c>)
+        /// against the system boot time (calculated via <see cref="Environment.TickCount64"/>). If it was written before the
+        /// current OS session, the count is maintained because the service is likely starting due to a "Restart Computer"
+        /// recovery action.
         /// </description>
         /// </item>
         /// <item>
@@ -801,31 +919,36 @@ namespace Servy.Service
         /// </remarks>
         private async Task ConditionalResetRestartAttemptsAsync(StartOptions options, CancellationToken cancellationToken = default)
         {
-            if (string.IsNullOrWhiteSpace(_restartAttemptsFile)) return;
+            if (string.IsNullOrWhiteSpace(_restartAttemptsServiceName)) return;
 
-            // Wait for the lock to secure the entire transaction
-            await _fileSemaphore.WaitAsync(cancellationToken);
+            var acquired = false;
             try
             {
+                // Wait for the lock to secure the entire transaction
+                await _restartAttemptsSemaphore.WaitAsync(cancellationToken);
+                acquired = true;
+
                 // 1. Protected Read (Exit early if already 0)
-                if ((await ReadAttemptsInternalAsync(cancellationToken)) == 0) return;
+                var state = await ReadAttemptsInternalAsync(cancellationToken);
+                if (state.Attempts == 0) return;
 
-                DateTime lastWriteUtc = File.GetLastWriteTimeUtc(_restartAttemptsFile);
+                // A counter that was never stamped is treated as written before this boot
+                DateTime lastWriteUtc = state.UpdatedAtUtc ?? DateTime.MinValue;
 
-                // Derive system boot time context directly. Arithmetic on a 64-bit millisecond tick counter
-                // is mathematically protected against runtime overflow exceptions for ~292 million years.
-                DateTime systemBootTimeUtc = DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64);
+                // The boot time comes from the GetSystemBootTimeUtc seam: the current UTC time minus the 64-bit
+                // millisecond uptime counter, which cannot overflow for ~292 million years.
+                DateTime systemBootTimeUtc = GetSystemBootTimeUtc();
 
                 // 2. Session Persistence Check
-                // If the file's last modification occurred before the current system boot,
+                // If the counter was last written before the current system boot,
                 // the service is starting in a new OS session. We maintain the existing counter
                 // to ensure recovery quotas (like RestartComputer) are respected across reboots.
                 if (lastWriteUtc < systemBootTimeUtc)
                 {
                     // We are running in a new OS session for the first time.
-                    // Touch the file to anchor it to the current session so future
+                    // Rewrite the unchanged counter to anchor it to the current session so future
                     // stability checks can decide based on in-session uptime.
-                    File.SetLastWriteTimeUtc(_restartAttemptsFile, DateTime.UtcNow);
+                    await WriteAttemptsInternalAsync(state.Attempts, cancellationToken);
                     return;
                 }
 
@@ -841,7 +964,8 @@ namespace Servy.Service
                 int cap = AppConfig.ConditionalResetMaxThresholdSeconds;
 
                 // If the detection window itself already exceeds the cap, the cap is meaningless -
-                // the contract is broken at configuration time and should be logged once.
+                // the contract is broken at configuration time. The warning repeats on every evaluation that
+                // gets this far (a non-zero counter, still inside the current session), not once per service.
                 if (detectionWindowSeconds > cap)
                 {
                     _logger?.Warn(
@@ -868,15 +992,23 @@ namespace Servy.Service
                     await WriteAttemptsInternalAsync(0, cancellationToken);
                 }
             }
+            catch (OperationCanceledException)
+            {
+                // Graceful exit if the service is stopping; no logging required
+            }
             catch (Exception ex)
             {
                 _logger?.Warn($"Error during conditional reset evaluation: {ex.Message}");
             }
             finally
             {
-                _fileSemaphore.Release();
+                if (acquired) ReleaseSafe(_restartAttemptsSemaphore);
             }
         }
+
+        #endregion
+
+        #region Pre-Launch and Hooks
 
         /// <summary>
         /// Starts the pre-launch process, if configured, before the main service process.
@@ -884,7 +1016,8 @@ namespace Servy.Service
         /// <param name="options">The service start options containing the pre-launch configuration.</param>
         /// <returns>
         /// <c>true</c> if the pre-launch process completed successfully or was skipped;
-        /// <c>false</c> if it failed and <see cref="StartOptions.PreLaunchIgnoreFailure"/> is <c>false</c>.
+        /// <c>false</c> if it failed and <see cref="StartOptions.PreLaunchIgnoreFailure"/> is <c>false</c>,
+        /// or if a service stop was requested before an attempt or during the back-off wait (whatever that setting is).
         /// </returns>
         /// <remarks>
         /// <para>
@@ -893,8 +1026,8 @@ namespace Servy.Service
         /// optionally logs standard output and error to the provided file paths.
         /// </para>
         /// <para>
-        /// The process is allowed to run for at least <see cref="AppConfig.MinPreLaunchTimeoutSeconds"/> seconds or
-        /// <see cref="StartOptions.PreLaunchTimeoutInSeconds"/>, whichever is greater, per attempt.
+        /// The process is allowed to run for <see cref="StartOptions.PreLaunchTimeoutInSeconds"/> seconds per attempt
+        /// (a value of 0 launches it fire-and-forget without waiting).
         /// If the process exits with a non-zero code or times out, it is retried up to
         /// <see cref="StartOptions.PreLaunchRetryAttempts"/> times.
         /// </para>
@@ -919,7 +1052,7 @@ namespace Servy.Service
             // Pre-Launch is the only hook with dedicated environment variables,
             // all other hooks reuse the main service environment variables.
             // This design is intentional.
-            var vars = options.PreLaunchEnvironmentVariables ?? options.EnvironmentVariables;
+            var vars = options.PreLaunchEnvironmentVariables;
             var args = options.PreLaunchExecutableArgs ?? string.Empty;
 
             var workingDir = string.IsNullOrWhiteSpace(options.PreLaunchStartupDirectory)
@@ -930,13 +1063,15 @@ namespace Servy.Service
 
             var launchOptions = new ProcessLaunchOptions
             {
+                AuditContext = "Pre-Launch",
                 ExecutablePath = options.PreLaunchExecutablePath,
                 Arguments = args,
                 StartupDirectory = workingDir,
                 EnvironmentVariables = vars,
+                AllowOverriddenRuntimeVars = options.AllowOverriddenRuntimeVars,
                 WaitChunkMs = _waitChunkMs,
                 ScmAdditionalTimeMs = _scmAdditionalTimeMs,
-                OnScmHeartbeat = new Action<int>((time) => _serviceHelper.RequestAdditionalTime(this, time, _logger)),
+                OnScmHeartbeat = new Action<int>((time) => _serviceHelper.RequestAdditionalTime(this, time, null)),
                 StdoutPath = options.PreLaunchStdoutPath,
                 StderrPath = options.PreLaunchStderrPath,
                 RedirectToWriters = !fireAndForget,
@@ -953,7 +1088,7 @@ namespace Servy.Service
             }
 
             // 3. Handle Synchronous Mode with Retries
-            launchOptions.TimeoutMs = ClampTimeout(Math.Max(options.PreLaunchTimeoutInSeconds, AppConfig.MinPreLaunchTimeoutSeconds));
+            launchOptions.TimeoutMs = ClampTimeout(options.PreLaunchTimeoutInSeconds);
             return RunSynchronousPreLaunch(launchOptions, options);
         }
 
@@ -997,14 +1132,22 @@ namespace Servy.Service
                     {
                         // We track this so if the main service stops while the fire-and-forget
                         // process is still running, we can kill the orphan.
-                        _trackedHooks.Add(new Hook { OperationName = "pre-launch", Process = nativeProcess });
+                        _trackedHooks.Add(new Hook { OperationName = "Pre-Launch", Process = nativeProcess });
                     }
                 }
+                else
+                {
+                    process.Dispose();
+                }
+
                 return true;
             }
             catch (Exception ex)
             {
-                _logger?.Error($"Failed to launch fire-and-forget pre-launch process: {ex.Message}");
+                if (ignoreFailure)
+                    _logger?.Warn("Failed to launch fire-and-forget pre-launch process.", ex);
+                else
+                    _logger?.Error("Failed to launch fire-and-forget pre-launch process.", ex);
                 return ignoreFailure;
             }
         }
@@ -1015,7 +1158,8 @@ namespace Servy.Service
         /// <param name="launchOptions">The initialized process launch parameters.</param>
         /// <param name="options">The original start options for access to retry and ignore settings.</param>
         /// <returns>
-        /// <see langword="true"/> if the process eventually returned exit code 0 or if failures are configured to be ignored.
+        /// <see langword="true"/> if the process eventually returned exit code 0 or if failures are configured to be ignored;
+        /// <see langword="false"/> otherwise, and always when a service stop is requested before an attempt or during the back-off wait.
         /// </returns>
         private bool RunSynchronousPreLaunch(ProcessLaunchOptions launchOptions, StartOptions options)
         {
@@ -1098,7 +1242,7 @@ namespace Servy.Service
                         }
 
                         // Pulse the SCM during the wait so the service is not killed by timeout.
-                        _serviceHelper.RequestAdditionalTime(this, _scmAdditionalTimeMs, _logger);
+                        _serviceHelper.RequestAdditionalTime(this, _scmAdditionalTimeMs, null);
                         elapsed += slice;
                     }
                 }
@@ -1117,77 +1261,238 @@ namespace Servy.Service
         }
 
         /// <summary>
-        /// Exposes the protected <see cref="OnStart(string[])"/> method for testing purposes.
-        /// Starts the service using the <see cref="TestModeFlag"/> to bypass environment-specific
-        /// initializations like Win32 service handle reflection.
+        /// Starts the configured post-launch executable, if defined.
         /// </summary>
-        public void StartForTest()
+        /// <remarks>
+        /// This method launches an external program specified in the service options
+        /// after the wrapped process has successfully started.
+        /// - If <see cref="_options"/> is <c>null</c> or no <c>PostLaunchExecutablePath</c> is set, the method does nothing.
+        /// - Environment variables in arguments are expanded before execution.
+        /// - The working directory defaults to <c>PostLaunchStartupDirectory</c>,
+        ///   or falls back to the main service's working directory if not set.
+        /// - The process is started in a fire-and-forget manner: it is not awaited, but its handle is kept in
+        ///   <c>_trackedHooks</c> so teardown can kill it if it is still running.
+        /// - Launch failures (e.g., file not found, access denied) are caught and logged by
+        ///   <see cref="RunFireAndForgetHook"/>; nothing is thrown to the caller.
+        /// </remarks>
+        private void StartPostLaunchProcess()
         {
-            // Passing the TestModeFlag ensures that the service logic runs without
-            // attempting to hook into the Windows Service Control Manager.
-            OnStart(new string[] { TestModeFlag });
+            RunFireAndForgetHook(
+                "Post-Launch",
+                exePath: _options?.PostLaunchExecutablePath,
+                rawArgs: _options?.PostLaunchExecutableArgs,
+                hookWorkingDir: _options?.PostLaunchStartupDirectory,
+                track: true);
         }
 
         /// <summary>
-        /// Initializes the stdout and stderr log writers based on the provided start options.
+        /// Executes a secondary process as a "fire-and-forget" hook, optionally tracking its lifecycle
+        /// to ensure resources are cleaned up or managed appropriately.
         /// </summary>
-        /// <param name="options">The start options containing paths and rotation settings for stdout and stderr.</param>
+        /// <param name="hookName">A descriptive name for the hook, used for logging and tracking purposes.</param>
+        /// <param name="exePath">The file path to the executable to be launched. If null or empty, the hook execution is aborted.</param>
+        /// <param name="rawArgs">The command-line arguments string to pass to the executable.</param>
+        /// <param name="hookWorkingDir">
+        /// The directory in which the process should start. If null or whitespace, defaults to the
+        /// primary service working directory specified in <c>_options</c>.
+        /// </param>
+        /// <param name="track">
+        /// If <c>true</c>, the launched process is added to the internal <c>_trackedHooks</c> collection
+        /// for management; otherwise, the process resources are disposed immediately after launch.
+        /// </param>
         /// <remarks>
-        /// - If <see cref="StartOptions.StdoutPath"/> is valid, a <see cref="Core.IO.RotatingStreamWriter"/> is created for stdout.
-        /// - If <see cref="StartOptions.StderrPath"/> is provided:
-        ///     - If it equals <see cref="StartOptions.StdoutPath"/> (case-insensitive), stderr shares the stdout writer.
-        ///     - Otherwise, a separate <see cref="Core.IO.RotatingStreamWriter"/> is created for stderr.
-        /// - If <see cref="StartOptions.StderrPath"/> is null, empty, or whitespace, no stderr writer is created.
+        /// This method encapsulates process startup logic using <see cref="ProcessLauncher"/> and
+        /// applies service-wide environment variables. Any exceptions during process creation or
+        /// environment validation are caught and logged silently to prevent service interruption.
         /// </remarks>
-        private void HandleLogWriters(StartOptions options)
+        private void RunFireAndForgetHook(
+            string hookName, string? exePath, string? rawArgs,
+            string? hookWorkingDir, bool track)
         {
-            // Helper method to create a rotating writer if the path is valid.
-            // Logs an error if the path is invalid or null/whitespace.
-            IStreamWriter? CreateWriter(string? path)
+            if (_options == null || string.IsNullOrWhiteSpace(exePath)) return;
+            try
             {
-                if (string.IsNullOrWhiteSpace(path))
-                    return null;
-
-                if (!_pathValidator.IsValidPath(path))
+                var workingDir = string.IsNullOrWhiteSpace(hookWorkingDir)
+                    ? _options.StartupDirectory : hookWorkingDir;
+                var launchOptions = new ProcessLaunchOptions
                 {
-                    _logger?.Error($"Invalid log file path: {path}");
-                    return null;
-                }
-
-                return _streamWriterFactory.Create(
-                    path,
-                    options.EnableSizeRotation,
-                    options.RotationSizeInBytes,
-                    options.EnableDateRotation,
-                    options.DateRotationType,
-                    options.MaxRotations,
-                    options.UseLocalTimeForRotation
-                    );
+                    AuditContext = hookName,
+                    ExecutablePath = exePath,
+                    Arguments = rawArgs ?? string.Empty,
+                    StartupDirectory = workingDir,
+                    EnvironmentVariables = _options.EnvironmentVariables,
+                    AllowOverriddenRuntimeVars = _options.AllowOverriddenRuntimeVars,
+                    FireAndForget = true,
+                    EnableConsoleUI = _options.EnableConsoleUI,
+                };
+                _logger?.Info($"Running {hookName} program: {launchOptions.ExecutablePath}");
+                var process = ProcessLauncher.Start(launchOptions, _processFactory, _logger!);
+                if (track && process.UnderlyingProcess is Process p)
+                    lock (_trackedHooks) _trackedHooks.Add(new Hook { OperationName = hookName, Process = p });
+                else process.Dispose();
             }
-
-            // Always create stdout writer if path is valid
-            _stdoutWriter = CreateWriter(options.StdoutPath);
-
-            // Only create stderr writer if a path is provided
-            if (!string.IsNullOrWhiteSpace(options.StderrPath))
-            {
-                // A non-null _stdoutWriter already implies StdoutPath is non-blank and passed IsValidPath
-                // (CreateWriter returns null otherwise), so only StderrPath still needs validating here.
-                if (_stdoutWriter != null && _pathValidator.IsValidPath(options.StderrPath))
-                {
-                    var canonStdErr = Helper.NormalizePath(options.StderrPath);
-                    var canonStdOut = Helper.NormalizePath(options.StdoutPath);
-
-                    // If stderr path equals stdout path (explicitly), use the same writer
-                    if (string.Equals(canonStdErr, canonStdOut, StringComparison.OrdinalIgnoreCase))
-                    {
-                        _stderrWriter = _stdoutWriter;
-                        return;
-                    }
-                }
-                _stderrWriter = CreateWriter(options.StderrPath);
-            }
+            catch (Exception ex) { _logger?.Error($"Failed to run {hookName} program.", ex); }
         }
+
+        /// <summary>
+        /// Executes the configured failure program if specified in the service options.
+        /// This is invoked when the child process exits with a non-zero code while recovery
+        /// is disabled, or after all recovery attempts have been exhausted
+        /// (restartAttempts >= MaxRestartAttempts). It is NOT invoked when the main child
+        /// process fails to start - that path stops the service without running the failure program.
+        /// </summary>
+        /// <remarks>
+        /// The failure program path, arguments, and working directory are taken from
+        /// the service options:
+        /// - <c>FailureProgramPath</c>: the full path to the program to run.
+        /// - <c>FailureProgramExecutableArgs</c>: the command-line arguments to pass.
+        /// - <c>FailureProgramStartupDirectory</c>: the working directory for the program.
+        ///
+        /// Exceptions thrown while attempting to start the failure program are caught
+        /// and logged to avoid crashing the service.
+        /// </remarks>
+        private void RunFailureProgram()
+        {
+            RunFireAndForgetHook(
+                 "Failure-Program",
+                 exePath: _options?.FailureProgramPath,
+                 rawArgs: _options?.FailureProgramExecutableArgs,
+                 hookWorkingDir: _options?.FailureProgramStartupDirectory,
+                 track: false);
+        }
+
+        /// <summary>
+        /// Executes an optional pre-stop executable.
+        /// Supports fire-and-forget or synchronous wait with SCM heartbeat pulses.
+        /// </summary>
+        /// <param name="options">The service configuration options.</param>
+        /// <returns><see langword="true"/> if the process succeeded or failures are ignored; otherwise <see langword="false"/>.</returns>
+        private bool StartPreStopProcess(StartOptions options)
+        {
+            if (string.IsNullOrWhiteSpace(options.PreStopExecutablePath))
+            {
+                _logger?.Info("No pre-stop executable configured. Skipping.");
+                return true;
+            }
+
+            _logger?.Info("Starting pre-stop process...");
+            bool logAsError = options.PreStopLogAsError;
+
+            // Helper to keep the catch block and failure logic clean
+            void LogIssue(string message, Exception? ex = null)
+            {
+                if (!logAsError)
+                    _logger?.Warn(message, ex);
+                else if (ex != null)
+                    _logger?.Error(message, ex);
+                else
+                    _logger?.Error(message);
+            }
+
+            try
+            {
+                // 1. Prepare Environment and Arguments
+                var args = options.PreStopExecutableArgs ?? string.Empty;
+
+                var workingDir = string.IsNullOrWhiteSpace(options.PreStopStartupDirectory)
+                    ? options.StartupDirectory
+                    : options.PreStopStartupDirectory;
+
+                // 2. Configure Launch Options
+                var effectiveTimeoutMs = ClampTimeout(options.PreStopTimeoutInSeconds);
+
+                var launchOptions = new ProcessLaunchOptions
+                {
+                    AuditContext = "Pre-Stop",
+                    ExecutablePath = options.PreStopExecutablePath,
+                    Arguments = args,
+                    StartupDirectory = workingDir,
+                    EnvironmentVariables = options.EnvironmentVariables,
+                    AllowOverriddenRuntimeVars = options.AllowOverriddenRuntimeVars,
+                    FireAndForget = (effectiveTimeoutMs == 0),
+                    TimeoutMs = effectiveTimeoutMs,
+                    WaitChunkMs = _waitChunkMs,
+                    ScmAdditionalTimeMs = _scmAdditionalTimeMs,
+                    OnScmHeartbeat = time => _serviceHelper.RequestAdditionalTime(this, time, null),
+                    LogErrorAsWarning = !logAsError,
+                    EnableConsoleUI = options.EnableConsoleUI,
+                };
+
+                // 3. Launch and Evaluate
+                using (var process = ProcessLauncher.Start(launchOptions, _processFactory, _logger!))
+                {
+                    if (launchOptions.FireAndForget)
+                    {
+                        _logger?.Info("Pre-stop configured as fire-and-forget. Continuing service stop immediately.");
+                        return true;
+                    }
+
+                    if (process.ExitCode == 0)
+                    {
+                        _logger?.Info("Pre-stop process completed successfully.");
+                        return true;
+                    }
+
+                    LogIssue($"Pre-stop process '{launchOptions.ExecutablePath}' exited with code {process.ExitCode}.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogIssue("Pre-stop process failed.", ex);
+            }
+
+            // 4. Final Policy Handling
+            if (!logAsError)
+            {
+                _logger?.Warn("Ignoring pre-stop failure and continuing service stop.");
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Initiates a fire-and-forget post-stop executable if configured.
+        /// This runs after the main process and its tree have been terminated.
+        /// </summary>
+        private void StartPostStopProcess()
+        {
+            RunFireAndForgetHook(
+                 "Post-Stop",
+                 exePath: _options?.PostStopExecutablePath,
+                 rawArgs: _options?.PostStopExecutableArgs,
+                 hookWorkingDir: _options?.PostStopStartupDirectory,
+                 track: false);
+        }
+
+        /// <summary>
+        /// Iterates through all tracked process hooks and ensures their underlying resources are released.
+        /// Caller must hold lock(_trackedHooks).
+        /// </summary>
+        /// <remarks>
+        /// This method should be called during service shutdown or when a service recovery cycle
+        /// requires a fresh state. It explicitly disposes of each <see cref="Hook"/> to prevent
+        /// native process handle leaks from Pre-Launch or Post-Launch operations.
+        /// </remarks>
+        private void CleanupTrackedHooks()
+        {
+            foreach (var hook in _trackedHooks)
+            {
+                // Safely dispose each hook to release native handles
+                try { hook.Dispose(); }
+                catch (Exception ex)
+                {
+                    _logger?.Warn($"Failed to dispose tracked hook: {ex.Message}");
+                }
+            }
+
+            // Clear the collection while still under the lock
+            _trackedHooks.Clear();
+        }
+
+        #endregion
+
+        #region Child Process and Output Redirection
 
         /// <summary>
         /// Starts the monitored child process using the executable path, arguments, and working directory from the options.
@@ -1197,7 +1502,13 @@ namespace Servy.Service
         /// <param name="token">The cancellation token for the operation.</param>
         private void StartMonitoredProcess(StartOptions options, CancellationToken token)
         {
-            StartProcess(options.ExecutablePath!, options.ExecutableArgs!, options.StartupDirectory!, options.EnvironmentVariables, token);
+            StartProcess(
+                options.ExecutablePath!,
+                options.ExecutableArgs!,
+                options.StartupDirectory!,
+                options.EnvironmentVariables,
+                options.AllowOverriddenRuntimeVars,
+                token);
             SetProcessPriority(options.Priority);
             SetProcessCpuAffinity(options.CpuAffinity);
         }
@@ -1211,7 +1522,7 @@ namespace Servy.Service
         {
             if (_childProcess == null)
             {
-                _logger?.Warn("SetProcessAffinity called before child process was started; ignoring.");
+                _logger?.Warn("SetProcessCpuAffinity called before child process was started; ignoring.");
                 return;
             }
 
@@ -1241,16 +1552,18 @@ namespace Servy.Service
         /// <param name="realArgs">The arguments to pass to the executable.</param>
         /// <param name="workingDir">The working directory for the process.</param>
         /// <param name="environmentVariables">Environment variables to pass to the process.</param>
+        /// <param name="allowOverriddenRuntimeVars">If set to <c>true</c>, allows runtime environment variables to be overridden; if <c>false</c>, preserves existing runtime variables.</param>
         /// <param name="token">The cancellation token for the operation.</param>
         private void StartProcess(
             string realExePath,
             string realArgs,
             string workingDir,
             List<EnvironmentVariable> environmentVariables,
+            bool allowOverriddenRuntimeVars,
             CancellationToken token = default)
         {
             _ = AllocConsole(); // inherited
-            _ = SetConsoleCtrlHandler(null, false); // inherited
+            _ = SetConsoleCtrlHandler(IntPtr.Zero, false); // inherited
             _ = SetConsoleOutputCP(CP_UTF8);
 
             var enableConsoleUI = _options?.EnableConsoleUI == true;
@@ -1261,6 +1574,7 @@ namespace Servy.Service
                 realArgs,
                 workingDir,
                 environmentVariables,
+                allowOverriddenRuntimeVars,
                 enableConsoleUI,
                 _logger,
                 "StartProcess");
@@ -1284,22 +1598,21 @@ namespace Servy.Service
                 _childProcess.OutputDataReceived += OnOutputDataReceived;
                 _childProcess.ErrorDataReceived += OnErrorDataReceived;
             }
-            _childProcess.Exited += OnProcessExited!;
+            _childProcess.Exited += OnProcessExited;
 
             // Start the process safely
             try
             {
-                if (!_childProcess.Start())
-                {
-                    throw new InvalidOperationException("Process.Start returned false (no process resource started).");
-                }
-
+                // UseShellExecute is false, so Start() cannot return false (there is no process to reuse):
+                // an unstartable executable surfaces as Win32Exception.
+                _childProcess.Start();
                 _logger?.Info($"Started child process with PID: {_childProcess.Id}");
             }
             catch (Exception ex)
             {
-                // This is now the SINGLE source of truth for start-up failure logging
+                // Start-up failures are logged here only; OnStart's catch must not log them again.
                 _logger?.Error($"Failed to start process '{_realExePath}': {ex.Message}");
+                ex.Data[StartFailureLoggedKey] = true;
 
                 CleanupFailedProcess();
 
@@ -1310,7 +1623,7 @@ namespace Servy.Service
             }
             finally
             {
-                _ = SetConsoleCtrlHandler(null, true);
+                _ = SetConsoleCtrlHandler(IntPtr.Zero, true);
             }
 
             // --- The code below this point ONLY executes if Start() was successful ---
@@ -1352,198 +1665,72 @@ namespace Servy.Service
         }
 
         /// <summary>
-        /// Asynchronously emits an out-of-band diagnostic heartbeat ping to the configured external monitoring endpoint.
+        /// Initializes the stdout and stderr log writers based on the provided start options.
         /// </summary>
+        /// <param name="options">The start options containing paths and rotation settings for stdout and stderr.</param>
         /// <remarks>
-        /// <para>
-        /// This operation runs entirely inside a fire-and-forget background task context. It is designed to be
-        /// non-blocking and fail-silent to ensure that network latency, DNS failures, or remote proxy outages
-        /// never delay or destabilize the primary process supervision loop.
-        /// </para>
-        /// <para>
-        /// Outbound requests are managed using a short timeout threshold to prevent backing up thread pool workers
-        /// or exhausting available network socket allocations during persistent endpoint blackouts.
-        /// </para>
-        /// <para>
-        /// If a lifecycle suffix is provided but extended flags are disabled (<see cref="StartOptions.EnableHeartbeatUrlFlags"/> is false),
-        /// the method exits immediately without scheduling a background task or making a network request.
-        /// </para>
+        /// - If <see cref="StartOptions.StdoutPath"/> is valid, a <see cref="Core.IO.RotatingStreamWriter"/> is created for stdout.
+        /// - If <see cref="StartOptions.StderrPath"/> is provided:
+        ///     - If it equals <see cref="StartOptions.StdoutPath"/> (case-insensitive), stderr shares the stdout writer.
+        ///     - Otherwise, a separate <see cref="Core.IO.RotatingStreamWriter"/> is created for stderr.
+        /// - If <see cref="StartOptions.StderrPath"/> is null, empty, or whitespace, no stderr writer is created.
         /// </remarks>
-        /// <param name="baseUrl">The absolute base target destination URL (e.g., "https://hc-ping.com/your-uuid").</param>
-        /// <param name="suffix">An optional trailing lifecycle flag state indicator to append to the base URL (e.g., "start" or "fail"). Pass null or empty for a standard health check loop pass.</param>
-        /// <param name="timeoutSeconds">The maximum duration in seconds allowed for the HTTP connection handshake and headers transmission before automatic cancellation.</param>
-        private void EmitHeartbeatPing(string? baseUrl, string suffix, int timeoutSeconds)
+        private void HandleLogWriters(StartOptions options)
         {
-            if (string.IsNullOrWhiteSpace(baseUrl) || _options == null || !_options.EnableHealthMonitoring) return;
-
-            // Capture the configuration state instantly on the caller thread to avoid thread-race NullReferenceExceptions
-            bool enableFlags = _options.EnableHeartbeatUrlFlags == true;
-
-            if (!string.IsNullOrEmpty(suffix) && !enableFlags) return;
-
-            // Fire-and-forget safely wrapped in an isolated background Task context
-            Task.Run(async () =>
+            // Helper method to create a rotating writer if the path is valid.
+            // Returns null silently for a null/whitespace path; logs an error if the path is invalid.
+            IStreamWriter? CreateWriter(string? path)
             {
+                if (string.IsNullOrWhiteSpace(path))
+                    return null;
+
+                if (!_pathValidator.IsValidPath(path))
+                {
+                    _logger?.Error($"Invalid log file path: {path}");
+                    return null;
+                }
+
                 try
                 {
-                    // Use native Uri combining rules to insulate from host-level file system path corruption
-                    var baseUri = new Uri(baseUrl);
-                    var targetUri = baseUri;
-                    if (!string.IsNullOrEmpty(suffix) && enableFlags)
-                    {
-                        var baseStr = baseUrl.EndsWith("/") ? baseUrl : baseUrl + "/";
-                        targetUri = new Uri(baseStr + suffix.TrimStart('/'));
-                    }
-
-                    _logger?.Debug($"Emitting heartbeat ping to: {Helpers.ServiceHelper.MaskUrl(targetUri.ToString())}");
-
-                    using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
-                    {
-                        // Execute using ResponseHeadersRead to avoid allocating buffers or reading potential body payload bytes
-                        using (var response = await SharedPingClient.GetAsync(targetUri, HttpCompletionOption.ResponseHeadersRead, cts.Token))
-                        {
-                            if (!response.IsSuccessStatusCode)
-                            {
-                                _logger?.Debug($"Heartbeat ping to {targetUri} returned unexpected status code: {(int)response.StatusCode} ({response.StatusCode})");
-                            }
-                        }
-                    }
+                    return _streamWriterFactory.Create(
+                        path,
+                        options.EnableSizeRotation,
+                        options.RotationSizeInBytes,
+                        options.EnableDateRotation,
+                        options.DateRotationType,
+                        options.MaxRotations,
+                        options.UseLocalTimeForRotation
+                        );
                 }
                 catch (Exception ex)
                 {
-                    // Fail-silent constraint: Log strictly at debug/trace level to eliminate local disk saturation if the network goes completely down
-                    _logger?.Debug($"Heartbeat ping to base URL '{Helpers.ServiceHelper.MaskUrl(baseUrl)}' failed silently.", ex);
+                    _logger?.Error($"Could not open log file '{path}'; continuing without redirection for this stream.", ex);
+                    return null;
                 }
-            });
-        }
-
-        /// <summary>
-        /// Cleans up the child process object if it fails to start, ensuring event handlers
-        /// are detached and the object is disposed before it can cause secondary exceptions.
-        /// </summary>
-        private void CleanupFailedProcess()
-        {
-            if (_childProcess == null) return;
-
-            try
-            {
-                // Unsubscribe from events we attached before calling .Start()
-                _childProcess.OutputDataReceived -= OnOutputDataReceived;
-                _childProcess.ErrorDataReceived -= OnErrorDataReceived;
-                _childProcess.Exited -= OnProcessExited!;
-
-                _childProcess.Dispose();
             }
-            catch (Exception ex)
-            {
-                _logger?.Warn($"Secondary error during failed process cleanup: {ex.Message}");
-            }
-            finally
-            {
-                _childProcess = null;
-            }
-        }
 
-        /// <summary>
-        /// Starts the configured post-launch executable, if defined.
-        /// </summary>
-        /// <remarks>
-        /// This method launches an external program specified in the service options
-        /// after the wrapped process has successfully started.
-        /// - If <see cref="_options"/> is <c>null</c> or no <c>PostLaunchExecutablePath</c> is set, the method does nothing.
-        /// - Environment variables in arguments are expanded before execution.
-        /// - The working directory defaults to <c>PostLaunchStartupDirectory</c>,
-        ///   or falls back to the main service's working directory if not set.
-        /// - The process is started in a fire-and-forget manner; no handle is kept or awaited.
-        /// </remarks>
-        /// <exception cref="System.ComponentModel.Win32Exception">
-        /// Thrown if the executable cannot be started (e.g., file not found, access denied).
-        /// </exception>
-        /// <exception cref="InvalidOperationException">
-        /// Thrown if no file name is specified in <c>ProcessStartInfo</c>.
-        /// </exception>
-        private void StartPostLaunchProcess()
-        {
-            RunFireAndForgetHook(
-                "post-launch",
-                exePath: _options?.PostLaunchExecutablePath,
-                rawArgs: _options?.PostLaunchExecutableArgs,
-                hookWorkingDir: _options?.PostLaunchStartupDirectory,
-                track: true);
-        }
+            // Always create stdout writer if path is valid
+            _stdoutWriter = CreateWriter(options.StdoutPath);
 
-        /// <summary>
-        /// Executes a secondary process as a "fire-and-forget" hook, optionally tracking its lifecycle
-        /// to ensure resources are cleaned up or managed appropriately.
-        /// </summary>
-        /// <param name="hookName">A descriptive name for the hook, used for logging and tracking purposes.</param>
-        /// <param name="exePath">The file path to the executable to be launched. If null or empty, the hook execution is aborted.</param>
-        /// <param name="rawArgs">The command-line arguments string to pass to the executable.</param>
-        /// <param name="hookWorkingDir">
-        /// The directory in which the process should start. If null or whitespace, defaults to the
-        /// primary service working directory specified in <c>_options</c>.
-        /// </param>
-        /// <param name="track">
-        /// If <c>true</c>, the launched process is added to the internal <c>_trackedHooks</c> collection
-        /// for management; otherwise, the process resources are disposed immediately after launch.
-        /// </param>
-        /// <remarks>
-        /// This method encapsulates process startup logic using <see cref="ProcessLauncher"/> and
-        /// applies service-wide environment variables. Any exceptions during process creation or
-        /// environment validation are caught and logged silently to prevent service interruption.
-        /// </remarks>
-        private void RunFireAndForgetHook(
-            string hookName, string? exePath, string? rawArgs,
-            string? hookWorkingDir, bool track)
-        {
-            if (_options == null || string.IsNullOrWhiteSpace(exePath)) return;
-            try
+            // Only create stderr writer if a path is provided
+            if (!string.IsNullOrWhiteSpace(options.StderrPath))
             {
-                var workingDir = string.IsNullOrWhiteSpace(hookWorkingDir)
-                    ? _options.StartupDirectory : hookWorkingDir;
-                var launchOptions = new ProcessLaunchOptions
+                // A non-null _stdoutWriter already implies StdoutPath is non-blank and passed IsValidPath
+                // (CreateWriter returns null otherwise), so only StderrPath still needs validating here.
+                if (_stdoutWriter != null && _pathValidator.IsValidPath(options.StderrPath))
                 {
-                    ExecutablePath = exePath,
-                    Arguments = rawArgs ?? string.Empty,
-                    StartupDirectory = workingDir,
-                    EnvironmentVariables = _options.EnvironmentVariables,
-                    FireAndForget = true,
-                    EnableConsoleUI = _options.EnableConsoleUI,
-                };
-                _logger?.Info($"Running {hookName} program: {launchOptions.ExecutablePath}");
-                var process = ProcessLauncher.Start(launchOptions, _processFactory, _logger!);
-                if (track && process.UnderlyingProcess is Process p)
-                    lock (_trackedHooks) _trackedHooks.Add(new Hook { OperationName = hookName, Process = p });
-                else process?.Dispose();
-            }
-            catch (Exception ex) { _logger?.Error($"Failed to run {hookName} program.", ex); }
-        }
+                    var canonStdErr = Helper.NormalizePath(options.StderrPath);
+                    var canonStdOut = Helper.NormalizePath(options.StdoutPath);
 
-        /// <summary>
-        /// Executes the configured failure program if specified in the service options.
-        /// This is invoked when the child process exits with a non-zero code while recovery
-        /// is disabled, or after all recovery attempts have been exhausted
-        /// (restartAttempts >= MaxRestartAttempts). It is NOT invoked when the main child
-        /// process fails to start - that path stops the service without running the failure program.
-        /// </summary>
-        /// <remarks>
-        /// The failure program path, arguments, and working directory are taken from
-        /// the service options:
-        /// - <c>FailureProgramPath</c>: the full path to the program to run.
-        /// - <c>FailureProgramParameters</c>: the command-line arguments to pass.
-        /// - <c>FailureProgramStartupDirectory</c>: the working directory for the program.
-        ///
-        /// Exceptions thrown while attempting to start the failure program are caught
-        /// and logged to avoid crashing the service.
-        /// </remarks>
-        private void RunFailureProgram()
-        {
-            RunFireAndForgetHook(
-                 "failure program",
-                 exePath: _options?.FailureProgramPath,
-                 rawArgs: _options?.FailureProgramArgs,
-                 hookWorkingDir: _options?.FailureProgramStartupDirectory,
-                 track: false);
+                    // If stderr path equals stdout path (explicitly), use the same writer
+                    if (string.Equals(canonStdErr, canonStdOut, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _stderrWriter = _stdoutWriter;
+                        return;
+                    }
+                }
+                _stderrWriter = CreateWriter(options.StderrPath);
+            }
         }
 
         /// <summary>
@@ -1575,61 +1762,32 @@ namespace Servy.Service
         }
 
         /// <summary>
-        /// Inserts PID in database and updates PreviousStopTimeout, ActiveStdoutPath and ActiveStderrPath.
+        /// Sets the priority class of the child process.
+        /// Logs info on success or a warning if it fails.
         /// </summary>
-        /// <param name="pid">PID.</param>
-        /// <param name="setPreviousStopTimeout">Indicates whether to set previous stop timeout.</param>
-        private void PersistProcessState(int? pid, bool setPreviousStopTimeout)
+        /// <param name="priority">The process priority to set.</param>
+        public void SetProcessPriority(ProcessPriorityClass priority)
         {
-            if (string.IsNullOrWhiteSpace(_serviceName))
+            if (_childProcess == null)
+            {
+                _logger?.Warn("SetProcessPriority called before child process was started; ignoring.");
                 return;
+            }
 
             try
             {
-                // We need to fetch the full unencrypted service DTO in order to update the runtime state fields.
-                // We cannot use decrypt:false here because encrypted fields (like Parameters and EnvironmentVariables)
-                // are not marked to be ignored during update, and the update operation requires the full DTO to avoid overwriting existing values with wrong values.
-                // This is a bit inefficient, but PersistProcessState only runs on service start/stop and process exit,
-                // so the performance impact should be minimal in the grand scheme of things.
-                var serviceDto = _serviceRepository.GetByName(_serviceName, decrypt: true);
-
-                if (serviceDto != null)
-                {
-                    serviceDto.Pid = pid;
-                    if (setPreviousStopTimeout)
-                        serviceDto.PreviousStopTimeout = _options?.StopTimeoutInSeconds;
-
-                    if (pid == null)
-                    {
-                        serviceDto.ActiveStdoutPath = null;
-                        serviceDto.ActiveStderrPath = null;
-                    }
-                    else
-                    {
-                        serviceDto.ActiveStdoutPath = _options?.StdoutPath;
-                        serviceDto.ActiveStderrPath = _options?.StderrPath;
-                    }
-
-                    _serviceRepository.Update(
-                        serviceDto,
-                        preserveExistingRuntimeState: false,
-                        preserveExistingCredentials: true
-                        );
-                }
+                _childProcess.PriorityClass = priority;
+                _logger?.Info($"Set process priority to {_childProcess.PriorityClass}.");
             }
             catch (Exception ex)
             {
-                _logger?.Error($"Failed to persist PID {pid} for service '{_serviceName}'.", ex);
+                _logger?.Warn($"Failed to set priority: {ex.Message}");
             }
         }
 
-        /// <summary>
-        /// Resets PID to null in database.
-        /// </summary>
-        private void ClearProcessState()
-        {
-            PersistProcessState(null, false);
-        }
+        #endregion
+
+        #region Exit Handling and Process State
 
         /// <summary>
         /// Event handler for the child process's Exited event.
@@ -1638,7 +1796,7 @@ namespace Servy.Service
         /// </summary>
         /// <param name="sender">The source of the event (the child process).</param>
         /// <param name="e">Event data containing no specific exit information.</param>
-        private async void OnProcessExited(object sender, EventArgs e)
+        private async void OnProcessExited(object? sender, EventArgs e)
         {
             try
             {
@@ -1651,9 +1809,8 @@ namespace Servy.Service
                 bool shouldStop = false;
                 int exitCode = -1;
 
-                // Move the await INSIDE the boundary.
-                // If teardown disposes the semaphore while we are suspended here,
-                // the ObjectDisposedException will be caught by our handler.
+                // The await sits inside this method's outer try: if teardown disposes the semaphore while
+                // we are suspended here, the ObjectDisposedException is caught by our handler below.
                 await _healthCheckSemaphore.WaitAsync(_cancellationSource?.Token ?? CancellationToken.None);
 
                 try
@@ -1674,29 +1831,7 @@ namespace Servy.Service
                         _logger?.Warn($"Failed to get exit code: {ex.Message}");
                     }
 
-                    if (exitCode == 0)
-                    {
-                        if (_options.RecoveryOnCleanExit)
-                        {
-                            _logger?.Info("Child process exited successfully (Code 0). RecoveryOnCleanExit is ENABLED. Checking recovery...");
-                            needsRecovery = RegisterFailureAndCheckRecovery();
-                        }
-                        else
-                        {
-                            _logger?.Info("Child process exited successfully (Code 0). Service will stop.");
-                            shouldStop = true;
-                        }
-                    }
-                    else if (_recoveryActionEnabled)
-                    {
-                        // Unified recovery check
-                        needsRecovery = RegisterFailureAndCheckRecovery();
-                    }
-                    else
-                    {
-                        _logger?.Error($"Process exited with code {exitCode} and recovery is disabled.");
-                        shouldStop = true;
-                    }
+                    (needsRecovery, shouldStop) = EvaluateExitOutcome(exitCode, "OnProcessExited");
                 }
                 finally
                 {
@@ -1706,7 +1841,7 @@ namespace Servy.Service
                 }
 
                 // Determine if this is an error exit that will result in a hard service stop
-                bool isCleanExit = exitCode == 0 && !_options.RecoveryOnCleanExit;
+                bool isCleanExit = exitCode == 0 && !(_options.RecoveryOnCleanExit && _recoveryActionEnabled);
                 bool isErrorStop = shouldStop && !isCleanExit; // True if it's an unrecovered crash or quota hit
 
                 // Trigger failure signal if local recovery handles it OR if recovery is disabled and it's an error exit
@@ -1798,53 +1933,102 @@ namespace Servy.Service
         }
 
         /// <summary>
-        /// Atomically registers a health check failure and evaluates if recovery should be initiated.
-        /// Assumes the caller has already acquired the _healthCheckSemaphore.
+        /// Evaluates child process exit code against recovery configuration options,
+        /// logging the event and determining whether to trigger recovery or stop the service.
         /// </summary>
-        private bool RegisterFailureAndCheckRecovery()
+        /// <param name="exitCode">The exit code of the terminated process, or null if unreachable.</param>
+        /// <param name="source">The caller context tag for log messages (e.g., "OnProcessExited" or "CheckHealth").</param>
+        /// <param name="isHealthCheck">Indicates whether the evaluation originates from periodic health monitoring polling, allowing failure tracking regardless of process exit event state.</param>
+        /// <returns>A tuple indicating whether recovery is needed or if the service should stop.</returns>
+        private (bool NeedsRecovery, bool ShouldStop) EvaluateExitOutcome(int? exitCode, string source, bool isHealthCheck = false)
         {
-            // Gatekeeper: If we are already recovering, do not increment or log more failures
-            if (_isRecovering) return false;
-
-            _failedChecks++;
-
-            if (_failedChecks >= _maxFailedChecks)
+            if (_options == null)
             {
-                // Set this immediately to block other threads/timers from incrementing
-                // while we are waiting for the recovery task to execute.
-                _isRecovering = true;
-
-                // Log inside the threshold block to guarantee it prints exactly once per recovery cycle
-                _logger?.Warn($"Health check failed ({_failedChecks}/{_maxFailedChecks}). Initiating recovery.");
-                return true;
+                return (false, true);
             }
 
-            _logger?.Warn($"Health check failed ({_failedChecks}/{_maxFailedChecks}).");
-            return false;
+            if (exitCode == 0)
+            {
+                if (_options.RecoveryOnCleanExit && (_recoveryActionEnabled || isHealthCheck))
+                {
+                    _logger?.Info($"[{source}] Child process exited successfully (Code 0). RecoveryOnCleanExit is ENABLED. Checking recovery...");
+                    return (RegisterFailureAndCheckRecovery(source), false);
+                }
+
+                _logger?.Info($"[{source}] Child process exited successfully (Code 0). Service will stop.");
+                return (false, true);
+            }
+
+            string exitCodeText = exitCode.HasValue
+                ? $"{exitCode.Value} (0x{exitCode.Value:X8})"
+                : "unavailable";
+
+            // Registers failure and checks recovery thresholds if recovery is enabled or if invoked from a health check pass.
+            // Otherwise, logs an error and initiates a service stop sequence.
+            if (_recoveryActionEnabled || isHealthCheck)
+            {
+                _logger?.Warn($"[{source}] Child process exited with code {exitCodeText}. Recovery is enabled; registering failure...");
+                return (RegisterFailureAndCheckRecovery(source), false);
+            }
+
+            _logger?.Error($"[{source}] Process exited with code {exitCodeText} and recovery is disabled.");
+            return (false, true);
         }
 
         /// <summary>
-        /// Sets the priority class of the child process.
-        /// Logs info on success or a warning if it fails.
+        /// Updates the service's existing database row with the PID, and optionally PreviousStopTimeout; sets
+        /// ActiveStdoutPath and ActiveStderrPath when <paramref name="pid"/> is non-null and clears them when it is null.
+        /// Does nothing if the service has no row.
         /// </summary>
-        /// <param name="priority">The process priority to set.</param>
-        public void SetProcessPriority(ProcessPriorityClass priority)
+        /// <param name="pid">PID.</param>
+        /// <param name="setPreviousStopTimeout">Indicates whether to set previous stop timeout.</param>
+        private void PersistProcessState(int? pid, bool setPreviousStopTimeout)
         {
-            if (_childProcess == null)
-            {
-                _logger?.Warn("SetProcessPriority called before child process was started; ignoring.");
+            if (string.IsNullOrWhiteSpace(_serviceName))
                 return;
-            }
 
             try
             {
-                _childProcess.PriorityClass = priority;
-                _logger?.Info($"Set process priority to {_childProcess.PriorityClass}.");
+                // Only the runtime state crosses the pipe: the host writes these columns and nothing else, so the
+                // service account can never change its own (or any other) service's configuration.
+                var state = new ServiceRuntimeStateDto
+                {
+                    Pid = pid,
+                    ActiveStdoutPath = pid == null ? null : _options?.StdoutPath,
+                    ActiveStderrPath = pid == null ? null : _options?.StderrPath,
+                    UpdatePreviousStopTimeout = setPreviousStopTimeout,
+                    PreviousStopTimeout = setPreviousStopTimeout ? _options?.StopTimeoutInSeconds : null,
+                };
+
+                _namedPipesService!.UpdateRuntimeState(_serviceName, state);
             }
             catch (Exception ex)
             {
-                _logger?.Warn($"Failed to set priority: {ex.Message}");
+                _logger?.Error($"Failed to persist PID {pid} for service '{_serviceName}'.", ex);
             }
+        }
+
+        /// <summary>
+        /// Resets PID to null in database and clears ActiveStdoutPath and ActiveStderrPath.
+        /// </summary>
+        private void ClearProcessState()
+        {
+            PersistProcessState(null, false);
+        }
+
+        #endregion
+
+        #region Health Monitoring and Recovery
+
+        /// <summary>
+        /// Determines whether health monitoring and automated recovery actions are fully enabled based on startup options.
+        /// </summary>
+        private static bool IsRecoveryEnabled(StartOptions options)
+        {
+            return options.EnableHealthMonitoring &&
+                   options.HeartbeatIntervalInSeconds > 0 &&
+                   options.MaxFailedChecks > 0 &&
+                   options.RecoveryAction != RecoveryAction.None;
         }
 
         /// <summary>
@@ -1866,14 +2050,166 @@ namespace Servy.Service
         }
 
         /// <summary>
+        /// Periodically evaluates the health of the child process.
+        /// Increments failure counters if the process is missing or crashed, and triggers recovery logic
+        /// when the maximum failure threshold is reached.
+        /// </summary>
+        /// <param name="sender">The timer instance that triggered the health check.</param>
+        /// <param name="e">Event data containing the time the check was triggered.</param>
+        /// <remarks>
+        /// This method acts as an async void event handler for timer ticks and delegates execution to
+        /// <see cref="CheckHealthCoreAsync"/>.
+        /// </remarks>
+        private async void CheckHealth(object? sender, ElapsedEventArgs e)
+        {
+            await CheckHealthCoreAsync(sender, e);
+        }
+
+        /// <summary>
+        /// Core internal asynchronous implementation for health monitoring checks.
+        /// Implements a thread-safe "gatekeeper" pattern using <see cref="_isRecovering"/>.
+        /// Exposed internally for deterministic testing and genuine task awaiting.
+        /// </summary>
+        /// <param name="sender">The timer instance that triggered the health check.</param>
+        /// <param name="e">Event data containing the time the check was triggered.</param>
+        internal async Task CheckHealthCoreAsync(object? sender, ElapsedEventArgs? e)
+        {
+            try
+            {
+                // Preliminary fast-fail check outside the lock
+                if (_isTearingDown || _disposed || _isRebooting || _isRecovering) return;
+
+                bool needsRecovery = false;
+                bool shouldStop = false;
+                bool performStabilityCheck = false;
+
+                // 1. FAST ASYNCHRONOUS LOCK: Only evaluate memory state
+                try
+                {
+                    await _healthCheckSemaphore.WaitAsync(_cancellationSource?.Token ?? CancellationToken.None);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Teardown in progress; abandon recovery quietly.
+                    _logger?.Info("CheckHealth: Semaphore disposed during wait. Teardown in progress.");
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger?.Info("CheckHealth: health check cancelled. Teardown in progress.");
+                    return;
+                }
+
+                try
+                {
+                    // Double-check: If we are already recovering, exit immediately
+                    if (_isTearingDown || _disposed || _isRecovering) return;
+
+                    // Capture _childProcess into a local variable to ensure atomicity.
+                    var process = _childProcess;
+
+                    bool isFailed = process == null || process.HasExited;
+                    if (isFailed)
+                    {
+                        int? exitCode = null;
+                        try { exitCode = process?.ExitCode; } catch (Exception ex) { _logger?.Warn($"Health check could not read ExitCode (treating as failure): {ex.Message}"); }
+
+                        (needsRecovery, shouldStop) = EvaluateExitOutcome(exitCode, "CheckHealth", isHealthCheck: true);
+
+                        // PLACEMENT 1: Alert the external monitor immediately if we are escalating to full recovery action
+                        if (needsRecovery && _options != null)
+                        {
+                            EmitHeartbeatPing(_options.HeartbeatUrl, AppConfig.HeartbeatUrlFailFlag, _options.HeartbeatUrlTimeoutInSeconds);
+                        }
+                    }
+                    else
+                    {
+                        // PROCESS IS HEALTHY
+                        if (_failedChecks > 0)
+                        {
+                            _logger?.Info("Child process is healthy again. Resetting transient failure count.");
+
+                            // PLACEMENT 2: Send an explicit structural /start signal showing recovery completed
+                            if (_options != null)
+                                EmitHeartbeatPing(_options.HeartbeatUrl, AppConfig.HeartbeatUrlStartFlag, _options.HeartbeatUrlTimeoutInSeconds);
+
+                            // Always reset memory count immediately so we don't trigger recovery again unnecessarily
+                            _failedChecks = 0;
+                        }
+                        else
+                        {
+                            // PLACEMENT 3: Standard routine operational tick (clean pass)
+                            if (_options != null)
+                                EmitHeartbeatPing(_options.HeartbeatUrl, string.Empty, _options.HeartbeatUrlTimeoutInSeconds);
+                        }
+
+                        // Flag to perform the stability check (a host pipe round trip) outside the lock
+                        performStabilityCheck = true;
+                    }
+                }
+                finally
+                {
+                    try { _healthCheckSemaphore.Release(); }
+                    catch (ObjectDisposedException) { /* Ignored during teardown */ }
+                }
+
+                // Actions outside the critical section
+                if (performStabilityCheck)
+                {
+                    // STABILITY CHECK (host pipe I/O)
+                    // This is safely outside the health lock, preventing it from stalling OnProcessExited.
+                    await ConditionalResetRestartAttemptsAsync(_options!, _cancellationSource?.Token ?? CancellationToken.None);
+                }
+
+                if (shouldStop) Stop();
+
+                // Runs outside the health lock so recovery cannot stall OnProcessExited.
+                if (needsRecovery) await InitiateRecoveryAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger?.Error("Critical error in health check loop.", ex);
+            }
+        }
+
+        /// <summary>
+        /// Atomically registers a health check failure and evaluates if recovery should be initiated.
+        /// Assumes the caller has already acquired the _healthCheckSemaphore.
+        /// </summary>
+        /// <param name="source">The caller context tag for log messages (e.g., "OnProcessExited" or "CheckHealth").</param>
+        private bool RegisterFailureAndCheckRecovery(string source)
+        {
+            // Gatekeeper: If we are already recovering, do not increment or log more failures
+            if (_isRecovering) return false;
+
+            _failedChecks++;
+
+            if (_failedChecks >= _maxFailedChecks)
+            {
+                // Set this immediately to block other threads/timers from incrementing
+                // while we are waiting for the recovery task to execute.
+                _isRecovering = true;
+
+                // Log inside the threshold block to guarantee it prints exactly once per recovery cycle
+                _logger?.Warn($"[{source}] Health check failed ({_failedChecks}/{_maxFailedChecks}). Initiating recovery.");
+                return true;
+            }
+
+            _logger?.Warn($"[{source}] Health check failed ({_failedChecks}/{_maxFailedChecks}).");
+            return false;
+        }
+
+        /// <summary>
         /// Orchestrates the recovery sequence when the child process is deemed unhealthy.
         /// Handles restart quota management, persistence of attempts, and execution of the recovery strategy.
         /// </summary>
         /// <remarks>
         /// This method uses a "Gatekeeper" pattern via the <c>_isRecovering</c> flag to ensure that
         /// only one recovery action is executed at a time, even if multiple health checks fail
-        /// simultaneously. The flag is reset in a <c>finally</c> block to guarantee that
-        /// monitoring can resume regardless of whether the recovery succeeded or threw an exception.
+        /// simultaneously. The flag is reset in a <c>finally</c> block so that monitoring can resume
+        /// after a non-terminal action or after any action that threw. After a successful
+        /// <see cref="RecoveryAction.RestartService"/> or <see cref="RecoveryAction.RestartComputer"/>
+        /// the gate deliberately stays closed, because this service instance is about to be replaced.
         /// </remarks>
         private async Task InitiateRecoveryAsync()
         {
@@ -1906,24 +2242,37 @@ namespace Servy.Service
 
                 try
                 {
-                    // Guard: prevent concurrent recovery attempts
+                    // Guard: teardown or a reboot may have started while we waited for the lock
                     if (_isTearingDown || _disposed || _isRebooting) return;
 
                     // _maxRestartAttempts == 0 means unlimited restart attempts
                     if (_maxRestartAttempts > 0)
                     {
-                        currentAttempts = await EnsureRestartAttemptsFileAsync();
+                        var ct = _cancellationSource?.Token ?? CancellationToken.None;
+                        var ca = await GetRestartAttemptsAsync(ct);
+
+                        // A read cancelled by a stop comes back as 0, which is not a count: a stop that began
+                        // during the read abandons the recovery instead of dispatching it as attempt 1
+                        if (ct.IsCancellationRequested || _isTearingDown || _disposed) return;
+
+                        if (ca == null)
+                        {
+                            _logger?.Error("Failed to read restart attempts from persistent storage. Aborting recovery.");
+                            return;
+                        }
+
+                        currentAttempts = ca.Value;
 
                         if (currentAttempts >= _maxRestartAttempts)
                         {
                             _logger?.Error($"Maximum restart attempts reached ({_maxRestartAttempts}). Stopping service.");
-                            await SaveRestartAttemptsAsync(0);  // Reset for next manual start
+                            await SaveRestartAttemptsAsync(0, ct);  // Reset for next manual start
                             shouldStop = true;
                         }
                         else
                         {
                             currentAttempts++;
-                            await SaveRestartAttemptsAsync(currentAttempts);
+                            await SaveRestartAttemptsAsync(currentAttempts, ct);
                         }
                     }
 
@@ -1950,19 +2299,15 @@ namespace Servy.Service
                     catch (ObjectDisposedException) { /* Ignored during teardown */ }
                 }
 
-                // Safely parse heartbeat metadata without NullReferenceException exposures
-                string? heartbeatUrl = _options?.HeartbeatUrl;
-                int timeout = _options?.HeartbeatUrlTimeoutInSeconds ?? AppConfig.DefaultHeartbeatUrlTimeoutSeconds;
-
                 if (shouldStop)
                 {
-                    // Emit external notification immediately when stopping due to exhausted quotas
-                    EmitHeartbeatPing(heartbeatUrl, AppConfig.HeartbeatUrlFailFlag, timeout);
-
                     RunFailureProgram();
                     Stop();
                     return;
                 }
+
+                // Teardown does not take _healthCheckSemaphore, so a stop may have begun since the guard above
+                if (_isTearingDown || _disposed) return;
 
                 try
                 {
@@ -2035,12 +2380,31 @@ namespace Servy.Service
 
                 case RecoveryAction.RestartProcess:
                     _serviceHelper.RestartProcess(
-                        _childProcess!,
-                        StartProcess,
+                        _childProcess,
+                        (exe, args, dir, envVars, allowOverriddenRuntimeVars, ct) =>
+                        {
+                            // Mutually exclusive with ExecuteTeardown, which holds this lock for its whole run:
+                            // either the relaunch completes first and Cleanup kills the new child, or teardown
+                            // has begun and the relaunch is skipped. Teardown never waits on this thread.
+                            lock (_teardownLock)
+                            {
+                                if (_isTearingDown || _disposed)
+                                {
+                                    _logger?.Info("Recovery relaunch skipped: the service is stopping.");
+                                    return false;
+                                }
+
+                                StartProcess(exe, args, dir, envVars, allowOverriddenRuntimeVars, ct);
+                                SetProcessPriority(_options?.Priority ?? ProcessPriorityClass.Normal);
+                                SetProcessCpuAffinity(_options?.CpuAffinity);
+                                return true;
+                            }
+                        },
                         _realExePath!,
                         _realArgs!,
                         _workingDir!,
                         _environmentVariables,
+                        _options?.AllowOverriddenRuntimeVars ?? false,
                         _logger,
                         ClampTimeout(_options?.StopTimeoutInSeconds ?? AppConfig.DefaultStopTimeout),
                         _cancellationSource?.Token ?? CancellationToken.None
@@ -2067,361 +2431,90 @@ namespace Servy.Service
         }
 
         /// <summary>
-        /// Periodically evaluates the health of the child process.
-        /// Increments failure counters if the process is missing or crashed, and triggers recovery logic
-        /// when the maximum failure threshold is reached.
-        /// </summary>
-        /// <param name="sender">The timer instance that triggered the health check.</param>
-        /// <param name="e">Event data containing the time the check was triggered.</param>
-        /// <remarks>
-        /// This method acts as an async void event handler for timer ticks and delegates execution to
-        /// <see cref="CheckHealthCoreAsync"/>.
-        /// </remarks>
-        private async void CheckHealth(object? sender, ElapsedEventArgs e)
-        {
-            await CheckHealthCoreAsync(sender, e);
-        }
-
-        /// <summary>
-        /// Core internal asynchronous implementation for health monitoring checks.
-        /// Implements a thread-safe "gatekeeper" pattern using <see cref="_isRecovering"/>.
-        /// Exposed internally for deterministic testing and genuine task awaiting.
-        /// </summary>
-        /// <param name="sender">The timer instance that triggered the health check.</param>
-        /// <param name="e">Event data containing the time the check was triggered.</param>
-        internal async Task CheckHealthCoreAsync(object? sender, ElapsedEventArgs? e)
-        {
-            try
-            {
-                // Preliminary fast-fail check outside the lock
-                if (_isTearingDown || _disposed || _isRebooting || _isRecovering) return;
-
-                bool needsRecovery = false;
-                bool shouldStop = false;
-                bool performStabilityCheck = false;
-
-                // 1. FAST ASYNCHRONOUS LOCK: Only evaluate memory state
-                try
-                {
-                    await _healthCheckSemaphore.WaitAsync(_cancellationSource?.Token ?? CancellationToken.None);
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Teardown in progress; abandon recovery quietly.
-                    _logger?.Info("CheckHealth: Semaphore disposed during wait. Teardown in progress.");
-                    return;
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger?.Info("CheckHealth: health check cancelled. Teardown in progress.");
-                    return;
-                }
-
-                try
-                {
-                    // Double-check: If we are already recovering, exit immediately
-                    if (_isTearingDown || _disposed || _isRecovering) return;
-
-                    // Capture _childProcess into a local variable to ensure atomicity.
-                    var process = _childProcess;
-
-                    bool isFailed = process == null || process.HasExited;
-                    if (isFailed)
-                    {
-                        int? exitCode = null;
-                        try { exitCode = process?.ExitCode; } catch (Exception ex) { _logger?.Warn($"Health check could not read ExitCode (treating as failure): {ex.Message}"); }
-
-                        if (exitCode == 0)
-                        {
-                            if (_options!.RecoveryOnCleanExit == true)
-                            {
-                                _logger?.Info("Health check detected clean exit (Code 0), but RecoveryOnCleanExit is ENABLED. Checking recovery...");
-                                needsRecovery = RegisterFailureAndCheckRecovery();
-                            }
-                            else
-                            {
-                                _logger?.Info("Health check detected child process exited successfully (Code 0). Service will stop.");
-                                shouldStop = true;
-                            }
-                        }
-                        else
-                        {
-                            // Unified recovery check for non-zero exit codes or missing processes
-                            needsRecovery = RegisterFailureAndCheckRecovery();
-                        }
-
-                        // PLACEMENT 1: Alert the external monitor immediately if we are escalating to full recovery action
-                        if (needsRecovery && _options != null)
-                        {
-                            EmitHeartbeatPing(_options.HeartbeatUrl, AppConfig.HeartbeatUrlFailFlag, _options.HeartbeatUrlTimeoutInSeconds);
-                        }
-                    }
-                    else
-                    {
-                        // PROCESS IS HEALTHY
-                        if (_failedChecks > 0)
-                        {
-                            _logger?.Info("Child process is healthy again. Resetting transient failure count.");
-
-                            // PLACEMENT 2: Send an explicit structural /start signal showing recovery completed
-                            if (_options != null)
-                                EmitHeartbeatPing(_options.HeartbeatUrl, AppConfig.HeartbeatUrlStartFlag, _options.HeartbeatUrlTimeoutInSeconds);
-
-                            // Always reset memory count immediately so we don't trigger recovery again unnecessarily
-                            _failedChecks = 0;
-                        }
-                        else
-                        {
-                            // PLACEMENT 3: Standard routine operational tick (clean pass)
-                            if (_options != null)
-                                EmitHeartbeatPing(_options.HeartbeatUrl, string.Empty, _options.HeartbeatUrlTimeoutInSeconds);
-                        }
-
-                        // Flag to perform disk-bound stability check outside the lock
-                        performStabilityCheck = true;
-                    }
-                }
-                finally
-                {
-                    try { _healthCheckSemaphore.Release(); }
-                    catch (ObjectDisposedException) { /* Ignored during teardown */ }
-                }
-
-                // Actions outside the critical section
-                if (performStabilityCheck)
-                {
-                    // STABILITY CHECK (Disk I/O)
-                    // This is safely outside the health lock, preventing it from stalling OnProcessExited.
-                    await ConditionalResetRestartAttemptsAsync(_options!, _cancellationSource?.Token ?? CancellationToken.None);
-                }
-
-                if (shouldStop) Stop();
-
-                // InitiateRecovery will now find _isRecovering is already true.
-                // Ensure InitiateRecovery's internal guard allows it to run if
-                // it's the one performing the recovery!
-                if (needsRecovery) await InitiateRecoveryAsync();
-            }
-            catch (Exception ex)
-            {
-                _logger?.Error("Critical error in health check loop.", ex);
-            }
-        }
-
-        /// <summary>
-        /// Called when the service receives a Stop command from the Service Control Manager (SCM).
-        /// Triggers the standardized teardown sequence.
-        /// </summary>
-        protected override void OnStop()
-        {
-            ExecuteTeardown(TeardownReason.Stop);
-
-            // Flush logs right before returning control to SCM
-            FlushAndShutdownLogger();
-
-            base.OnStop();
-        }
-
-        /// <summary>
-        /// Handles custom control commands sent to the service by the Service Control Manager (SCM).
-        /// Specifically intercepts the Pre-Shutdown signal to begin an orchestrated teardown.
-        /// </summary>
-        /// <param name="command">The control code sent by the SCM.</param>
-        protected override void OnCustomCommand(int command)
-        {
-            if (command == SERVICE_CONTROL_PRESHUTDOWN)
-            {
-                if (_isRebooting)
-                {
-                    _logger?.Info("Pre-Shutdown bypassed: System reboot initiated by recovery logic.");
-                    // Signal stopped immediately so the OS doesn't wait for us
-                    UpdateServiceStatus(SERVICE_STOPPED, 0);
-                    FlushAndShutdownLogger();
-                    return;
-                }
-
-                _logger?.Info("Pre-Shutdown received. Starting orchestrated teardown...");
-
-                if (_serviceHandle == IntPtr.Zero)
-                {
-                    _logger?.Error("Service handle is null! SCM notification impossible. Falling back to synchronous teardown.");
-
-                    // Log the completion intention right before the logger is destroyed
-                    _logger?.Info("Pre-Shutdown fallback path entered. Initiating synchronous teardown before Environment.Exit.");
-                    try
-                    {
-                        ExecuteTeardown(TeardownReason.PreShutdown);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.Error($"Fallback teardown failed: {ex.Message}");
-                    }
-                    finally
-                    {
-                        var code = Environment.ExitCode != 0 ? Environment.ExitCode : 1;
-                        FlushAndShutdownLogger();
-                        Environment.Exit(code);
-                    }
-                    return;
-                }
-
-                // 1. Immediately tell SCM we are transitioning to a stop state and need a 30s window.
-                // This moves the service into the STOP_PENDING state in the eyes of the OS.
-                UpdateServiceStatus(SERVICE_STOP_PENDING, AppConfig.PreShutdownWaitHintMs);
-
-                Task<bool> stopTask = Task.Run(() => ExecuteTeardown(TeardownReason.PreShutdown));
-
-                // 2. Wait in pulses.
-                // We increment the checkpoint each pulse to prove to the SCM that we haven't hung.
-                // This loop is guaranteed to terminate because the underlying teardown logic
-                // (SafeKillProcess) enforces an absolute, stopwatch-backed timeout limit.
-                bool teardownSucceeded = false;
-                try
-                {
-                    while (!stopTask.Wait(AppConfig.PreShutdownPulseIntervalMs))
-                    {
-                        _checkPoint++;
-                        UpdateServiceStatus(SERVICE_STOP_PENDING, AppConfig.PreShutdownWaitHintMs);
-                    }
-                    teardownSucceeded = stopTask.Status == TaskStatus.RanToCompletion && stopTask.Result;
-                }
-                catch (AggregateException ex)
-                {
-                    _logger?.Error($"Teardown task faulted during pre-shutdown wait: {ex.Flatten().InnerException?.Message}", ex);
-                }
-
-                // 3. Final Signal: Inform the SCM that the service has successfully reached the STOPPED state.
-                if (teardownSucceeded)
-                {
-                    _logger?.Info("Pre-Shutdown handling complete. Setting SERVICE_STOPPED.");
-                }
-                else
-                {
-                    _logger?.Error("Pre-Shutdown teardown reported failure; signaling SERVICE_STOPPED with non-zero exit code so SCM records the failure.");
-                    if (ExitCode == 0) ExitCode = AppConfig.ServiceSpecificErrorCode; // ERROR_SERVICE_SPECIFIC_ERROR
-                }
-                UpdateServiceStatus(SERVICE_STOPPED, 0);
-
-                // 4. SHUTDOWN LOGGER LAST
-                FlushAndShutdownLogger();
-
-                return;
-            }
-
-            base.OnCustomCommand(command);
-        }
-
-        /// <summary>
-        /// Safely flushes and shuts down the loggers with a strict timeout
-        /// to prevent OS-level RPC hangs during system shutdown.
-        /// </summary>
-        private void FlushAndShutdownLogger()
-        {
-            // Snapshot + clear synchronously so concurrent callers can no longer reach the old logger.
-            IServyLogger? toDispose = Interlocked.Exchange(ref _logger, null);
-
-            try
-            {
-                var flushTask = Task.Run(() =>
-                {
-                    try { Logger.Shutdown(); } catch { /* fail-silent */ }
-                    try { toDispose?.Dispose(); } catch { /* fail-silent */ }
-                });
-
-                if (!flushTask.Wait(AppConfig.LoggerFlushTimeoutMs))
-                {
-                    // Observe orphan so it can't surface an unobserved exception later.
-                    _ = flushTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
-                }
-            }
-            catch
-            {
-                // Fail-silent (per existing contract)
-            }
-        }
-
-        /// <summary>
-        /// Updates the service status by calling the Win32 SetServiceStatus API.
-        /// This informs the SCM of the service's current state and expected wait times.
-        /// </summary>
-        /// <param name="state">The current state of the service (e.g., <c>SERVICE_STOP_PENDING</c> or <c>SERVICE_STOPPED</c>).</param>
-        /// <param name="waitHint">The estimated time for the pending operation in milliseconds.</param>
-        private void UpdateServiceStatus(int state, int waitHint)
-        {
-            try
-            {
-                if (_serviceHandle == IntPtr.Zero)
-                {
-                    _logger?.Error("Service handle is null, cannot update status");
-                    return;
-                }
-
-                int win32ExitCode = 0;
-                int specificExitCode = 0;
-                if (state == SERVICE_STOPPED && ExitCode != 0)
-                {
-                    // ERROR_SERVICE_SPECIFIC_ERROR tells SCM to read dwServiceSpecificExitCode
-                    win32ExitCode = AppConfig.ServiceSpecificErrorCode; // ERROR_SERVICE_SPECIFIC_ERROR
-                    specificExitCode = ExitCode;
-                }
-
-                // Construct the Win32 status structure.
-                SERVICE_STATUS status = new SERVICE_STATUS
-                {
-                    dwServiceType = SERVICE_WIN32_OWN_PROCESS,
-                    dwCurrentState = state,
-                    // If stopped, we accept nothing. Otherwise, we maintain our acceptance of Stop and Preshutdown.
-                    dwControlsAccepted = state == SERVICE_STOPPED
-                        ? 0
-                        : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN),
-                    dwWin32ExitCode = win32ExitCode,
-                    dwServiceSpecificExitCode = specificExitCode,
-                    dwCheckPoint = (int)_checkPoint,
-                    dwWaitHint = waitHint
-                };
-
-                // Invoke the P/Invoke method to update the SCM
-                if (!SetServiceStatus(_serviceHandle, ref status))
-                {
-                    int error = Marshal.GetLastWin32Error();
-                    _logger?.Error($"SetServiceStatus failed with Win32 error code: {error}");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger?.Error($"Exception in UpdateServiceStatus: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Called when the system is shutting down.
-        /// Mimics the Stop command to ensure child processes and hooks are cleaned up before the OS terminates the process.
+        /// Asynchronously emits an out-of-band diagnostic heartbeat ping to the configured external monitoring endpoint.
         /// </summary>
         /// <remarks>
-        /// This requires <see cref="ServiceBase.CanShutdown"/> to be set to <see langword="true"/> in the service constructor.
+        /// <para>
+        /// This operation runs entirely inside a fire-and-forget background task context. It is designed to be
+        /// non-blocking and fail-silent to ensure that network latency, DNS failures, or remote proxy outages
+        /// never delay or destabilize the primary process supervision loop.
+        /// </para>
+        /// <para>
+        /// Outbound requests are managed using a short timeout threshold to prevent backing up thread pool workers
+        /// or exhausting available network socket allocations during persistent endpoint blackouts.
+        /// </para>
+        /// <para>
+        /// If a lifecycle suffix is provided but extended flags are disabled (<see cref="StartOptions.EnableHeartbeatUrlFlags"/> is false),
+        /// the method exits immediately without scheduling a background task or making a network request.
+        /// </para>
         /// </remarks>
-        protected override void OnShutdown()
+        /// <param name="baseUrl">The absolute base target destination URL (e.g., "https://hc-ping.com/your-uuid" or "https://hc-ping.com/your-uuid?key=val").</param>
+        /// <param name="suffix">An optional trailing lifecycle flag state indicator to append to the base URL (e.g., "start" or "fail"). Pass null or empty for a standard health check loop pass.</param>
+        /// <param name="timeoutSeconds">The maximum duration in seconds allowed for the HTTP connection handshake and headers transmission before automatic cancellation.</param>
+        private void EmitHeartbeatPing(string? baseUrl, string suffix, int timeoutSeconds)
         {
-            if (_isRebooting)
+            if (string.IsNullOrWhiteSpace(baseUrl) || _options == null || !_options.EnableHealthMonitoring) return;
+
+            // Capture the configuration state instantly on the caller thread to avoid thread-race NullReferenceExceptions
+            bool enableFlags = _options.EnableHeartbeatUrlFlags;
+
+            if (!string.IsNullOrEmpty(suffix) && !enableFlags) return;
+
+            // Fire-and-forget safely wrapped in an isolated background Task context
+            Task.Run(async () =>
             {
-                _logger?.Info("Shutdown bypassed: System reboot initiated by recovery logic.");
-                FlushAndShutdownLogger();
-                return;
-            }
+                try
+                {
+                    // Parse the base URL first so a malformed value fails here rather than at request time
+                    var baseUri = new Uri(baseUrl);
+                    var targetUri = baseUri;
+                    if (!string.IsNullOrEmpty(suffix))
+                    {
+                        var builder = new UriBuilder(baseUri);
 
-            ExecuteTeardown(TeardownReason.Shutdown);
+                        // UriBuilder keeps the existing query when only the path changes, so the flag lands in the path.
+                        string currentPath = builder.Path.EndsWith("/") ? builder.Path : builder.Path + "/";
+                        builder.Path = currentPath + suffix.TrimStart('/');
 
-            // Save final logs before the OS kills the process
-            FlushAndShutdownLogger();
+                        targetUri = builder.Uri;
+                    }
 
-            base.OnShutdown();
+                    var flagLabel = string.IsNullOrEmpty(suffix) ? "routine" : suffix.TrimStart('/');
+                    _logger?.Debug($"Emitting heartbeat ping to: {Helpers.ServiceHelper.MaskUrl(targetUri.ToString())} (flag: {flagLabel})");
+
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+                    {
+                        // Execute using ResponseHeadersRead to avoid allocating buffers or reading potential body payload bytes
+                        using (var response = await SharedPingClient.GetAsync(targetUri, HttpCompletionOption.ResponseHeadersRead, cts.Token))
+                        {
+                            if (!response.IsSuccessStatusCode)
+                            {
+                                _logger?.Debug($"Heartbeat ping to {Helpers.ServiceHelper.MaskUrl(targetUri.ToString())} (flag: {flagLabel}) returned unexpected status code: {(int)response.StatusCode} ({response.StatusCode})");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Fail-silent constraint: Log strictly at debug/trace level to eliminate local disk saturation if the network goes completely down
+                    _logger?.Debug($"Heartbeat ping to base URL '{Helpers.ServiceHelper.MaskUrl(baseUrl)}' failed silently.", ex);
+                }
+            });
         }
+
+        #endregion
+
+        #region Teardown and Process Termination
 
         /// <summary>
         /// Orchestrates the shared teardown logic for both service stops and system shutdowns.
         /// Handles cancellation, event invocation, and resource cleanup.
         /// </summary>
         /// <param name="reason">The context of the teardown (e.g., "Stop" or "Shutdown") used for logging purposes.</param>
+        /// <returns>
+        /// <see langword="true"/> if the teardown completed in this call or had already run (or is running) on another;
+        /// <see langword="false"/> if it threw, in which case the tearing-down flag is cleared so a later stop can retry.
+        /// </returns>
         private bool ExecuteTeardown(TeardownReason reason)
         {
             // Use a local flag to track if we actually performed the work
@@ -2479,10 +2572,7 @@ namespace Servy.Service
                         try { _cancellationSource?.Dispose(); } catch (Exception ex) { _logger?.Warn($"Disposing _cancellationSource failed: {ex.Message}"); }
                         _cancellationSource = null;
 
-                        try { _secureData?.Dispose(); } catch (Exception ex) { _logger?.Warn($"Disposing _secureData failed: {ex.Message}"); }
-                        try { _protectedKeyProvider?.Dispose(); } catch (Exception ex) { _logger?.Warn($"Disposing _protectedKeyProvider failed: {ex.Message}"); }
-                        try { _dbContext?.Dispose(); } catch (Exception ex) { _logger?.Warn($"Disposing _dbContext failed: {ex.Message}"); }
-                        try { _fileSemaphore.Dispose(); } catch (Exception ex) { _logger?.Warn($"Disposing _fileSemaphore failed: {ex.Message}"); }
+                        try { _restartAttemptsSemaphore.Dispose(); } catch (Exception ex) { _logger?.Warn($"Disposing _restartAttemptsSemaphore failed: {ex.Message}"); }
                         try { _healthCheckSemaphore.Dispose(); } catch (Exception ex) { _logger?.Warn($"Disposing _healthCheckSemaphore failed: {ex.Message}"); }
                     }
                 }
@@ -2511,13 +2601,13 @@ namespace Servy.Service
             {
                 // 1. Unhook Exited event early so we don't trigger "unexpected exit" logic
                 if (_childProcess != null)
-                    _childProcess.Exited -= OnProcessExited!;
+                    _childProcess.Exited -= OnProcessExited;
 
                 // 2. Pre-Stop Hook
                 // Even if this fails, we usually want to continue killing the main process
-                var preStopSuccess = StartPreStopProcess(_options!);
+                var preStopSuccess = StartPreStopProcess(_options);
 
-                if (!preStopSuccess && _options!.PreStopLogAsError)
+                if (!preStopSuccess && _options.PreStopLogAsError)
                 {
                     _logger?.Error("Pre-stop failed. Manual intervention may be required, but continuing cleanup to avoid orphans.");
                 }
@@ -2525,7 +2615,7 @@ namespace Servy.Service
                 // 3. Main Kill Sequence (with SCM Heartbeats)
                 if (_childProcess != null)
                 {
-                    SafeKillProcess(_childProcess, ClampTimeout(_options!.StopTimeoutInSeconds));
+                    SafeKillProcess(_childProcess, ClampTimeout(_options.StopTimeoutInSeconds));
 
                     // Only cancel if redirection was active AND the stream is actually open
                     if (_childProcess.StartInfo.RedirectStandardOutput)
@@ -2550,7 +2640,7 @@ namespace Servy.Service
                         try
                         {
                             // Always check HasExited first
-                            if (!hook.Process.HasExited)
+                            if (!HasTrackedHookExited(hook.Process))
                             {
                                 var opName = string.IsNullOrWhiteSpace(hook.OperationName) ? "unnamed" : hook.OperationName;
                                 int pid = 0;
@@ -2563,7 +2653,7 @@ namespace Servy.Service
                                 // 1. Issue the kill request
                                 try
                                 {
-                                    hook.Process.Kill(entireProcessTree: true);
+                                    KillTrackedHook(hook.Process);
                                 }
                                 catch (Exception killEx)
                                 {
@@ -2571,18 +2661,18 @@ namespace Servy.Service
                                 }
 
                                 // 2. Bounded wait with SCM heartbeat pulses
-                                int timeoutMs = AppConfig.HookCleanupTimeoutMs;
+                                int timeoutMs = GetHookCleanupTimeoutMs();
                                 int pulseIntervalMs = AppConfig.SafeKillProcessPulseIntervalMs;
                                 int elapsedMs = 0;
 
-                                while (!hook.Process.HasExited && elapsedMs < timeoutMs)
+                                while (!HasTrackedHookExited(hook.Process) && elapsedMs < timeoutMs)
                                 {
                                     int waitTime = Math.Min(pulseIntervalMs, timeoutMs - elapsedMs);
 
                                     // Request additional time to prevent SCM from terminating the service during a slow kernel teardown
                                     _serviceHelper.RequestAdditionalTime(this, _scmAdditionalTimeMs, null);
 
-                                    if (hook.Process.WaitForExit(waitTime))
+                                    if (WaitForTrackedHookExit(hook.Process, waitTime))
                                     {
                                         break;
                                     }
@@ -2591,7 +2681,7 @@ namespace Servy.Service
                                 }
 
                                 // 3. Evaluate outcome
-                                if (!hook.Process.HasExited)
+                                if (!HasTrackedHookExited(hook.Process))
                                 {
                                     _logger?.Warn($"Tracked hook '{opName}' (PID: {pid}) did not exit within the {timeoutMs}ms budget. Proceeding with teardown to avoid SCM hang.");
                                 }
@@ -2650,91 +2740,30 @@ namespace Servy.Service
         }
 
         /// <summary>
-        /// Executes an optional pre-stop executable.
-        /// Supports fire-and-forget or synchronous wait with SCM heartbeat pulses.
+        /// Cleans up the child process object if it fails to start, ensuring event handlers
+        /// are detached and the object is disposed before it can cause secondary exceptions.
         /// </summary>
-        /// <param name="options">The service configuration options.</param>
-        /// <returns><see langword="true"/> if the process succeeded or failures are ignored; otherwise <see langword="false"/>.</returns>
-        private bool StartPreStopProcess(StartOptions options)
+        private void CleanupFailedProcess()
         {
-            if (options == null || string.IsNullOrWhiteSpace(options.PreStopExecutablePath))
-            {
-                _logger?.Info("No pre-stop executable configured. Skipping.");
-                return true;
-            }
-
-            _logger?.Info("Starting pre-stop process...");
-            bool logAsError = options.PreStopLogAsError;
-
-            // Helper to keep the catch block and failure logic clean
-            void LogIssue(string message, Exception? ex = null)
-            {
-                if (!logAsError)
-                    _logger?.Warn(message);
-                else if (ex != null)
-                    _logger?.Error(message, ex);
-                else
-                    _logger?.Error(message);
-            }
+            if (_childProcess == null) return;
 
             try
             {
-                // 1. Prepare Environment and Arguments
-                var args = options.PreStopExecutableArgs ?? string.Empty;
+                // Unsubscribe from events we attached before calling .Start()
+                _childProcess.OutputDataReceived -= OnOutputDataReceived;
+                _childProcess.ErrorDataReceived -= OnErrorDataReceived;
+                _childProcess.Exited -= OnProcessExited;
 
-                var workingDir = string.IsNullOrWhiteSpace(options.PreStopStartupDirectory)
-                    ? options.StartupDirectory
-                    : options.PreStopStartupDirectory;
-
-                // 2. Configure Launch Options
-                var effectiveTimeoutMs = ClampTimeout(options.PreStopTimeoutInSeconds);
-
-                var launchOptions = new ProcessLaunchOptions
-                {
-                    ExecutablePath = options.PreStopExecutablePath,
-                    Arguments = args,
-                    StartupDirectory = workingDir,
-                    EnvironmentVariables = options.EnvironmentVariables,
-                    FireAndForget = (effectiveTimeoutMs == 0),
-                    TimeoutMs = effectiveTimeoutMs,
-                    WaitChunkMs = _waitChunkMs,
-                    ScmAdditionalTimeMs = _scmAdditionalTimeMs,
-                    OnScmHeartbeat = time => _serviceHelper.RequestAdditionalTime(this, time, _logger),
-                    LogErrorAsWarning = !logAsError,
-                    EnableConsoleUI = options.EnableConsoleUI,
-                };
-
-                // 3. Launch and Evaluate
-                using (var process = ProcessLauncher.Start(launchOptions, _processFactory, _logger!))
-                {
-                    if (launchOptions.FireAndForget)
-                    {
-                        _logger?.Info("Pre-stop configured as fire-and-forget. Continuing service stop immediately.");
-                        return true;
-                    }
-
-                    if (process.ExitCode == 0)
-                    {
-                        _logger?.Info("Pre-stop process completed successfully.");
-                        return true;
-                    }
-
-                    LogIssue($"Pre-stop process '{launchOptions.ExecutablePath}' exited with code {process.ExitCode}.");
-                }
+                _childProcess.Dispose();
             }
             catch (Exception ex)
             {
-                LogIssue("Pre-stop process failed.", ex);
+                _logger?.Warn($"Secondary error during failed process cleanup: {ex.Message}");
             }
-
-            // 4. Final Policy Handling
-            if (!logAsError)
+            finally
             {
-                _logger?.Warn("Ignoring pre-stop failure and continuing service stop.");
-                return true;
+                _childProcess = null;
             }
-
-            return false;
         }
 
         /// <summary>
@@ -2772,7 +2801,6 @@ namespace Servy.Service
                 }
                 catch (Exception ex)
                 {
-                    /* Process already dead, can't get children anyway */
                     _logger?.Warn($"SafeKillProcess error while getting process PID and StartTime: {ex.Message}");
                 }
 
@@ -2781,17 +2809,20 @@ namespace Servy.Service
                 try
                 {
                     // Use GetAllDescendants to scan the entire deep tree instead of just Level 1
-                    var initialChildren = ProcessExtensions.GetAllDescendants(parentPid, parentStartTime);
+                    var initialChildren = GetProcessDescendants(parentPid, parentStartTime);
                     childCount = initialChildren.Count;
 
                     if (childCount > 0)
                     {
-                        _logger?.Info($"Pre-stop scan found {childCount} active descendants for PID {parentPid}:");
-                        foreach (var child in initialChildren)
+                        var formattedChildren = initialChildren.Select(child =>
                         {
-                            _logger?.Info($"  - {child.Format()}");
-                            child.Dispose(); // Dispose immediately after logging to avoid handle leaks
-                        }
+                            var formatted = $"  - {child.Format()}";
+                            child.Dispose(); // Dispose immediately after formatting to avoid handle leaks
+                            return formatted;
+                        });
+
+                        var childrenList = string.Join(Environment.NewLine, formattedChildren);
+                        _logger?.Info($"Pre-stop scan found {childCount} active descendants for PID {parentPid}:{Environment.NewLine}{childrenList}");
                     }
                     else
                     {
@@ -2805,7 +2836,7 @@ namespace Servy.Service
                 // ---------------------
 
                 // Total timeout = time for main process to stop + time for descendants to stop + safety buffer
-                var totalTimeoutMs = 2L * timeoutMs + childCount * ((long)timeoutMs + AppConfig.DefaultDescendantPostKillWaitMs) + AppConfig.SafeKillProcessSafetyBufferMs;
+                var totalTimeoutMs = 2L * timeoutMs + childCount * ((long)timeoutMs + AppConfig.DefaultPostKillWaitMs) + AppConfig.SafeKillProcessSafetyBufferMs;
 
                 Task<bool?> stopTask = Task.Run(() =>
                 {
@@ -2856,7 +2887,6 @@ namespace Servy.Service
                 }
                 finally { sw.Stop(); }
 
-
                 // 3. SAFE RESULT RETRIEVAL
                 // We only access .Result if the task truly succeeded.
                 bool outcomeHandled = false;
@@ -2881,9 +2911,14 @@ namespace Servy.Service
                 }
                 else
                 {
-                    // Timeout: task is still running. Don't fall through to HandleStopResult,
-                    // which would misreport "had already exited".
+                    // Timeout: task is still running.
                     _logger?.Warn($"Child process '{process.Format()}' stop sequence did not complete within the safety budget; the kill task is still running and will be abandoned.");
+
+                    // Observe the orphan, and record why the abandoned kill actually ended.
+                    _ = stopTask.ContinueWith(
+                        t => _logger?.Warn($"Abandoned stop task for '{process.Format()}' later faulted: {t.Exception?.Flatten().InnerException?.Message}"),
+                        TaskContinuationOptions.OnlyOnFaulted);
+
                     outcomeHandled = true;
                 }
 
@@ -2922,72 +2957,290 @@ namespace Servy.Service
         }
 
         /// <summary>
-        /// Initiates a fire-and-forget post-stop executable if configured.
-        /// This runs after the main process and its tree have been terminated.
+        /// Sends the kill request for a tracked hook's whole process tree by calling
+        /// <see cref="Process.Kill(bool)"/>.
         /// </summary>
-        private void StartPostStopProcess()
+        /// <param name="process">The tracked hook's process.</param>
+        /// <exception cref="System.ComponentModel.Win32Exception">
+        /// Propagated from <see cref="Process.Kill(bool)"/> when the process could not be terminated.
+        /// </exception>
+        /// <exception cref="NotSupportedException">
+        /// Propagated from <see cref="Process.Kill(bool)"/> when the process is a remote one.
+        /// </exception>
+        /// <exception cref="InvalidOperationException">
+        /// Propagated from <see cref="Process.Kill(bool)"/> when the process has already exited or
+        /// no process is associated with the object.
+        /// </exception>
+        /// <remarks>
+        /// This is a seam over <see cref="Process.Kill(bool)"/>; the production implementation forwards
+        /// to it unchanged, so the tracked-hook loop in <see cref="Cleanup"/> behaves exactly as it did
+        /// when it called the method directly. It is overridable because no user-mode test can make
+        /// <c>Kill</c> fail on a live process it owns, so the "Failed to send Kill signal" warning was
+        /// never executed under test.
+        /// </remarks>
+        protected virtual void KillTrackedHook(Process process)
         {
-            RunFireAndForgetHook(
-                 "post-stop",
-                 exePath: _options?.PostStopExecutablePath,
-                 rawArgs: _options?.PostStopExecutableArgs,
-                 hookWorkingDir: _options?.PostStopStartupDirectory,
-                 track: false);
+            process.Kill(entireProcessTree: true);
         }
 
         /// <summary>
-        /// Iterates through all tracked process hooks and ensures their underlying resources are released.
-        /// Caller must hold lock(_trackedHooks).
+        /// Gets a value indicating whether a tracked hook's process has exited by reading
+        /// <see cref="Process.HasExited"/>.
         /// </summary>
+        /// <param name="process">The tracked hook's process.</param>
+        /// <returns>
+        /// <see langword="true"/> if the process has exited; otherwise, <see langword="false"/>.
+        /// </returns>
+        /// <exception cref="InvalidOperationException">
+        /// Propagated from <see cref="Process.HasExited"/> when no process is associated with the object.
+        /// </exception>
+        /// <exception cref="System.ComponentModel.Win32Exception">
+        /// Propagated from <see cref="Process.HasExited"/> when the exit code could not be read.
+        /// </exception>
         /// <remarks>
-        /// This method should be called during service shutdown or when a service recovery cycle
-        /// requires a fresh state. It explicitly disposes of each <see cref="Hook"/> to prevent
-        /// native process handle leaks from Pre-Launch or Post-Launch operations.
+        /// This is a seam over <see cref="Process.HasExited"/>; the production implementation forwards
+        /// to it unchanged. It is overridable so a test can model a hook that survives the kill for the
+        /// whole <see cref="AppConfig.HookCleanupTimeoutMs"/> budget, which no ordinary user-mode
+        /// process does.
         /// </remarks>
-        private void CleanupTrackedHooks()
+        protected virtual bool HasTrackedHookExited(Process process)
         {
-            foreach (var hook in _trackedHooks)
+            return process.HasExited;
+        }
+
+        /// <summary>
+        /// Gets the total time, in milliseconds, that <see cref="Cleanup"/> spends waiting for a
+        /// tracked hook's process to exit, by reading <see cref="AppConfig.HookCleanupTimeoutMs"/>.
+        /// </summary>
+        /// <returns>The hook cleanup budget, in milliseconds.</returns>
+        /// <remarks>
+        /// This is a seam over <see cref="AppConfig.HookCleanupTimeoutMs"/>; the production
+        /// implementation forwards to it unchanged, so the bounded wait in <see cref="Cleanup"/>
+        /// behaves exactly as it did when it read the constant directly. It is overridable because the
+        /// shipped budget equals <see cref="AppConfig.SafeKillProcessPulseIntervalMs"/>, which leaves
+        /// the loop a single wait and makes its pulse chunking unobservable; a test needs a budget
+        /// that is not a multiple of the pulse interval.
+        /// </remarks>
+        protected virtual int GetHookCleanupTimeoutMs()
+        {
+            return AppConfig.HookCleanupTimeoutMs;
+        }
+
+        /// <summary>
+        /// Gets the UTC time at which the current OS session started.
+        /// </summary>
+        /// <returns>The current UTC time minus the system uptime.</returns>
+        /// <remarks>
+        /// This is a seam over <see cref="Environment.TickCount64"/>, read by the session-persistence check in
+        /// <see cref="ConditionalResetRestartAttemptsAsync"/>. It is overridable because a test that needs a
+        /// restart counter older than the reset cap cannot have one on a machine that booted more recently
+        /// than that: the counter would be treated as written before boot and the threshold would never be
+        /// evaluated.
+        /// </remarks>
+        protected virtual DateTime GetSystemBootTimeUtc()
+        {
+            return DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64);
+        }
+
+        /// <summary>
+        /// Waits up to <paramref name="timeoutMs"/> milliseconds for a tracked hook's process to exit
+        /// by calling <see cref="Process.WaitForExit(int)"/>.
+        /// </summary>
+        /// <param name="process">The tracked hook's process.</param>
+        /// <param name="timeoutMs">The maximum time to wait, in milliseconds.</param>
+        /// <returns>
+        /// <see langword="true"/> if the process exited within the wait; otherwise, <see langword="false"/>.
+        /// </returns>
+        /// <exception cref="InvalidOperationException">
+        /// Propagated from <see cref="Process.WaitForExit(int)"/> when no process is associated with
+        /// the object.
+        /// </exception>
+        /// <exception cref="System.ComponentModel.Win32Exception">
+        /// Propagated from <see cref="Process.WaitForExit(int)"/> when the wait handle could not be
+        /// opened.
+        /// </exception>
+        /// <remarks>
+        /// This is a seam over <see cref="Process.WaitForExit(int)"/>; the production implementation
+        /// forwards to it unchanged. It is overridable so the bounded wait's pulse and budget
+        /// arithmetic can be observed without a test really waiting.
+        /// </remarks>
+        [ExcludeFromCodeCoverage]
+        protected virtual bool WaitForTrackedHookExit(Process process, int timeoutMs)
+        {
+            return process.WaitForExit(timeoutMs);
+        }
+
+        /// <summary>
+        /// Enumerates the entire descendant tree of a process by calling
+        /// <see cref="ProcessExtensions.GetAllDescendants(int, DateTime)"/>.
+        /// </summary>
+        /// <param name="parentPid">The process ID of the parent whose descendants are enumerated.</param>
+        /// <param name="parentStartTime">
+        /// The start time of the parent process, used by the enumeration to reject a recycled PID.
+        /// </param>
+        /// <returns>
+        /// A flattened list of the parent's descendants. The caller owns every returned
+        /// <see cref="Process"/> and must dispose it to avoid leaking native handles.
+        /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Propagated from <see cref="ProcessExtensions.GetAllDescendants(int, DateTime)"/> when
+        /// <paramref name="parentPid"/> is not positive.
+        /// </exception>
+        /// <exception cref="ArgumentException">
+        /// Propagated from <see cref="ProcessExtensions.GetAllDescendants(int, DateTime)"/> when
+        /// <paramref name="parentStartTime"/> is <see cref="DateTime.MinValue"/>.
+        /// </exception>
+        /// <exception cref="System.ComponentModel.Win32Exception">
+        /// Propagated from <see cref="ProcessExtensions.GetAllDescendants(int, DateTime)"/> when the
+        /// Toolhelp32 snapshot cannot be created.
+        /// </exception>
+        /// <remarks>
+        /// This is a seam over <see cref="ProcessExtensions.GetAllDescendants(int, DateTime)"/>; the
+        /// production implementation forwards to it unchanged, so the pre-stop scan in
+        /// <see cref="SafeKillProcess(IProcessWrapper, int)"/> behaves exactly as it did when it called
+        /// the static method directly. It is overridable because that scan walks the real process table:
+        /// with the mocked process wrappers the tests use, the lineage matches nothing live, so the scan
+        /// always ended in its own catch and neither the found arm, the empty arm nor the per-child
+        /// disposal was ever executed under test. The count the scan returns also feeds the stop safety
+        /// budget, so it is behaviour and not only logging.
+        /// </remarks>
+        protected virtual List<Process> GetProcessDescendants(int parentPid, DateTime parentStartTime)
+        {
+            return ProcessExtensions.GetAllDescendants(parentPid, parentStartTime);
+        }
+
+        /// <summary>
+        /// Terminates the host process with the supplied exit code by calling <see cref="Environment.Exit(int)"/>.
+        /// </summary>
+        /// <param name="exitCode">The exit code to report to the operating system.</param>
+        /// <remarks>
+        /// This is a seam over <see cref="Environment.Exit(int)"/>; the production implementation forwards
+        /// to it unchanged, so every caller behaves exactly as it did when it called
+        /// <see cref="Environment.Exit(int)"/> directly. It is overridable so the pre-shutdown fallback in
+        /// <see cref="OnCustomCommand(int)"/>, which runs when no service handle is available, can be
+        /// observed from a test without ending the test host. Like <see cref="Environment.Exit(int)"/>,
+        /// the production implementation does not return.
+        /// </remarks>
+        [ExcludeFromCodeCoverage]
+        protected virtual void TerminateProcess(int exitCode)
+        {
+            Environment.Exit(exitCode);
+        }
+
+        /// <summary>
+        /// Gets the native status handle the Service Control Manager assigned to this service.
+        /// </summary>
+        /// <returns>
+        /// <see cref="System.ServiceProcess.ServiceBase.ServiceHandle"/>, which is
+        /// <see cref="IntPtr.Zero"/> when the process is not running under the SCM.
+        /// </returns>
+        /// <remarks>
+        /// <see cref="System.ServiceProcess.ServiceBase.ServiceHandle"/> is protected, so it cannot be
+        /// read through an injected seam. Overridable instead, so a test can supply a handle without a
+        /// real SCM registration. The production body is the property read it replaces.
+        /// </remarks>
+        [ExcludeFromCodeCoverage]
+        protected virtual IntPtr GetNativeServiceHandle()
+        {
+            return ServiceHandle;
+        }
+
+        /// <summary>
+        /// Updates the service status by calling the Win32 SetServiceStatus API.
+        /// This informs the SCM of the service's current state and expected wait times.
+        /// </summary>
+        /// <param name="state">The current state of the service (e.g., <c>SERVICE_STOP_PENDING</c> or <c>SERVICE_STOPPED</c>).</param>
+        /// <param name="waitHint">The estimated time for the pending operation in milliseconds.</param>
+        /// <remarks>
+        /// Overridable so the pre-shutdown orchestration in <see cref="OnCustomCommand(int)"/> can be
+        /// observed without a real service handle driving the SetServiceStatus P/Invoke.
+        /// </remarks>
+        protected virtual void UpdateServiceStatus(int state, int waitHint)
+        {
+            try
             {
-                // Safely dispose each hook to release native handles
-                try { hook.Dispose(); }
-                catch (Exception ex)
+                if (_serviceHandle == IntPtr.Zero)
                 {
-                    _logger?.Warn($"Failed to dispose tracked hook: {ex.Message}");
+                    _logger?.Error("Service handle is null, cannot update status");
+                    return;
+                }
+
+                int win32ExitCode = 0;
+                int specificExitCode = 0;
+                if (state == SERVICE_STOPPED && ExitCode != 0)
+                {
+                    // ERROR_SERVICE_SPECIFIC_ERROR tells SCM to read dwServiceSpecificExitCode
+                    win32ExitCode = AppConfig.ServiceSpecificErrorCode; // ERROR_SERVICE_SPECIFIC_ERROR
+                    specificExitCode = ExitCode;
+                }
+
+                // Construct the Win32 status structure.
+                SERVICE_STATUS status = new SERVICE_STATUS
+                {
+                    dwServiceType = SERVICE_WIN32_OWN_PROCESS,
+                    dwCurrentState = state,
+                    // If stopped, we accept nothing. Otherwise, we maintain our acceptance of Stop and Preshutdown.
+                    dwControlsAccepted = state == SERVICE_STOPPED
+                        ? 0
+                        : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN),
+                    dwWin32ExitCode = win32ExitCode,
+                    dwServiceSpecificExitCode = specificExitCode,
+                    dwCheckPoint = (state == SERVICE_STOPPED || state == SERVICE_RUNNING) ? 0 : (int)_checkPoint,
+                    dwWaitHint = waitHint
+                };
+
+                // Invoke the P/Invoke method to update the SCM
+                if (!_scmNative.SetServiceStatus(_serviceHandle, ref status))
+                {
+                    int error = _scmNative.GetLastWin32Error();
+                    _logger?.Error($"SetServiceStatus failed with Win32 error code: {error}");
                 }
             }
-
-            // Clear the collection while still under the lock
-            _trackedHooks.Clear();
+            catch (Exception ex)
+            {
+                _logger?.Error($"Exception in UpdateServiceStatus: {ex.Message}");
+            }
         }
 
         /// <summary>
-        /// Releases the unmanaged resources used by the <see cref="Service"/> and optionally releases the managed resources.
+        /// Safely flushes and shuts down the loggers with a strict timeout
+        /// to prevent OS-level RPC hangs during system shutdown.
         /// </summary>
-        /// <param name="disposing">
-        /// <c>true</c> to release both managed and unmanaged resources;
-        /// <c>false</c> to release only unmanaged resources.
-        /// </param>
-        /// <remarks>
-        /// This method follows the standard .NET Dispose pattern. It ensures that
-        /// <see cref="ExecuteTeardown(TeardownReason)"/> is called to gracefully
-        /// stop background processes and cleanup orchestration state before the
-        /// object is destroyed.
-        /// </remarks>
-        protected override void Dispose(bool disposing)
+        private void FlushAndShutdownLogger()
         {
-            if (disposing)
+            // Snapshot + clear synchronously so concurrent callers can no longer reach the old logger.
+            IServyLogger? toDispose = Interlocked.Exchange(ref _logger, null);
+
+            try
             {
-                // 1. Reuse existing orchestration logic to stop the service
-                // This is called while managed resources are still valid.
-                ExecuteTeardown(TeardownReason.Stop);
+                var flushTask = Task.Run(() =>
+                {
+                    try { Logger.Shutdown(); } catch { /* fail-silent */ }
+                    try { toDispose?.Dispose(); } catch { /* fail-silent */ }
+                });
 
-                // 2. Catch-all for test environments and manual disposal
-                FlushAndShutdownLogger();
+                if (!flushTask.Wait(AppConfig.LoggerFlushTimeoutMs))
+                {
+                    // Observe orphan so it can't surface an unobserved exception later.
+                    _ = flushTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                }
             }
-
-            // 3. Call the base class implementation to complete the chain
-            base.Dispose(disposing);
+            catch
+            {
+                // Fail-silent (per existing contract)
+            }
         }
 
+        /// <summary>
+        /// Safely releases a <see cref="SemaphoreSlim"/> instance, catching and ignoring any <see cref="ObjectDisposedException"/>
+        /// </summary>
+        /// <param name="semaphoreSlim">The <see cref="SemaphoreSlim"/> instance to release.</param>
+        private static void ReleaseSafe(SemaphoreSlim semaphoreSlim)
+        {
+            try { semaphoreSlim.Release(); }
+            catch (ObjectDisposedException) { /* teardown disposed it while we held it */ }
+        }
+
+        #endregion
     }
 }

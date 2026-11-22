@@ -1,3 +1,4 @@
+using Servy.Core.Helpers;
 using Servy.Core.Native;
 using System.Diagnostics.CodeAnalysis;
 using System.ServiceProcess;
@@ -12,13 +13,18 @@ namespace Servy.Service
 
         /// <summary>
         /// Main entry point of the Servy Windows service application.
-        /// Re-attaches the parent console for diagnostic output and starts the service host.
+        /// Re-attaches the parent console for diagnostic output, declares the registry as the source of the
+        /// System environment variables and runs the service.
         /// </summary>
+        /// <param name="args">Command-line arguments passed to the process; not read here.</param>
         [ExcludeFromCodeCoverage]
         internal static void Main(string[] args)
         {
             _ = NativeMethods.FreeConsole();
             _ = NativeMethods.AttachConsole(NativeMethods.ATTACH_PARENT_PROCESS);
+
+            // The environment came from the Service Control Manager at boot: System variables follow the registry (#7393)
+            SystemEnvironmentHelper.InitializeForService();
 
             ServiceBase[] servicesToRun =
             {

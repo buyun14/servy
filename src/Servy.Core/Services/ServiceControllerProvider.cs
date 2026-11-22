@@ -15,21 +15,37 @@ namespace Servy.Core.Services
         /// Initializes a new instance of the <see cref="ServiceControllerProvider"/> class.
         /// </summary>
         /// <param name="factory">A factory function used to create wrappers for native service controllers.</param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="factory"/> is null.</exception>
         public ServiceControllerProvider(Func<string, IServiceControllerWrapper> factory)
         {
             _factory = factory ?? throw new ArgumentNullException(nameof(factory));
         }
 
         /// <summary>
-        /// Retrieves all Windows services from the local machine and wraps them in testable abstractions.
+        /// Initializes a new instance of the <see cref="ServiceControllerProvider"/> class using standard production wrappers.
         /// </summary>
-        /// <returns>An array of <see cref="IServiceControllerWrapper"/> instances.</returns>
+        public ServiceControllerProvider()
+            : this(serviceName => new ServiceControllerWrapper(serviceName))
+        {
+        }
+
+        /// <inheritdoc />
+        public IServiceControllerWrapper GetService(string serviceName)
+        {
+            if (string.IsNullOrWhiteSpace(serviceName))
+                throw new ArgumentException("serviceName cannot be null or whitespace.", nameof(serviceName));
+
+            return _factory(serviceName);
+        }
+
+        /// <inheritdoc />
         [ExcludeFromCodeCoverage]
         public IServiceControllerWrapper[] GetServices()
         {
-            // Retrieve native ServiceController instances from the OS,
-            // then map them to the custom wrapper using the provided factory.
-            return MapAndDisposeServices(sc => _factory(sc.ServiceName));
+            // Retrieve native ServiceController instances from the OS
+            // and adopt them directly into wrappers to preserve pre-populated SCM status/displayName metadata.
+            var controllers = ServiceController.GetServices();
+            return controllers.Select(sc => new ServiceControllerWrapper(sc)).ToArray();
         }
 
         /// <summary>

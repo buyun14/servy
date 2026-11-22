@@ -10,6 +10,7 @@ using Servy.Manager.Resources;
 using Servy.Manager.ViewModels;
 using Servy.Testing;
 using Servy.UI.Services;
+using System.Security;
 using Helper = Servy.Testing.Helper;
 
 namespace Servy.Manager.UnitTests.ViewModels
@@ -48,28 +49,32 @@ namespace Servy.Manager.UnitTests.ViewModels
         [Fact]
         public void Constructor_NullAppConfig_ThrowsArgumentNullException()
         {
-            Assert.Throws<ArgumentNullException>(() => new LogsViewModel(
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>("appConfig", () => new LogsViewModel(
                 null!, _eventLogServiceMock.Object, _cursorServiceMock.Object, _mockMessageBoxService.Object));
         }
 
         [Fact]
         public void Constructor_NullEventLogService_ThrowsArgumentNullException()
         {
-            Assert.Throws<ArgumentNullException>(() => new LogsViewModel(
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>("eventLogService", () => new LogsViewModel(
                 _appConfigurationMock.Object, null!, _cursorServiceMock.Object, _mockMessageBoxService.Object));
         }
 
         [Fact]
         public void Constructor_NullCursorService_ThrowsArgumentNullException()
         {
-            Assert.Throws<ArgumentNullException>(() => new LogsViewModel(
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>("cursorService", () => new LogsViewModel(
                 _appConfigurationMock.Object, _eventLogServiceMock.Object, null!, _mockMessageBoxService.Object));
         }
 
         [Fact]
         public void Constructor_NullMessageBoxService_ThrowsArgumentNullException()
         {
-            Assert.Throws<ArgumentNullException>(() => new LogsViewModel(
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>("messageBoxService", () => new LogsViewModel(
                 _appConfigurationMock.Object, _eventLogServiceMock.Object, _cursorServiceMock.Object, null!));
         }
 
@@ -90,6 +95,29 @@ namespace Servy.Manager.UnitTests.ViewModels
                 Assert.True((vm.FromDate.Value - expectedFrom).Duration() < TimeSpan.FromMinutes(1));
                 Assert.True((vm.ToDate.Value - DateTime.Now).Duration() < TimeSpan.FromMinutes(1));
                 Assert.Equal(EventLogLevel.All, vm.SelectedLevel);
+            }
+        }
+
+        [Fact]
+        public void ResetDateWindowToNow_AfterConstruction_ReSeedsBothEndsOfTheWindow()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            using (var vm = CreateViewModel())
+            {
+                // Arrange - a Manager left open long enough for the constructor's window to go stale
+                var stale = new DateTime(2020, 1, 1);
+                vm.FromDate = stale;
+                vm.ToDate = stale;
+
+                // Act
+                vm.ResetDateWindowToNow();
+
+                // Assert - the window now ends at "now" and spans LogsWindowDays (mocked to 7),
+                // which the constructor test cannot show because it starts from an unset window.
+                Assert.NotNull(vm.FromDate);
+                Assert.NotNull(vm.ToDate);
+                Assert.True((vm.ToDate.Value - DateTime.Now).Duration() < TimeSpan.FromMinutes(1));
+                Assert.True((vm.ToDate.Value - vm.FromDate.Value - TimeSpan.FromDays(7)).Duration() < TimeSpan.FromMinutes(1));
             }
         }
 
@@ -149,6 +177,29 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public void SelectedLogAndSelectedLevel_DuplicateAssignments_DoNotRaisePropertyChanged()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            using (var vm = CreateViewModel())
+            {
+                // Arrange
+                var row = new LogEntryModel { Message = "Error Context" };
+                vm.SelectedLog = row;
+                vm.SelectedLevel = EventLogLevel.Error;
+
+                int notificationCount = 0;
+                vm.PropertyChanged += (s, e) => notificationCount++;
+
+                // Act
+                vm.SelectedLog = row;
+                vm.SelectedLevel = EventLogLevel.Error;
+
+                // Assert
+                Assert.Equal(0, notificationCount);
+            }
+        }
+
+        [Fact]
         public void FromDate_ShouldUpdate_ToDateMinDate()
         {
             using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
@@ -179,6 +230,62 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                 // Assert
                 Assert.Equal(newDate, vm.FromDateMaxDate);
+            }
+        }
+
+        [Fact]
+        public void FromDateAndToDate_WithATimeOfDay_BoundTheOtherPickerAtMidnightOfThatDay()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            using (var vm = CreateViewModel())
+            {
+                // Arrange - values with a time of day, which is what ResetDateWindowToNow assigns
+                var from = new DateTime(2026, 1, 2, 13, 45, 30);
+                var to = new DateTime(2026, 1, 9, 23, 59, 59);
+
+                // Act
+                vm.FromDate = from;
+                vm.ToDate = to;
+
+                // Assert
+                Assert.Equal(new DateTime(2026, 1, 2), vm.ToDateMinDate);
+                Assert.Equal(new DateTime(2026, 1, 9), vm.FromDateMaxDate);
+            }
+        }
+
+        [Fact]
+        public void FromDate_SetToNull_ClearsToDateMinDate()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            using (var vm = CreateViewModel())
+            {
+                // Arrange - the constructor seeded a window, so the bound starts out set
+                Assert.NotNull(vm.ToDateMinDate);
+
+                // Act
+                vm.FromDate = null;
+
+                // Assert
+                Assert.Null(vm.FromDate);
+                Assert.Null(vm.ToDateMinDate);
+            }
+        }
+
+        [Fact]
+        public void ToDate_SetToNull_ClearsFromDateMaxDate()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            using (var vm = CreateViewModel())
+            {
+                // Arrange - the constructor seeded a window, so the bound starts out set
+                Assert.NotNull(vm.FromDateMaxDate);
+
+                // Act
+                vm.ToDate = null;
+
+                // Assert
+                Assert.Null(vm.ToDate);
+                Assert.Null(vm.FromDateMaxDate);
             }
         }
 
@@ -258,18 +365,59 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public void SelectedLog_SetToARow_ShowsThatRowsMessage()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            using (var vm = CreateViewModel())
+            {
+                // Arrange
+                var changed = new List<string?>();
+                vm.PropertyChanged += (s, e) => changed.Add(e.PropertyName);
+
+                // Act
+                vm.SelectedLog = new LogEntryModel { Message = "Error Context" };
+
+                // Assert
+                Assert.Equal("Error Context", vm.SelectedLogMessage);
+                Assert.Contains(nameof(LogsViewModel.SelectedLogMessage), changed);
+                Assert.Contains(nameof(LogsViewModel.SelectedLog), changed);
+            }
+        }
+
+        [Fact]
+        public void SelectedLog_SetToARowWithoutAMessage_ShowsAnEmptyMessage()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            using (var vm = CreateViewModel())
+            {
+                // Arrange - a previous selection, so the empty string below is not the initial state
+                vm.SelectedLog = new LogEntryModel { Message = "Error Context" };
+
+                // Act
+                vm.SelectedLog = new LogEntryModel { Message = null };
+
+                // Assert
+                Assert.Equal(string.Empty, vm.SelectedLogMessage);
+            }
+        }
+
+        [Fact]
         public void LogLevels_Get_ExcludesCriticalAndVerbose()
         {
+            // Arrange - derive the expectation from the enum itself, so a new EventLogLevel member
+            // forces a decision here instead of entering the dropdown unnoticed.
+            var excluded = new[] { EventLogLevel.Critical, EventLogLevel.Verbose };
+            var expected = Enum.GetValues(typeof(EventLogLevel))
+                .Cast<EventLogLevel>()
+                .Except(excluded)
+                .ToList();
+
             // Act
             var levels = LogsViewModel.LogLevels;
 
-            // Assert
-            Assert.DoesNotContain(EventLogLevel.Critical, levels);
-            Assert.DoesNotContain(EventLogLevel.Verbose, levels);
-            Assert.Contains(EventLogLevel.All, levels);
-            Assert.Contains(EventLogLevel.Error, levels);
-            Assert.Contains(EventLogLevel.Information, levels);
-            Assert.Contains(EventLogLevel.Warning, levels);
+            // Assert - pins content, order and count in one assertion
+            Assert.Equal(expected, levels);
+            Assert.All(excluded, level => Assert.DoesNotContain(level, levels));
         }
 
         #endregion
@@ -301,7 +449,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                         // Act
                         var searchTask = vm.SearchCommand.ExecuteAsync(null);
 
-                        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+                        var timeoutTask = Task.Delay(TestTimeouts.CiGenerous);
                         var completedTask = await Task.WhenAny(scrollEventSource.Task, timeoutTask);
 
                         if (completedTask == timeoutTask)
@@ -323,6 +471,124 @@ namespace Servy.Manager.UnitTests.ViewModels
                             _cursorServiceMock.Verify(c => c.SetWaitCursor(), Times.Once);
                             _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
                         }
+                    }
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_RunTwice_ReplacesThePreviousRowsAndReportsEachCountInTheFooter()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                {
+                    // Arrange - two rows for the first search, one different row for the second, none for the third
+                    var first = new List<ServyEventLogEntry>
+                    {
+                        new ServyEventLogEntry { EventId = 1, Time = DateTimeOffset.Now, Level = EventLogLevel.Information, Message = "first-a" },
+                        new ServyEventLogEntry { EventId = 2, Time = DateTimeOffset.Now, Level = EventLogLevel.Information, Message = "first-b" },
+                    };
+                    var second = new List<ServyEventLogEntry>
+                    {
+                        new ServyEventLogEntry { EventId = 3, Time = DateTimeOffset.Now, Level = EventLogLevel.Warning, Message = "second-only" },
+                    };
+
+                    _eventLogServiceMock
+                        .SetupSequence(s => s.SearchAsync(It.IsAny<EventLogLevel?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(first)
+                        .ReturnsAsync(second)
+                        .ReturnsAsync(new List<ServyEventLogEntry>());
+
+                    using (var vm = CreateViewModel())
+                    {
+                        // Act
+                        await vm.SearchCommand.ExecuteAsync(null);
+                        var footerAfterFirst = vm.FooterText;
+
+                        await vm.SearchCommand.ExecuteAsync(null);
+                        var rowsAfterSecond = vm.LogsView.SourceCollection.Cast<LogEntryModel>().Select(r => r.Message).ToList();
+                        var footerAfterSecond = vm.FooterText;
+
+                        await vm.SearchCommand.ExecuteAsync(null);
+                        var rowsAfterThird = vm.LogsView.SourceCollection.Cast<LogEntryModel>().ToList();
+                        var footerAfterThird = vm.FooterText;
+
+                        // Assert - the second search replaced the first instead of appending to it
+                        Assert.Equal(new[] { "second-only" }, rowsAfterSecond);
+                        Assert.Empty(rowsAfterThird);
+
+                        // Assert - each count picked its own template ({1} is the duration, so compare the part before it)
+                        Assert.StartsWith(string.Format(Strings.Footer_Log_Many, "2", "|").Split('|')[0], footerAfterFirst);
+                        Assert.StartsWith(string.Format(Strings.Footer_Log_One, "1", "|").Split('|')[0], footerAfterSecond);
+                        Assert.StartsWith(string.Format(Strings.Footer_Log_None, "0", "|").Split('|')[0], footerAfterThird);
+                    }
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_MapsEveryEventLogFieldOntoTheLogEntryModel()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                {
+                    // Arrange - distinctive values so no field can match by default
+                    var time = new DateTimeOffset(2026, 3, 4, 5, 6, 7, TimeSpan.FromHours(5));
+                    var entries = new List<ServyEventLogEntry>
+                    {
+                        new ServyEventLogEntry { EventId = 4242, Time = time, Level = EventLogLevel.Warning, Message = "disk almost full" }
+                    };
+
+                    _eventLogServiceMock
+                        .Setup(s => s.SearchAsync(It.IsAny<EventLogLevel?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(entries);
+
+                    using (var vm = CreateViewModel())
+                    {
+                        // Act
+                        await vm.SearchCommand.ExecuteAsync(null);
+
+                        // Assert
+                        var row = Assert.Single(vm.LogsView.SourceCollection.Cast<LogEntryModel>());
+                        Assert.Equal(4242, row.EventId);
+                        Assert.Equal(EventLogLevel.Warning, row.Level);
+                        Assert.Equal("disk almost full", row.Message);
+                        Assert.Equal(time.LocalDateTime, row.Time);
+                    }
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_PassesLevelDatesAndKeywordToTheEventLogService()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                {
+                    // Arrange
+                    _eventLogServiceMock
+                        .Setup(s => s.SearchAsync(It.IsAny<EventLogLevel?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServyEventLogEntry>());
+
+                    using (var vm = CreateViewModel())
+                    {
+                        var from = new DateTime(2026, 1, 2, 3, 4, 5);
+                        var to = new DateTime(2026, 1, 9, 3, 4, 5);
+                        vm.FromDate = from;
+                        vm.ToDate = to;
+                        vm.SelectedLevel = EventLogLevel.Error;
+                        vm.Keyword = "ServyAgent";
+
+                        // Act
+                        await vm.SearchCommand.ExecuteAsync(null);
+
+                        // Assert
+                        _eventLogServiceMock.Verify(
+                            s => s.SearchAsync(EventLogLevel.Error, from, to, "ServyAgent", It.IsAny<CancellationToken>()),
+                            Times.Once);
                     }
                 }
             }, createApp: true);
@@ -355,7 +621,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                     // 2. Poll until the first token reference is registered inside the model
                     await Helper.WaitUntilAsync(
                         () => TestReflection.GetField<CancellationTokenSource>(vm, "_searchCts") != null,
-                        TimeSpan.FromSeconds(2),
+                        TestTimeouts.CiGenerous,
                         TimeSpan.FromMilliseconds(10),
                         TestContext.Current.CancellationToken);
 
@@ -374,6 +640,52 @@ namespace Servy.Manager.UnitTests.ViewModels
                     secondSearchTcs.TrySetResult(Array.Empty<ServyEventLogEntry>());
 
                     await Task.WhenAll(firstSearchTask, secondSearchTask);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task Search_SupersededSearchAnswersLate_KeepsTheNewerRows()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange - the first query hangs, the second answers at once
+                    var staleSearchTcs = new TaskCompletionSource<IEnumerable<ServyEventLogEntry>>();
+                    IEnumerable<ServyEventLogEntry> fresh = new List<ServyEventLogEntry>
+                    {
+                        new ServyEventLogEntry { EventId = 2, Time = DateTimeOffset.Now, Level = EventLogLevel.Information, Message = "fresh" }
+                    };
+
+                    var searchCallCount = 0;
+                    _eventLogServiceMock
+                        .Setup(s => s.SearchAsync(It.IsAny<EventLogLevel?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                        .Returns(() =>
+                        {
+                            searchCallCount++;
+                            return searchCallCount == 1 ? staleSearchTcs.Task : Task.FromResult(fresh);
+                        });
+
+                    var scrollCount = 0;
+                    vm.ScrollLogsToTopRequested += () => scrollCount++;
+
+                    // Act - the second search supersedes the first, then the first query answers with rows of its own
+                    var staleSearchTask = (Task)TestReflection.InvokeNonPublic(vm, "Search", new object[] { null! })!;
+                    var freshSearchTask = (Task)TestReflection.InvokeNonPublic(vm, "Search", new object[] { null! })!;
+                    await freshSearchTask;
+
+                    staleSearchTcs.TrySetResult(new List<ServyEventLogEntry>
+                    {
+                        new ServyEventLogEntry { EventId = 1, Time = DateTimeOffset.Now, Level = EventLogLevel.Information, Message = "stale" }
+                    });
+                    await staleSearchTask;
+
+                    // Assert - the late answer neither replaced the rows nor scrolled the grid again
+                    var rows = vm.LogsView.SourceCollection.Cast<LogEntryModel>().Select(r => r.Message).ToList();
+                    Assert.Equal(new[] { "fresh" }, rows);
+                    Assert.Equal(1, scrollCount);
                 }
             }, createApp: true);
         }
@@ -399,6 +711,65 @@ namespace Servy.Manager.UnitTests.ViewModels
                         _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
                         Assert.False(vm.IsBusy);
                         Assert.Equal(Strings.Button_Search, vm.SearchButtonText);
+                        _mockMessageBoxService.Verify(
+                            m => m.ShowErrorAsync("WMI Repository Event log corruption detected", UiAppConfig.Caption),
+                            Times.Once);
+                    }
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_ServiceThrowsSecurityException_ShowsItsOwnMessage()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                {
+                    // Arrange - the access-denied wrapper EventLogService throws for a non-elevated caller
+                    _eventLogServiceMock
+                        .Setup(s => s.SearchAsync(It.IsAny<EventLogLevel?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                        .ThrowsAsync(new SecurityException("Access denied to Windows Event Log."));
+
+                    using (var vm = CreateViewModel())
+                    {
+                        // Act
+                        await vm.SearchCommand.ExecuteAsync(null);
+
+                        // Assert - its own message, not the generic one
+                        _mockMessageBoxService.Verify(
+                            m => m.ShowErrorAsync("Access denied to Windows Event Log.", UiAppConfig.Caption),
+                            Times.Once);
+                        _mockMessageBoxService.Verify(
+                            m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption),
+                            Times.Never);
+                    }
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_ServiceThrowsUnrecognizedException_ShowsGenericErrorMessage()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                {
+                    // Arrange - neither SecurityException nor InvalidOperationException, so the
+                    // generic-message arm of HandleSearchExceptionAsync is the one that must fire.
+                    _eventLogServiceMock
+                        .Setup(s => s.SearchAsync(It.IsAny<EventLogLevel?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                        .ThrowsAsync(new TimeoutException("event log query timed out"));
+
+                    using (var vm = CreateViewModel())
+                    {
+                        // Act
+                        await vm.SearchCommand.ExecuteAsync(null);
+
+                        // Assert
+                        _mockMessageBoxService.Verify(
+                            m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption),
+                            Times.Once);
                     }
                 }
             }, createApp: true);
@@ -436,7 +807,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         #region Resource Management, Cleanup & Disposal Tests
 
         [Fact]
-        public async Task Cleanup_ShouldCancelAndDisposeToken()
+        public async Task CancelSearch_ActiveSearchInFlight_CancelsAndDisposesToken()
         {
             using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
             {
@@ -500,24 +871,50 @@ namespace Servy.Manager.UnitTests.ViewModels
                 // Arrange
                 var vm = CreateViewModel();
 
-                // Act - Verify initial state before disposal context
-                bool isDisposedBefore = TestReflection.GetField<bool>(vm, "_isDisposed");
-                Assert.False(isDisposedBefore, "The logs view model wrapper should not initialize in a pre-disposed state.");
+                // Arrange - Verify initial state before disposal context
+                int isDisposedBefore = TestReflection.GetField<int>(vm, "_isDisposed");
+                Assert.Equal(0, isDisposedBefore);
 
                 // Act - First explicit teardown execution context
                 vm.Dispose();
 
                 // Assert - Guard must be active after primary disposal loop pass
-                bool isDisposedAfterFirst = TestReflection.GetField<bool>(vm, "_isDisposed");
-                Assert.True(isDisposedAfterFirst, "The internal _isDisposed state guard was not toggled on the primary cleanup path execution.");
+                int isDisposedAfterFirst = TestReflection.GetField<int>(vm, "_isDisposed");
+                Assert.Equal(1, isDisposedAfterFirst);
 
-                // Reset the guard so the second Dispose exercises the full dispose body again
-                TestReflection.SetField(vm, "_isDisposed", false);
-                var doubleDisposeException = Record.Exception(vm.Dispose);
+                using (var sentinelCts = new CancellationTokenSource())
+                {
+                    // Arrange - a token planted after the first Dispose stands in for state that a
+                    // second, unguarded pass through ClearActiveSearchContext would cancel and dispose
+                    TestReflection.SetField(vm, "_searchCts", sentinelCts);
 
-                // Assert
-                Assert.Null(doubleDisposeException);
-                Assert.True(TestReflection.GetField<bool>(vm, "_isDisposed"), "Second Dispose after guard reset did not set _isDisposed back to true.");
+                    // Act - Second teardown pass, reached naturally; nothing resets the guard in between
+                    var doubleDisposeException = Record.Exception(vm.Dispose);
+
+                    // Assert - The early return leaves the planted token untouched; without the guard
+                    // the dispose body would run a second time and cancel it
+                    Assert.Null(doubleDisposeException);
+                    Assert.False(sentinelCts.IsCancellationRequested, "The disposed guard did not exit early: the second Dispose ran the dispose body again.");
+                    Assert.Equal(1, TestReflection.GetField<int>(vm, "_isDisposed"));
+                }
+            }
+        }
+
+        [Fact]
+        public void Dispose_DetachesScrollLogsToTopRequestedSubscribers()
+        {
+            using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+            {
+                // Arrange - a subscriber like the one LogsView attaches on DataContext change
+                var vm = CreateViewModel();
+                vm.ScrollLogsToTopRequested += () => { };
+                Assert.NotNull(TestReflection.GetField<Action?>(vm, "ScrollLogsToTopRequested"));
+
+                // Act
+                vm.Dispose();
+
+                // Assert - Dispose(bool) drops every subscriber (#3315), as ConsoleViewModel does for RequestScroll
+                Assert.Null(TestReflection.GetField<Action?>(vm, "ScrollLogsToTopRequested"));
             }
         }
 

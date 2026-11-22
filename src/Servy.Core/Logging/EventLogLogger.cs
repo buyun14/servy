@@ -52,8 +52,10 @@ namespace Servy.Core.Logging
             _isEventLogEnabled = isEventLogEnabled;
             _currentLogLevel = (int)level;
 
-            // Enforce clean layout validation if a top-level global instance prefix is supplied.
-            Prefix = string.IsNullOrWhiteSpace(prefix) ? null : $"[{prefix.Trim()}]";
+            // Sanitize and wrap the optional instance prefix if supplied.
+            Prefix = string.IsNullOrWhiteSpace(prefix)
+                ? null
+                : $"[{ScopedEventLogLogger.SanitizePrefixSegment(prefix)}]";
 
             if (_isEventLogEnabled)
             {
@@ -113,14 +115,7 @@ namespace Servy.Core.Logging
         /// <inheritdoc />
         public void Debug(string message, Exception? ex = null)
         {
-            if (string.IsNullOrEmpty(message)) return;
-
-            if ((LogLevel)_currentLogLevel <= LogLevel.Debug)
-            {
-                // Debug logs are traditionally skipped for Event Log to avoid clutter,
-                // but we always keep the File Log.
-                Logger.Debug(Format(message), ex);
-            }
+            DebugCore(_currentLogLevel, Format, message, ex);
         }
 
         /// <inheritdoc />
@@ -139,6 +134,12 @@ namespace Servy.Core.Logging
         public void Error(string message, Exception? ex = null)
         {
             WriteLeveled((LogLevel)_currentLogLevel, LogLevel.Error, EventLogEntryType.Error, EventIds.Error, message, ex, Format, _isEventLogEnabled, Logger.Error);
+        }
+
+        /// <inheritdoc />
+        public void Report(LogLevel level, string title, string body)
+        {
+            WriteReport((LogLevel)_currentLogLevel, level, title, body, Format, _isEventLogEnabled);
         }
 
         #endregion
@@ -162,9 +163,29 @@ namespace Servy.Core.Logging
         #region Private Helpers
 
         /// <summary>
+        /// Centralized <see cref="LogLevel.Debug"/> pipeline handler shared by <see cref="EventLogLogger"/> and its
+        /// nested scoped logger, so the threshold check and the file-log-only routing are stated once.
+        /// </summary>
+        /// <param name="currentLevel">The active <see cref="LogLevel"/> threshold configured for the invoking scope.</param>
+        /// <param name="format">A delegate used to apply instance-specific prefixing to the message.</param>
+        /// <param name="message">The primary log text content.</param>
+        /// <param name="ex">An optional <see cref="Exception"/> to be appended to the log.</param>
+        private static void DebugCore(int currentLevel, Func<string, string> format, string message, Exception? ex)
+        {
+            if (string.IsNullOrEmpty(message)) return;
+
+            if ((LogLevel)currentLevel <= LogLevel.Debug)
+            {
+                // Debug logs are traditionally skipped for Event Log to avoid clutter,
+                // but we always keep the File Log.
+                Logger.Debug(format(message), ex);
+            }
+        }
+
+        /// <summary>
         /// Centralized parameterized log pipeline handler to eliminate code duplication across log severity variants.
         /// Orchestrates the conditional flow between the Windows Event Log sink and the secondary file system logger,
-        /// while enforcing thread-local log level thresholds and standardized message formatting.
+        /// while enforcing the log level threshold of the invoking logger scope and standardized message formatting.
         /// </summary>
         /// <param name="currentLevel">The active <see cref="LogLevel"/> threshold configured for the invoking scope.</param>
         /// <param name="targetLevel">The <see cref="LogLevel"/> required for this entry to be processed.</param>
@@ -200,26 +221,95 @@ namespace Servy.Core.Logging
         }
 
         /// <summary>
+        /// Centralized report pipeline shared by <see cref="EventLogLogger"/> and its nested scoped
+        /// logger. The Event Log renders newlines, so it receives the composed block verbatim as one
+        /// entry exactly as <see cref="WriteLeveled"/> sends a message today; the file sink receives
+        /// the report through <see cref="Logger.Report"/>, one timestamped entry per physical line.
+        /// </summary>
+        /// <param name="currentLevel">The active <see cref="LogLevel"/> threshold configured for the invoking scope.</param>
+        /// <param name="targetLevel">The <see cref="LogLevel"/> required for this report to be processed.</param>
+        /// <param name="title">The report heading.</param>
+        /// <param name="body">The report body.</param>
+        /// <param name="formatSelector">A delegate used to apply instance-specific prefixing to the message.</param>
+        /// <param name="isEventLogSinkEnabled">Indicates whether the Windows Event Log sink is active for the current logger scope.</param>
+        private void WriteReport(
+            LogLevel currentLevel,
+            LogLevel targetLevel,
+            string title,
+            string body,
+            Func<string, string> formatSelector,
+            bool isEventLogSinkEnabled)
+        {
+            if (string.IsNullOrEmpty(title) && string.IsNullOrEmpty(body)) return;
+
+            if (currentLevel <= targetLevel)
+            {
+                // Debug stays file-only, to avoid Event Log clutter - the same rule DebugCore states.
+                if (isEventLogSinkEnabled && targetLevel > LogLevel.Debug)
+                {
+                    var block = string.IsNullOrEmpty(body) ? title : $"{title}\n{body}";
+                    MapEventLogCategory(targetLevel, out var entryType, out var eventId);
+                    SafeWriteToEventLog(formatSelector(block), entryType, eventId);
+                }
+
+                Logger.Report(targetLevel, formatSelector(title), body);
+            }
+        }
+
+        /// <summary>
+        /// Maps a <see cref="LogLevel"/> onto the Windows Event Log entry type and event ID the
+        /// leveled writers already use, so a report is categorized exactly as an Info, Warn or
+        /// Error entry is.
+        /// </summary>
+        /// <param name="level">The report severity.</param>
+        /// <param name="entryType">The matching <see cref="EventLogEntryType"/>.</param>
+        /// <param name="eventId">The matching application-specific event ID.</param>
+        private static void MapEventLogCategory(LogLevel level, out EventLogEntryType entryType, out int eventId)
+        {
+            switch (level)
+            {
+                case LogLevel.Error:
+                    entryType = EventLogEntryType.Error;
+                    eventId = EventIds.Error;
+                    break;
+                case LogLevel.Warn:
+                    entryType = EventLogEntryType.Warning;
+                    eventId = EventIds.Warning;
+                    break;
+                default:
+                    entryType = EventLogEntryType.Information;
+                    eventId = EventIds.Info;
+                    break;
+            }
+        }
+
+        /// <summary>
         /// Centralized wrapper used to write an entry to the Windows Event Log, enforcing message truncation rules
         /// and providing lazily synchronized registration safeguards across all domains.
         /// </summary>
         /// <param name="logName">The Windows Event Log to write to (e.g., Application).</param>
         /// <param name="source">The event source name.</param>
-        /// <param name="message">The full string message layout definition data contents payload.</param>
-        /// <param name="type">The standard Windows event severity logging level context enumeration.</param>
+        /// <param name="message">The formatted log message to write.</param>
+        /// <param name="type">The severity classification for the entry (Information, Warning, or Error).</param>
         /// <param name="eventId">The application-specific event ID.</param>
-        internal static void WriteRawToWindowsEventLog(string logName, string source, string message, EventLogEntryType type, int eventId)
+        /// <param name="ensureSourceRegistered">
+        /// <see langword="true"/> to check the source and register it when missing, for callers with no
+        /// initialization behind them; <see langword="false"/> for a caller that has already established
+        /// the source exists. <see cref="EventLog.SourceExists"/> enumerates the subkeys of every log
+        /// under HKLM, and on the instance path it runs once per entry written.
+        /// </param>
+        internal static void WriteRawToWindowsEventLog(string logName, string source, string message, EventLogEntryType type, int eventId, bool ensureSourceRegistered = true)
         {
             try
             {
                 // Source registration check: verify structural setup bounds ahead of writing entries
-                if (!EventLog.SourceExists(source))
+                if (ensureSourceRegistered && !EventLog.SourceExists(source))
                 {
                     EventLog.CreateEventSource(source, logName);
                 }
 
                 var safeMessage = message.Length > AppConfig.EventLogMessageMaxChars
-                    ? message.Substring(0, AppConfig.EventLogMessageMaxChars) + "...[truncated]"
+                    ? message.Substring(0, Math.Max(0, AppConfig.EventLogMessageMaxChars - AppConfig.EventLogTruncationSuffix.Length)) + AppConfig.EventLogTruncationSuffix
                     : message;
 
                 using (var instanceLog = new EventLog(logName))
@@ -248,8 +338,12 @@ namespace Servy.Core.Logging
                 if (!_isInitialized) return;
             }
 
-            // Threading the raw execution directly into the static shared utility layout context
-            WriteRawToWindowsEventLog(AppConfig.EventLogName, _source, message, type, eventId);
+            // Delegate to the shared static writer so instance and static callers use the same
+            // truncation and source-registration safeguards.
+            // _isInitialized is only ever set true after InitializeEventLog has itself confirmed the
+            // source exists and is bound to AppConfig.EventLogName, and it is cleared on every failure
+            // path and on Dispose - so reaching here already proves the registration this would re-check.
+            WriteRawToWindowsEventLog(AppConfig.EventLogName, _source, message, type, eventId, ensureSourceRegistered: false);
         }
 
         /// <summary>
@@ -275,7 +369,7 @@ namespace Servy.Core.Logging
                         Logger.Error(
                             $"Event source '{_source}' is already registered to log '{currentLog}', " +
                             $"not '{AppConfig.EventLogName}'. Refusing to write to the wrong log - " +
-                            $"falling back to file-only logging. Run as admin and delete/recreate the source to fix.");
+                            "falling back to file-only logging. Run as admin and delete/recreate the source to fix.");
                         return;
                     }
                 }
@@ -347,12 +441,7 @@ namespace Servy.Core.Logging
             /// <inheritdoc />
             public void Debug(string message, Exception? ex = null)
             {
-                if (string.IsNullOrEmpty(message)) return;
-
-                if ((LogLevel)_currentLogLevel <= LogLevel.Debug)
-                {
-                    Logger.Debug(Format(message), ex);
-                }
+                DebugCore(_currentLogLevel, Format, message, ex);
             }
 
             /// <inheritdoc />
@@ -371,6 +460,12 @@ namespace Servy.Core.Logging
             public void Error(string message, Exception? ex = null)
             {
                 _parent.WriteLeveled((LogLevel)_currentLogLevel, LogLevel.Error, EventLogEntryType.Error, EventIds.Error, message, ex, Format, _isEventLogEnabled, Logger.Error);
+            }
+
+            /// <inheritdoc />
+            public void Report(LogLevel level, string title, string body)
+            {
+                _parent.WriteReport((LogLevel)_currentLogLevel, level, title, body, Format, _isEventLogEnabled);
             }
 
             /// <inheritdoc />
@@ -427,7 +522,6 @@ namespace Servy.Core.Logging
             /// </summary>
             internal static string SanitizePrefixSegment(string segment)
             {
-                if (string.IsNullOrWhiteSpace(segment)) return string.Empty;
                 return segment.Replace('[', '(').Replace(']', ')').Trim();
             }
 
@@ -440,7 +534,7 @@ namespace Servy.Core.Logging
             {
                 // Prefix is now pre-wrapped safely in its own bracket sets (e.g., "[A]" or "[A] [B]")
                 // so Format simply appends it directly without performing outer re-wrapping logic.
-                return string.IsNullOrWhiteSpace(Prefix) ? message : $"{Prefix} {message}";
+                return $"{Prefix} {message}";
             }
         }
 

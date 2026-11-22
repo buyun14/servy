@@ -1,22 +1,26 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Shared helper routines for encoding-preserving file update operations.
 
 .DESCRIPTION
     Provides unified file update logic (Update-FilesContent), shared build artifact
-    exclusion patterns, and bootstraps Get-FileEncoding.ps1 for versioning scripts.
+    exclusion patterns, central BOM required extension definitions, and bootstraps
+    Get-FileEncoding.ps1 for versioning and formatting scripts.
 #>
 
 # Shared exclusion array and regex pattern for transient build artifacts, dependencies, and vcs metadata
 $script:BuildArtifactExclusionDirs = @('bin', 'obj', 'packages', '.git', '.vs', 'node_modules', 'coveragereport', 'TestResults')
 $script:BuildArtifactExclusionRegex = '[\\/](bin|obj|packages|\.git|\.vs|node_modules|coveragereport|TestResults)[\\/]'
 
+# Centralized list of file extensions that require UTF-8 with BOM encoding (must agree with .editorconfig)
+$script:BomRequiredExtensions = @('.ps1', '.psm1', '.psd1', '.xml', '.config')
+
 # Bootstrap Get-FileEncoding.ps1
 $helperFile = "Get-FileEncoding.ps1"
 $helperPath = Join-Path $PSScriptRoot $helperFile
-
-if (Test-Path $helperPath) {
+if (Test-Path -LiteralPath $helperPath) {
     . $helperPath
 } else {
     throw "Critical dependency missing: '$helperFile' was not found at '$helperPath'. Ensure the helper is in the same directory as this script."
@@ -52,6 +56,9 @@ function Update-FilesContent {
         [Parameter(Mandatory = $true, ParameterSetName = 'SingleEdit')]
         $Replacement,
 
+        [Parameter(ParameterSetName = 'SingleEdit')]
+        [int]$ExpectMatchCount,
+
         [Parameter(Mandatory = $true, ParameterSetName = 'MultiEdit')]
         [array]$Edits,
 
@@ -62,16 +69,20 @@ function Update-FilesContent {
 
     # Normalize single pattern/replacement input to the Edits array format
     if ($PSCmdlet.ParameterSetName -eq 'SingleEdit') {
-        $Edits = @(@{ Pattern = $Pattern; Replacement = $Replacement })
+        $editHashtable = @{ Pattern = $Pattern; Replacement = $Replacement }
+        if ($PSBoundParameters.ContainsKey('ExpectMatchCount')) {
+            $editHashtable['ExpectedCount'] = $ExpectMatchCount
+        }
+        $Edits = @($editHashtable)
     }
 
     foreach ($file in $Files) {
         if ($null -eq $file) { continue }
         $path = if ($file -is [string]) { $file } else { $file.FullName }
 
-        if (-not (Test-Path $path)) {
+        if (-not (Test-Path -LiteralPath $path)) {
             Write-Warning "Skipping missing file: $path"
-            if ($ExpectMatch) {
+            if ($ExpectMatch -or $PSBoundParameters.ContainsKey('ExpectMatchCount')) {
                 $script:HadFailure = $true
             }
             continue
@@ -85,13 +96,35 @@ function Update-FilesContent {
 
             $matchCount = 0
             $newContent = $content
+            $fileHadEditFailure = $false
 
             foreach ($edit in $Edits) {
                 $editPattern = $edit.Pattern
                 $editReplacement = $edit.Replacement
 
+                # Resolve expected count setting if defined in hashtable (supports ExpectedCount or ExpectedMatchCount)
+                $expectedCount = $null
+                if ($edit.ContainsKey('ExpectedCount')) {
+                    $expectedCount = [int]$edit.ExpectedCount
+                } elseif ($edit.ContainsKey('ExpectedMatchCount')) {
+                    $expectedCount = [int]$edit.ExpectedMatchCount
+                }
+
                 $regexMatches = [regex]::Matches($newContent, $editPattern)
                 $found = $regexMatches.Count
+
+                # Verify exact match count constraint if specified
+                if ($null -ne $expectedCount) {
+                    if ($found -ne $expectedCount) {
+                        Write-Warning "Match count mismatch for pattern '$editPattern' in $path. Expected: $expectedCount, Found: $found"
+                        $script:HadFailure = $true
+                        $fileHadEditFailure = $true
+                    }
+                } elseif ($found -eq 0 -and $ExpectMatch) {
+                    Write-Warning "No matches found for pattern '$editPattern' in explicitly-targeted path: $path"
+                    $script:HadFailure = $true
+                    $fileHadEditFailure = $true
+                }
 
                 if ($found -gt 0) {
                     $matchCount += $found
@@ -100,13 +133,12 @@ function Update-FilesContent {
                     } else {
                         $newContent = [regex]::Replace($newContent, $editPattern, [string]$editReplacement)
                     }
-                } elseif ($ExpectMatch) {
-                    Write-Warning "No matches found for pattern '$editPattern' in explicitly-targeted path: $path"
-                    $script:HadFailure = $true
                 }
             }
 
-            if ($matchCount -gt 0) {
+            if ($fileHadEditFailure) {
+                Write-Warning "Skipping write to ${path}: one or more edits in this set failed validation; leaving the file untouched rather than applying a partial update."
+            } elseif ($matchCount -gt 0) {
                 $script:filesModified++
                 $script:totalReplacements += $matchCount
 

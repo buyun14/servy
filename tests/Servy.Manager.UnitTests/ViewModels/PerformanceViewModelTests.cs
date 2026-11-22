@@ -9,7 +9,6 @@ using Servy.Manager.ViewModels;
 using Servy.Testing;
 using Servy.UI.Constants;
 using Servy.UI.Services;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Threading;
@@ -29,7 +28,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         private readonly Mock<IUiDispatcher> _mockUiDispatcher;
 
         // Track generated SUT view model instances to enforce complete memory containment cleanup
-        private readonly ConcurrentBag<PerformanceViewModel> _allocatedViewModels = new ConcurrentBag<PerformanceViewModel>();
+        private readonly TrackedViewModels _allocatedViewModels = new TrackedViewModels();
 
         public PerformanceViewModelTests()
         {
@@ -41,8 +40,8 @@ namespace Servy.Manager.UnitTests.ViewModels
             _mockUiDispatcher = new Mock<IUiDispatcher>();
             _mockProcessKiller = new Mock<IProcessKiller>();
 
-            // InitTimer() reads PerformanceRefreshIntervalInMs; give it a sane interval
-            _mockAppConfig.Setup(c => c.PerformanceRefreshIntervalInMs).Returns(1000);
+            // InitTimer() reads PerformanceRefreshIntervalMs; give it a sane interval
+            _mockAppConfig.Setup(c => c.PerformanceRefreshIntervalMs).Returns(1000);
 
             // Stub out formatting helpers to return predictable metric text
             _mockProcessHelper.Setup(p => p.FormatCpuUsage(It.IsAny<double>())).Returns("15%");
@@ -59,7 +58,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 _mockProcessHelper.Object,
                 _mockUiDispatcher.Object);
 
-            _allocatedViewModels.Add(vm);
+            _allocatedViewModels.Track(vm);
             return vm;
         }
 
@@ -98,7 +97,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
                 using (var dtViewModel = new PerformanceViewModel())
                 {
-                    _allocatedViewModels.Add(dtViewModel);
+                    _allocatedViewModels.Track(dtViewModel);
 
                     // Assert
                     // Verify basic structural state and clean empty graph collection initialization
@@ -170,6 +169,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
                 using (var vm = CreateViewModel())
                 {
+                    // Arrange
                     var mockService = new PerformanceService { Name = "SameService" };
                     vm.SelectedService = mockService;
 
@@ -257,21 +257,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                                      .Returns(Task.CompletedTask);
 
                     // Act
-                    // Use TestReflection to invoke OnTickAsync, which now supports inheritance hierarchy traversal
-                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
-
-                    // 2. Keep the message pump processing while waiting for Task.Run to finish
-                    var pumpTimeout = TimeSpan.FromSeconds(10);
-                    var sw = Stopwatch.StartNew();
-                    while (!task.IsCompleted)
-                    {
-                        if (sw.Elapsed > pumpTimeout)
-                            throw new TimeoutException($"OnTickAsync did not complete within {pumpTimeout.TotalSeconds:0}s.");
-                        Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.Background);
-                        Thread.Sleep(1);
-                    }
-
-                    task.GetAwaiter().GetResult();
+                    PumpUntilCompleted((Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!);
 
                     // Assert
                     Assert.Equal("2050", vm.Pid);
@@ -286,8 +272,522 @@ namespace Servy.Manager.UnitTests.ViewModels
                     Assert.NotEmpty(vm.CpuFillPoints);
                     Assert.NotEmpty(vm.RamPointCollection);
                     Assert.NotEmpty(vm.RamFillPoints);
+
+                    // The metric read is preceded by one cache eviction pass for exited processes
+                    _mockProcessHelper.Verify(p => p.MaintainCache(), Times.Once);
                 }
             }, createApp: true);
+        }
+
+        [Fact]
+        public void AddPoint_CpuPeakBelowTheFixedFloor_ScalesTheAxisAgainstThatFloor()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    // Stop the background DispatcherTimer so only the value added below reaches the buffer
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // 45.5 * GraphScaleHeadroom (1.2) is 54.6, which stays under the fixed CPU floor,
+                    // so the floor - not the observed peak - is what the axis is scaled against.
+                    const double cpuValue = 45.5;
+
+                    // Act
+                    TestReflection.InvokeNonPublic(vm, "AddPoint", cpuValue, MetricType.Cpu);
+
+                    // Assert
+                    // y = GraphHeight - (value / floor) * GraphHeight = 200 - (45.5 / 100) * 200 = 109.
+                    // The floor is spelled out as a literal on purpose: an assertion that read the
+                    // constant back would move with it and could no longer detect a change to it.
+                    var point = Assert.Single(vm.CpuPointCollection);
+                    Assert.Equal(109d, point.Y, 6);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void AddPoint_CpuPeakAboveTheFixedFloor_ScalesTheAxisWithHeadroom()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    // Stop the background DispatcherTimer so only the value added below reaches the buffer
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // 90 * GraphScaleHeadroom (1.2) is 108, which beats the fixed CPU floor of 100,
+                    // so the headroom product - not the floor - is what the axis is scaled against.
+                    // This is the arm the floor test above cannot reach.
+                    const double cpuValue = 90;
+
+                    // Act
+                    TestReflection.InvokeNonPublic(vm, "AddPoint", cpuValue, MetricType.Cpu);
+
+                    // Assert
+                    // y = GraphHeight - (value / (value * headroom)) * GraphHeight
+                    //   = 200 - (90 / 108) * 200 = 33.333333.
+                    // Without the headroom factor the axis would fall back to the 100 floor and y
+                    // would be 20. The expected value is spelled out as a literal on purpose, for
+                    // the reason the floor test above gives: an assertion that read the constants
+                    // back would move with them and could no longer detect a change to them.
+                    var point = Assert.Single(vm.CpuPointCollection);
+                    Assert.Equal(200d / 6, point.Y, 6);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void AddPoint_RamPeakAboveTheFixedFloor_ScalesTheAxisWithHeadroomAndClosesTheFillPolygon()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    // Stop the background DispatcherTimer so only the value added below reaches the buffer
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // 50 MB * 1.2 headroom is 60, which beats the 10 MB RAM floor, so the headroom
+                    // product is the axis maximum. This is the arm the small-process test cannot reach.
+                    const double ramMb = 50;
+
+                    // Act
+                    TestReflection.InvokeNonPublic(vm, "AddPoint", ramMb, MetricType.Ram);
+
+                    // Assert
+                    // y = 200 - (50 / 60) * 200 = 33.333333. Against the bare floor y would be -800,
+                    // and without the headroom factor it would be 0. Literals on purpose, as in the CPU tests.
+                    var point = Assert.Single(vm.RamPointCollection);
+                    Assert.Equal(0d, point.X, 6);
+                    Assert.Equal(200d / 6, point.Y, 6);
+
+                    // The fill is the line plus two points on the baseline (y = GraphHeight = 200) that close
+                    // the polygon: first under the last line point, then under the first one.
+                    Assert.Equal(3, vm.RamFillPoints.Count);
+                    Assert.Equal(point, vm.RamFillPoints[0]);
+                    Assert.Equal(new Point(0, 200), vm.RamFillPoints[1]);
+                    Assert.Equal(new Point(0, 200), vm.RamFillPoints[2]);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_SmallProcess_ChartsRamInMegabytesAgainstTheRamFloor()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    SynchronizationContext.SetSynchronizationContext(
+                        new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
+
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // The PID is unchanged, so the tick charts without resetting the seeded history
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync(2050);
+
+                    // 5 MB of RAM: 5 * GraphScaleHeadroom (1.2) is 6, which stays under the 10 MB
+                    // floor, so the floor is the axis maximum. The reading is given in bytes,
+                    // which is the unit IProcessHelper reports.
+                    _mockProcessHelper.Setup(p => p.GetProcessTreeMetrics(2050))
+                                      .Returns(new ProcessMetrics(10, 5L * 1024 * 1024));
+
+                    _mockUiDispatcher.Setup(d => d.InvokeAsync(It.IsAny<Action>()))
+                                     .Callback<Action>(action => action())
+                                     .Returns(Task.CompletedTask);
+
+                    // Act
+                    PumpUntilCompleted((Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!);
+
+                    // Assert
+                    // The history keeps its fixed capacity: the selection seeded it with 101 zeros,
+                    // this sample is the 102nd value and the oldest is dequeued for it.
+                    Assert.Equal(101, vm.RamPointCollection.Count);
+
+                    // The sample is the newest value, so it is charted at the right edge:
+                    // x = 100 * (GraphWidth / 100) = 400,
+                    // y = GraphHeight - (5 / 10) * GraphHeight = 100.
+                    // Charting the raw byte count instead of megabytes would scale the axis against
+                    // the sample itself rather than the floor and put y at 33.333333 instead.
+                    var last = vm.RamPointCollection[vm.RamPointCollection.Count - 1];
+                    Assert.Equal(400d, last.X, 6);
+                    Assert.Equal(100d, last.Y, 6);
+
+                    // The fill polygon is the 101 line points plus two closing points on the baseline
+                    // (y = GraphHeight = 200): under the last line point first, then under the first one.
+                    Assert.Equal(103, vm.RamFillPoints.Count);
+                    Assert.Equal(new Point(400, 200), vm.RamFillPoints[101]);
+                    Assert.Equal(new Point(0, 200), vm.RamFillPoints[102]);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_ServiceStopped_ClearsPidAndDisablesCopyPidCommand()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+
+                    // Stop the background DispatcherTimer to prevent concurrent automatic ticks
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // The monitored service stopped, so the repository no longer reports a PID
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync((int?)null);
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    task.GetAwaiter().GetResult();
+
+                    // Assert - the running -> stopped transition clears the PID and greys out the Copy PID button
+                    Assert.Null(mockService.Pid);
+                    Assert.Equal(UiConstants.NotAvailable, vm.Pid);
+                    Assert.False(vm.CopyPidCommand.CanExecute(null));
+
+                    // The early return is what makes the branch falsifiable: no metrics are collected for a stopped service
+                    _mockProcessHelper.Verify(p => p.GetProcessTreeMetrics(It.IsAny<int>()), Times.Never);
+                    _mockProcessHelper.Verify(p => p.MaintainCache(), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_ServiceAlreadyStopped_LeavesGraphsAndLabelsUntouched()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    // The selection has no PID: the service was already stopped before this tick
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = null };
+                    vm.SelectedService = mockService;
+
+                    // Stop the background DispatcherTimer to prevent concurrent automatic ticks
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // Seed state that only ResetGraphsAndResynchronizePid would overwrite
+                    vm.CpuUsage = "50%";
+                    var cpuPoints = vm.CpuPointCollection;
+                    var stalePoint = new Point(-1, -1);
+                    cpuPoints.Add(stalePoint);
+
+                    // The service is still stopped, so the repository reports no PID again
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync((int?)null);
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    task.GetAwaiter().GetResult();
+
+                    // Assert - a stopped -> stopped tick is a no-op; only the running -> stopped transition resets (#3339)
+                    Assert.Null(mockService.Pid);
+                    Assert.Equal("50%", vm.CpuUsage);
+                    Assert.Same(cpuPoints, vm.CpuPointCollection);
+                    Assert.Contains(stalePoint, vm.CpuPointCollection);
+                    _mockProcessHelper.Verify(p => p.GetProcessTreeMetrics(It.IsAny<int>()), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_PidChanged_ResetsGraphsAndCollectsForTheNewPid()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    SynchronizationContext.SetSynchronizationContext(
+                        new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
+
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // Seed a point that only a graph reset can remove, so the reset is verified and not assumed
+                    var stalePoint = new Point(-1, -1);
+                    vm.CpuPointCollection.Add(stalePoint);
+                    vm.RamPointCollection.Add(stalePoint);
+
+                    // The service restarted, so it comes back on a different PID than the seeded one
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync(9999);
+
+                    var fakeMetrics = new ProcessMetrics(45.5, 50 * 1024 * 1024);
+                    _mockProcessHelper.Setup(p => p.GetProcessTreeMetrics(9999)).Returns(fakeMetrics);
+
+                    _mockUiDispatcher.Setup(d => d.InvokeAsync(It.IsAny<Action>()))
+                                     .Callback<Action>(action => action())
+                                     .Returns(Task.CompletedTask);
+
+                    // Act
+                    PumpUntilCompleted((Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!);
+
+                    // Assert - the new PID is adopted and the previous process's history is not charted as the new one's
+                    Assert.Equal(9999, mockService.Pid);
+                    Assert.Equal("9999", vm.Pid);
+                    Assert.DoesNotContain(stalePoint, vm.CpuPointCollection);
+                    Assert.DoesNotContain(stalePoint, vm.RamPointCollection);
+
+                    _mockProcessHelper.Verify(p => p.GetProcessTreeMetrics(9999), Times.Once);
+                    _mockProcessHelper.Verify(p => p.GetProcessTreeMetrics(2050), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_SelectionChangesDuringPidLookup_DropsTheTick()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // The user switches service while the repository call is in flight. The backing field is
+                    // swapped directly so the switch does not restart the monitoring timer mid-test.
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .Callback(() => TestReflection.SetField(vm, "_selectedService",
+                                               new PerformanceService { Name = "OtherService", Pid = 1 }))
+                                           .ReturnsAsync(2050);
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    task.GetAwaiter().GetResult();
+
+                    // Assert - the superseded selection's metrics never reach the new selection's graph
+                    _mockProcessHelper.Verify(p => p.GetProcessTreeMetrics(It.IsAny<int>()), Times.Never);
+                    Assert.Equal(UiConstants.NotAvailable, vm.CpuUsage);
+                    Assert.Empty(vm.CpuPointCollection);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_ValidService_PassesTheMonitoringSessionTokenToThePidLookup()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = null };
+                    vm.SelectedService = mockService;
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+                    var sessionToken = TestReflection.GetField<CancellationTokenSource>(vm, "_monitoringCts").Token;
+
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync((int?)null);
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    task.GetAwaiter().GetResult();
+
+                    // Assert - the live session token, not CancellationToken.None
+                    Assert.True(sessionToken.CanBeCanceled);
+                    _mockServiceRepository.Verify(r => r.GetServicePidAsync("ServyDaemon", sessionToken), Times.Once);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_MonitoringCancelledBeforeMetricWalk_NeverRunsTheProcessTreeWalk()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    SynchronizationContext.SetSynchronizationContext(
+                        new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
+
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // Seed CpuUsage so the PID-changed reset raises PropertyChanged for it; that reset runs
+                    // after the post-lookup drop guard and before Task.Run, which is the window to cancel in.
+                    vm.CpuUsage = "50%";
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync(9999);
+                    vm.PropertyChanged += (sender, e) =>
+                    {
+                        if (e.PropertyName == nameof(vm.CpuUsage))
+                            TestReflection.GetField<CancellationTokenSource>(vm, "_monitoringCts").Cancel();
+                    };
+
+                    // Act & Assert - Task.Run sees the cancelled session token and never starts the metric walk
+                    Assert.ThrowsAny<OperationCanceledException>(
+                        () => PumpUntilCompleted((Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!));
+                    _mockProcessHelper.Verify(p => p.GetProcessTreeMetrics(It.IsAny<int>()), Times.Never);
+                    _mockProcessHelper.Verify(p => p.MaintainCache(), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_MonitoringCancelledDuringPidLookup_DropsTheTick()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // Seed a label that only the PID-changed branch's graph reset would overwrite
+                    vm.CpuUsage = "50%";
+
+                    // Monitoring is cancelled while the repository call is in flight, and the selection is
+                    // kept, so the token term of the drop guard is the only thing that can stop this tick.
+                    // The repository reports a different PID, which is what the guarded branch would adopt.
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .Callback(() => TestReflection.GetField<CancellationTokenSource>(vm, "_monitoringCts").Cancel())
+                                           .ReturnsAsync(9999);
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    task.GetAwaiter().GetResult();
+
+                    // Assert - a tick whose monitoring session was cancelled during the PID lookup
+                    // writes nothing back to the selection it was started for
+                    Assert.Equal(2050, mockService.Pid);
+                    Assert.Equal("50%", vm.CpuUsage);
+                    _mockProcessHelper.Verify(p => p.GetProcessTreeMetrics(It.IsAny<int>()), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_MonitoringCancelledDuringMetricCollection_DropsTheTick()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    SynchronizationContext.SetSynchronizationContext(
+                        new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
+
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync(2050);
+
+                    // Monitoring is cancelled while the metrics are being collected off the UI thread
+                    _mockProcessHelper.Setup(p => p.GetProcessTreeMetrics(2050))
+                                      .Callback(() => TestReflection.GetField<CancellationTokenSource>(vm, "_monitoringCts").Cancel())
+                                      .Returns(new ProcessMetrics(45.5, 50 * 1024 * 1024));
+
+                    _mockUiDispatcher.Setup(d => d.InvokeAsync(It.IsAny<Action>()))
+                                     .Callback<Action>(action => action())
+                                     .Returns(Task.CompletedTask);
+
+                    // Act
+                    PumpUntilCompleted((Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!);
+
+                    // Assert - metrics collected for a cancelled monitoring session are discarded
+                    _mockProcessHelper.Verify(p => p.FormatCpuUsage(It.IsAny<double>()), Times.Never);
+                    Assert.Equal(UiConstants.NotAvailable, vm.CpuUsage);
+                    Assert.Equal(UiConstants.NotAvailable, vm.RamUsage);
+                    Assert.Empty(vm.CpuPointCollection);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void OnTickAsync_SelectionChangesDuringMetricCollection_DropsTheTick()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange
+                    SynchronizationContext.SetSynchronizationContext(
+                        new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
+
+                    var mockService = new PerformanceService { Name = "ServyDaemon", Pid = 2050 };
+                    vm.SelectedService = mockService;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    _mockServiceRepository.Setup(r => r.GetServicePidAsync("ServyDaemon", It.IsAny<CancellationToken>()))
+                                           .ReturnsAsync(2050);
+
+                    // The user switches service while the metrics are being collected off the UI thread
+                    _mockProcessHelper.Setup(p => p.GetProcessTreeMetrics(2050))
+                                      .Callback(() => TestReflection.SetField(vm, "_selectedService",
+                                          new PerformanceService { Name = "OtherService", Pid = 1 }))
+                                      .Returns(new ProcessMetrics(45.5, 50 * 1024 * 1024));
+
+                    _mockUiDispatcher.Setup(d => d.InvokeAsync(It.IsAny<Action>()))
+                                     .Callback<Action>(action => action())
+                                     .Returns(Task.CompletedTask);
+
+                    // Act
+                    PumpUntilCompleted((Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!);
+
+                    // Assert - the stale service's metrics are not written into the newly selected service's graph
+                    _mockProcessHelper.Verify(p => p.FormatCpuUsage(It.IsAny<double>()), Times.Never);
+                    Assert.Equal(UiConstants.NotAvailable, vm.CpuUsage);
+                    Assert.Equal(UiConstants.NotAvailable, vm.RamUsage);
+                    Assert.Empty(vm.CpuPointCollection);
+                }
+            }, createApp: true);
+        }
+
+        /// <summary>
+        /// Keeps the current dispatcher pumping until <paramref name="task"/> completes, so the
+        /// <see cref="Task.Run(Action)"/> awaited inside ApplyTickAsync can finish, then observes its result.
+        /// </summary>
+        /// <param name="task">The tick task to await.</param>
+        private static void PumpUntilCompleted(Task task)
+        {
+            var sw = Stopwatch.StartNew();
+            while (!task.IsCompleted)
+            {
+                if (sw.Elapsed > TestTimeouts.CiGenerous)
+                    throw new TimeoutException($"OnTickAsync did not complete within {TestTimeouts.CiGenerous.TotalSeconds:0}s.");
+                Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.Background);
+                Thread.Sleep(1);
+            }
+
+            task.GetAwaiter().GetResult();
         }
 
         #endregion
@@ -302,6 +802,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
                 using (var vm = CreateViewModel())
                 {
+                    // Arrange
                     var mockService = new PerformanceService { Name = "ActiveService", Pid = 8888 };
                     vm.SelectedService = mockService;
 
@@ -316,6 +817,56 @@ namespace Servy.Manager.UnitTests.ViewModels
 
         #endregion
 
+        #region Advanced Code-Gap Coverage (CreateServiceItem)
+
+        [Fact]
+        public void CreateServiceItem_ValidServiceInput_MapsToPerformanceServiceWithMatchingNameAndPid()
+        {
+            // Arrange, Act & Assert
+            Helper.RunOnSTA(() =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service { Name = "EngineService", Pid = 4321 };
+
+                    // Act
+                    var result = TestReflection.InvokeNonPublic(vm, "CreateServiceItem", service);
+
+                    // Assert
+                    var item = Assert.IsType<PerformanceService>(result);
+                    Assert.Equal("EngineService", item.Name);
+                    Assert.Equal(4321, item.Pid);
+                }
+            });
+        }
+
+        [Fact]
+        public void CreateServiceItem_NullServiceInput_ReturnsInstanceWithNullFields()
+        {
+            // Arrange, Act & Assert
+            Helper.RunOnSTA(() =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Act
+                    // The override tolerates a null row via ?. - closed #2843 changed this from throwing,
+                    // so the tolerant behaviour is pinned separately from the valid-input mapping.
+                    var result = TestReflection.InvokeNonPublic(vm, "CreateServiceItem", (Service?)null);
+
+                    // Assert
+                    var item = Assert.IsType<PerformanceService>(result);
+                    Assert.Null(item.Name);
+                    Assert.Null(item.Pid);
+                }
+            });
+        }
+
+        #endregion
+
         #region Disposal & Teardown
 
         /// <summary>
@@ -323,17 +874,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         /// </summary>
         public void Dispose()
         {
-            foreach (var vm in _allocatedViewModels)
-            {
-                try
-                {
-                    vm.Dispose();
-                }
-                catch
-                {
-                    // Catch-all block to guarantee adjacent cleanup executions complete safely
-                }
-            }
+            _allocatedViewModels.Dispose();
         }
 
         #endregion

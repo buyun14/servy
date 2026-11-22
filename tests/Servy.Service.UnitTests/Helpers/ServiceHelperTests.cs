@@ -1,45 +1,94 @@
 using Moq;
-using Servy.Core.Data;
+using Servy.Core.Config;
 using Servy.Core.EnvironmentVariables;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using Servy.Service.CommandLine;
 using Servy.Service.Helpers;
 using Servy.Service.ProcessManagement;
+using Servy.Testing;
 using System.Diagnostics;
 using System.ServiceProcess;
 using ServiceHelper = Servy.Service.Helpers.ServiceHelper;
 
-#if !DEBUG
-using Servy.Core.Config;
-#endif
-
 namespace Servy.Service.UnitTests.Helpers
 {
-    [CollectionDefinition("ServiceHelperTests", DisableParallelization = true)]
+    [CollectionDefinition(Name, DisableParallelization = true)]
     public class ServiceHelperTestsCollection
     {
+        /// <summary>Collection name; reference this instead of repeating the string literal.</summary>
+        public const string Name = "ServiceHelperTests";
+
         // Enforces strict sequential isolation across the execution suite
     }
 
-    [Collection("ServiceHelperTests")]
+    [Collection(ServiceHelperTestsCollection.Name)]
     public class ServiceHelperTests
     {
         private readonly Mock<ICommandLineProvider> _mockCommandLineProvider;
         private readonly Mock<IProcessHelper> _mockProcessHelper;
-        private readonly Mock<IServiceRepository> _mockRepo;
+        private readonly Mock<INamedPipesService> _mockNamedPipesService;
         private readonly ServiceHelper _helper;
 
         public ServiceHelperTests()
         {
             _mockCommandLineProvider = new Mock<ICommandLineProvider>();
             _mockProcessHelper = new Mock<IProcessHelper>();
-            _mockRepo = new Mock<IServiceRepository>();
+            _mockNamedPipesService = new Mock<INamedPipesService>();
 
             // Default setup to pass validation so we can isolate specific test cases
             _mockProcessHelper.Setup(ph => ph.ValidatePath(It.IsAny<string>(), It.IsAny<bool>())).Returns(true);
 
             _helper = new ServiceHelper(_mockCommandLineProvider.Object, _mockProcessHelper.Object);
+        }
+
+        private class TestableServiceHelper : ServiceHelper
+        {
+            private readonly Queue<bool> _waitForExitResults = new Queue<bool>();
+
+            public int RestarterExeMaxWaitMsOverride { get; set; } = 300000;
+            public int RestarterKillGracePeriodMsOverride { get; set; } = 5000;
+            public bool KillCalled { get; private set; }
+            public bool ShouldKillThrow { get; set; }
+            public List<int> WaitBudgetsMs { get; } = new List<int>();
+
+            public TestableServiceHelper(ICommandLineProvider commandLineProvider, IProcessHelper processHelper)
+                : base(commandLineProvider, processHelper)
+            {
+            }
+
+            public void QueueWaitForExitResult(bool result)
+            {
+                _waitForExitResults.Enqueue(result);
+            }
+
+            protected override int GetRestarterExeMaxWaitMs()
+                => RestarterExeMaxWaitMsOverride;
+
+            protected override int GetRestarterKillGracePeriodMs()
+                => RestarterKillGracePeriodMsOverride;
+
+            protected override bool WaitForProcessExit(Process process, int milliseconds)
+            {
+                WaitBudgetsMs.Add(milliseconds);
+
+                if (_waitForExitResults.Count > 0)
+                {
+                    return _waitForExitResults.Dequeue();
+                }
+
+                return true;
+            }
+
+            protected override void KillProcess(Process process)
+            {
+                KillCalled = true;
+                if (ShouldKillThrow)
+                {
+                    throw new InvalidOperationException("No process is associated with this object.");
+                }
+            }
         }
 
         #region Initialization Verification Tests
@@ -64,7 +113,6 @@ namespace Servy.Service.UnitTests.Helpers
         public void LogStartupArguments_LogsPublicData()
         {
             // Arrange
-            var args = new[] { "arg1", "arg2" };
             var options = new StartOptions
             {
                 ServiceName = "TestService",
@@ -78,117 +126,130 @@ namespace Servy.Service.UnitTests.Helpers
             _helper.LogStartupArguments(options, mockLog.Object);
 
             // Assert
-            mockLog.Verify(l => l.Info(It.Is<string>(s =>
-                s.IndexOf("Startup Parameters", StringComparison.OrdinalIgnoreCase) >= 0), It.IsAny<Exception>()),
+            // The public dump is a report now, so the title is its own argument and the composed
+            // sections arrive in the body rather than flattened into one Info message.
+            mockLog.Verify(l => l.Report(LogLevel.Info, It.Is<string>(t =>
+                t.IndexOf("Startup Parameters", StringComparison.OrdinalIgnoreCase) >= 0), It.IsAny<string>()),
                 Times.Once);
 
-            mockLog.Verify(l => l.Info(It.Is<string>(s => s.Contains("serviceName: TestService")), It.IsAny<Exception>()), Times.Once);
+            mockLog.Verify(l => l.Report(LogLevel.Info, It.IsAny<string>(), It.Is<string>(b => b.Contains("serviceName: TestService"))), Times.Once);
         }
 
         [Fact]
-        public void LogStartupArguments_NullOptions_LogsError()
+        public void LogStartupArguments_HeartbeatUrlWithCredentials_LogsMaskedUrlAndNoSecrets()
+        {
+            // Arrange
+            var options = new StartOptions
+            {
+                ServiceName = "TestService",
+                ExecutablePath = "C:\\test.exe",
+                EnableDebugLogs = false,
+                HeartbeatUrl = "https://hbUser:hbPassw0rd@hc-ping.com/12345678-abcd-ef01-2345?token=QueryTokenSecret"
+            };
+
+            var bodies = new List<string>();
+            var mockLog = new Mock<IServyLogger>();
+            mockLog
+                .Setup(l => l.Report(It.IsAny<LogLevel>(), It.IsAny<string>(), It.IsAny<string>()))
+                .Callback<LogLevel, string, string>((_, _, body) => bodies.Add(body));
+
+            // Act
+            _helper.LogStartupArguments(options, mockLog.Object);
+
+            // Assert
+            string dump = string.Join(Environment.NewLine, bodies);
+            Assert.Contains("- heartbeatUrl: https://hc-ping.com/12345... [MASKED]", dump);
+            Assert.DoesNotContain("hbUser", dump);
+            Assert.DoesNotContain("hbPassw0rd", dump);
+            Assert.DoesNotContain("12345678-abcd", dump);
+            Assert.DoesNotContain("QueryTokenSecret", dump);
+        }
+
+        [Fact]
+        public void LogStartupArguments_NullOptions_ThrowsArgumentNullException()
         {
             // Arrange
             var mockLog = new Mock<IServyLogger>();
 
-            // Act
-            _helper.LogStartupArguments(null!, mockLog.Object);
-
-            // Assert
-            mockLog.Verify(l => l.Error("StartOptions is null.", It.IsAny<Exception>()), Times.Once);
+            // Act & Assert
+            Assert.Throws<ArgumentNullException>(() => _helper.LogStartupArguments(null!, mockLog.Object));
         }
 
         [Fact]
         public void LogStartupArguments_EnableDebugLogsTrue_LogsMaskedSensitiveDataToTextLog()
         {
             // Arrange
-            string tempLogFileName = $"Servy_Test_Log_{Guid.NewGuid():N}.log";
-            string tempLogFilePath = Path.Combine(Logger.LogsPath, tempLogFileName);
+            var mockEventLog = new Mock<IServyLogger>();
 
-            try
+            var options = new StartOptions
             {
-                // Re-initialize static Logger cleanly for this test
-                Logger.Shutdown();
-                Logger.Initialize(tempLogFileName, LogLevel.Info);
-
-                var mockEventLog = new Mock<IServyLogger>();
-
-                var options = new StartOptions
+                ServiceName = "SecureService",
+                EnableDebugLogs = true,
+                ExecutableArgs = "--password=SuperSecretPassword --api_key DB12345 --port 8080",
+                FailureProgramExecutableArgs = "/token:SecretToken123 /normalArg test",
+                EnvironmentVariables = new List<EnvironmentVariable>
                 {
-                    ServiceName = "SecureService",
-                    EnableDebugLogs = true,
-                    ExecutableArgs = "--password=SuperSecretPassword --api_key DB12345 --port 8080",
-                    FailureProgramArgs = "/token:SecretToken123 /normalArg test",
-                    EnvironmentVariables = new List<EnvironmentVariable>
-                    {
-                        new EnvironmentVariable { Name = "DB_PASSWORD", Value = "SqlPass123" },
-                        new EnvironmentVariable { Name = "NORMAL_ENV", Value = "PublicValue" }
-                    },
-                    PreLaunchExecutableArgs = "connect --jwt=TokenVal",
-                    PreLaunchEnvironmentVariables = new List<EnvironmentVariable>
-                    {
-                        new EnvironmentVariable { Name = "AUTH_TOKEN", Value = "JwtSecret" }
-                    },
-                    PostLaunchExecutableArgs = "--session \"Active Session Id\"",
-                    PreStopExecutableArgs = "stop --cert-thumbprint abcde123",
-                    PostStopExecutableArgs = "cleanup --pat SecretPatToken"
-                };
-
-                // Capture public parameters logged through the IServyLogger interface
-                var publicLoggedEntries = new List<string>();
-                mockEventLog
-                    .Setup(l => l.Info(It.IsAny<string>(), It.IsAny<Exception>()))
-                    .Callback<string, Exception?>((msg, _) => publicLoggedEntries.Add(msg));
-
-                // Act
-                _helper.LogStartupArguments(options, mockEventLog.Object);
-
-                // Flush/Shutdown static logger to release file handles
-                Logger.Shutdown();
-
-                // Assert
-                string publicLogOutput = string.Join(Environment.NewLine, publicLoggedEntries);
-                string textLogOutput = File.Exists(tempLogFilePath) ? File.ReadAllText(tempLogFilePath) : string.Empty;
-                string combinedLogOutput = publicLogOutput + Environment.NewLine + textLogOutput;
-
-                // 0. The dump actually happened on the channels under test
-                Assert.NotEmpty(publicLoggedEntries);
-                Assert.Contains("Startup Parameters", publicLogOutput, StringComparison.OrdinalIgnoreCase);
-                Assert.True(File.Exists(tempLogFilePath), $"Expected log file was not created at '{tempLogFilePath}'. Ensure process has write permissions.");
-                Assert.Contains("Startup Parameters - SENSITIVE DATA", textLogOutput, StringComparison.OrdinalIgnoreCase);
-
-                // 1. SECURITY TRACE CHECKS: Explicitly confirm no raw secret values were leaked anywhere
-                Assert.DoesNotContain("SuperSecretPassword", combinedLogOutput);
-                Assert.DoesNotContain("DB12345", combinedLogOutput);
-                Assert.DoesNotContain("SecretToken123", combinedLogOutput);
-                Assert.DoesNotContain("SqlPass123", combinedLogOutput);
-                Assert.DoesNotContain("TokenVal", combinedLogOutput);
-                Assert.DoesNotContain("JwtSecret", combinedLogOutput);
-                Assert.DoesNotContain("Active Session Id", combinedLogOutput);
-                Assert.DoesNotContain("abcde123", combinedLogOutput);
-                Assert.DoesNotContain("SecretPatToken", combinedLogOutput);
-
-                // 2. Sensitive values were emitted in masked form in the local text log
-                Assert.Contains("********", textLogOutput);
-                Assert.Contains("--password=********", textLogOutput);
-                Assert.Contains("DB_PASSWORD", textLogOutput); // key kept for diagnosability
-
-                // 3. Confirm separation: Sensitive log section is present in text log, but NOT sent to the event logger interface
-                Assert.DoesNotContain("SENSITIVE DATA", publicLogOutput);
-
-                // 4. Non-sensitive data is untouched and present
-                Assert.Contains("PublicValue", textLogOutput);
-                Assert.Contains("--port 8080", textLogOutput);
-                Assert.Contains("/normalArg test", textLogOutput);
-            }
-            finally
-            {
-                Logger.Shutdown();
-                if (File.Exists(tempLogFilePath))
+                    new EnvironmentVariable { Name = "DB_PASSWORD", Value = "SqlPass123" },
+                    new EnvironmentVariable { Name = "AZURE_CREDENTIALS", Value = "{\"clientSecret\":\"SecretAzureKey\"}" },
+                    new EnvironmentVariable { Name = "NORMAL_ENV", Value = "PublicValue" }
+                },
+                PreLaunchExecutableArgs = "connect --jwt=TokenVal",
+                PreLaunchEnvironmentVariables = new List<EnvironmentVariable>
                 {
-                    try { File.Delete(tempLogFilePath); } catch { /* Ignore file cleanup errors */ }
-                }
-            }
+                    new EnvironmentVariable { Name = "AUTH_TOKEN", Value = "JwtSecret" }
+                },
+                PostLaunchExecutableArgs = "--session \"Active Session Id\"",
+                PreStopExecutableArgs = "stop --cert-thumbprint abcde123",
+                PostStopExecutableArgs = "cleanup --pat SecretPatToken"
+            };
+
+            // Capture public parameters logged through the IServyLogger interface. The public dump
+            // is emitted as a report, so title and body are captured as the one entry they compose.
+            var publicLoggedEntries = new List<string>();
+            mockEventLog
+                .Setup(l => l.Report(It.IsAny<LogLevel>(), It.IsAny<string>(), It.IsAny<string>()))
+                .Callback<LogLevel, string, string>((_, title, body) => publicLoggedEntries.Add(title + Environment.NewLine + body));
+
+            // Act
+            // LogCapture routes the static Logger into a private temp directory (the logDirectory
+            // seam from #5459) so the test never creates or re-ACLs the product's own logs directory.
+            string textLogOutput = LogCapture.Run(() => _helper.LogStartupArguments(options, mockEventLog.Object));
+
+            // Assert
+            string publicLogOutput = string.Join(Environment.NewLine, publicLoggedEntries);
+            string combinedLogOutput = publicLogOutput + Environment.NewLine + textLogOutput;
+
+            // 0. The dump actually happened on the channels under test
+            Assert.NotEmpty(publicLoggedEntries);
+            Assert.Contains("Startup Parameters", publicLogOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.NotEmpty(textLogOutput);
+            Assert.Contains("Startup Parameters - SENSITIVE DATA", textLogOutput, StringComparison.OrdinalIgnoreCase);
+
+            // 1. SECURITY TRACE CHECKS: Explicitly confirm no raw secret values were leaked anywhere
+            Assert.DoesNotContain("SuperSecretPassword", combinedLogOutput);
+            Assert.DoesNotContain("DB12345", combinedLogOutput);
+            Assert.DoesNotContain("SecretToken123", combinedLogOutput);
+            Assert.DoesNotContain("SqlPass123", combinedLogOutput);
+            Assert.DoesNotContain("SecretAzureKey", combinedLogOutput);
+            Assert.DoesNotContain("TokenVal", combinedLogOutput);
+            Assert.DoesNotContain("JwtSecret", combinedLogOutput);
+            Assert.DoesNotContain("Active Session Id", combinedLogOutput);
+            Assert.DoesNotContain("abcde123", combinedLogOutput);
+            Assert.DoesNotContain("SecretPatToken", combinedLogOutput);
+
+            // 2. Sensitive values were emitted in masked form in the local text log
+            Assert.Contains("********", textLogOutput);
+            Assert.Contains("--password=********", textLogOutput);
+            Assert.Contains("DB_PASSWORD", textLogOutput); // key kept for diagnosability
+            Assert.Contains("AZURE_CREDENTIALS=********", textLogOutput);
+
+            // 3. Confirm separation: Sensitive log section is present in text log, but NOT sent to the event logger interface
+            Assert.DoesNotContain("SENSITIVE DATA", publicLogOutput);
+
+            // 4. Non-sensitive data is untouched and present
+            Assert.Contains("PublicValue", textLogOutput);
+            Assert.Contains("--port 8080", textLogOutput);
+            Assert.Contains("/normalArg test", textLogOutput);
         }
 
         #endregion
@@ -267,12 +328,22 @@ namespace Servy.Service.UnitTests.Helpers
         public void ParseOptions_EmptyArgs_ThrowsArgumentExceptionFromParser()
         {
             // Act & Assert
-            Assert.Throws<ArgumentException>(() => _helper.ParseOptions(_mockRepo.Object, new string[0]));
+            Assert.Throws<ArgumentException>(() => _helper.ParseOptions(_mockNamedPipesService.Object, new string[0]));
         }
 
         #endregion
 
         #region ValidateAndLog Tests
+
+        [Fact]
+        public void ValidateAndLog_NullOptions_ThrowsArgumentNullException()
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+
+            // Act & Assert
+            Assert.Throws<ArgumentNullException>(() => _helper.ValidateAndLog(null!, mockLog.Object));
+        }
 
         [Fact]
         public void ValidateAndLog_AllPathsValid_ReturnsTrue_NoErrorsLogged()
@@ -366,31 +437,47 @@ namespace Servy.Service.UnitTests.Helpers
 
             // Act & Assert
             Assert.Throws<ArgumentNullException>(() => _helper.RestartProcess(
-                null!, null!, "exe", "args", "dir", new List<EnvironmentVariable>(), mockLog.Object, 1000, cancellationToken: TestContext.Current.CancellationToken));
+                null!, null!, "exe", "args", "dir", new List<EnvironmentVariable>(), false, mockLog.Object, 1000, cancellationToken: TestContext.Current.CancellationToken));
         }
 
         [Fact]
         public void RestartProcess_ProcessActive_StopsParentAndDescendantsThenRestarts()
         {
             // Arrange
+            var startTime = new DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Local);
             var mockProcess = new Mock<IProcessWrapper>();
             mockProcess.Setup(p => p.Id).Returns(1234);
-            mockProcess.Setup(p => p.StartTime).Returns(DateTime.Now);
+            mockProcess.Setup(p => p.StartTime).Returns(startTime);
             mockProcess.Setup(p => p.HasExited).Returns(false);
 
             var mockLog = new Mock<IServyLogger>();
-            bool startActionInvoked = false;
+            var environment = new List<EnvironmentVariable> { new EnvironmentVariable { Name = "K", Value = "V" } };
+            using var cancellation = new CancellationTokenSource();
+
+            (string Exe, string Args, string Dir, List<EnvironmentVariable> Env, bool Allow, CancellationToken Token)? seen = null;
             StartProcessCallback startAction =
-                (exe, args, dir, env, ct) => startActionInvoked = true;
+                (exe, args, dir, env, allowOverriddenRuntimeVars, ct) =>
+                {
+                    seen = (exe, args, dir, env, allowOverriddenRuntimeVars, ct);
+                    return true;
+                };
 
             // Act
-            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), mockLog.Object, 1000, CancellationToken.None);
+            // allowOverriddenRuntimeVars is true, deliberately not its default, so it cannot be replaced by a literal false
+            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", environment, true, mockLog.Object, 1000, cancellation.Token);
 
             // Assert
             mockProcess.Verify(p => p.Stop(1000), Times.Once);
-            mockProcess.Verify(p => p.StopDescendants(1234, It.IsAny<DateTime>(), 1000), Times.Once);
+            mockProcess.Verify(p => p.StopDescendants(1234, startTime, 1000), Times.Once);
             mockProcess.Verify(p => p.Dispose(), Times.Once);
-            Assert.True(startActionInvoked);
+
+            Assert.NotNull(seen);
+            Assert.Equal("exe", seen.Value.Exe);
+            Assert.Equal("args", seen.Value.Args);
+            Assert.Equal("dir", seen.Value.Dir);
+            Assert.Same(environment, seen.Value.Env);
+            Assert.True(seen.Value.Allow);
+            Assert.Equal(cancellation.Token, seen.Value.Token);
             mockLog.Verify(l => l.Info("Process restarted.", It.IsAny<Exception>()), Times.Once);
         }
 
@@ -405,16 +492,40 @@ namespace Servy.Service.UnitTests.Helpers
             var mockLog = new Mock<IServyLogger>();
             bool startActionInvoked = false;
             StartProcessCallback startAction =
-                (exe, args, dir, env, ct) => startActionInvoked = true;
+                (exe, args, dir, env, allowOverriddenRuntimeVars, ct) => startActionInvoked = true;
 
             // Act
-            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), mockLog.Object, 1000, CancellationToken.None);
+            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), false, mockLog.Object, 1000, TestContext.Current.CancellationToken);
 
             // Assert
             mockLog.Verify(l => l.Warn(It.Is<string>(s => s.Contains("error while getting process PID")), It.IsAny<Exception>()), Times.Once);
+            // The parent is gone, so it is not stopped again, but its descendants are still swept,
+            // with the unknown lineage passed through as it stands
             mockProcess.Verify(p => p.Stop(It.IsAny<int>()), Times.Never);
+            mockProcess.Verify(p => p.StopDescendants(0, DateTime.MinValue, 1000), Times.Once);
             mockProcess.Verify(p => p.Dispose(), Times.Once);
             Assert.True(startActionInvoked);
+        }
+
+        [Fact]
+        public void RestartProcess_ProcessAlreadyExited_SkipsStopButStillSweepsDescendants()
+        {
+            // Arrange
+            var startTime = new DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Local);
+            var mockProcess = new Mock<IProcessWrapper>();
+            mockProcess.Setup(p => p.Id).Returns(1234);
+            mockProcess.Setup(p => p.StartTime).Returns(startTime);
+            mockProcess.Setup(p => p.HasExited).Returns(true);
+
+            var mockLog = new Mock<IServyLogger>();
+            StartProcessCallback startAction = (exe, args, dir, env, allowOverriddenRuntimeVars, ct) => true;
+
+            // Act
+            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), false, mockLog.Object, 1000, TestContext.Current.CancellationToken);
+
+            // Assert
+            mockProcess.Verify(p => p.Stop(It.IsAny<int>()), Times.Never);
+            mockProcess.Verify(p => p.StopDescendants(1234, startTime, 1000), Times.Once);
         }
 
         [Fact]
@@ -429,10 +540,10 @@ namespace Servy.Service.UnitTests.Helpers
             var mockLog = new Mock<IServyLogger>();
             bool startActionInvoked = false;
             StartProcessCallback startAction =
-                (exe, args, dir, env, ct) => startActionInvoked = true;
+                (exe, args, dir, env, allowOverriddenRuntimeVars, ct) => startActionInvoked = true;
 
             // Act
-            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), mockLog.Object, 1000, CancellationToken.None);
+            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), false, mockLog.Object, 1000, TestContext.Current.CancellationToken);
 
             // Assert
             mockLog.Verify(l => l.Error(It.Is<string>(s => s.Contains("proceeding with launch anyway")), It.IsAny<UnauthorizedAccessException>()), Times.Once);
@@ -440,55 +551,149 @@ namespace Servy.Service.UnitTests.Helpers
             Assert.True(startActionInvoked);
         }
 
+        [Fact]
+        public void RestartProcess_StopDescendantsThrows_LogsWarningAndRestartsAnyway()
+        {
+            // Arrange
+            var mockProcess = new Mock<IProcessWrapper>();
+            mockProcess.Setup(p => p.Id).Returns(1234);
+            mockProcess.Setup(p => p.StartTime).Returns(DateTime.Now);
+            mockProcess.Setup(p => p.HasExited).Returns(false);
+            mockProcess.Setup(p => p.StopDescendants(It.IsAny<int>(), It.IsAny<DateTime>(), It.IsAny<int>()))
+                .Throws(new InvalidOperationException("Snapshot failed"));
+
+            var mockLog = new Mock<IServyLogger>();
+            bool startActionInvoked = false;
+            StartProcessCallback startAction =
+                (exe, args, dir, env, allowOverriddenRuntimeVars, ct) => startActionInvoked = true;
+
+            // Act
+            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), false, mockLog.Object, 1000, TestContext.Current.CancellationToken);
+
+            // Assert
+            // Stop() itself succeeds here; only the descendant sweep fails, which is the inner of the
+            // two nested "log and keep going" catches and, unlike its sibling, had no test at all.
+            mockProcess.Verify(p => p.Stop(1000), Times.Once);
+            mockLog.Verify(l => l.Warn(It.Is<string>(s => s.Contains("descendant cleanup failed")), It.IsAny<Exception>()), Times.Once);
+            mockProcess.Verify(p => p.Dispose(), Times.Once);
+            Assert.True(startActionInvoked);
+            mockLog.Verify(l => l.Info("Process restarted.", It.IsAny<Exception>()), Times.Once);
+        }
+
+        [Fact]
+        public void RestartProcess_StartActionThrows_LogsErrorAndStillDisposesProcess()
+        {
+            // Arrange
+            var mockProcess = new Mock<IProcessWrapper>();
+            mockProcess.Setup(p => p.Id).Returns(1234);
+            mockProcess.Setup(p => p.StartTime).Returns(DateTime.Now);
+            mockProcess.Setup(p => p.HasExited).Returns(false);
+
+            var mockLog = new Mock<IServyLogger>();
+            StartProcessCallback startAction =
+                (exe, args, dir, env, allowOverriddenRuntimeVars, ct) => { throw new InvalidOperationException("Launch failed"); };
+
+            // Act
+            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), false, mockLog.Object, 1000, TestContext.Current.CancellationToken);
+
+            // Assert
+            // The whole stop sequence succeeds here and only the relaunch throws, so the exception
+            // reaches the method's outer catch - the one arm the sibling tests above never enter,
+            // because each of their exceptions is swallowed by one of the two inner catches first.
+            mockProcess.Verify(p => p.Stop(1000), Times.Once);
+            mockLog.Verify(l => l.Error("Failed to restart process.", It.IsAny<InvalidOperationException>()), Times.Once);
+            mockProcess.Verify(p => p.Dispose(), Times.Once);
+        }
+
+        [Fact]
+        public void RestartProcess_StartActionSkipsTheLaunch_DoesNotLogProcessRestarted()
+        {
+            // Arrange
+            var mockProcess = new Mock<IProcessWrapper>();
+            mockProcess.Setup(p => p.Id).Returns(1234);
+            mockProcess.Setup(p => p.StartTime).Returns(DateTime.Now);
+            mockProcess.Setup(p => p.HasExited).Returns(false);
+
+            var mockLog = new Mock<IServyLogger>();
+            bool startActionInvoked = false;
+            StartProcessCallback startAction =
+                (exe, args, dir, env, allowOverriddenRuntimeVars, ct) =>
+                {
+                    // The callback declines the launch, as the service's relaunch does once a stop has begun
+                    startActionInvoked = true;
+                    return false;
+                };
+
+            // Act
+            _helper.RestartProcess(mockProcess.Object, startAction, "exe", "args", "dir", new List<EnvironmentVariable>(), false, mockLog.Object, 1000, TestContext.Current.CancellationToken);
+
+            // Assert
+            // The old process is still stopped and disposed, but no new one exists, so the success line
+            // would be false
+            Assert.True(startActionInvoked);
+            mockProcess.Verify(p => p.Stop(1000), Times.Once);
+            mockProcess.Verify(p => p.Dispose(), Times.Once);
+            mockLog.Verify(l => l.Info("Process restarted.", It.IsAny<Exception>()), Times.Never);
+            mockLog.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+        }
+
         #endregion
 
         #region RestartService Tests
 
         [Fact]
-        public void RestartService_ProcessIsNull_LogsError()
+        public void RestartService_RestarterFailsToStart_LogsErrorAndAborts()
         {
             // Arrange
             var mockLog = new Mock<IServyLogger>();
-            var restarterPath = Path.Combine(GetTargetRestarterDirectory(), "Servy.Restarter.exe");
 
-            // Safe guard: Ensure target sandbox directory exists (crucial for ProgramData on barebones CI servers)
-            var directory = Path.GetDirectoryName(restarterPath);
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+            using (new PlaceholderRestarter())
             {
-                Directory.CreateDirectory(directory);
-            }
-
-            // Defensively ensure a dummy restarter file exists in the sandbox if it isn't already present,
-            // without modifying or deleting a real build artifact.
-            bool createdDummy = false;
-            if (!File.Exists(restarterPath))
-            {
-                File.WriteAllText(restarterPath, "dummy");
-                createdDummy = true;
-            }
-
-            try
-            {
-                _mockProcessHelper.Setup(p => p.Start(It.IsAny<ProcessStartInfo>())).Returns((Process?)null);
+                // Mock the process helper to return null. This guarantees we bypass the multi-minute
+                // constant timeout loop and safely test the start failure pathway without deleting production binaries.
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns((Process?)null);
 
                 // Act
-                _helper.RestartService("TestService", mockLog.Object);
+                _helper.RestartService("TestServiceToRecovery", mockLog.Object);
 
                 // Assert
+                // Verify that the start failure branch executed cleanly and surfaced the corresponding error profile
                 mockLog.Verify(l => l.Error("Failed to start Servy.Restarter.exe.", It.IsAny<Exception>()), Times.Once);
             }
-            finally
+        }
+
+        [Theory]
+        [InlineData("My Service", "My Service")]
+        [InlineData("My:Service", "My%3AService")]
+        public void RestartService_PassesTheServiceNameAndItsOwnLogFolder(string serviceName, string expectedFolderName)
+        {
+            // Arrange: the restarter runs under the service account, which can only write logs\services\<ServiceName>\
+            var mockLog = new Mock<IServyLogger>();
+            ProcessStartInfo? started = null;
+
+            using (new PlaceholderRestarter())
             {
-                // Clean up only if this specific test run spawned the temporary placeholder
-                if (createdDummy && File.Exists(restarterPath))
-                {
-                    File.Delete(restarterPath);
-                }
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Callback<ProcessStartInfo>(psi => started = psi)
+                    .Returns((Process?)null);
+
+                // Act
+                _helper.RestartService(serviceName, mockLog.Object);
+
+                // Assert: the restarter logs in the same encoded folder the wrapper logs in
+                var expectedFolder = Path.Combine(AppConfig.ServiceLogsFolderPath, expectedFolderName);
+                Assert.NotNull(started);
+                Assert.Equal($"\"{serviceName}\" \"{expectedFolder}\"", started!.Arguments);
+                Assert.Equal(expectedFolder, Servy.Service.Service.GetLogDirectory(new[] { "Servy.Service.exe", serviceName }));
+                Assert.False(started.UseShellExecute);
             }
         }
 
         [Fact]
-        public void RestartService_RestarterFailsToStart_LogsErrorAndAborts()
+        public void RestartService_RestarterExeMissing_LogsErrorAndAborts()
         {
             // Arrange
             var mockLog = new Mock<IServyLogger>();
@@ -497,41 +702,237 @@ namespace Servy.Service.UnitTests.Helpers
 
             var restarterPath = Path.Combine(dir, "Servy.Restarter.exe");
 
-            // Defensively ensure a dummy restarter file exists in the sandbox if it isn't already present,
-            // without modifying or deleting a real build artifact.
-            bool createdDummy = false;
-            if (!File.Exists(restarterPath))
+            // Move a real restarter out of the way rather than deleting it; the sibling test above
+            // creates a placeholder at this very path, so the missing-file guard is only reachable
+            // while nothing is there.
+            var backupPath = restarterPath + ".missing-branch.bak";
+            var moved = false;
+            if (File.Exists(restarterPath))
             {
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                File.WriteAllText(restarterPath, "Temporary Test Placeholder");
-                createdDummy = true;
+                if (File.Exists(backupPath)) File.Delete(backupPath);
+                File.Move(restarterPath, backupPath);
+                moved = true;
             }
-
-            // Mock the process helper to return null. This guarantees we bypass the multi-minute
-            // constant timeout loop and safely test the start failure pathway without deleting production binaries.
-            _mockProcessHelper
-                .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
-                .Returns((Process?)null);
 
             try
             {
                 // Act
-                _helper.RestartService("TestServiceToRecovery", mockLog.Object);
+                _helper.RestartService("TestServiceMissingRestarter", mockLog.Object);
 
                 // Assert
-                // Verify that the start failure branch executed cleanly and surfaced the corresponding error profile
-                mockLog.Verify(l => l.Error(
-                    It.Is<string>(s => s.Contains("Failed to start Servy.Restarter.exe")),
-                    It.IsAny<Exception>()),
-                    Times.Once);
+                // The guard returns before the ProcessStartInfo is built, so the start-failure
+                // branch one line below it - the only branch the sibling test drives - is never reached.
+                mockLog.Verify(l => l.Error("Servy.Restarter.exe not found.", It.IsAny<Exception>()), Times.Once);
+                _mockProcessHelper.Verify(h => h.Start(It.IsAny<ProcessStartInfo>()), Times.Never);
             }
             finally
             {
-                // Clean up only if this specific test run spawned the temporary placeholder
-                if (createdDummy && File.Exists(restarterPath))
+                // Restore the artifact this test displaced, whatever the assertions did
+                if (moved)
                 {
-                    try { File.Delete(restarterPath); } catch { /* Ignore file locks */ }
+                    if (File.Exists(restarterPath)) File.Delete(restarterPath);
+                    File.Move(backupPath, restarterPath);
                 }
+            }
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(3)]
+        public void RestartService_RestarterExits_LogsTheExitCodeAtTheMatchingLevel(int exitCode)
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+
+            // RUNTIME BOUNDARY: a real, ALREADY EXITED Process, so WaitForExit returns true
+            // immediately and ExitCode reads back the value we asked for - the multi-minute
+            // RestarterExeMaxWaitMs loop is never entered.
+            using (new PlaceholderRestarter())
+            using (var exitedProcess = new Process())
+            {
+                exitedProcess.StartInfo = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c exit {exitCode}",
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                };
+                exitedProcess.Start();
+                exitedProcess.WaitForExit(5000);
+
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns(exitedProcess);
+
+                // Act
+                _helper.RestartService("TestServiceExitCode" + exitCode, mockLog.Object);
+
+                // Assert
+                if (exitCode == 0)
+                {
+                    mockLog.Verify(l => l.Info(It.Is<string>(m => m.Contains("exited with code 0")), It.IsAny<Exception>()), Times.Once);
+                    mockLog.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                }
+                else
+                {
+                    mockLog.Verify(l => l.Error(It.Is<string>(m => m.Contains($"exited with non-zero code {exitCode}")), It.IsAny<Exception>()), Times.Once);
+                }
+            }
+        }
+
+        [Fact]
+        public void RestartService_StartThrows_LogsErrorAndDoesNotPropagate()
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+
+            using (new PlaceholderRestarter())
+            {
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Throws(new System.ComponentModel.Win32Exception(5, "Access is denied"));
+
+                // Act
+                var ex = Record.Exception(() => _helper.RestartService("TestServiceStartThrows", mockLog.Object));
+
+                // Assert
+                // The launch failure is swallowed and logged; RestartService never propagates.
+                Assert.Null(ex);
+                mockLog.Verify(l => l.Error("Failed to launch restarter.", It.IsAny<Exception>()), Times.Once);
+            }
+        }
+
+        #endregion
+
+        #region RestartService Timeout & Kill Branch Tests
+
+        [Fact]
+        public void RestartService_RestarterTimesOut_KillsOrphanedProcessAndLogsError()
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+            var testableHelper = new TestableServiceHelper(_mockCommandLineProvider.Object, _mockProcessHelper.Object)
+            {
+                RestarterExeMaxWaitMsOverride = 10,
+                RestarterKillGracePeriodMsOverride = 10
+            };
+
+            // Queue 1st WaitForExit (RestarterExeMaxWaitMs) -> false (timeout)
+            // Queue 2nd WaitForExit (RestarterKillGracePeriodMs) -> true (cleanup complete)
+            testableHelper.QueueWaitForExitResult(false);
+            testableHelper.QueueWaitForExitResult(true);
+
+            using (new PlaceholderRestarter())
+            using (var dummyProcess = new Process())
+            {
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns(dummyProcess);
+
+                // Act
+                testableHelper.RestartService("TestServiceTimeout", mockLog.Object);
+
+                // Assert
+                mockLog.Verify(l => l.Error(It.Is<string>(m => m.Contains("timed out after")), It.IsAny<Exception>()), Times.Once);
+                Assert.True(testableHelper.KillCalled, "Orphaned restarter process should have been killed.");
+            }
+        }
+
+        [Fact]
+        public void RestartService_RestarterTimesOut_KillGracePeriodExceeded_LogsWarning()
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+            var testableHelper = new TestableServiceHelper(_mockCommandLineProvider.Object, _mockProcessHelper.Object)
+            {
+                RestarterExeMaxWaitMsOverride = 10,
+                RestarterKillGracePeriodMsOverride = 10
+            };
+
+            // Queue 1st WaitForExit (RestarterExeMaxWaitMs) -> false (timeout)
+            // Queue 2nd WaitForExit (RestarterKillGracePeriodMs) -> false (cleanup delayed)
+            testableHelper.QueueWaitForExitResult(false);
+            testableHelper.QueueWaitForExitResult(false);
+
+            using (new PlaceholderRestarter())
+            using (var dummyProcess = new Process())
+            {
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns(dummyProcess);
+
+                // Act
+                testableHelper.RestartService("TestServiceKillWaitTimeout", mockLog.Object);
+
+                // Assert
+                mockLog.Verify(l => l.Error(It.Is<string>(m => m.Contains("timed out after")), It.IsAny<Exception>()), Times.Once);
+                mockLog.Verify(l => l.Warn(It.Is<string>(m => m.Contains("kernel cleanup is taking longer than")), It.IsAny<Exception>()), Times.Once);
+                Assert.True(testableHelper.KillCalled, "Orphaned restarter process should have been killed.");
+            }
+        }
+
+        [Fact]
+        public void RestartService_RestarterTimesOut_WaitsTheMaxWaitFirstThenTheKillGracePeriod()
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+            var testableHelper = new TestableServiceHelper(_mockCommandLineProvider.Object, _mockProcessHelper.Object)
+            {
+                RestarterExeMaxWaitMsOverride = 120000,     // 2 minutes
+                RestarterKillGracePeriodMsOverride = 7000   // 7 seconds
+            };
+            testableHelper.QueueWaitForExitResult(false);
+            testableHelper.QueueWaitForExitResult(false);
+
+            using (new PlaceholderRestarter())
+            using (var dummyProcess = new Process())
+            {
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns(dummyProcess);
+
+                // Act
+                testableHelper.RestartService("TestServiceBudgets", mockLog.Object);
+
+                // Assert
+                Assert.Equal(new[] { 120000, 7000 }, testableHelper.WaitBudgetsMs);
+                mockLog.Verify(l => l.Error(
+                    "Servy.Restarter.exe timed out after 2 minutes. Forcing termination to prevent orphan conflicts.",
+                    It.IsAny<Exception>()), Times.Once);
+                mockLog.Verify(l => l.Warn(
+                    "Restarter killed, but kernel cleanup is taking longer than 7 seconds.",
+                    It.IsAny<Exception>()), Times.Once);
+            }
+        }
+
+        [Fact]
+        public void RestartService_RestarterTimesOut_KillThrowsException_LogsError()
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+            var testableHelper = new TestableServiceHelper(_mockCommandLineProvider.Object, _mockProcessHelper.Object)
+            {
+                RestarterExeMaxWaitMsOverride = 10,
+                ShouldKillThrow = true
+            };
+
+            // Queue 1st WaitForExit -> false (timeout), KillProcess will throw exception
+            testableHelper.QueueWaitForExitResult(false);
+
+            using (new PlaceholderRestarter())
+            using (var dummyProcess = new Process())
+            {
+                _mockProcessHelper
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns(dummyProcess);
+
+                // Act
+                testableHelper.RestartService("TestServiceKillException", mockLog.Object);
+
+                // Assert
+                mockLog.Verify(l => l.Error(It.Is<string>(m => m.Contains("timed out after")), It.IsAny<Exception>()), Times.Once);
+                mockLog.Verify(l => l.Error(It.Is<string>(m => m.Contains("Failed to kill orphaned restarter")), It.IsAny<Exception>()), Times.Once);
+                Assert.True(testableHelper.KillCalled, "Orphaned restarter KillProcess should have been called.");
             }
         }
 
@@ -589,11 +990,102 @@ namespace Servy.Service.UnitTests.Helpers
                 Times.Once);
         }
 
+        [Fact]
+        public void RestartComputer_ProcessStartReturnsNull_LogsError()
+        {
+            // Arrange
+            var mockLog = new Mock<IServyLogger>();
+
+            // Same shape as the RestartService null-return test in the RestartService Tests region: shutdown.exe never
+            // starts, so the using block binds null and the guard inside it is the only thing that
+            // can report the failure - no exception is thrown, so the catch below it stays out of it.
+            _mockProcessHelper
+                .Setup(p => p.Start(It.IsAny<ProcessStartInfo>()))
+                .Returns((Process?)null);
+
+            // Act
+            _helper.RestartComputer(mockLog.Object);
+
+            // Assert
+            mockLog.Verify(l => l.Error(
+                It.Is<string>(s => s.Contains("no process was started")),
+                null),
+                Times.Once);
+        }
+
         #endregion
 
         #region RequestAdditionalTime Tests
 
         private class DummyService : ServiceBase { }
+
+        /// <summary>
+        /// Replaces the SCM call of <see cref="ServiceHelper.RequestAdditionalTimeCore"/>, which only
+        /// succeeds for a service actually running under the SCM, so the success path and the
+        /// last-resort catch become reachable from a unit test.
+        /// </summary>
+        private class SeamServiceHelper : ServiceHelper
+        {
+            private readonly Exception? _throwOnCore;
+
+            public SeamServiceHelper(ICommandLineProvider commandLineProvider, IProcessHelper processHelper, Exception? throwOnCore = null)
+                : base(commandLineProvider, processHelper)
+            {
+                _throwOnCore = throwOnCore;
+            }
+
+            public int? RequestedMilliseconds { get; private set; }
+
+            protected override void RequestAdditionalTimeCore(ServiceBase service, int milliseconds)
+            {
+                RequestedMilliseconds = milliseconds;
+                if (_throwOnCore != null) throw _throwOnCore;
+            }
+        }
+
+        [Fact]
+        public void RequestAdditionalTime_CoreSucceeds_LogsRequestedMilliseconds()
+        {
+            // Arrange
+            var helper = new SeamServiceHelper(_mockCommandLineProvider.Object, _mockProcessHelper.Object);
+
+            using (var service = new DummyService())
+            {
+                var mockLog = new Mock<IServyLogger>();
+
+                // Act
+                helper.RequestAdditionalTime(service, 5000, mockLog.Object);
+
+                // Assert
+                Assert.Equal(5000, helper.RequestedMilliseconds);
+                mockLog.Verify(l => l.Debug(It.Is<string>(s => s.Contains("Requested additional 5000 ms")), It.IsAny<Exception>()), Times.Once);
+                mockLog.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+            }
+        }
+
+        [Fact]
+        public void RequestAdditionalTime_CoreThrowsNonInvalidOperation_LogsErrorAndDoesNotPropagate()
+        {
+            // Arrange - the last-resort catch, which exists so SCM signalling never crashes the service.
+            // The type must not derive from InvalidOperationException or the arm above swallows it
+            // silently, which rules out ObjectDisposedException; a Win32Exception is what a failing
+            // SCM call actually surfaces.
+            var thrown = new System.ComponentModel.Win32Exception(5, "Access is denied");
+            var helper = new SeamServiceHelper(_mockCommandLineProvider.Object, _mockProcessHelper.Object, thrown);
+
+            using (var service = new DummyService())
+            {
+                var mockLog = new Mock<IServyLogger>();
+
+                // Act
+                var exception = Record.Exception(() => helper.RequestAdditionalTime(service, 5000, mockLog.Object));
+
+                // Assert
+                Assert.Null(exception);
+                mockLog.Verify(l => l.Error(It.Is<string>(s => s.Contains("RequestAdditionalTime failed")), thrown), Times.Once);
+                mockLog.Verify(l => l.Debug(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+            }
+        }
 
         [Fact]
         public void RequestAdditionalTime_UnstartedService_SwallowsInvalidOperationException()
@@ -608,7 +1100,7 @@ namespace Servy.Service.UnitTests.Helpers
 
                 // Assert
                 Assert.Null(exception);
-                mockLog.Verify(l => l.Info(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                mockLog.Verify(l => l.Debug(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
                 mockLog.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
             }
         }
@@ -623,7 +1115,7 @@ namespace Servy.Service.UnitTests.Helpers
             _helper.RequestAdditionalTime(null!, 5000, mockLog.Object);
 
             // Assert
-            mockLog.Verify(l => l.Info(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+            mockLog.Verify(l => l.Debug(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
             mockLog.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
         }
 
@@ -634,7 +1126,7 @@ namespace Servy.Service.UnitTests.Helpers
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void MaskRawArguments_NullOrWhitespace_ReturnsOriginalValue(string? input)
         {
             // Act
@@ -684,6 +1176,78 @@ namespace Servy.Service.UnitTests.Helpers
         }
 
         [Theory]
+        [InlineData("PGPASSWORD=abc", "PGPASSWORD=********")]
+        [InlineData("DBPASSWORD=hunter2", "DBPASSWORD=********")]
+        [InlineData("SMTPPASSWORD=s3cr3t", "SMTPPASSWORD=********")]
+        [InlineData("APITOKEN=abc123", "APITOKEN=********")]
+        [InlineData("GITHUBTOKEN=ghp_xxx", "GITHUBTOKEN=********")]
+        [InlineData("AWSSECRET=zz", "AWSSECRET=********")]
+        [InlineData("myapp.exe --apikey KKK", "myapp.exe --apikey ********")]
+        public void MaskRawArguments_PrefixWithoutSeparator_SuccessfullyMasksSecret(string input, string expected)
+        {
+            // Act
+            var result = ServiceHelper.MaskRawArguments(input);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
+        [Theory]
+        [InlineData("COMPAT=1", "COMPAT=1")]
+        [InlineData("CONCERT=tonight", "CONCERT=tonight")]
+        [InlineData("ARKANSAS=little_rock", "ARKANSAS=little_rock")]
+        [InlineData("SECRETARY=john_doe", "SECRETARY=john_doe")]
+        [InlineData("SECRETSAUCE=recipe", "SECRETSAUCE=recipe")]
+        [InlineData("SECRETARY2=john", "SECRETARY2=john")]
+        public void MaskRawArguments_ShortKeyFalsePositiveGuards_PreservesNonSensitiveInput(string input, string expected)
+        {
+            // Act
+            var result = ServiceHelper.MaskRawArguments(input);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
+        [Theory]
+        [InlineData("AZURE_CREDENTIALS=my_azure_secret_json", "AZURE_CREDENTIALS=********")]
+        [InlineData("CREDENTIALS=sensitive_blob", "CREDENTIALS=********")]
+        [InlineData("SECRETS=top_secret_val", "SECRETS=********")]
+        [InlineData("DOCKER_SECRETS=token_val", "DOCKER_SECRETS=********")]
+        [InlineData("TOKENS=bearer_123", "TOKENS=********")]
+        [InlineData("GITHUB_TOKENS=ghp_abc", "GITHUB_TOKENS=********")]
+        [InlineData("PASSWORDS=secret123", "PASSWORDS=********")]
+        [InlineData("CERTIFICATES=cert_data", "CERTIFICATES=********")]
+        [InlineData("COOKIES=session_cookie_val", "COOKIES=********")]
+        [InlineData("myapp.exe --secrets=secret_payload", "myapp.exe --secrets=********")]
+        [InlineData("SECRETS_FILE=/etc/x", "SECRETS_FILE=********")]
+        [InlineData("TOKENS_PATH=/x", "TOKENS_PATH=********")]
+        [InlineData("DB_PASSWORDS_ENC=xx", "DB_PASSWORDS_ENC=********")]
+        [InlineData("myapp.exe --api_keys_file secret.json", "myapp.exe --api_keys_file ********")]
+        public void MaskRawArguments_PluralKeywords_SuccessfullyMasksSecrets(string input, string expected)
+        {
+            // Act
+            var result = ServiceHelper.MaskRawArguments(input);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
+        [Theory]
+        [InlineData("PASSWORD1=hunter2", "PASSWORD1=********")]
+        [InlineData("DB_PASSWORD2=hunter2", "DB_PASSWORD2=********")]
+        [InlineData("SECRET2024=abc", "SECRET2024=********")]
+        [InlineData("myapp.exe --db-token2 abc123", "myapp.exe --db-token2 ********")]
+        [InlineData("TOKEN2=bearer_123", "TOKEN2=********")]
+        public void MaskRawArguments_KeywordFollowedByDigits_SuccessfullyMasksSecrets(string input, string expected)
+        {
+            // Act
+            var result = ServiceHelper.MaskRawArguments(input);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
+        [Theory]
         [InlineData("API_KEY: my-secret-token", "API_KEY: ********")]
         [InlineData("API_KEY/my-secret-token", "API_KEY/********")]
         [InlineData("DATABASE_PASSWORD=secret", "DATABASE_PASSWORD=********")]
@@ -698,7 +1262,7 @@ namespace Servy.Service.UnitTests.Helpers
 
         [Theory]
         [InlineData("myapp.exe --password mysecret", "myapp.exe --password ********")]
-        [InlineData("CONNSTR my server address password", "CONNSTR my server address ********")]
+        [InlineData("CONNSTR my server address password", "CONNSTR ********")]
         public void MaskRawArguments_BranchB_SpaceSeparators_MasksCorrectly(string input, string expected)
         {
             // Act
@@ -747,6 +1311,20 @@ namespace Servy.Service.UnitTests.Helpers
             Assert.Equal(input, result); // Should remain completely untouched
         }
 
+        [Theory]
+        [InlineData("--db-password=hunter2 dump.sql", "--db-password=********")]
+        [InlineData("PASSWORD hunter2 dump.sql", "PASSWORD ********")]
+        [InlineData("PASSPHRASE=correct horse battery staple", "PASSPHRASE=********")]
+        [InlineData("API_KEY my-secret-token extra_arg1 extra_arg2", "API_KEY ********")]
+        public void MaskRawArguments_UnquotedMultiWordWithTrailingPositionalArgs_RedactsEntireValueWithoutLeakingFirstToken(string input, string expected)
+        {
+            // Act
+            var result = ServiceHelper.MaskRawArguments(input);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
         #endregion
 
         #region MaskUrl Tests
@@ -754,8 +1332,8 @@ namespace Servy.Service.UnitTests.Helpers
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
-        public void MaskUrl_NonAbsoluteInput_ShouldReturnEmptyString(string? inputUrl)
+        [InlineData("    ")]
+        public void MaskUrl_NullOrWhitespaceInput_ShouldReturnEmptyString(string? inputUrl)
         {
             // Act
             var result = ServiceHelper.MaskUrl(inputUrl);
@@ -767,7 +1345,7 @@ namespace Servy.Service.UnitTests.Helpers
         [Theory]
         [InlineData("not-a-valid-url")]
         [InlineData("/relative/path/only")]
-        public void MaskUrl_InvalidInput_ShouldReturnInvalidUrlString(string? inputUrl)
+        public void MaskUrl_NonAbsoluteInput_ShouldReturnInvalidUrlString(string? inputUrl)
         {
             // Act
             var result = ServiceHelper.MaskUrl(inputUrl);
@@ -779,7 +1357,7 @@ namespace Servy.Service.UnitTests.Helpers
         [Theory]
         [InlineData("https://hc-ping.com/12345678-abcd", "https://hc-ping.com/12345... [MASKED]")]
         [InlineData("http://internal-webhook/secretkeyhere", "http://internal-webhook/secre... [MASKED]")]
-        [InlineData("https://api.test.org/abcdef", "https://api.test.org/abcde... [MASKED]")] // "/abcdef" length is 7 -> hits Math.Min(5, 6)
+        [InlineData("https://api.test.org/abcdef", "https://api.test.org/abcde... [MASKED]")] // "/abcdef" length is 7 -> first 5 characters after the slash are kept
         public void MaskUrl_WhenLocalPathLengthIsGreaterThanSix_ShouldPreserveHostAndFivePathCharacters(string inputUrl, string expectedUrl)
         {
             // Act
@@ -836,14 +1414,43 @@ namespace Servy.Service.UnitTests.Helpers
 
         private static string GetTargetRestarterDirectory()
         {
-            // ROBUSTNESS: In Release configurations, the SUT expects the restarter binary
-            // to be located in AppConfig.ProgramDataPath. In Debug, it expects BaseDirectory.
-            // We write the file directly where the compiled execution path expects it.
-#if DEBUG
-            return AppFoldersHelper.GetAppDirectory();
-#else
-            return AppConfig.ProgramDataPath;
-#endif
+            // ROBUSTNESS: ask the SUT's own resolver where the restarter is expected rather than
+            // re-deriving the DEBUG/RELEASE split here. These tests drive RestartService's error
+            // branches, not its path resolution, so the fixture belongs wherever the code looks;
+            // AppConfig.GetServyRestarterPath is asserted on its own in Servy.Core.UnitTests.
+            return Path.GetDirectoryName(AppConfig.GetServyRestarterPath())!;
+        }
+
+        /// <summary>
+        /// Puts a placeholder Servy.Restarter.exe where RestartService looks for it, but only when
+        /// nothing is there already, and removes it on dispose only in that case - a real build
+        /// artifact is never overwritten or deleted (#3111, #4910).
+        /// </summary>
+        private sealed class PlaceholderRestarter : IDisposable
+        {
+            private readonly string _path;
+            private readonly bool _created;
+
+            public PlaceholderRestarter()
+            {
+                var dir = GetTargetRestarterDirectory();
+                _path = Path.Combine(dir, "Servy.Restarter.exe");
+
+                if (!File.Exists(_path))
+                {
+                    if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                    File.WriteAllText(_path, "Temporary Test Placeholder");
+                    _created = true;
+                }
+            }
+
+            public void Dispose()
+            {
+                if (_created && File.Exists(_path))
+                {
+                    try { File.Delete(_path); } catch { /* Ignore file locks */ }
+                }
+            }
         }
 
         #endregion

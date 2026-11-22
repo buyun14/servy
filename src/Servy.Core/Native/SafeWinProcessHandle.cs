@@ -9,16 +9,15 @@ namespace Servy.Core.Native
     [ExcludeFromCodeCoverage]
     public sealed class SafeWinProcessHandle : SafeHandleZeroOrMinusOneIsInvalid
     {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SafeWinProcessHandle"/> class for P/Invoke marshalling or manual allocation.
+        /// </summary>
         public SafeWinProcessHandle() : base(ownsHandle: true) { }
 
         /// <summary>
-        /// Returns the underlying handle value, or <see cref="IntPtr.Zero"/> if the handle is closed or invalid.
+        /// Executes the code required to free the native handle using <c>CloseHandle</c>.
         /// </summary>
-        public IntPtr GetHandleOrZero()
-        {
-            return IsClosed || IsInvalid ? IntPtr.Zero : base.DangerousGetHandle();
-        }
-
+        /// <returns><see langword="true"/> if the handle is released successfully; otherwise, <see langword="false"/>.</returns>
         protected override bool ReleaseHandle()
         {
             return NativeMethods.CloseHandle(handle);

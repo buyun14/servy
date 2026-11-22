@@ -2,26 +2,25 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
 
     <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>false</SelfContained>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <IncludeAllContentForSelfExtract>false</IncludeAllContentForSelfExtract>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <StripSymbols>true</StripSymbols>
 
     <IsTrimmable>true</IsTrimmable>
     <PublishTrimmed>true</PublishTrimmed>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <TrimMode>partial</TrimMode>
-    <DebuggerSupport>false</DebuggerSupport>
     <PublishReadyToRun>false</PublishReadyToRun>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+
+    <DebuggerSupport>true</DebuggerSupport>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>portable</DebugType>
+    <CopyOutputSymbolsToPublishDirectory>true</CopyOutputSymbolsToPublishDirectory>
   </PropertyGroup>
 
   <ItemGroup>
@@ -30,24 +29,14 @@
 
   <PropertyGroup>
     <AssemblyTitle>Servy.Service</AssemblyTitle>
-    <AssemblyDescription>Servy Wrapper Windows Service</AssemblyDescription>
+    <Description>Servy Wrapper Windows Service</Description>
     <Product>Servy.Service</Product>
   </PropertyGroup>
-
-  <ItemGroup>
-    <None Remove="Resources\Servy.Restarter.exe" />
-    <None Remove="Resources\Servy.Restarter.pdb" />
-  </ItemGroup>
 
   <ItemGroup>
     <Content Include="appsettings.service.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-  </ItemGroup>
-
-  <ItemGroup>
-    <EmbeddedResource Include="Resources\Servy.Restarter.exe" />
-    <EmbeddedResource Include="Resources\Servy.Restarter.pdb" />
   </ItemGroup>
 
   <ItemGroup>
@@ -70,7 +59,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Servy.Core\Servy.Core.csproj" />
-    <ProjectReference Include="..\Servy.Infrastructure\Servy.Infrastructure.csproj" />
   </ItemGroup>
 
 </Project>

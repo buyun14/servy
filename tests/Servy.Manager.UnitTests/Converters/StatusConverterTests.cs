@@ -1,6 +1,7 @@
 using Servy.Core.Enums;
 using Servy.Manager.Converters;
 using Servy.Manager.Resources;
+using Servy.Testing;
 using System.Globalization;
 using System.Windows.Data;
 
@@ -26,6 +27,7 @@ namespace Servy.Manager.UnitTests.Converters
             { ServiceStatus.ContinuePending, nameof(Strings.Status_ContinuePending) },
             { ServiceStatus.PausePending,    nameof(Strings.Status_PausePending) },
             { ServiceStatus.Paused,          nameof(Strings.Status_Paused) },
+            { ServiceStatus.Unknown,         nameof(Strings.Status_Unknown) },
         };
 
         #endregion
@@ -60,7 +62,7 @@ namespace Servy.Manager.UnitTests.Converters
         }
 
         [Fact]
-        public void Convert_NullInput_ReturnsEmptyString()
+        public void Convert_NullValue_ReturnsEmptyString()
         {
             // Act
             var result = _converter.Convert(null!, typeof(string), null!, CultureInfo.InvariantCulture);
@@ -69,39 +71,29 @@ namespace Servy.Manager.UnitTests.Converters
             Assert.Equal(string.Empty, result);
         }
 
+        [Theory]
+        [InlineData("Running")]
+        [InlineData("Invalid")]
+        public void Convert_IncompatibleValue_EchoesInput(string value)
+        {
+            // Act: a string is not a ServiceStatus, so the map lookup misses and GetFallbackValue runs
+            var result = _converter.Convert(value, typeof(string), null!, CultureInfo.InvariantCulture);
+
+            // Assert: the raw value is surfaced rather than masquerading as a mapped status
+            Assert.Equal(value, result);
+        }
+
         #endregion
 
         #region ConvertBack Tests
 
         [Theory]
-        [MemberData(nameof(StatusMappings))]
-        public void ConvertBack_ValidString_ReturnsEnum(ServiceStatus expected, string resourceName)
-        {
-            // Arrange: Extract the static public resource string value via direct reflection on Strings
-            var input = typeof(Strings).GetProperty(resourceName)?.GetValue(null!)!;
-
-            // Act
-            var result = _converter.ConvertBack(input, typeof(ServiceStatus), null!, CultureInfo.InvariantCulture);
-
-            // Assert
-            Assert.Equal(expected, result);
-        }
-
-        [Fact]
-        public void ConvertBack_NullInput_ReturnsDoNothing()
+        [InlineData(null)]
+        [InlineData("Any UI value")]
+        public void ConvertBack_ReturnsDoNothing(object? value)
         {
             // Act
-            var result = _converter.ConvertBack(null!, typeof(string), null!, CultureInfo.InvariantCulture);
-
-            // Assert
-            Assert.Equal(Binding.DoNothing, result);
-        }
-
-        [Fact]
-        public void ConvertBack_InvalidString_ReturnsDoNothing()
-        {
-            // Act
-            var result = _converter.ConvertBack("Unknown status string", typeof(ServiceStatus), null!, CultureInfo.InvariantCulture);
+            var result = _converter.ConvertBack(value!, typeof(ServiceStatus), null!, CultureInfo.InvariantCulture);
 
             // Assert
             Assert.Equal(Binding.DoNothing, result);
@@ -112,9 +104,27 @@ namespace Servy.Manager.UnitTests.Converters
         #region Completeness Guard Tests
 
         [Fact]
-        public void ServiceStatusEnum_AllValuesAreMappedAndAccountedFor()
+        public void StatusMap_CoversEveryDeclaredServiceStatus()
         {
-            // Arrange & Act: Extract the distinct mapped enum values directly from the theory data source using Param1
+            // Arrange: Extract the private static StatusMap directly from StatusConverter
+            var map = TestReflection.GetFieldStatic<Dictionary<ServiceStatus, Func<string>>>(typeof(StatusConverter), "StatusMap");
+
+            // Act
+            var declared = Enum.GetValues(typeof(ServiceStatus)).Cast<ServiceStatus>().ToHashSet();
+            var mapKeys = map.Keys.ToHashSet();
+
+            // Assert: Ensure bidirectional completeness between StatusMap keys and ServiceStatus enum values
+            var unmappedValues = declared.Except(mapKeys).ToList();
+            var extraValues = mapKeys.Except(declared).ToList();
+
+            Assert.Empty(unmappedValues);
+            Assert.Empty(extraValues);
+        }
+
+        [Fact]
+        public void StatusMappings_CoverEveryDeclaredServiceStatus()
+        {
+            // Arrange & Act: Extract the distinct mapped enum values from the theory data source via the ITheoryDataRow interface explicit implementation
             var covered = StatusMappings.Select(row => (ServiceStatus)((ITheoryDataRow)row).GetData()[0]!).ToHashSet();
             var declared = Enum.GetValues(typeof(ServiceStatus)).Cast<ServiceStatus>().ToHashSet();
 

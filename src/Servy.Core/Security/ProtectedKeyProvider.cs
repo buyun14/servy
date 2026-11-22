@@ -42,11 +42,6 @@ namespace Servy.Core.Security
         /// </summary>
         private static readonly ConcurrentDictionary<string, int> MigrationFailureCounts = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-        /// <summary>
-        /// The number of consecutive migration failures before escalating to a system-level Error/EventLog entry.
-        /// </summary>
-        private const int MigrationFailureEscalationThreshold = 3;
-
         #endregion
 
         #region Private Fields
@@ -91,14 +86,14 @@ namespace Servy.Core.Security
         public byte[] GetKey()
         {
             ThrowIfDisposed();
-            return GetCachedOrGenerate(ref _cachedKey, _keyFilePath, 32, "encryption key");
+            return GetCachedOrGenerate(ref _cachedKey, _keyFilePath, AppConfig.AesKeySizeBytes, "encryption key");
         }
 
         /// <inheritdoc />
         public byte[] GetIV()
         {
             ThrowIfDisposed();
-            return GetCachedOrGenerate(ref _cachedIv, _ivFilePath, 16, "encryption IV");
+            return GetCachedOrGenerate(ref _cachedIv, _ivFilePath, AppConfig.AesIvSizeBytes, "encryption IV");
         }
 
         #endregion
@@ -128,7 +123,7 @@ namespace Servy.Core.Security
                 }
 
                 // 2. GENERATE: Materialize and cache the keys.
-                // GetOrGenerate handles its own internal migration/rotation logic.
+                // GetOrGenerate handles its own legacy-entropy migration; it never replaces an existing key file.
                 byte[] decrypted = GetOrGenerate(path, length, materialName);
 
                 // Take ownership of the buffer instead of copying it, so no un-zeroed
@@ -225,6 +220,10 @@ namespace Servy.Core.Security
         /// Safely executes an action delegate within a cross-process system mutex mapped to a specific filesystem path.
         /// Ensures synchronization between Session 0 System processes and Interactive user instances.
         /// </summary>
+        /// <param name="path">The full filesystem path of the protected file; the mutex name is derived from it.</param>
+        /// <param name="action">The work to run while the mutex is held.</param>
+        /// <exception cref="System.Security.SecurityException">Thrown when the global mutex cannot be created or opened.</exception>
+        /// <exception cref="TimeoutException">Thrown when the mutex is not acquired within <see cref="AppConfig.KeyProviderMutexTimeoutSeconds"/>.</exception>
         private void RunUnderMutex(string path, Action action)
         {
             // Compute a deterministic FNV-1a stable hash of the path to avoid process-randomized string.GetHashCode() anomalies
@@ -242,16 +241,25 @@ namespace Servy.Core.Security
                 // This ensures both the Session 0 SYSTEM service and the interactive user Manager share the exact same lock.
                 var mutexSecurity = new MutexSecurity();
 
-                // Allow everyone (WorldSid) to Synchronize and Modify (Release) the shared Mutex
+                // Both the Session 0 service account (LocalSystem, LocalService, NetworkService or a custom
+                // service account) and the elevated Manager/CLI are authenticated principals, so
+                // AuthenticatedUsers covers every participant while excluding ANONYMOUS LOGON and Guest,
+                // which Everyone would admit. The key files this lock guards are narrower: SecurityHelper.ApplySecurityRules
+                // grants only Administrators and Local System on them (plus the current user of an unelevated run).
                 var accessRule = new MutexAccessRule(
-                    new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                    new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
                     MutexRights.Synchronize | MutexRights.Modify,
                     AccessControlType.Allow);
 
                 mutexSecurity.AddAccessRule(accessRule);
 
                 // Use MutexAcl to atomically instantiate the named system mutex with security descriptors applied
-                mutex = MutexAcl.Create(initiallyOwned: false, mutexName, out _, mutexSecurity);
+                mutex = MutexAcl.Create(initiallyOwned: false, mutexName, out bool createdNew, mutexSecurity);
+
+                if (!createdNew)
+                {
+                    Logger.Debug($"Joined existing cross-process mutex '{mutexName}'; its DACL was set by the creating process.");
+                }
             }
             catch (Exception ex)
             {
@@ -311,33 +319,30 @@ namespace Servy.Core.Security
         /// </exception>
         private byte[] GetOrGenerate(string path, int length, string materialName)
         {
-            // Double-check locking pattern to ensure only one process or thread generates the file
-            if (!File.Exists(path))
-            {
-                byte[] generatedData = null!;
-                RunUnderMutex(path, () =>
-                {
-                    if (!File.Exists(path))
-                    {
-                        generatedData = GenerateRandomBytes(length);
-                        SaveProtected(path, generatedData);
-                    }
-                });
-
-                if (generatedData != null)
-                {
-                    return generatedData;
-                }
-            }
-
             byte[]? encrypted = null;
             try
             {
-                // Retry with short exponential backoff
-                const int maxRetries = 3;
+                // Double-check locking pattern to ensure only one process or thread generates the file
+                if (!File.Exists(path))
+                {
+                    byte[] generatedData = null!;
+                    RunUnderMutex(path, () =>
+                    {
+                        if (!File.Exists(path))
+                        {
+                            generatedData = GenerateRandomBytes(length);
+                            SaveProtected(path, generatedData);
+                        }
+                    });
 
-                // Move the safety check to the loop condition
-                for (int attempt = 0; attempt < maxRetries; attempt++)
+                    if (generatedData != null)
+                    {
+                        return generatedData;
+                    }
+                }
+
+                // Retry with short exponential backoff
+                for (int attempt = 0; attempt < AppConfig.KeyProviderReadMaxRetries; attempt++)
                 {
                     try
                     {
@@ -348,11 +353,11 @@ namespace Servy.Core.Security
                         (ex is IOException io && !(io is FileNotFoundException) && !(io is DirectoryNotFoundException))
                         || ex is UnauthorizedAccessException)
                     {
-                        // If this was the last attempt, rethrow to be caught by BaseCommand
-                        if (attempt == maxRetries - 1)
+                        // If this was the last attempt, log and rethrow to the caller
+                        if (attempt == AppConfig.KeyProviderReadMaxRetries - 1)
                         {
                             var verb = ex is UnauthorizedAccessException ? "Access denied" : "Failed to read file";
-                            Logger.Error($"{verb} after {maxRetries} attempts: {path}", ex);
+                            Logger.Error($"{verb} after {AppConfig.KeyProviderReadMaxRetries} attempts: {path}", ex);
                             throw;
                         }
 
@@ -365,20 +370,18 @@ namespace Servy.Core.Security
                 // static analysis tools (and good practice) appreciate the explicit guard.
                 if (encrypted is null)
                 {
-                    throw new InvalidOperationException($"Failed to read {path} after {maxRetries} attempts");
+                    throw new InvalidOperationException($"Failed to read {path} after {AppConfig.KeyProviderReadMaxRetries} attempts");
                 }
 
                 byte[] dynamicEntropy = MachineEntropy.Value;
+                byte[] primary;
 
                 try
                 {
-                    // 1. Primary Attempt (v7.9+ logic): Use machine-unique entropy
-                    var unprotectResult = ProtectedData.Unprotect(encrypted, dynamicEntropy, ProtectionScope);
-
-                    // Reset failure counter on successful read with modern entropy
-                    MigrationFailureCounts.TryRemove(path, out _);
-
-                    return unprotectResult;
+                    // 1. Primary Attempt (v7.9+ logic): Use machine-unique entropy.
+                    // Only the decryption belongs here: a blob that decrypts but holds the wrong length is not a
+                    // legacy file, so its length is checked after this try and goes straight to the CRITICAL handler.
+                    primary = ProtectedData.Unprotect(encrypted, dynamicEntropy, ProtectionScope);
                 }
                 catch (CryptographicException primaryEx)
                 {
@@ -388,7 +391,8 @@ namespace Servy.Core.Security
                     TryWriteServyEventLog(fallbackLogMsg, EventLogEntryType.Warning, EventIds.TransientMigrationWarning);
 
                     // 2. Fallback Attempt (v7.8 compatibility): Try with NO entropy (null)
-                    byte[] decryptedData = ProtectedData.Unprotect(encrypted, null, ProtectionScope);
+                    byte[] decryptedData = EnsureLength(ProtectedData.Unprotect(encrypted, null, ProtectionScope), length, materialName, path);
+                    EnsureAdministrativeOwner(path, materialName);
 
                     try
                     {
@@ -412,7 +416,7 @@ namespace Servy.Core.Security
                         int failCount = MigrationFailureCounts.AddOrUpdate(path, 1, (_, count) => count + 1);
                         string baseMsg = $"Key migration to entropy-protected format failed for '{path}'";
 
-                        if (failCount >= MigrationFailureEscalationThreshold)
+                        if (failCount >= AppConfig.KeyProviderMigrationFailureEscalationThreshold)
                         {
                             string escalatedMsg = $"[EventID: {EventIds.PersistentMigrationFailure}] PERSISTENT SECURITY DEGRADATION: {baseMsg}. Failed {failCount} consecutive times. The file cannot be upgraded to modern encryption. System remains in v7.8 compatibility mode.";
                             TryWriteServyEventLog($"{escalatedMsg}\n\nError: {ex.Message}", EventLogEntryType.Error, EventIds.PersistentMigrationFailure);
@@ -420,7 +424,7 @@ namespace Servy.Core.Security
                         }
                         else
                         {
-                            string warningMsg = $"[EventID: {EventIds.TransientMigrationWarning}] {baseMsg} (Attempt {failCount}/{MigrationFailureEscalationThreshold}): {ex.Message}";
+                            string warningMsg = $"[EventID: {EventIds.TransientMigrationWarning}] {baseMsg} (Attempt {failCount}/{AppConfig.KeyProviderMigrationFailureEscalationThreshold}): {ex.Message}";
                             TryWriteServyEventLog(warningMsg, EventLogEntryType.Warning, EventIds.TransientMigrationWarning);
                             Logger.Warn(warningMsg);
                         }
@@ -429,19 +433,32 @@ namespace Servy.Core.Security
                         return decryptedData;
                     }
                 }
+
+                var unprotectResult = EnsureLength(primary, length, materialName, path);
+                EnsureAdministrativeOwner(path, materialName);
+
+                // Reset failure counter on successful read with modern entropy
+                MigrationFailureCounts.TryRemove(path, out _);
+
+                return unprotectResult;
             }
             catch (CryptographicException ex)
             {
-                // DPAPI is machine-specific; moving the file to another server will trigger this exception.
-                string errorMsg = $"Failed to unprotect {materialName} at '{path}'. The file may have been moved from another machine or restored from an image.";
+                // DPAPI is machine-specific; moving the file to another server will trigger this exception. So does a
+                // corrupt or truncated file. Either way the file is left exactly as it is: Servy never replaces an existing
+                // key file, because a new key cannot decrypt anything the database already holds.
+                string errorMsg = $"CRITICAL: Failed to unprotect {materialName} at '{path}'. The file is corrupt, or was moved " +
+                                  "from another machine or restored from an image. It was NOT replaced, and no service configuration " +
+                                  "was changed: Servy refuses to save any service while its secrets cannot be decrypted.";
 
-                string workaround = "Workaround:\n" +
-                                    "1. (If possible) Export service configurations to XML or JSON on the original machine.\n" +
-                                    "2. On the new machine, backup and delete the following folders:\n" +
-                                    "   - %ProgramData%\\Servy\\security\n" +
-                                    "   - %ProgramData%\\Servy\\db\n" +
-                                    "3. Import the services via the CLI, PowerShell, or Manager.\n" +
-                                    "4. You will need to re-enter usernames and passwords if your services run under specific accounts, as those secrets are not exported for security reasons.";
+                string workaround = "What to do:\n" +
+                                    "1. Do NOT delete or replace aes_key.dat or aes_iv.dat: a new key can never decrypt the existing database.\n" +
+                                    "2. Restore %ProgramData%\\Servy\\security\\aes_key.dat and aes_iv.dat from a backup of THIS machine, then restart Servy.\n" +
+                                    "3. Otherwise, copy %ProgramData%\\Servy\\db\\Servy.db back to the original machine (the one whose aes_key.dat " +
+                                    "encrypted it) and export the service configurations to XML or JSON there.\n" +
+                                    "4. Only then, on this machine, back up and delete %ProgramData%\\Servy\\security and %ProgramData%\\Servy\\db, " +
+                                    "and import the exported configurations via the CLI, PowerShell, or Manager. Usernames and passwords of services that " +
+                                    "run under specific accounts are not exported and must be re-entered.";
 
                 // Direct Event Log Surface
                 TryWriteServyEventLog($"{errorMsg}\n\n{workaround}\n\nError: {ex.Message}", EventLogEntryType.Error, EventIds.KeyUnprotectFailed);
@@ -450,6 +467,13 @@ namespace Servy.Core.Security
 
                 Logger.Error(msg, ex);
 
+                throw new InvalidOperationException(msg, ex);
+            }
+            catch (Exception ex) when (ex is TimeoutException || ex is System.Security.SecurityException)
+            {
+                var msg = $"Could not acquire the cross-process lock needed to create the {materialName} at '{path}'. " +
+                          "Another Servy process may be holding it, or the global lock could not be established.";
+                Logger.Error(msg, ex);
                 throw new InvalidOperationException(msg, ex);
             }
             finally
@@ -481,8 +505,7 @@ namespace Servy.Core.Security
 
                 // CHECK: Is this a child of the root vault?
                 // This prevents the "reset ACL" bug for subfolders like /db or /security
-                string root = AppConfig.ProgramDataPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-                bool isChildOfRoot = directory != null && directory.StartsWith(root, StringComparison.OrdinalIgnoreCase);
+                bool isChildOfRoot = IsChildOfVaultRoot(directory);
 
                 if (!string.IsNullOrEmpty(directory))
                 {
@@ -490,7 +513,7 @@ namespace Servy.Core.Security
                 }
 
                 // Encrypt data with DPAPI using the machine-specific key and additional entropy.
-                // DataProtectionScope is usually LocalMachine for services
+                // ProtectionScope is always LocalMachine, so every account on this machine shares the same DPAPI key
                 byte[] dynamicEntropy = MachineEntropy.Value;
                 encrypted = ProtectedData.Protect(data, dynamicEntropy, ProtectionScope);
 
@@ -541,6 +564,98 @@ namespace Servy.Core.Security
                     CryptographicOperations.ZeroMemory(encrypted);
                 }
             }
+        }
+
+        /// <summary>
+        /// Determines whether a directory lies below the Servy vault root, <see cref="AppConfig.ProgramDataPath"/>, where
+        /// key files inherit their DACL from the vault instead of carrying a protected one.
+        /// </summary>
+        /// <param name="directory">The directory that holds a key file.</param>
+        /// <returns><see langword="true"/> when <paramref name="directory"/> is below the vault root.</returns>
+        private static bool IsChildOfVaultRoot(string? directory)
+        {
+            string root = AppConfig.ProgramDataPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return directory != null && directory.StartsWith(root, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// On an elevated run, hands an existing key file that a principal other than <c>Administrators</c> or
+        /// <c>Local System</c> owns to <c>BUILTIN\Administrators</c> and re-hardens its DACL the way
+        /// <see cref="SaveProtected"/> writes it (#7531).
+        /// </summary>
+        /// <param name="path">The full filesystem path of the key file, already read and unprotected.</param>
+        /// <param name="materialName">A label for the material.</param>
+        /// <remarks>
+        /// <para>
+        /// A key file created by an earlier unelevated run, such as a portable install without a vault yet, is owned by
+        /// that user, who keeps an implicit right to rewrite its DACL. The file is still loaded, so the secrets it
+        /// encrypts stay readable; only its owner and DACL are changed.
+        /// </para>
+        /// <para>
+        /// An unelevated run leaves the file exactly as it is and loads it as before, so a command that reads the key
+        /// today without elevation keeps working. A reparse point is left as it is, because the ACL write would land on
+        /// the link's target. A failure to rewrite the owner or the DACL is logged and never stops the key from loading.
+        /// </para>
+        /// </remarks>
+        private static void EnsureAdministrativeOwner(string path, string materialName)
+        {
+            if (!SecurityHelper.IsAdministrator())
+                return;
+
+            try
+            {
+                var file = new FileInfo(path);
+                if ((file.Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint)
+                {
+                    Logger.Warn($"The {materialName} at '{path}' is a reparse point (symlink/junction), so its owner and ACL were left unchanged.");
+                    return;
+                }
+
+                var security = file.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+                var owner = security.GetOwner(typeof(SecurityIdentifier));
+                var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+
+                if (SecurityHelper.IsAdministrativePrincipal(owner))
+                    return;
+
+                // An owner keeps an implicit right to rewrite the DACL, so the file is handed over before it is re-hardened
+                security.SetOwner(adminSid);
+
+                SecurityIdentifier? currentUserSid;
+                using (var identity = WindowsIdentity.GetCurrent())
+                {
+                    currentUserSid = identity.User;
+                }
+
+                SecurityHelper.ApplySecurityRules(security, currentUserSid, breakInheritance: !IsChildOfVaultRoot(Path.GetDirectoryName(path)));
+                file.SetAccessControl(security);
+
+                Logger.Warn($"The {materialName} at '{path}' was owned by '{owner?.Value ?? "an unknown principal"}'. It was handed to BUILTIN\\Administrators and its ACL was re-hardened.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Could not take ownership of the {materialName} at '{path}' and re-harden its ACL. It was loaded anyway.", ex);
+            }
+        }
+
+        /// <summary>
+        /// Checks that unprotected key material has the length Servy generates. A blob that DPAPI accepts but that holds
+        /// material of another length is a corrupt or foreign file, never a key to derive from.
+        /// </summary>
+        /// <param name="material">The unprotected material.</param>
+        /// <param name="length">The expected length.</param>
+        /// <param name="materialName">A label for the material.</param>
+        /// <param name="path">The file it was read from.</param>
+        /// <returns><paramref name="material"/>, when its length is right.</returns>
+        /// <exception cref="CryptographicException">Thrown, after the material is zeroed, when the length is wrong.</exception>
+        internal static byte[] EnsureLength(byte[] material, int length, string materialName, string path)
+        {
+            if (material != null && material.Length == length)
+                return material;
+
+            var actual = material?.Length ?? 0;
+            if (material != null) CryptographicOperations.ZeroMemory(material);
+            throw new CryptographicException($"The {materialName} at '{path}' holds {actual} bytes instead of {length}.");
         }
 
         /// <summary>

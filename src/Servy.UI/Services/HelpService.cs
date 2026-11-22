@@ -19,6 +19,11 @@ namespace Servy.UI.Services
         private readonly IMessageBoxService _messageBoxService;
 
         /// <summary>
+        /// The application lifetime token, cancelled when the application begins shutting down.
+        /// </summary>
+        private readonly CancellationToken _appLifetimeToken;
+
+        /// <summary>
         /// Shared instance to prevent socket exhaustion and allow connection pooling.
         /// </summary>
         private static readonly HttpClient _httpClient = new HttpClient();
@@ -39,13 +44,15 @@ namespace Servy.UI.Services
         /// Initializes a new instance of the <see cref="HelpService"/> class.
         /// </summary>
         /// <param name="messageBoxService">The message box service used for UI dialogs.</param>
-        public HelpService(IMessageBoxService messageBoxService)
+        /// <param name="appLifetimeToken">The application lifetime token, cancelled when the application begins shutting down.</param>
+        public HelpService(IMessageBoxService messageBoxService, CancellationToken appLifetimeToken = default)
         {
             _messageBoxService = messageBoxService ?? throw new ArgumentNullException(nameof(messageBoxService));
+            _appLifetimeToken = appLifetimeToken;
         }
 
         /// <inheritdoc />
-        public async Task OpenDocumentationAsync(string caption)
+        public async Task OpenDocumentationAsync(string caption, CancellationToken cancellationToken = default)
         {
             try
             {
@@ -64,12 +71,14 @@ namespace Servy.UI.Services
         }
 
         /// <inheritdoc />
-        public async Task CheckUpdatesAsync(string caption)
+        public async Task CheckUpdatesAsync(string caption, CancellationToken cancellationToken = default)
         {
             try
             {
                 // Patience window for a manual UI trigger (see AppConfig.UpdateCheckTimeoutSeconds)
-                using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(AppConfig.UpdateCheckTimeoutSeconds)))
+                using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(AppConfig.UpdateCheckTimeoutSeconds)))
+                // Link the timeout to application shutdown and to the caller, so closing the app cancels the request
+                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, _appLifetimeToken, cancellationToken))
                 using (var response = await _httpClient.GetAsync(AppConfig.LatestReleaseApiUrl, cts.Token))
                 {
                     response.EnsureSuccessStatusCode();
@@ -80,7 +89,9 @@ namespace Servy.UI.Services
 
                     if (string.IsNullOrEmpty(tagName))
                     {
-                        await _messageBoxService.ShowInfoAsync(Strings.Msg_NoUpdatesAvailable, caption);
+                        Logger.Warn("Update check response carried no tag_name; the payload was not a release object.");
+                        await _messageBoxService.ShowErrorAsync(
+                            string.Format(Strings.Msg_UpdateCheckInvalidTag, "<missing>"), caption);
                         return;
                     }
 
@@ -102,7 +113,8 @@ namespace Servy.UI.Services
                     // This prevents false positives caused by System.Version evaluating missing fields (-1) as less than 0.
                     var normalizedLatest = NormalizeVersion(latestVersion);
 
-                    // Fall back to a blank version array if the assembly definition configuration is malformed
+                    // Fall back to version 0.0.0.0 when the running assembly's version could not be parsed
+                    // (AppConfig.Version is "unknown" when the assembly has no version).
                     var normalizedCurrent = NormalizeVersion(currentVersion ?? new Version(0, 0, 0, 0));
 
                     if (normalizedLatest > normalizedCurrent)
@@ -112,7 +124,16 @@ namespace Servy.UI.Services
                         {
                             const string headlessLabel = "CheckUpdates";
                             const string fallbackDebug = "Release link opened in an existing process.";
-                            OpenExternalUrl(AppConfig.LatestReleaseLink, headlessLabel, fallbackDebug);
+                            try
+                            {
+                                OpenExternalUrl(AppConfig.LatestReleaseLink, headlessLabel, fallbackDebug);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Error($"Failed to open release link: {AppConfig.LatestReleaseLink}", ex);
+                                await _messageBoxService.ShowErrorAsync(
+                                    string.Format(Strings.Msg_ReleaseLinkOpenFailed, ex.Message), caption);
+                            }
                         }
                     }
                     else
@@ -123,6 +144,14 @@ namespace Servy.UI.Services
             }
             catch (OperationCanceledException)
             {
+                if (_appLifetimeToken.IsCancellationRequested || cancellationToken.IsCancellationRequested)
+                {
+                    // Cancelled by application shutdown or by the caller, not by the update-check deadline
+                    Logger.Warn("Update check canceled.");
+                    await _messageBoxService.ShowErrorAsync(Strings.Msg_UpdateCheckCanceled, caption);
+                    return;
+                }
+
                 // Specific handling for the update-check timeout (AppConfig.UpdateCheckTimeoutSeconds)
                 Logger.Warn("Update check timed out.");
                 await _messageBoxService.ShowErrorAsync(Strings.Msg_UpdateCheckTimeout, caption);
@@ -151,7 +180,7 @@ namespace Servy.UI.Services
         }
 
         /// <inheritdoc />
-        public async Task OpenAboutDialogAsync(string about, string caption)
+        public async Task OpenAboutDialogAsync(string about, string caption, CancellationToken cancellationToken = default)
         {
             await _messageBoxService.ShowInfoAsync(about, caption);
         }
@@ -160,13 +189,13 @@ namespace Servy.UI.Services
         /// Opens a URL using the system's default browser or logs the action if running in headless mode.
         /// </summary>
         /// <param name="url">The external web address or file path to open.</param>
-        /// <param name="headlessLabel">A descriptive label used for console output when <see cref="IsHeadlessMode"/> is true.</param>
+        /// <param name="headlessLabel">A descriptive label used for console output when <see cref="UiHeadless.IsEnabled"/> is true.</param>
         /// <param name="fallbackDebug">The debug message to log if the process cannot be tracked (e.g., when handed off to an existing browser instance).</param>
         /// <remarks>
         /// This method handles the non-deterministic return value of <see cref="Process.Start(ProcessStartInfo)"/>.
         /// When a URL is handed off to an existing browser process, the method immediately logs
         /// the <paramref name="fallbackDebug"/> message. In UI environments, any returned process
-        /// handle is disposed immediately to prevent resource leaks in the Manager interface.
+        /// handle is disposed immediately to prevent resource leaks.
         /// </remarks>
         private static void OpenExternalUrl(string url, string headlessLabel, string fallbackDebug)
         {
@@ -178,18 +207,13 @@ namespace Servy.UI.Services
             }
 
             // Process.Start can return null if it hands off to an existing browser instance
-            var process = Process.Start(psi);
-            if (process != null)
+            using (var process = Process.Start(psi))
             {
-                using (process)
+                if (process == null)
                 {
-                    // Native handle is closed immediately after launch
-                    // to prevent leaks in the Manager UI.
+                    // ShellExecute hands a URL to an already-running browser and returns no Process.
+                    Logger.Debug(fallbackDebug);
                 }
-            }
-            else
-            {
-                Logger.Debug(fallbackDebug);
             }
         }
     }

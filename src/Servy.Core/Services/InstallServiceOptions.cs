@@ -47,7 +47,12 @@ namespace Servy.Core.Services
         /// <summary>Enable size-based log rotation.</summary>
         public bool EnableSizeRotation { get; set; } = AppConfig.DefaultEnableSizeRotation;
 
-        /// <summary>Size threshold in bytes that triggers a log rotation. Only used when <see cref="EnableSizeRotation"/> is true; the value is clamped to a minimum of 1 MB.</summary>
+        /// <summary>
+        /// Size threshold in bytes that triggers a log rotation. Only used when <see cref="EnableSizeRotation"/> is true.
+        /// Callers are expected to supply a value of at least <see cref="AppConfig.MinRotationSize"/> MB;
+        /// <see cref="Servy.Core.Validation.IServiceValidationRules"/> enforces that bound on the DTO before mapping,
+        /// and a value below 1 MB disables rotation rather than lowering the threshold.
+        /// </summary>
         public long RotationSizeInBytes { get; set; } = AppConfig.ToBytes(AppConfig.DefaultRotationSizeMB);
 
         /// <summary>Use local system time (instead of UTC) for log rotation. Defaults to <see cref="AppConfig.DefaultUseLocalTimeForRotation"/>.</summary>
@@ -89,13 +94,28 @@ namespace Servy.Core.Services
         /// <summary>Failure program working directory.</summary>
         public string? FailureProgramStartupDirectory { get; set; }
 
-        /// <summary>Failure program parameters.</summary>
-        public string? FailureProgramArgs { get; set; }
+        /// <summary>The command line arguments to pass to the failure program.</summary>
+        public string? FailureProgramExecutableArgs { get; set; }
 
-        /// <summary>Environment variables.</summary>
+        /// <summary>
+        /// Environment variables for the wrapped process as <c>KEY=VALUE</c> pairs separated by semicolons or newlines
+        /// (a literal '=' or ';' inside a value is escaped with a backslash). Not validated by
+        /// <see cref="IServiceManager.InstallServiceAsync"/>; callers run <see cref="Servy.Core.Validation.IServiceValidationRules"/>
+        /// (or <see cref="Servy.Core.EnvironmentVariables.EnvironmentVariablesValidator"/>) before installing.
+        /// </summary>
         public string? EnvironmentVariables { get; set; }
 
-        /// <summary>Service dependencies.</summary>
+        /// <summary>
+        /// Whether to allow overriding of protected runtime variables (e.g., <c>JAVA_HOME</c>, <c>JAVA_OPTS</c>, <c>CATALINA_OPTS</c>) by the service's environment variables.
+        /// </summary>
+        public bool AllowOverriddenRuntimeVars { get; set; }
+
+        /// <summary>
+        /// Names of the services this service depends on, separated by semicolons or newlines (not commas).
+        /// A name may carry a leading '+' to reference a load-order group. Not validated by
+        /// <see cref="IServiceManager.InstallServiceAsync"/>; callers run <see cref="Servy.Core.Validation.IServiceValidationRules"/>
+        /// (or <see cref="Servy.Core.ServiceDependencies.ServiceDependenciesValidator"/>) before installing.
+        /// </summary>
         public string? ServiceDependencies { get; set; }
 
         /// <summary>Service account username: .\username  for local accounts, DOMAIN\username for domain accounts.</summary>
@@ -110,10 +130,10 @@ namespace Servy.Core.Services
         /// <summary>Pre-launch working directory.</summary>
         public string? PreLaunchStartupDirectory { get; set; }
 
-        /// <summary>Command line arguments to pass to the pre-launch executable.</summary>
+        /// <summary>The command line arguments to pass to the pre-launch executable.</summary>
         public string? PreLaunchArgs { get; set; }
 
-        /// <summary>Pre-launch environment variables.</summary>
+        /// <summary>Environment variables for the pre-launch process, in the same <c>KEY=VALUE</c> format and with the same caller-side validation as <see cref="EnvironmentVariables"/>.</summary>
         public string? PreLaunchEnvironmentVariables { get; set; }
 
         /// <summary>Optional path for pre-launch standard output redirection. If null, no redirection is performed.</summary>
@@ -137,7 +157,7 @@ namespace Servy.Core.Services
         /// <summary>Post-launch working directory.</summary>
         public string? PostLaunchStartupDirectory { get; set; }
 
-        /// <summary>Command line arguments to pass to the post-launch executable.</summary>
+        /// <summary>The command line arguments to pass to the post-launch executable.</summary>
         public string? PostLaunchArgs { get; set; }
 
         /// <summary>Enable debug logs for the service wrapper.</summary>
@@ -167,7 +187,7 @@ namespace Servy.Core.Services
         /// <summary>The startup directory for the pre-stop executable.</summary>
         public string? PreStopStartupDirectory { get; set; }
 
-        /// <summary>The parameters for the pre-stop executable.</summary>
+        /// <summary>The command line arguments to pass to the pre-stop executable.</summary>
         public string? PreStopArgs { get; set; }
 
         /// <summary>The maximum time in seconds to wait for the pre-stop executable to complete.</summary>
@@ -182,7 +202,7 @@ namespace Servy.Core.Services
         /// <summary>The startup directory for the post-stop executable.</summary>
         public string? PostStopStartupDirectory { get; set; }
 
-        /// <summary>The parameters for the post-stop executable.</summary>
+        /// <summary>The command line arguments to pass to the post-stop executable.</summary>
         public string? PostStopArgs { get; set; }
     }
 }

@@ -231,7 +231,7 @@ namespace Servy.Core.Helpers
                         var now = DateTime.UtcNow;
                         var totalTime = process.TotalProcessorTime;
 
-                        if (!_prevCpuTimes.TryGetValue(pid, out var prev) || prev == null)
+                        if (!_prevCpuTimes.TryGetValue(pid, out var prev))
                         {
                             UpdateCpuSample(pid, now, totalTime);
                             return new ProcessMetrics(0, ram);
@@ -289,9 +289,10 @@ namespace Servy.Core.Helpers
                 totalRam += metrics.RamUsage;
             }
 
-            // CPU is normalized 0-100% of whole-machine capacity. The sum across a tree
-            // is bounded by 100% because they share the same physical cores.
-            totalCpu = Math.Min(Math.Max(totalCpu, 0.0), 100.0);
+            // CPU is normalized 0-100% of whole-machine capacity. Per-process values are non-negative by
+            // construction, so only the upper bound needs enforcing: the sum across a tree is bounded by
+            // 100% because the processes share the same physical cores.
+            totalCpu = Math.Min(totalCpu, 100.0);
             return new ProcessMetrics(totalCpu, totalRam);
         }
 
@@ -305,34 +306,19 @@ namespace Servy.Core.Helpers
         /// <inheritdoc />
         public string FormatRamUsage(long ramUsage)
         {
-            const double KB = 1024.0;
-            const double MB = KB * 1024.0;
-            const double GB = MB * 1024.0;
-            const double TB = GB * 1024.0;
+            string[] units = { "B", "KB", "MB", "GB", "TB" };
 
-            string result;
-            if (ramUsage < KB)
+            double value = ramUsage;
+            int unit = 0;
+
+            while (unit < units.Length - 1 &&
+                   Math.Round(value, 1, MidpointRounding.AwayFromZero) >= 1024.0)
             {
-                result = $"{ramUsage.ToString("0.0", CultureInfo.InvariantCulture)} B";
-            }
-            else if (ramUsage < MB)
-            {
-                result = $"{(ramUsage / KB).ToString("0.0", CultureInfo.InvariantCulture)} KB";
-            }
-            else if (ramUsage < GB)
-            {
-                result = $"{(ramUsage / MB).ToString("0.0", CultureInfo.InvariantCulture)} MB";
-            }
-            else if (ramUsage < TB)
-            {
-                result = $"{(ramUsage / GB).ToString("0.0", CultureInfo.InvariantCulture)} GB";
-            }
-            else
-            {
-                result = $"{(ramUsage / TB).ToString("0.0", CultureInfo.InvariantCulture)} TB";
+                value /= 1024.0;
+                unit++;
             }
 
-            return result;
+            return $"{value.ToString("0.0", CultureInfo.InvariantCulture)} {units[unit]}";
         }
 
         /// <inheritdoc />
@@ -342,8 +328,9 @@ namespace Servy.Core.Helpers
 
             inputPath = inputPath.Trim();
 
-            // 1. Expand variables (Note: only expands variables existing in the calling process's environment)
-            var expandedPath = Environment.ExpandEnvironmentVariables(inputPath);
+            // 1. Expand variables against the process environment, brought up to date first with the System variables
+            //    added or changed in the registry since the process started (#7393); one removed is dropped only in an application
+            var expandedPath = SystemEnvironmentHelper.ExpandSystemEnvironmentVariables(inputPath);
 
             // 2. Ensure the path is absolute before checking the filesystem
             if (!Helper.IsAbsolute(expandedPath))
@@ -351,7 +338,7 @@ namespace Servy.Core.Helpers
                 throw new InvalidOperationException($"Path '{expandedPath}' is relative. Only absolute paths are allowed.");
             }
 
-            // 3. Normalize (removes trailing slashes, resolves ..\ segments)
+            // 3. Normalize (resolves .\ and ..\ segments; a trailing separator is kept, unlike Helper.NormalizePath)
             var normalizedPath = Path.GetFullPath(expandedPath);
 
             return normalizedPath;

@@ -18,18 +18,6 @@ namespace Servy.Core.Native
         #region Helper Methods
 
         /// <summary>
-        /// A safelist of built-in Windows accounts that are actual service runners.
-        /// These do not have passwords and cannot be validated via LogonUser.
-        /// Constructed dynamically from the canonical alias sets defined in <see cref="ServiceAccounts"/>.
-        /// </summary>
-        private static readonly HashSet<string> RunnableServiceAccounts = new HashSet<string>(
-            ServiceAccounts.LocalSystemAliases
-                .Union(ServiceAccounts.LocalServiceAliases)
-                .Union(ServiceAccounts.NetworkServiceAliases),
-            StringComparer.OrdinalIgnoreCase
-        );
-
-        /// <summary>
         /// Identifies well-known Windows groups or logon contexts that are NOT
         /// valid runnable service accounts, despite being passwordless.
         /// </summary>
@@ -40,7 +28,13 @@ namespace Servy.Core.Native
             "Batch", "NT AUTHORITY\\Batch",
             "Interactive", "NT AUTHORITY\\Interactive",
             "Service", "NT AUTHORITY\\Service",
-            "Network", "NT AUTHORITY\\Network"
+            "Network", "NT AUTHORITY\\Network",
+
+            // BUILTIN\ groups: real, resolvable SIDs that can never run a service.
+            // Without these, LogonUser reports them as a bad password (see #ERROR_LOGON_FAILURE path).
+            "BUILTIN\\Administrators", "BUILTIN\\Users", "BUILTIN\\Guests",
+            "BUILTIN\\Power Users", "BUILTIN\\Remote Desktop Users", "BUILTIN\\Backup Operators",
+            "Administrators", "Users", "Guests"
         };
 
         /// <summary>
@@ -58,6 +52,7 @@ namespace Servy.Core.Native
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentException("username cannot be empty or whitespace.", nameof(username));
 
+            // Keep trimming for safety
             username = username.Trim();
 
             // 0. FORBIDDEN GROUP CHECK
@@ -69,19 +64,16 @@ namespace Servy.Core.Native
 
             // The pattern safely allows for 'NT AUTHORITY\Account', 'DOMAIN\Account', or '.\Account'
             const string pattern = @"^[\w \.\-]+\\[\w \.@!\-]+\$?$";
-            var isGmsa = string.IsNullOrEmpty(password) && username.EndsWith('$');
+            var isGmsa = ServiceAccounts.IsGmsa(username, password);
 
-            // 1. Check the static exhaustive list (Case-Insensitive via HashSet comparer).
-            // 2. Catch Virtual Service Accounts (NT SERVICE\...)
-            // 3. Catch IIS AppPool Identities (IIS APPPOOL\...)
-            var isVirtualAccount = username.StartsWith("NT SERVICE\\", StringComparison.OrdinalIgnoreCase)
-                                   || username.StartsWith("IIS APPPOOL\\", StringComparison.OrdinalIgnoreCase);
-            var isBuiltIn = RunnableServiceAccounts.Contains(username) || isVirtualAccount;
+            // Check if the account is an OS-managed built-in service account
+            var isBuiltIn = ServiceAccounts.IsBuiltInServiceAccount(username);
 
             // Logon Validation Guard for Built-in Accounts
-            // These accounts (NetworkService, Virtual Accounts, etc.) are managed by the OS.
-            // We short-circuit here to prevent Identity Resolution (Translate) from failing on
-            // dot-prefixed formats like '.\NetworkService' which do not exist in the local SAM.
+            // These accounts (NetworkService, Virtual Accounts, etc.) are managed by the OS and are
+            // returned early for two reasons: Translate() fails on dot-prefixed forms like
+            // '.\NetworkService' that do not exist in the local SAM, and their specialised formats
+            // would be false negatives against the username regex below.
             if (isBuiltIn)
             {
                 if (!string.IsNullOrEmpty(password))
@@ -91,8 +83,6 @@ namespace Servy.Core.Native
                 return;
             }
 
-            // Skip regex validation for known built-in identities to avoid false negatives
-            // on specialized formats.
             const string invalidMsg = "Username format is invalid. Expected .\\Username, DOMAIN\\Username, or NT AUTHORITY\\ServiceAccount.";
             if (!Regex.IsMatch(username, pattern, RegexOptions.IgnoreCase, AppConfig.InputRegexTimeout))
             {
@@ -105,7 +95,7 @@ namespace Servy.Core.Native
             string domain = parts[0].Trim();
             string user = parts[1].Trim();
 
-            if (string.IsNullOrWhiteSpace(domain) || string.IsNullOrWhiteSpace(user?.TrimEnd('$')))
+            if (string.IsNullOrWhiteSpace(domain) || string.IsNullOrWhiteSpace(user.TrimEnd('$')))
             {
                 throw new ArgumentException(invalidMsg);
             }
@@ -113,11 +103,7 @@ namespace Servy.Core.Native
             // 1. Identity Resolution
             try
             {
-                string translationName = username;
-                if (username.StartsWith(".\\", StringComparison.OrdinalIgnoreCase))
-                {
-                    translationName = Environment.MachineName + username.Substring(1);
-                }
+                string translationName = ServiceAccounts.ExpandLocalShorthand(username);
                 var ntAccount = new NTAccount(translationName);
                 _ = ntAccount.Translate(typeof(SecurityIdentifier));
             }
@@ -169,7 +155,7 @@ namespace Servy.Core.Native
                             error = Marshal.GetLastWin32Error();
                             if (error == Errors.ERROR_LOGON_FAILURE) throw new UnauthorizedAccessException("Invalid username or password.");
                             throw new Win32Exception(error,
-                                $"Service logon failed. Ensure the account has 'Log on as a service' (granted automatically by Servy) and is not denied service logon.");
+                                "Service logon failed. Ensure the account has 'Log on as a service' (granted automatically by Servy) and is not denied service logon.");
                         default:
                             throw new Win32Exception(error, $"Logon failed with error code {error}.");
                     }
@@ -231,12 +217,12 @@ namespace Servy.Core.Native
         /// Probes a file to capture its unique identity using OS handles and cryptographic content digests.
         /// </summary>
         /// <param name="fs">The open file stream.</param>
-        /// <returns>A populated identity structure. Check <see cref="FILE_IDENTITY.IsValidHandleInfo"/> for success state.</returns>
-        public static FILE_IDENTITY GetFileIdentity(FileStream fs)
+        /// <returns>A populated identity structure. Check <see cref="FileIdentity.IsValidHandleInfo"/> for success state.</returns>
+        public static FileIdentity GetFileIdentity(FileStream fs)
         {
             if (fs == null) throw new ArgumentNullException(nameof(fs));
 
-            var identity = new FILE_IDENTITY { PrefixDigest = string.Empty };
+            var identity = new FileIdentity { PrefixDigest = null };
 
             // 1. Kernel32 Handle Probe
             try
@@ -266,8 +252,8 @@ namespace Servy.Core.Native
                     {
                         fs.Seek(0, SeekOrigin.Begin);
 
-                        // Buffer size is configurable via AppConfig to get past common log headers/prologues.
-                        // We also incorporate fs.Length to differentiate rotated logs that have identical prefixes but different sizes.
+                        // AppConfig.FileIdentityPrefixBytes (4096) clears common application log headers
+                        // and prologues, so two rotated logs sharing a prologue still hash differently.
                         byte[] buffer = new byte[AppConfig.FileIdentityPrefixBytes];
 
                         int read = 0;
@@ -287,12 +273,14 @@ namespace Servy.Core.Native
                             {
                                 sha256.AppendData(buffer, 0, read);
 
-                                // Length-domain separator so 'AB' + 8-byte little-endian length cannot collide with 'A' + 'B' + 8-byte little-endian length.
+                                // Mix in the total size so two files with identical prefixes but different
+                                // lengths do not produce the same digest (#2130).
                                 sha256.AppendData(BitConverter.GetBytes(fs.Length));
 
                                 byte[] hashBytes = sha256.GetHashAndReset();
 
-                                // Store as a lowercase hex string for consistent identification across probes and to catch size drifts.
+                                // Lowercase hex string rather than a byte[] so FileIdentity.IsDifferentFrom
+                                // can compare digests with != instead of comparing arrays by reference.
                                 identity.PrefixDigest = Convert.ToHexString(hashBytes).ToLowerInvariant();
                             }
                         }

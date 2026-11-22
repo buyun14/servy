@@ -1,5 +1,6 @@
 using Servy.Manager.Config;
 using System.ComponentModel;
+using System.Reflection;
 using AppConfig = Servy.Core.Config.AppConfig;
 
 namespace Servy.Manager.UnitTests.Config
@@ -18,9 +19,9 @@ namespace Servy.Manager.UnitTests.Config
 
             // Assert - Refresh Intervals
             Assert.Equal(AppConfig.DefaultRefreshIntervalInSeconds, config.RefreshIntervalInSeconds);
-            Assert.Equal(AppConfig.DefaultPerformanceRefreshIntervalInMs, config.PerformanceRefreshIntervalInMs);
-            Assert.Equal(AppConfig.DefaultConsoleRefreshIntervalInMs, config.ConsoleRefreshIntervalInMs);
-            Assert.Equal(AppConfig.DefaultDependenciesRefreshIntervalInMs, config.DependenciesRefreshIntervalInMs);
+            Assert.Equal(AppConfig.DefaultMonitoringRefreshIntervalMs, config.PerformanceRefreshIntervalMs);
+            Assert.Equal(AppConfig.DefaultMonitoringRefreshIntervalMs, config.ConsoleRefreshIntervalMs);
+            Assert.Equal(AppConfig.DefaultMonitoringRefreshIntervalMs, config.DependenciesRefreshIntervalMs);
 
             // Assert - Limits and Thresholds
             Assert.Equal(AppConfig.DefaultConsoleMaxLines, config.ConsoleMaxLines);
@@ -30,10 +31,22 @@ namespace Servy.Manager.UnitTests.Config
 
             // Assert - Paths
             Assert.Equal(AppConfig.DefaultDesktopAppPublishPath, config.DesktopAppPublishPath);
+
+            // Assert - Column visibility: nothing is hidden at design time
+            Assert.Equal(string.Empty, config.ServicesHiddenColumns);
+            Assert.Equal(string.Empty, config.LogsHiddenColumns);
+
+            // Assert - Migration flag: the stub reports the display-name column migration as not done
+            Assert.False(config.IsDisplayNameColumnMigrated);
+
+            // Assert - Window layout: nothing is persisted at design time, so the default layout applies
+            Assert.Equal(string.Empty, config.MainWindowPlacement);
+            Assert.Equal(string.Empty, config.ServicesColumnWidths);
+            Assert.Equal(string.Empty, config.LogsColumnWidths);
         }
 
         [Fact]
-        public void DesignTimeAppConfig_PropertyChanged_DiscardsSubscribersAndNeverRaises()
+        public void DesignTimeAppConfig_PropertyChanged_SubscribeAndUnsubscribeRaiseNothing()
         {
             // Arrange
             IAppConfiguration config = new DesignTimeAppConfig();
@@ -49,6 +62,22 @@ namespace Servy.Manager.UnitTests.Config
 
             // Assert: Verify that adding/removing the event handler is a complete no-op and never notifies subscribers
             Assert.Equal(0, raisedCount);
+        }
+
+        [Fact]
+        public void DesignTimeAppConfig_PropertyChanged_DiscardsSubscribers()
+        {
+            // Arrange
+            // An auto-implemented event compiles to a private backing field and would retain every
+            // designer subscriber; the empty add/remove accessors compile to no field at all, which
+            // is the whole reason this stub declares them explicitly.
+
+            // Act
+            var backingField = typeof(DesignTimeAppConfig)
+                .GetField(nameof(IAppConfiguration.PropertyChanged), BindingFlags.Instance | BindingFlags.NonPublic);
+
+            // Assert
+            Assert.Null(backingField);
         }
     }
 }

@@ -18,7 +18,7 @@ namespace Servy.Infrastructure.Data
     public class DapperExecutor : IDapperExecutor
     {
         private const string RetryLoopMisconfiguredMessage =
-            "Database retry budget is exhausted before any attempt was made. Verify AppConfig.Db*MaxRetries is > 0.";
+            "Database retry budget is exhausted before any attempt was made. Verify AppConfig.DbSyncMaxAttempts and AppConfig.DbAsyncMaxAttempts are > 0.";
 
         private readonly IAppDbContext _dbContext;
 
@@ -26,6 +26,7 @@ namespace Servy.Infrastructure.Data
         /// Initializes a new instance of the <see cref="DapperExecutor"/> class.
         /// </summary>
         /// <param name="dbContext">The database context used to manage SQLite connections.</param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="dbContext"/> is null.</exception>
         public DapperExecutor(IAppDbContext dbContext)
         {
             _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
@@ -105,6 +106,24 @@ namespace Servy.Infrastructure.Data
             return transaction is WrappedDbTransaction wrapper ? wrapper.Transaction : transaction;
         }
 
+        /// <summary>
+        /// Re-binds a <see cref="CommandDefinition"/> so Dapper receives the unwrapped native transaction
+        /// (<paramref name="actualTx"/>) instead of the <see cref="WrappedDbTransaction"/> the caller passed in.
+        /// Note: <paramref name="ct"/> is the same token as <see cref="CommandDefinition.CancellationToken"/>
+        /// on every attempt - ExecuteWithRetryAsync does not mint a fresh per-attempt token today.
+        /// </summary>
+        private static CommandDefinition Rebind(in CommandDefinition command, IDbTransaction? actualTx, CancellationToken ct)
+        {
+            return new CommandDefinition(
+                command.CommandText,
+                command.Parameters,
+                actualTx,
+                command.CommandTimeout,
+                command.CommandType,
+                command.Flags,
+                ct);
+        }
+
         /// <inheritdoc />
         public IDbTransaction BeginTransaction() =>
             ExecuteWithRetry(() =>
@@ -118,7 +137,7 @@ namespace Servy.Infrastructure.Data
                 }
                 catch
                 {
-                    connection?.Dispose();
+                    connection.Dispose();
                     throw;
                 }
             }, "BEGIN TRANSACTION")!;
@@ -133,7 +152,7 @@ namespace Servy.Infrastructure.Data
         /// </summary>
         private T? ExecuteWithRetry<T>(Func<T> action, string? sql = null)
         {
-            for (int i = 0; i < AppConfig.DbSyncMaxRetries; i++)
+            for (int i = 0; i < AppConfig.DbSyncMaxAttempts; i++)
             {
                 try
                 {
@@ -143,7 +162,7 @@ namespace Servy.Infrastructure.Data
                 {
                     string queryContext = FormatSqlForLog(sql);
 
-                    if (i == AppConfig.DbSyncMaxRetries - 1)
+                    if (i == AppConfig.DbSyncMaxAttempts - 1)
                     {
                         Logger.Warn($"Sync database operation exhausted bounded retry budget. Query: [{queryContext}]");
                         throw;
@@ -152,7 +171,7 @@ namespace Servy.Infrastructure.Data
                     // Use the unified helper with Sync-specific configuration
                     int delay = CalculateBackoff(i, AppConfig.DbSyncInitialDelayMs, AppConfig.DbSyncMaxJitterMs);
 
-                    Logger.Warn($"Database busy (sync attempt {i + 1}/{AppConfig.DbSyncMaxRetries}). Spinning for {delay}ms... Query: [{queryContext}]");
+                    Logger.Warn($"Database busy (sync attempt {i + 1}/{AppConfig.DbSyncMaxAttempts}). Retrying in {delay}ms... Query: [{queryContext}]");
 
                     Thread.Sleep(delay);
                 }
@@ -166,7 +185,7 @@ namespace Servy.Infrastructure.Data
         /// </summary>
         private async Task<T?> ExecuteWithRetryAsync<T>(Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken, string? sql = null)
         {
-            for (int i = 0; i < AppConfig.DbAsyncMaxRetries; i++)
+            for (int i = 0; i < AppConfig.DbAsyncMaxAttempts; i++)
             {
                 // Fail fast if the operation was cancelled before or during the retry loop
                 cancellationToken.ThrowIfCancellationRequested();
@@ -179,7 +198,7 @@ namespace Servy.Infrastructure.Data
                 {
                     string queryContext = FormatSqlForLog(sql);
 
-                    if (i == AppConfig.DbAsyncMaxRetries - 1)
+                    if (i == AppConfig.DbAsyncMaxAttempts - 1)
                     {
                         Logger.Warn($"Async database operation exhausted bounded retry budget. Query: [{queryContext}]");
                         throw;
@@ -187,7 +206,7 @@ namespace Servy.Infrastructure.Data
 
                     // Use the unified helper with Async-specific configuration
                     int delay = CalculateBackoff(i, AppConfig.DbAsyncInitialDelayMs, AppConfig.DbAsyncMaxJitterMs);
-                    Logger.Warn($"Database busy (async attempt {i + 1}/{AppConfig.DbAsyncMaxRetries}). Retrying in {delay}ms... Query: [{queryContext}]");
+                    Logger.Warn($"Database busy (async attempt {i + 1}/{AppConfig.DbAsyncMaxAttempts}). Retrying in {delay}ms... Query: [{queryContext}]");
 
                     // Critical: Pass the token to Task.Delay so we don't hang if cancelled during backoff
                     await Task.Delay(delay, cancellationToken);
@@ -207,7 +226,7 @@ namespace Servy.Infrastructure.Data
         /// <returns>The calculated delay in milliseconds, representing the capped exponential backoff plus a random jitter component.</returns>
         private static int CalculateBackoff(int attempt, int initialDelayMs, int maxJitterMs, int maxBackoffMs = AppConfig.DbBackoffMaxMs)
         {
-            // Use long math and cap to prevent silent overflow if MaxRetries is ever raised
+            // Use long math and cap to prevent silent overflow if DbSyncMaxAttempts or DbAsyncMaxAttempts is ever raised
             long shifted = (long)initialDelayMs << Math.Min(attempt, 30);
             int backoff = (int)Math.Min(shifted, maxBackoffMs);
             int jitter = Random.Shared.Next(0, maxJitterMs + 1);
@@ -217,7 +236,7 @@ namespace Servy.Infrastructure.Data
         /// <summary>
         /// Flattens and truncates an SQL string for clean, single-line log output.
         /// </summary>
-        private static string FormatSqlForLog(string? sql, int maxLength = 60)
+        private static string FormatSqlForLog(string? sql, int maxLength = AppConfig.DbSqlLogMaxLength)
         {
             if (string.IsNullOrWhiteSpace(sql)) return "Unknown Query";
 
@@ -337,7 +356,7 @@ namespace Servy.Infrastructure.Data
                 }
                 catch
                 {
-                    connection?.Dispose();
+                    connection.Dispose();
                     throw;
                 }
             }, cancellationToken, "BEGIN TRANSACTION"))!;
@@ -402,18 +421,7 @@ namespace Servy.Infrastructure.Data
 
             return await ExecuteWithRetryAsync(async (ct) =>
             {
-                // Re-bind the CommandDefinition here so Dapper receives the unwrapped native transaction
-                // (actualTx) instead of the WrappedDbTransaction the caller passed in. Note: 'ct' is the
-                // same token as command.CancellationToken on every attempt - ExecuteWithRetryAsync does not
-                // mint a fresh per-attempt token today.
-                var cmd = new CommandDefinition(
-                    command.CommandText,
-                    command.Parameters,
-                    actualTx,
-                    command.CommandTimeout,
-                    command.CommandType,
-                    command.Flags,
-                    ct);
+                var cmd = Rebind(command, actualTx, ct);
 
                 if (cmd.Transaction != null)
                 {
@@ -453,18 +461,7 @@ namespace Servy.Infrastructure.Data
 
             return await ExecuteWithRetryAsync(async (ct) =>
             {
-                // Re-bind the CommandDefinition here so Dapper receives the unwrapped native transaction
-                // (actualTx) instead of the WrappedDbTransaction the caller passed in. Note: 'ct' is the
-                // same token as command.CancellationToken on every attempt - ExecuteWithRetryAsync does not
-                // mint a fresh per-attempt token today.
-                var cmd = new CommandDefinition(
-                    command.CommandText,
-                    command.Parameters,
-                    actualTx,
-                    command.CommandTimeout,
-                    command.CommandType,
-                    command.Flags,
-                    ct);
+                var cmd = Rebind(command, actualTx, ct);
 
                 if (cmd.Transaction != null)
                 {
@@ -486,18 +483,7 @@ namespace Servy.Infrastructure.Data
 
             return await ExecuteWithRetryAsync(async (ct) =>
             {
-                // Re-bind the CommandDefinition here so Dapper receives the unwrapped native transaction
-                // (actualTx) instead of the WrappedDbTransaction the caller passed in. Note: 'ct' is the
-                // same token as command.CancellationToken on every attempt - ExecuteWithRetryAsync does not
-                // mint a fresh per-attempt token today.
-                var cmd = new CommandDefinition(
-                    command.CommandText,
-                    command.Parameters,
-                    actualTx,
-                    command.CommandTimeout,
-                    command.CommandType,
-                    command.Flags,
-                    ct);
+                var cmd = Rebind(command, actualTx, ct);
 
                 if (cmd.Transaction != null)
                 {

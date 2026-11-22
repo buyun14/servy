@@ -34,16 +34,62 @@ namespace Servy.Manager.UnitTests.Converters
         #region Constructor Dependency Injection & Fallback Tests
 
         [Fact]
+        public void Constructor_DesignMode_FallsBackToDesignTimeHelper()
+        {
+            // Arrange
+            var originalCheck = ProcessMetricConverter<double>.IsInDesignModeCheck;
+            ProcessMetricConverter<double>.IsInDesignModeCheck = () => true;
+
+            try
+            {
+                // Act
+                var converter = new TestMetricConverter();
+
+                // Assert
+                Assert.NotNull(converter.ExposedProcessHelper);
+                Assert.IsType<DesignTimeProcessHelper>(converter.ExposedProcessHelper);
+            }
+            finally
+            {
+                ProcessMetricConverter<double>.IsInDesignModeCheck = originalCheck;
+            }
+        }
+
+        [Fact]
+        public void Constructor_DesignMode_UsesDesignTimeHelperEvenWhenDIHasAHelper()
+        {
+            // Arrange
+            var mockHelper = new Mock<IProcessHelper>();
+            var originalCheck = ProcessMetricConverter<double>.IsInDesignModeCheck;
+            ProcessMetricConverter<double>.IsInDesignModeCheck = () => true;
+
+            try
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton<IProcessHelper>(mockHelper.Object)))
+                {
+                    // Act
+                    var converter = new TestMetricConverter();
+
+                    // Assert
+                    Assert.IsType<DesignTimeProcessHelper>(converter.ExposedProcessHelper);
+                    Assert.NotSame(mockHelper.Object, converter.ExposedProcessHelper);
+                }
+            }
+            finally
+            {
+                ProcessMetricConverter<double>.IsInDesignModeCheck = originalCheck;
+            }
+        }
+
+        [Fact]
         public void Constructor_ServicesAndHelperAvailable_ResolvesProcessHelperFromDI()
         {
             // Arrange
             var mockHelper = new Mock<IProcessHelper>();
-            var mockKiller = new Mock<IProcessKiller>();
 
             using (new AmbientAppServicesScope(sc =>
             {
                 sc.AddSingleton<IProcessHelper>(mockHelper.Object);
-                sc.AddSingleton<IProcessKiller>(mockKiller.Object);
             }))
             {
                 // Act
@@ -79,9 +125,7 @@ namespace Servy.Manager.UnitTests.Converters
         public void Constructor_ServicesNotNullButHelperMissing_FallsBackToDesignTimeHelper()
         {
             // Arrange
-            var mockKiller = new Mock<IProcessKiller>();
-
-            using (new AmbientAppServicesScope(sc => sc.AddSingleton(mockKiller.Object)))
+            using (new AmbientAppServicesScope(sc => { }))
             {
                 // Act
                 var converter = new TestMetricConverter();
@@ -110,41 +154,31 @@ namespace Servy.Manager.UnitTests.Converters
             Assert.Equal("45.2 Unit", result);
         }
 
-        [Fact]
-        public void Convert_ValueIsNull_ReturnsUnknownMetricPlaceholder()
+        [Theory]
+        [InlineData(null)]
+        [InlineData("Malformed String Intruding into Double Path")]
+        public void Convert_NullOrIncompatibleValue_ReturnsNotAvailablePlaceholder(object? input)
         {
             // Arrange
             var converter = new TestMetricConverter();
 
             // Act
-            var result = converter.Convert(null!, typeof(string), null!, CultureInfo.InvariantCulture);
+            var result = converter.Convert(input!, typeof(string), null!, CultureInfo.InvariantCulture);
 
             // Assert
             Assert.Equal(UiConstants.NotAvailable, result);
         }
 
-        [Fact]
-        public void Convert_ValueIsIncompatibleType_ReturnsUnknownMetricPlaceholder()
-        {
-            // Arrange
-            var converter = new TestMetricConverter();
-            string illegalTypeInput = "Malformed String Intruding into Double Path";
-
-            // Act
-            var result = converter.Convert(illegalTypeInput, typeof(string), null!, CultureInfo.InvariantCulture);
-
-            // Assert
-            Assert.Equal(UiConstants.NotAvailable, result);
-        }
-
-        [Fact]
-        public void ConvertBack_Always_ReturnsBindingDoNothingToken()
+        [Theory]
+        [InlineData(null)]
+        [InlineData("Any UI value")]
+        public void ConvertBack_ReturnsDoNothing(object? value)
         {
             // Arrange
             var converter = new TestMetricConverter();
 
             // Act
-            var result = converter.ConvertBack("Any UI Value String", typeof(double), null!, CultureInfo.InvariantCulture);
+            var result = converter.ConvertBack(value!, typeof(double), null!, CultureInfo.InvariantCulture);
 
             // Assert
             Assert.Equal(Binding.DoNothing, result);

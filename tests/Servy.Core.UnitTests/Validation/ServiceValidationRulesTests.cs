@@ -5,6 +5,7 @@ using Servy.Core.Helpers;
 using Servy.Core.Resources;
 using Servy.Core.UnitTests.Helpers;
 using Servy.Core.Validation;
+using Servy.Testing;
 
 namespace Servy.Core.UnitTests.Validation
 {
@@ -31,6 +32,14 @@ namespace Servy.Core.UnitTests.Validation
         }
 
         [Fact]
+        public void Constructor_NullProcessHelper_ThrowsArgumentNullException()
+        {
+            // Arrange, Act & Assert
+            var ex = Assert.Throws<ArgumentNullException>(() => new ServiceValidationRules(null!));
+            Assert.Equal("processHelper", ex.ParamName);
+        }
+
+        [Fact]
         public void Validate_NullDto_ReturnsError()
         {
             // Act
@@ -43,9 +52,11 @@ namespace Servy.Core.UnitTests.Validation
         [Theory]
         [InlineData("", "C:\\path.exe", nameof(Strings.Msg_ServiceNameRequired))]
         [InlineData(null, "C:\\path.exe", nameof(Strings.Msg_ServiceNameRequired))]
+        [InlineData("   ", "C:\\path.exe", nameof(Strings.Msg_ServiceNameRequired))]
         [InlineData("Name", "", nameof(Strings.Msg_ExecutablePathRequired))]
         [InlineData("Name", null, nameof(Strings.Msg_ExecutablePathRequired))]
-        public void Validate_MissingVitalFields_ReturnsSpecificValidationError(string? name, string? path, string expectedResourceKey)
+        [InlineData("Name", "   ", nameof(Strings.Msg_ExecutablePathRequired))]
+        public void Validate_MissingVitalFields_ReturnsSpecificValidationErrorAndStopsValidation(string? name, string? path, string expectedResourceKey)
         {
             // Arrange
             var dto = new ServiceDto { Name = name!, ExecutablePath = path! };
@@ -60,7 +71,8 @@ namespace Servy.Core.UnitTests.Validation
             // Act
             var result = _sut.Validate(dto);
 
-            // Assert
+            // Assert: the guard returns immediately, so this is the only error reported
+            Assert.Single(result.Errors);
             Assert.Contains(expectedError, result.Errors);
         }
 
@@ -74,7 +86,7 @@ namespace Servy.Core.UnitTests.Validation
             // Also set other invalid fields to ensure validation stops early
             dto.Description = new string('C', AppConfig.MaxDescriptionLength + 1);
 
-            var (_, expectedErrorMsg) = Helper.IsServiceNameValid(dto.Name);
+            var (_, expectedErrorMsg) = Core.Helpers.Helper.IsServiceNameValid(dto.Name);
 
             // Act
             var result = _sut.Validate(dto);
@@ -82,6 +94,42 @@ namespace Servy.Core.UnitTests.Validation
             // Assert
             Assert.Single(result.Errors);
             Assert.Contains(expectedErrorMsg, result.Errors);
+        }
+
+        [Theory]
+        [InlineData("Servy")]
+        [InlineData("servy")]
+        [InlineData("SERVY")]
+        public void Validate_NameReservedForTheServyHost_ReturnsOnlyTheReservedNameError(string name)
+        {
+            // Arrange: install and import both run these rules; the Servy host service (Servy.Host.exe) owns the name
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.Name = name;
+            dto.Description = new string('C', AppConfig.MaxDescriptionLength + 1);
+
+            // Act
+            var result = _sut.Validate(dto, importMode: true);
+
+            // Assert: the guard returns immediately
+            Assert.Equal(new[] { string.Format(Strings.Msg_ServiceNameReservedForServyHost, name) }, result.Errors);
+        }
+
+        [Theory]
+        [InlineData("ServyApp")]
+        [InlineData("My Servy")]
+        [InlineData("Servy.Host")]
+        public void Validate_NameThatOnlyContainsServy_IsNotReserved(string name)
+        {
+            // Arrange
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.Name = name;
+
+            // Act
+            var result = _sut.Validate(dto);
+
+            // Assert
+            Assert.DoesNotContain(string.Format(Strings.Msg_ServiceNameReservedForServyHost, name), result.Errors);
+            Assert.Empty(result.Errors);
         }
 
         [Fact]
@@ -102,6 +150,21 @@ namespace Servy.Core.UnitTests.Validation
         }
 
         [Fact]
+        public void Validate_ExceedingDisplayNameLength_ReturnsError()
+        {
+            // Arrange
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.DisplayName = new string('C', AppConfig.MaxDisplayNameLength + 1);
+
+            // Act
+            var result = _sut.Validate(dto);
+
+            // Assert
+            Assert.Single(result.Errors);
+            Assert.Contains(string.Format(Strings.Msg_DisplayNameLengthReached, AppConfig.MaxDisplayNameLength), result.Errors);
+        }
+
+        [Fact]
         public void Validate_ExceedingDescriptionLength_ReturnsError()
         {
             // Arrange
@@ -114,6 +177,62 @@ namespace Servy.Core.UnitTests.Validation
             // Assert
             Assert.Single(result.Errors);
             Assert.Contains(string.Format(Strings.Msg_DescriptionLengthReached, AppConfig.MaxDescriptionLength), result.Errors);
+        }
+
+        [Theory]
+        [InlineData(nameof(ServiceDto.Parameters), nameof(Strings.Label_Parameters))]
+        [InlineData(nameof(ServiceDto.PreLaunchParameters), nameof(Strings.Label_PreLaunchParameters))]
+        [InlineData(nameof(ServiceDto.PostLaunchParameters), nameof(Strings.Label_PostLaunchParameters))]
+        [InlineData(nameof(ServiceDto.PreStopParameters), nameof(Strings.Label_PreStopParameters))]
+        [InlineData(nameof(ServiceDto.PostStopParameters), nameof(Strings.Label_PostStopParameters))]
+        [InlineData(nameof(ServiceDto.FailureProgramParameters), nameof(Strings.Label_FailureProgramParameters))]
+        public void Validate_ExceedingParametersLength_ReturnsErrorForField(string propertyName, string resourceLabelKey)
+        {
+            // Arrange
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            var oversizedValue = new string('C', AppConfig.MaxArgumentLength + 1);
+
+            // Set value via property reflection
+            typeof(ServiceDto)
+                .GetProperty(propertyName)
+                ?.SetValue(dto, oversizedValue);
+
+            // Get static property value from resource class
+            var expectedLabel = typeof(Strings)
+                .GetProperty(resourceLabelKey, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                ?.GetValue(null) as string;
+
+            Assert.NotNull(expectedLabel);
+
+            // Act
+            var result = _sut.Validate(dto);
+
+            // Assert
+            Assert.Single(result.Errors);
+            Assert.Contains(string.Format(Strings.Msg_ArgumentsLengthReachedForField, expectedLabel, AppConfig.MaxArgumentLength), result.Errors);
+        }
+
+        [Fact]
+        public void Validate_LengthsExactlyAtTheirCaps_ReturnsValid()
+        {
+            // Arrange: every capped text field at exactly its limit
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.DisplayName = new string('C', AppConfig.MaxDisplayNameLength);
+            dto.Description = new string('C', AppConfig.MaxDescriptionLength);
+            var atCap = new string('C', AppConfig.MaxArgumentLength);
+            dto.Parameters = atCap;
+            dto.PreLaunchParameters = atCap;
+            dto.PostLaunchParameters = atCap;
+            dto.PreStopParameters = atCap;
+            dto.PostStopParameters = atCap;
+            dto.FailureProgramParameters = atCap;
+
+            // Act
+            var result = _sut.Validate(dto);
+
+            // Assert
+            Assert.True(result.IsValid, string.Join(", ", result.Errors));
+            Assert.Empty(result.Errors);
         }
 
         [Fact]
@@ -190,7 +309,7 @@ namespace Servy.Core.UnitTests.Validation
 
             dto.HeartbeatInterval = AppConfig.MinHeartbeatInterval - 1;
             dto.MaxFailedChecks = AppConfig.MaxMaxFailedChecks + 1;
-            dto.MaxRestartAttempts = -5;
+            dto.MaxRestartAttempts = AppConfig.MinMaxRestartAttempts - 1;
 
             // Act
             var result = _sut.Validate(dto);
@@ -218,6 +337,118 @@ namespace Servy.Core.UnitTests.Validation
         }
 
         [Fact]
+        public void Validate_Credentials_PasswordsDifferOnlyByCase_ReturnsOnlyTheMismatchError()
+        {
+            // Arrange
+            // An account shape that makes ValidateCredentials throw, so a logon check that runs
+            // after the mismatch would add a second error.
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.RunAsLocalSystem = false;
+            dto.UserAccount = "InvalidAccountFormatWithoutPrefix";
+            dto.Password = "Secret123";
+
+            // Act
+            var result = _sut.Validate(dto, confirmPassword: "SECRET123");
+
+            // Assert
+            // The ordinal comparison reports the mismatch, and the else arm skips the logon check.
+            Assert.Equal(new[] { Strings.Msg_PasswordsDontMatch }, result.Errors);
+        }
+
+        [Fact]
+        public void Validate_Credentials_RunAsLocalSystemNotSet_StillValidatesTheAccount()
+        {
+            // Arrange: null is not LocalSystem, so the account is checked
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.RunAsLocalSystem = null;
+            dto.UserAccount = "InvalidAccountFormatWithoutPrefix";
+            dto.Password = "Password123!";
+
+            // Act
+            var result = _sut.Validate(dto, confirmPassword: "Password123!");
+
+            // Assert
+            Assert.Single(result.Errors);
+            Assert.Contains("Username format is invalid", result.Errors[0]);
+        }
+
+        [Fact]
+        public void Validate_Credentials_NullPasswordWithEmptyConfirmation_IsNotAMismatch()
+        {
+            // Arrange
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.RunAsLocalSystem = false;
+            dto.UserAccount = "InvalidAccountFormatWithoutPrefix";
+            dto.Password = null;
+
+            // Act
+            var result = _sut.Validate(dto, confirmPassword: string.Empty);
+
+            // Assert: the comparison passed, so the account check ran and is the only error
+            Assert.DoesNotContain(Strings.Msg_PasswordsDontMatch, result.Errors);
+            Assert.Single(result.Errors);
+            Assert.Contains("Username format is invalid", result.Errors[0]);
+        }
+
+        [Fact]
+        public void Validate_Credentials_PasswordSetWithEmptyConfirmation_ReturnsOnlyTheMismatchError()
+        {
+            // Arrange
+            // A typed password and a blank Confirm box (the desktop app passes "" for an untouched field).
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.RunAsLocalSystem = false;
+            dto.UserAccount = "InvalidAccountFormatWithoutPrefix";
+            dto.Password = "Secret123";
+
+            // Act
+            var result = _sut.Validate(dto, confirmPassword: string.Empty);
+
+            // Assert
+            // "" is compared, not skipped (#4400), so the mismatch is the only error and the logon check does not run.
+            Assert.Equal(new[] { Strings.Msg_PasswordsDontMatch }, result.Errors);
+        }
+
+        [Fact]
+        public void Validate_Credentials_NoConfirmationField_SkipsTheCompareAndValidatesTheAccount()
+        {
+            // Arrange
+            // The CLI install path: a user account and password, and no confirmation field (confirmPassword left null).
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.RunAsLocalSystem = false;
+            dto.UserAccount = "InvalidAccountFormatWithoutPrefix";
+            dto.Password = "Secret123";
+
+            // Act
+            var result = _sut.Validate(dto);
+
+            // Assert
+            // null means "no confirmation field": no mismatch is reported and the account check is what runs.
+            Assert.DoesNotContain(Strings.Msg_PasswordsDontMatch, result.Errors);
+            Assert.Single(result.Errors);
+            Assert.Contains("Username format is invalid", result.Errors[0]);
+        }
+
+        [Fact]
+        public void Validate_Credentials_NativeValidationFailure_SurfacesExceptionMessageInResult()
+        {
+            // Arrange: Configure non-LocalSystem credentials with an invalid account string format
+            // to force NativeMethodsHelpers.ValidateCredentials to throw an ArgumentException.
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.RunAsLocalSystem = false;
+            dto.UserAccount = "InvalidAccountFormatWithoutPrefix";
+            dto.Password = "Password123!";
+
+            // Act: Pass matching confirmPassword to bypass password mismatch check and execute ValidateCredentials
+            var result = _sut.Validate(dto, confirmPassword: "Password123!");
+
+            // Assert: Verify the exception message thrown by NativeMethodsHelpers.ValidateCredentials
+            // was caught by the catch block and surfaced in result.Errors.
+            Assert.False(result.IsValid);
+            Assert.Single(result.Errors);
+            Assert.Contains("Username format is invalid", result.Errors[0]);
+        }
+
+        [Fact]
         public void Validate_InvalidEnvVarsAndDependencies_ReturnsErrors()
         {
             // Arrange
@@ -230,7 +461,7 @@ namespace Servy.Core.UnitTests.Validation
 
             // Assert
             // 1. Verify environment variable syntax validation error
-            Assert.Contains(Strings.Msg_EnvironmentVariableMissingEquals, result.Errors);
+            Assert.Contains(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 1), result.Errors);
 
             // 2. Verify service dependency regex character validation error
             Assert.Contains(string.Format(Strings.Msg_InvalidServiceDependencyName, "MissingDep?"), result.Errors);
@@ -245,7 +476,7 @@ namespace Servy.Core.UnitTests.Validation
             dto.PreLaunchStartupDirectory = "invalid|dir";
             dto.PreLaunchEnvironmentVariables = "INVALID_VAR"; // Missing '=' -> Triggers Strings.Msg_EnvironmentVariableMissingEquals
             dto.PreLaunchTimeoutSeconds = AppConfig.MaxPreLaunchTimeoutSeconds + 1;
-            dto.PreLaunchRetryAttempts = -1;
+            dto.PreLaunchRetryAttempts = AppConfig.MinPreLaunchRetryAttempts - 1;
             dto.PreLaunchStdoutPath = "invalid>out";
             dto.PreLaunchStderrPath = "invalid>err";
 
@@ -255,7 +486,7 @@ namespace Servy.Core.UnitTests.Validation
             // Assert
             Assert.Contains(Strings.Msg_InvalidPreLaunchPath, result.Errors);
             Assert.Contains(Strings.Msg_InvalidPreLaunchStartupDirectory, result.Errors);
-            Assert.Contains(Strings.Msg_EnvironmentVariableMissingEquals, result.Errors);
+            Assert.Contains(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 1), result.Errors);
             Assert.Contains(string.Format(Strings.Msg_InvalidPreLaunchTimeout, AppConfig.MinPreLaunchTimeoutSeconds, AppConfig.MaxPreLaunchTimeoutSeconds), result.Errors);
             Assert.Contains(string.Format(Strings.Msg_InvalidPreLaunchRetryAttempts, AppConfig.MinPreLaunchRetryAttempts, AppConfig.MaxPreLaunchRetryAttempts), result.Errors);
             Assert.Contains(Strings.Msg_InvalidPreLaunchStdoutPath, result.Errors);
@@ -377,6 +608,89 @@ namespace Servy.Core.UnitTests.Validation
 
             // Assert
             Assert.DoesNotContain(Strings.Msg_PasswordsDontMatch, result.Errors);
+        }
+
+        [Fact]
+        public void Validate_ImportMode_SkipsNativeCredentialValidation()
+        {
+            // Arrange: the account shape that Validate_Credentials_NativeValidationFailure_SurfacesExceptionMessageInResult
+            // proves drives NativeMethodsHelpers.ValidateCredentials to throw.
+            var dto = ServiceDtoFactory.CreateValidValidationBase();
+            dto.RunAsLocalSystem = false;
+            dto.UserAccount = "InvalidAccountFormatWithoutPrefix";
+            dto.Password = "Password123!";
+
+            // Act: confirmPassword is left null, which is what every production import path passes
+            // (ServiceDtoImportValidator and both ServiceConfigurationValidator call sites). With it null
+            // the password comparison is inert, so ValidateCredentials is the only thing importMode suppresses.
+            var result = _sut.Validate(dto, importMode: true);
+
+            // Assert: no logon round trip was attempted, so no credential error surfaced.
+            Assert.True(result.IsValid);
+            Assert.Empty(result.Errors);
+        }
+
+        [Fact]
+        public void Validate_TimeoutsAndRotation_ExactMinAndMaxBoundaries_ReturnsValid()
+        {
+            // Arrange: Create two DTOs, one with all timeout and rotation values set to their minimum inclusive bounds,
+            // and one set to their maximum inclusive bounds.
+            var minDto = ServiceDtoFactory.CreateValidValidationBase();
+            minDto.StartTimeout = AppConfig.MinStartTimeout;
+            minDto.StopTimeout = AppConfig.MinStopTimeout;
+            minDto.RotationSize = AppConfig.MinRotationSize;
+            minDto.MaxRotations = AppConfig.MinMaxRotations;
+            minDto.HeartbeatUrlTimeoutSeconds = AppConfig.MinHeartbeatUrlTimeoutSeconds;
+
+            var maxDto = ServiceDtoFactory.CreateValidValidationBase();
+            maxDto.StartTimeout = AppConfig.MaxStartTimeout;
+            maxDto.StopTimeout = AppConfig.MaxStopTimeout;
+            maxDto.RotationSize = AppConfig.MaxRotationSize;
+            maxDto.MaxRotations = AppConfig.MaxMaxRotations;
+            maxDto.HeartbeatUrlTimeoutSeconds = AppConfig.MaxHeartbeatUrlTimeoutSeconds;
+
+            // Act
+            var minResult = _sut.Validate(minDto);
+            var maxResult = _sut.Validate(maxDto);
+
+            // Assert
+            Assert.True(minResult.IsValid, $"Validation failed for inclusive minimum boundary values: {string.Join(", ", minResult.Errors)}");
+            Assert.Empty(minResult.Errors);
+
+            Assert.True(maxResult.IsValid, $"Validation failed for inclusive maximum boundary values: {string.Join(", ", maxResult.Errors)}");
+            Assert.Empty(maxResult.Errors);
+        }
+
+        [Fact]
+        public void Validate_HealthAndLifecycleTimeouts_ExactMinAndMaxBoundaries_ReturnsValid()
+        {
+            // Arrange: Test inclusive min/max bounds for health monitoring and lifecycle hook timeouts/retries
+            var minDto = ServiceDtoFactory.CreateValidValidationBase();
+            minDto.HeartbeatInterval = AppConfig.MinHeartbeatInterval;
+            minDto.MaxFailedChecks = AppConfig.MinMaxFailedChecks;
+            minDto.MaxRestartAttempts = AppConfig.MinMaxRestartAttempts;
+            minDto.PreLaunchTimeoutSeconds = AppConfig.MinPreLaunchTimeoutSeconds;
+            minDto.PreLaunchRetryAttempts = AppConfig.MinPreLaunchRetryAttempts;
+            minDto.PreStopTimeoutSeconds = AppConfig.MinPreStopTimeoutSeconds;
+
+            var maxDto = ServiceDtoFactory.CreateValidValidationBase();
+            maxDto.HeartbeatInterval = AppConfig.MaxHeartbeatInterval;
+            maxDto.MaxFailedChecks = AppConfig.MaxMaxFailedChecks;
+            maxDto.MaxRestartAttempts = AppConfig.MaxMaxRestartAttempts;
+            maxDto.PreLaunchTimeoutSeconds = AppConfig.MaxPreLaunchTimeoutSeconds;
+            maxDto.PreLaunchRetryAttempts = AppConfig.MaxPreLaunchRetryAttempts;
+            maxDto.PreStopTimeoutSeconds = AppConfig.MaxPreStopTimeoutSeconds;
+
+            // Act
+            var minResult = _sut.Validate(minDto);
+            var maxResult = _sut.Validate(maxDto);
+
+            // Assert
+            Assert.True(minResult.IsValid, $"Validation failed for inclusive minimum health/lifecycle boundary values: {string.Join(", ", minResult.Errors)}");
+            Assert.Empty(minResult.Errors);
+
+            Assert.True(maxResult.IsValid, $"Validation failed for inclusive maximum health/lifecycle boundary values: {string.Join(", ", maxResult.Errors)}");
+            Assert.Empty(maxResult.Errors);
         }
     }
 }

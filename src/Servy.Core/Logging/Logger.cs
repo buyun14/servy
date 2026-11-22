@@ -14,13 +14,14 @@ namespace Servy.Core.Logging
     /// Uses <see cref="RotatingStreamWriter"/> to rotate logs by size and/or date interval
     /// (daily, weekly, monthly), preventing unbounded file growth.
     /// </summary>
+    /// <remarks>
+    /// While Servy's built-in entry points configure the logger in one call via <see cref="Initialize(string?, LogLevel, bool, int, DateRotationType, bool, int, string?)"/>,
+    /// the individual runtime setters (<see cref="SetLogRotationSize"/>, <see cref="SetMaxBackupLogFiles"/>,
+    /// <see cref="SetDateRotationType"/>, <see cref="SetUseLocalTimeForRotation"/>, and <see cref="SetLogLevel"/>)
+    /// are intentionally retained as part of the public <c>Servy.Core</c> API for live reconfiguration.
+    /// </remarks>
     public static class Logger
     {
-        /// <summary>
-        /// Logs folder path.
-        /// </summary>
-        public static readonly string LogsPath = Path.Combine(AppConfig.ProgramDataPath, "logs");
-
         /// <summary>
         /// Matches any sequence of standard or Unicode line terminators
         /// </summary>
@@ -40,10 +41,16 @@ namespace Servy.Core.Logging
         private static volatile int _currentLogLevel = (int)LogLevel.Info;
 
         private static string? _fileName;
+        private static string? _logDirectory;
         private static bool _enableSizeRotation = AppConfig.DefaultEnableInternalLogSizeRotation;
         private static int _logRotationSizeMB = AppConfig.DefaultRotationSizeMB;
         private static DateRotationType _dateRotationType;
         private static bool _useLocalTimeForRotation;
+
+        /// <summary>
+        /// Gets the effective directory path where active log output is currently written.
+        /// </summary>
+        public static string EffectiveLogsPath => !string.IsNullOrEmpty(_logDirectory) ? _logDirectory : AppConfig.LogsFolderPath;
 
         /// <summary>
         /// The maximum number of backup log files to keep.
@@ -61,13 +68,16 @@ namespace Servy.Core.Logging
 
         /// <summary>
         /// Pre-computed, uppercase string representations of LogLevels.
+        /// Indexed directly by (int)LogLevel, so this array must carry one entry per
+        /// loggable member of <see cref="LogLevel"/> in declaration order.
+        /// LogLevel.None is a threshold sentinel and is never passed to Log().
         /// </summary>
         private static readonly string[] LevelStrings = new[]
         {
-            "DEBUG", // 0
-            "INFO",  // 1
-            "WARN",  // 2
-            "ERROR"  // 3
+            "DEBUG", // LogLevel.Debug = 0
+            "INFO",  // LogLevel.Info  = 1
+            "WARN",  // LogLevel.Warn  = 2
+            "ERROR"  // LogLevel.Error = 3
         };
 
         /// <summary>
@@ -84,6 +94,11 @@ namespace Servy.Core.Logging
         /// </param>
         /// <param name="useLocalTimeForRotation">Indicates whether to use local system time for log rotation (Default: false (UTC)).</param>
         /// <param name="maxBackupLogFiles">The maximum number of backup files to retain. Defaults to 10. Set to 0 for unlimited backups.</param>
+        /// <param name="logDirectory">
+        /// An optional custom directory path for log files. Pass <c>null</c> (the default) to leave the
+        /// currently configured directory unchanged; pass an empty string to reset it to
+        /// <see cref="AppConfig.LogsFolderPath"/>. A non-empty value becomes the new log directory.
+        /// </param>
         public static void Initialize(
             string? fileName,
             LogLevel logLevel = LogLevel.Info,
@@ -91,12 +106,25 @@ namespace Servy.Core.Logging
             int logRotationSizeMB = AppConfig.DefaultRotationSizeMB,
             DateRotationType dateRotationType = DateRotationType.None,
             bool useLocalTimeForRotation = AppConfig.DefaultUseLocalTimeForRotation,
-            int maxBackupLogFiles = AppConfig.LoggerDefaultMaxBackupLogFiles
+            int maxBackupLogFiles = AppConfig.LoggerDefaultMaxBackupLogFiles,
+            string? logDirectory = null
             )
         {
             lock (_lock)
             {
                 _fileName = fileName;
+
+                // Only override _logDirectory when a non-null custom path is explicitly provided.
+                if (logDirectory != null)
+                {
+                    _logDirectory = logDirectory;
+                }
+
+                if (string.IsNullOrEmpty(_fileName))
+                {
+                    Shutdown();
+                }
+
                 Initialize(logLevel, enableSizeRotation, logRotationSizeMB, dateRotationType, useLocalTimeForRotation, maxBackupLogFiles);
             }
         }
@@ -112,7 +140,7 @@ namespace Servy.Core.Logging
         /// </para>
         /// <para>
         /// Settings established here govern the behavior of the <c>InternalInitialize</c> process, which
-        /// manages the physical file handles and archive logic for the <see cref="Servy.Service"/>.
+        /// manages the physical file handles and archive logic for the calling application's log file.
         /// </para>
         /// </remarks>
         /// <param name="logLevel">The minimum severity level required for an entry to be recorded. Defaults to <see cref="LogLevel.Info"/>.</param>
@@ -165,7 +193,7 @@ namespace Servy.Core.Logging
             {
                 EnsureLogsDir();
 
-                string logPath = Path.Combine(LogsPath, _fileName);
+                string logPath = Path.Combine(EffectiveLogsPath, _fileName);
 
                 // Convert MB to Bytes for the underlying writer
                 long rotationSizeInBytes = AppConfig.ToBytes(_logRotationSizeMB);
@@ -207,7 +235,7 @@ namespace Servy.Core.Logging
                     if (Interlocked.Increment(ref _initFallbackWriteCount) <= AppConfig.LoggerMaxFallbackWrites)
                     {
                         EnsureLogsDir();
-                        File.AppendAllText(Path.Combine(LogsPath, "LoggerInitializationErrors.log"),
+                        File.AppendAllText(Path.Combine(EffectiveLogsPath, "LoggerInitializationErrors.log"),
                             $"{FormatTimestampPrefix()} Failed to initialize logger with file '{_fileName}'. Exception: {ex}{Environment.NewLine}");
                     }
                 }
@@ -393,16 +421,49 @@ namespace Servy.Core.Logging
         }
 
         /// <summary>
+        /// Writes a multi-line report: the title, then every physical line of the body as its own
+        /// entry, so a composed section layout survives the single-line contract that
+        /// <see cref="Debug"/>, <see cref="Info"/>, <see cref="Warn"/> and <see cref="Error"/> enforce.
+        /// Use it for structured dumps; the leveled methods stay single-line.
+        /// </summary>
+        /// <param name="level">The severity level of the report; skipped if below the configured minimum.</param>
+        /// <param name="title">The report heading, written as its own entry.</param>
+        /// <param name="body">The report body; every physical line becomes its own entry.</param>
+        /// <remarks>
+        /// Each emitted line carries its own timestamp and level, which is what keeps a report
+        /// greppable. A leading indent is deliberately not added: <see cref="Log"/> sanitizes with
+        /// <c>Trim()</c>, so leading whitespace cannot reach the file anyway.
+        /// </remarks>
+        public static void Report(LogLevel level, string title, string body)
+        {
+            if (string.IsNullOrEmpty(title) && string.IsNullOrEmpty(body)) return;
+
+            if ((LogLevel)_currentLogLevel > level) return;
+
+            if (!string.IsNullOrEmpty(title))
+            {
+                Log(level, title);
+            }
+
+            if (string.IsNullOrEmpty(body)) return;
+
+            // Split on LF and drop a trailing CR, so a body composed with either "\n" or
+            // Environment.NewLine yields the same one-entry-per-line result.
+            foreach (var line in body.Split('\n'))
+            {
+                Log(level, line.TrimEnd('\r'));
+            }
+        }
+
+        /// <summary>
         /// Core logging logic that handles thread synchronization and delegated I/O via the rotating writer.
         /// </summary>
         /// <param name="level">The severity level enum.</param>
         /// <param name="message">The content of the log entry.</param>
-        private static void Log(LogLevel level, string? message)
+        private static void Log(LogLevel level, string message)
         {
             // Fast path: nothing to write to. Shutdown() is the only writer that nulls this.
             if (_writer == null) return;
-
-            if (string.IsNullOrEmpty(message)) return;
 
             // DEADLOCK GUARD: If the underlying RotatingStreamWriter calls Logger.Warn/Error
             // during its rotation loop, it will synchronously re-enter this method on the same thread.
@@ -415,7 +476,7 @@ namespace Servy.Core.Logging
                     if (Interlocked.Increment(ref _logFallbackWriteCount) <= AppConfig.LoggerMaxFallbackWrites)
                     {
                         EnsureLogsDir();
-                        File.AppendAllText(Path.Combine(LogsPath, "LoggerWriteErrors.log"),
+                        File.AppendAllText(Path.Combine(EffectiveLogsPath, "LoggerWriteErrors.log"),
                             $"{FormatTimestampPrefix()} RE-ENTRANT LOGGER AVOIDED: {message}{Environment.NewLine}");
                     }
                 }
@@ -425,9 +486,7 @@ namespace Servy.Core.Logging
 
             // Pre-compute formatting, regex sanitization, and timestamping outside the global lock.
             // This minimizes critical section contention, allowing concurrent log entry formatting.
-            string levelName = (int)level >= 0 && (int)level < LevelStrings.Length
-                ? LevelStrings[(int)level]
-                : level.ToString().ToUpperInvariant(); // Fallback for safety
+            string levelName = LevelStrings[(int)level];
 
             // Sanitize message into a single-line representation for better scannability
             string sanitizedMessage = SanitizeToSingleLine(message);
@@ -459,7 +518,7 @@ namespace Servy.Core.Logging
                     if (Interlocked.Increment(ref _logFallbackWriteCount) <= AppConfig.LoggerMaxFallbackWrites)
                     {
                         EnsureLogsDir();
-                        File.AppendAllText(Path.Combine(LogsPath, "LoggerWriteErrors.log"),
+                        File.AppendAllText(Path.Combine(EffectiveLogsPath, "LoggerWriteErrors.log"),
                             $"{FormatTimestampPrefix()} Failed to write log entry: {ex.Message}{Environment.NewLine}");
                     }
                 }
@@ -507,11 +566,14 @@ namespace Servy.Core.Logging
         /// <param name="ex">An optional exception; when present it is formatted and appended as " | Exception: ...".</param>
         private static void WriteLeveled(LogLevel targetLevel, string? message, Exception? ex)
         {
-            if (string.IsNullOrEmpty(message)) return;
+            if (string.IsNullOrEmpty(message) && ex == null) return;
 
             if ((LogLevel)_currentLogLevel <= targetLevel)
             {
-                Log(targetLevel, ex != null ? $"{message} | Exception: {FormatException(ex)}" : message);
+                string entry = ex != null
+                    ? (string.IsNullOrEmpty(message) ? FormatException(ex) : $"{message} | Exception: {FormatException(ex)}")
+                    : message!;
+                Log(targetLevel, entry);
             }
         }
 
@@ -521,7 +583,7 @@ namespace Servy.Core.Logging
         private static void EnsureLogsDir()
         {
             // Uses SecurityHelper to create the directory with specific permissions
-            SecurityHelper.CreateSecureDirectory(LogsPath, breakInheritance: false);
+            SecurityHelper.CreateSecureDirectory(EffectiveLogsPath, breakInheritance: false);
         }
 
         /// <summary>
@@ -532,8 +594,6 @@ namespace Servy.Core.Logging
         /// <returns>A formatted string with frame separators instead of newlines.</returns>
         private static string FormatException(Exception ex)
         {
-            if (ex == null) return string.Empty;
-
             var sb = new StringBuilder();
 
             // Stack tracking for true tree traversal
@@ -546,8 +606,12 @@ namespace Servy.Core.Logging
             {
                 var (current, depth) = nodeStack.Pop();
 
-                if (current == null || depth >= AppConfig.LoggerMaxInnerExceptionDepth)
+                if (depth >= AppConfig.LoggerMaxInnerExceptionDepth)
                 {
+                    if (currentStructuralDepth > 0)
+                    {
+                        sb.Append(" [Inner -> ... depth limit reached]");
+                    }
                     continue;
                 }
 
@@ -587,7 +651,7 @@ namespace Servy.Core.Logging
                     int target = Math.Max(0, AppConfig.LoggerMaxFormattedExceptionLength - reserved);
 
                     // Avoid splitting a UTF-16 surrogate pair
-                    if (target > 0 && target < sb.Length && char.IsHighSurrogate(sb[target - 1]))
+                    if (target > 0 && char.IsHighSurrogate(sb[target - 1]))
                     {
                         target--;
                     }

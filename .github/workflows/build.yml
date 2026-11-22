@@ -49,10 +49,16 @@ jobs:
           max_retries: ${{ env.MAX_RETRIES }}
 
       - name: Restore dependencies
-        run: dotnet restore Servy.sln
+        shell: pwsh
+        run: |
+          dotnet restore Servy.sln
+          if ($LASTEXITCODE -ne 0) { throw "Restore failed for Servy.sln (exit $LASTEXITCODE)" }
 
       - name: Build solution (Debug)
-        run: dotnet build Servy.sln --configuration Debug --no-restore
+        shell: pwsh
+        run: |
+          dotnet build Servy.sln --configuration Debug --no-restore
+          if ($LASTEXITCODE -ne 0) { throw "Debug build failed for Servy.sln (exit $LASTEXITCODE)" }
 
       - name: Build Servy projects (Release ${{ matrix.arch }})
         shell: pwsh
@@ -63,6 +69,7 @@ jobs:
           $runtime = $env:MATRIX_RUNTIME
 
           $projects = @(
+            "src\Servy.Host\Servy.Host.csproj",
             "src\Servy.Restarter\Servy.Restarter.csproj",
             "src\Servy.Service\Servy.Service.csproj",
             "src\Servy\Servy.csproj",

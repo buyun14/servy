@@ -114,7 +114,8 @@ namespace Servy.Service.CommandLine
 
         /// <summary>
         /// Gets or sets the maximum time in seconds allowed for the external heartbeat URL request to complete before it is cancelled.
-        /// Value must be clamped between <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> and <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/>.
+        /// Value must be between <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> and <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/>;
+        /// values outside that range are rejected by <see cref="Servy.Core.Validation.IServiceValidationRules"/> at install time.
         /// Default is <see cref="AppConfig.DefaultHeartbeatUrlTimeoutSeconds"/>.
         /// </summary>
         public int HeartbeatUrlTimeoutInSeconds { get; set; } = AppConfig.DefaultHeartbeatUrlTimeoutSeconds;
@@ -141,12 +142,17 @@ namespace Servy.Service.CommandLine
         /// <summary>
         /// Gets or sets the command-line arguments to pass to the failure program.
         /// </summary>
-        public string? FailureProgramArgs { get; set; }
+        public string? FailureProgramExecutableArgs { get; set; }
 
         /// <summary>
         /// Gets or sets the environment variables of the child process.
         /// </summary>
         public List<EnvironmentVariable> EnvironmentVariables { get; set; } = new List<EnvironmentVariable>();
+
+        /// <summary>
+        /// Gets or sets a value indicating whether to allow overriding of protected runtime variables (e.g., <c>JAVA_HOME</c>, <c>JAVA_OPTS</c>, <c>CATALINA_OPTS</c>) by the service's environment variables.
+        /// </summary>
+        public bool AllowOverriddenRuntimeVars { get; set; }
 
         /// <summary>
         /// Gets or sets the full path to the pre-launch executable to run.
@@ -218,8 +224,9 @@ namespace Servy.Service.CommandLine
         /// <summary>
         /// Gets or sets a value indicating whether debug logs are enabled.
         /// When enabled, environment variables and process parameters are recorded in the local
-        /// log file at <c>%ProgramData%\Servy\logs\Servy.Service.log</c>. Sensitive data is
-        /// never written to the Windows Event Log or shown by the CLI / PowerShell module.
+        /// log file at <c>%ProgramData%\Servy\logs\services\&lt;ServiceName&gt;\Servy.Service.log</c>. Sensitive data is
+        /// never written to the Windows Event Log; the CLI <c>show</c> command and <c>Show-ServyService</c> mask it
+        /// unless <c>--decrypt</c> / <c>-Decrypt</c> is passed.
         /// Not recommended for production environments, as these logs may contain sensitive information.
         /// </summary>
         public bool EnableDebugLogs { get; set; } = AppConfig.DefaultEnableDebugLogs;

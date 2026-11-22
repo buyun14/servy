@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Runs unit tests and integration tests, and generates code coverage reports.
@@ -10,9 +10,16 @@
     3. Collects code coverage in Cobertura format.
     4. Generates an aggregated HTML coverage report using ReportGenerator.
 
+.PARAMETER IncludeStress
+    When specified, includes tests tagged with Category=Stress. Defaults to excluding them.
+
 .EXAMPLE
     ./test.ps1
-    Runs all unit tests and generates the coverage report.
+    Runs all unit tests (excluding Stress tests) and generates the coverage report.
+
+.EXAMPLE
+    ./test.ps1 -IncludeStress
+    Runs all unit tests, including Stress tests, and generates the coverage report.
 
 .NOTES
     Author: Akram El Assas
@@ -21,7 +28,14 @@
         - .NET SDK installed and accessible in PATH.
         - ReportGenerator tool installed and available in PATH.
 #>
+param(
+    [switch]$IncludeStress
+)
+
 $ErrorActionPreference = "Stop"
+
+# Load shared coverage configuration filters
+$CoverageFilters = . (Join-Path $PSScriptRoot "coverage-filters.ps1")
 
 # Directories
 $ScriptDir = $PSScriptRoot
@@ -29,18 +43,18 @@ $TestResultsDir = Join-Path -Path $ScriptDir -ChildPath "TestResults"
 $CoverageReportDir = Join-Path -Path $ScriptDir -ChildPath "coveragereport"
 
 # Cleanup previous results
-if (Test-Path $TestResultsDir) {
+if (Test-Path -LiteralPath $TestResultsDir) {
     Write-Host "Cleaning up previous test results..."
-    Remove-Item -Path $TestResultsDir -Recurse -Force
+    Remove-Item -LiteralPath $TestResultsDir -Recurse -Force
 }
 
-if (Test-Path $CoverageReportDir) {
+if (Test-Path -LiteralPath $CoverageReportDir) {
     Write-Host "Cleaning up previous coverage report..."
-    Remove-Item -Path $CoverageReportDir -Recurse -Force
+    Remove-Item -LiteralPath $CoverageReportDir -Recurse -Force
 }
 
 # The native filesystem globbing filter (*Tests.csproj) already naturally excludes 'Servy.Testing.csproj'.
-$RawTestProjects = Get-ChildItem -Path $ScriptDir -Recurse -Filter '*Tests.csproj'
+$RawTestProjects = Get-ChildItem -LiteralPath $ScriptDir -Recurse -Filter '*Tests.csproj'
 
 if (-not $RawTestProjects) {
     Write-Host "No '*Tests.csproj' projects found under $ScriptDir - nothing to test." -ForegroundColor Red
@@ -56,22 +70,24 @@ foreach ($ProjFile in $RawTestProjects) {
 
     Write-Host "Running tests for $($Proj)..." -ForegroundColor Cyan
 
-    # Build the 'dotnet test' arguments for this project
+    $resultsPath = Join-Path -Path $TestResultsDir -ChildPath $ProjName
+
+    # Build pure MTP v2 'dotnet test' arguments
     $dotnetArgs = @(
         'test', $Proj,
-        '--configuration', 'Debug',
-        '--blame',
-        '--blame-crash',
-        '--blame-crash-dump-type', 'full',
-        '--collect', 'XPlat Code Coverage',
-        '--results-directory', (Join-Path $TestResultsDir $ProjName)
+        '--configuration', 'Debug'
     )
 
+    if (-not $IncludeStress) {
+        $dotnetArgs += @('--filter', 'Category!=Stress')
+    }
+
     $dotnetArgs += @(
+        '--results-directory', $resultsPath,
         '--',
-        'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura',
-        'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude=[*.UnitTests]*,[*.IntegrationTests]*,[Servy.Testing]*,**/*.xaml,**/*.xaml.cs,**/*.g.cs,**/*.Designer.cs,**/obj/**/*',
-        'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeProperties="True"'
+        '--coverage',
+        '--coverage-output-format', 'cobertura',
+        '--coverage-output', 'coverage.cobertura.xml'
     )
 
     & dotnet @dotnetArgs
@@ -88,9 +104,12 @@ reportgenerator `
     -reports:$CoverageFiles `
     -targetdir:$CoverageReportDir `
     -reporttypes:Html `
-    -assemblyfilters:"-*.UnitTests;-*.IntegrationTests;-Servy.Testing" `
-    -filefilters:"-**/*.xaml;-**/*.xaml.cs;-**/*.g.cs;-**/*.Designer.cs;-**/obj/**/*"
+    -assemblyfilters:$CoverageFilters.Assemblies `
+    -filefilters:$CoverageFilters.Files
 
-if ($LASTEXITCODE -ne 0) { Write-Host "reportgenerator failed"; exit $LASTEXITCODE }
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "reportgenerator failed (exit $LASTEXITCODE)" -ForegroundColor Red
+    exit $LASTEXITCODE
+}
 
 Write-Host "Coverage report generated at $CoverageReportDir"

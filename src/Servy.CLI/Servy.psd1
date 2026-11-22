@@ -1,9 +1,9 @@
-@{
+﻿@{
     # Script module or binary module file associated with this manifest.
     RootModule        = 'Servy.psm1'
 
     # Version number of this module.
-    ModuleVersion     = '9.5.0'
+    ModuleVersion     = '11.0.0'
 
     # Supported PSEditions
     # CompatiblePSEditions = @('Desktop', 'Core')
@@ -18,10 +18,10 @@
     CompanyName       = 'Akram El Assas'
 
     # Copyright statement for this module
-    Copyright         = '(c) Akram El Assas. All rights reserved.'
+    Copyright         = 'Copyright © 2026 Akram El Assas. All rights reserved.'
 
     # Description of the functionality provided by this module
-    Description       = 'PowerShell module to manage Windows services using the Servy CLI. Provides functions to install, uninstall, start, stop, restart, export and import configurations, and check the status of Windows services. Works with both installed and portable versions of Servy.'
+    Description       = 'PowerShell module to manage Windows services using the Servy CLI. Provides functions to install, uninstall, start, stop, restart, export and import configurations, check the status of Windows services, and show a service''s configuration or list all services. Works with both installed and portable versions of Servy.'
 
     # Minimum version of the PowerShell engine required by this module
     PowerShellVersion = '2.0'
@@ -62,6 +62,7 @@
     # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
     FunctionsToExport = @(
         'Set-ServyConfig',
+        'Set-ServyHardenedFileAcl',
         'Get-ServyVersion',
         'Get-ServyHelp',
         'Install-ServyService',
@@ -70,6 +71,8 @@
         'Stop-ServyService',
         'Restart-ServyService',
         'Get-ServyServiceStatus',
+        'Show-ServyService',
+        'Show-ServyServices',
         'Export-ServyServiceConfig',
         'Import-ServyServiceConfig'
     )

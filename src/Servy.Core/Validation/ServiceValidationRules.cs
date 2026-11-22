@@ -6,7 +6,6 @@ using Servy.Core.Logging;
 using Servy.Core.Native;
 using Servy.Core.Resources;
 using Servy.Core.ServiceDependencies;
-using System.Reflection;
 
 namespace Servy.Core.Validation
 {
@@ -59,46 +58,43 @@ namespace Servy.Core.Validation
                 return result;
             }
 
+            // The Servy host service (Servy.Host.exe) owns this name, and every Servy service depends on it
+            if (Helper.IsReservedForServyHost(dto.Name))
+            {
+                result.Errors.Add(string.Format(Strings.Msg_ServiceNameReservedForServyHost, dto.Name));
+                return result;
+            }
+
             // Length Bounds
             if (dto.DisplayName?.Length > AppConfig.MaxDisplayNameLength)
                 result.Errors.Add(string.Format(Strings.Msg_DisplayNameLengthReached, AppConfig.MaxDisplayNameLength));
             if (dto.Description?.Length > AppConfig.MaxDescriptionLength)
                 result.Errors.Add(string.Format(Strings.Msg_DescriptionLengthReached, AppConfig.MaxDescriptionLength));
 
-            var paramFieldsNamed = new (string Name, string? Value)[]
+            var paramFieldsNamed = new (string Label, string? Value)[]
             {
-                (nameof(dto.Parameters),               dto.Parameters),
-                (nameof(dto.PreLaunchParameters),      dto.PreLaunchParameters),
-                (nameof(dto.PostLaunchParameters),     dto.PostLaunchParameters),
-                (nameof(dto.PreStopParameters),        dto.PreStopParameters),
-                (nameof(dto.PostStopParameters),       dto.PostStopParameters),
-                (nameof(dto.FailureProgramParameters), dto.FailureProgramParameters),
+                (Strings.Label_Parameters,               dto.Parameters),
+                (Strings.Label_PreLaunchParameters,      dto.PreLaunchParameters),
+                (Strings.Label_PostLaunchParameters,     dto.PostLaunchParameters),
+                (Strings.Label_PreStopParameters,        dto.PreStopParameters),
+                (Strings.Label_PostStopParameters,       dto.PostStopParameters),
+                (Strings.Label_FailureProgramParameters, dto.FailureProgramParameters),
             };
-            foreach (var (name, value) in paramFieldsNamed)
+            foreach (var (label, value) in paramFieldsNamed)
             {
                 if (value?.Length > AppConfig.MaxArgumentLength)
-                    result.Errors.Add(string.Format(Strings.Msg_ArgumentsLengthReachedForField, name, AppConfig.MaxArgumentLength));
+                    result.Errors.Add(string.Format(Strings.Msg_ArgumentsLengthReachedForField, label, AppConfig.MaxArgumentLength));
             }
 
             // CpuAffinity
-            if (!AffinityHelper.ValidateAffinity(dto.CpuAffinity, out string? errorMessage) && errorMessage != null)
-                result.Errors.Add(errorMessage);
+            if (!AffinityHelper.ValidateAffinity(dto.CpuAffinity, out string? errorMessage))
+                result.Errors.Add(errorMessage ?? string.Format(Strings.Msg_InvalidConfig, nameof(dto.CpuAffinity)));
 
             // Reflected [ServicePath] Validation
             var pathViolations = ServicePathValidator.FindAllViolations(dto, _processHelper.ValidatePath);
             foreach (var pathViolation in pathViolations)
             {
-                string? errorString = null;
-                if (!string.IsNullOrEmpty(pathViolation.Attribute.ErrorResourceKey))
-                {
-                    var property = typeof(Strings).GetProperty(
-                        pathViolation.Attribute.ErrorResourceKey,
-                        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-
-                    errorString = property?.GetValue(null) as string;
-                }
-
-                result.Errors.Add(errorString ?? string.Format(Strings.Msg_InvalidPathInConfig, pathViolation.Attribute.Label));
+                result.Errors.Add(pathViolation.ResolveErrorMessage());
             }
 
             // External Wrapper Executable Path
@@ -111,25 +107,25 @@ namespace Servy.Core.Validation
             if (!string.IsNullOrWhiteSpace(dto.StderrPath) && !Helper.IsValidPath(dto.StderrPath))
                 result.Errors.Add(Strings.Msg_InvalidStderrPath);
 
+            // One shape for every bounded numeric field: the value, its two bounds and the message
+            // that reports them are stated once, at the single line where they meet.
+            void CheckRange(int? value, int min, int max, string message)
+            {
+                if (value.HasValue && (value < min || value > max))
+                    result.Errors.Add(string.Format(message, min, max));
+            }
+
             // Timeouts & Rotation Bounds
-            if (dto.StartTimeout.HasValue && (dto.StartTimeout < AppConfig.MinStartTimeout || dto.StartTimeout > AppConfig.MaxStartTimeout))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidStartTimeout, AppConfig.MinStartTimeout, AppConfig.MaxStartTimeout));
-            if (dto.StopTimeout.HasValue && (dto.StopTimeout < AppConfig.MinStopTimeout || dto.StopTimeout > AppConfig.MaxStopTimeout))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidStopTimeout, AppConfig.MinStopTimeout, AppConfig.MaxStopTimeout));
-            if (dto.RotationSize.HasValue && (dto.RotationSize < AppConfig.MinRotationSize || dto.RotationSize > AppConfig.MaxRotationSize))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidRotationSize, AppConfig.MinRotationSize, AppConfig.MaxRotationSize));
-            if (dto.MaxRotations.HasValue && (dto.MaxRotations < AppConfig.MinMaxRotations || dto.MaxRotations > AppConfig.MaxMaxRotations))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidMaxRotations, AppConfig.MinMaxRotations, AppConfig.MaxMaxRotations));
-            if (dto.HeartbeatUrlTimeoutSeconds.HasValue && (dto.HeartbeatUrlTimeoutSeconds < AppConfig.MinHeartbeatUrlTimeoutSeconds || dto.HeartbeatUrlTimeoutSeconds > AppConfig.MaxHeartbeatUrlTimeoutSeconds))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidHeartbeatUrlTimeout, AppConfig.MinHeartbeatUrlTimeoutSeconds, AppConfig.MaxHeartbeatUrlTimeoutSeconds));
+            CheckRange(dto.StartTimeout, AppConfig.MinStartTimeout, AppConfig.MaxStartTimeout, Strings.Msg_InvalidStartTimeout);
+            CheckRange(dto.StopTimeout, AppConfig.MinStopTimeout, AppConfig.MaxStopTimeout, Strings.Msg_InvalidStopTimeout);
+            CheckRange(dto.RotationSize, AppConfig.MinRotationSize, AppConfig.MaxRotationSize, Strings.Msg_InvalidRotationSize);
+            CheckRange(dto.MaxRotations, AppConfig.MinMaxRotations, AppConfig.MaxMaxRotations, Strings.Msg_InvalidMaxRotations);
+            CheckRange(dto.HeartbeatUrlTimeoutSeconds, AppConfig.MinHeartbeatUrlTimeoutSeconds, AppConfig.MaxHeartbeatUrlTimeoutSeconds, Strings.Msg_InvalidHeartbeatUrlTimeout);
 
             // Health & Recovery
-            if (dto.HeartbeatInterval.HasValue && (dto.HeartbeatInterval < AppConfig.MinHeartbeatInterval || dto.HeartbeatInterval > AppConfig.MaxHeartbeatInterval))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidHeartbeatInterval, AppConfig.MinHeartbeatInterval, AppConfig.MaxHeartbeatInterval));
-            if (dto.MaxFailedChecks.HasValue && (dto.MaxFailedChecks < AppConfig.MinMaxFailedChecks || dto.MaxFailedChecks > AppConfig.MaxMaxFailedChecks))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidMaxFailedChecks, AppConfig.MinMaxFailedChecks, AppConfig.MaxMaxFailedChecks));
-            if (dto.MaxRestartAttempts.HasValue && (dto.MaxRestartAttempts < AppConfig.MinMaxRestartAttempts || dto.MaxRestartAttempts > AppConfig.MaxMaxRestartAttempts))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidMaxRestartAttempts, AppConfig.MinMaxRestartAttempts, AppConfig.MaxMaxRestartAttempts));
+            CheckRange(dto.HeartbeatInterval, AppConfig.MinHeartbeatInterval, AppConfig.MaxHeartbeatInterval, Strings.Msg_InvalidHeartbeatInterval);
+            CheckRange(dto.MaxFailedChecks, AppConfig.MinMaxFailedChecks, AppConfig.MaxMaxFailedChecks, Strings.Msg_InvalidMaxFailedChecks);
+            CheckRange(dto.MaxRestartAttempts, AppConfig.MinMaxRestartAttempts, AppConfig.MaxMaxRestartAttempts, Strings.Msg_InvalidMaxRestartAttempts);
 
             // Heartbeat URL Validation
             if (!string.IsNullOrWhiteSpace(dto.HeartbeatUrl))
@@ -162,26 +158,23 @@ namespace Servy.Core.Validation
             }
 
             // Environment & Dependencies
-            if (!EnvironmentVariablesValidator.Validate(StringHelper.NormalizeString(dto.EnvironmentVariables), out var envErrors))
+            if (!EnvironmentVariablesValidator.Validate(dto.EnvironmentVariables, out var envErrors))
                 result.Errors.AddRange(envErrors);
-            if (!ServiceDependenciesValidator.Validate(StringHelper.NormalizeString(dto.ServiceDependencies), out var depsErrors))
+            if (!ServiceDependenciesValidator.Validate(dto.ServiceDependencies, out var depsErrors))
                 result.Errors.AddRange(depsErrors);
 
             // Pre-Launch Environment & Destination Output Paths
-            if (!EnvironmentVariablesValidator.Validate(StringHelper.NormalizeString(dto.PreLaunchEnvironmentVariables), out var preLaunchEnvErrors))
+            if (!EnvironmentVariablesValidator.Validate(dto.PreLaunchEnvironmentVariables, out var preLaunchEnvErrors))
                 result.Errors.AddRange(preLaunchEnvErrors);
             if (!string.IsNullOrWhiteSpace(dto.PreLaunchStdoutPath) && !Helper.IsValidPath(dto.PreLaunchStdoutPath))
                 result.Errors.Add(Strings.Msg_InvalidPreLaunchStdoutPath);
             if (!string.IsNullOrWhiteSpace(dto.PreLaunchStderrPath) && !Helper.IsValidPath(dto.PreLaunchStderrPath))
                 result.Errors.Add(Strings.Msg_InvalidPreLaunchStderrPath);
-            if (dto.PreLaunchTimeoutSeconds.HasValue && (dto.PreLaunchTimeoutSeconds < AppConfig.MinPreLaunchTimeoutSeconds || dto.PreLaunchTimeoutSeconds > AppConfig.MaxPreLaunchTimeoutSeconds))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidPreLaunchTimeout, AppConfig.MinPreLaunchTimeoutSeconds, AppConfig.MaxPreLaunchTimeoutSeconds));
-            if (dto.PreLaunchRetryAttempts.HasValue && (dto.PreLaunchRetryAttempts < AppConfig.MinPreLaunchRetryAttempts || dto.PreLaunchRetryAttempts > AppConfig.MaxPreLaunchRetryAttempts))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidPreLaunchRetryAttempts, AppConfig.MinPreLaunchRetryAttempts, AppConfig.MaxPreLaunchRetryAttempts));
+            CheckRange(dto.PreLaunchTimeoutSeconds, AppConfig.MinPreLaunchTimeoutSeconds, AppConfig.MaxPreLaunchTimeoutSeconds, Strings.Msg_InvalidPreLaunchTimeout);
+            CheckRange(dto.PreLaunchRetryAttempts, AppConfig.MinPreLaunchRetryAttempts, AppConfig.MaxPreLaunchRetryAttempts, Strings.Msg_InvalidPreLaunchRetryAttempts);
 
             // Pre-Stop Timeout
-            if (dto.PreStopTimeoutSeconds.HasValue && (dto.PreStopTimeoutSeconds < AppConfig.MinPreStopTimeoutSeconds || dto.PreStopTimeoutSeconds > AppConfig.MaxPreStopTimeoutSeconds))
-                result.Errors.Add(string.Format(Strings.Msg_InvalidPreStopTimeout, AppConfig.MinPreStopTimeoutSeconds, AppConfig.MaxPreStopTimeoutSeconds));
+            CheckRange(dto.PreStopTimeoutSeconds, AppConfig.MinPreStopTimeoutSeconds, AppConfig.MaxPreStopTimeoutSeconds, Strings.Msg_InvalidPreStopTimeout);
 
             return result;
         }

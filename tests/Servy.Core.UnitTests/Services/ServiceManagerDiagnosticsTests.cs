@@ -1,0 +1,298 @@
+using Moq;
+using Servy.Core.Config;
+using Servy.Core.Data;
+using Servy.Core.DTOs;
+using Servy.Core.Enums;
+using Servy.Core.Logging;
+using Servy.Core.Native;
+using Servy.Core.ServiceDependencies;
+using Servy.Core.Services;
+using Servy.Core.UnitTests.Logging;
+using Servy.Testing;
+using System.ComponentModel;
+using System.ServiceProcess;
+
+namespace Servy.Core.UnitTests.Services
+{
+    /// <summary>
+    /// Covers the <see cref="ServiceManager"/> arms that a log entry distinguishes: the install
+    /// rollback's two failure paths, the startup-type mapper's filtered catch and its catch-all,
+    /// and the outer catch-all of <see cref="ServiceManager.GetServiceStartupType"/>. Each returns
+    /// the same value as a path beside it, so the log line is what tells them apart and these tests
+    /// drive the static <see cref="Logger"/> - hence the sequential logger collection.
+    /// </summary>
+    [Collection(LoggerCollection.Name)]
+    public class ServiceManagerDiagnosticsTests : IDisposable
+    {
+        /// <summary>
+        /// The SCM dependency list of a service configured with no dependencies: every Servy service depends on the
+        /// Servy host service.
+        /// </summary>
+        private static readonly string HostOnlyDependencies = ServiceDependenciesParser.ParseWithRequired(null, AppConfig.ServyHostServiceName);
+
+        private readonly FakeServiceHandles _handles = new FakeServiceHandles();
+
+        #region Install rollback logging
+
+        [Fact]
+        public async Task InstallService_ShouldLogManualCleanupWarning_WhenRollbackDeleteServiceReturnsFalse()
+        {
+            // Arrange
+            var mocks = new InstallMocks(this);
+            mocks.WindowsServiceApi.Setup(x => x.DeleteService(mocks.ServiceHandle)).Returns(false);
+            mocks.Win32ErrorProvider.Setup(x => x.GetLastWin32Error()).Returns(1072);
+
+            // Act
+            var capture = await LogCapture.RunAsync(() => mocks.Manager.InstallServiceAsync(mocks.Options, cancellationToken: TestContext.Current.CancellationToken), LogLevel.Debug);
+
+            // Assert
+            Assert.False(capture.Result.IsSuccess);
+            mocks.WindowsServiceApi.Verify(x => x.DeleteService(mocks.ServiceHandle), Times.Once);
+
+            // A rollback that could not delete the service leaves an SCM orphan, and the only thing
+            // standing between that and a silent leak is this line naming the service and the error.
+            Assert.Contains($"Rollback failed: DeleteService returned false for '{InstallMocks.ServiceName}'", capture.Log);
+            Assert.Contains("Win32 error: 1072", capture.Log);
+            Assert.Contains("Manual cleanup may be required", capture.Log);
+        }
+
+        [Fact]
+        public async Task InstallService_ShouldSwallowAndLog_WhenRollbackDeleteServiceThrows()
+        {
+            // Arrange
+            var mocks = new InstallMocks(this);
+            mocks.WindowsServiceApi.Setup(x => x.DeleteService(mocks.ServiceHandle))
+                .Throws(new InvalidOperationException("SCM handle already closed"));
+
+            // Act
+            var capture = await LogCapture.RunAsync(() => mocks.Manager.InstallServiceAsync(mocks.Options, cancellationToken: TestContext.Current.CancellationToken), LogLevel.Debug);
+
+            // Assert
+            // The rollback runs inside a finally: an exception escaping it would replace the install's
+            // own failure result with a throw, so swallowing it and logging is the contract.
+            Assert.False(capture.Result.IsSuccess);
+            Assert.Contains($"Rollback raised an exception for '{InstallMocks.ServiceName}'", capture.Log);
+        }
+
+        #endregion
+
+        #region MapStartupType filtered catch and catch-all
+
+        [Theory]
+        [InlineData(typeof(InvalidOperationException))]
+        [InlineData(typeof(Win32Exception))]
+        public async Task GetServiceStartupType_ShouldLogAtDebugAndReturnUnknown_WhenStartTypeThrowsProtectedServiceError(Type exceptionType)
+        {
+            // Arrange
+            const string serviceName = "ProtectedService";
+
+            // The two exception types the filter names are what ServiceController.StartType raises for
+            // a service this process cannot open; a type outside the filter falls to the catch-all
+            // below it, which logs at Error level and is covered by the next test in this region.
+            var thrown = exceptionType == typeof(Win32Exception)
+                ? (Exception)new Win32Exception(5)
+                : new InvalidOperationException("Access is denied");
+
+            var mockController = new Mock<IServiceControllerWrapper>();
+            mockController.Setup(c => c.ServiceName).Returns(serviceName);
+            mockController.Setup(c => c.StartType).Throws(thrown);
+
+            var manager = new ServiceManager(
+                _ => mockController.Object,
+                new Mock<IServiceControllerProvider>().Object,
+                new Mock<IWindowsServiceApi>().Object,
+                new Mock<IWin32ErrorProvider>().Object,
+                new Mock<IServiceRepository>().Object);
+
+            // Act
+            var capture = await LogCapture.RunAsync(() =>
+                Task.FromResult(manager.GetServiceStartupType(serviceName, TestContext.Current.CancellationToken)), LogLevel.Debug);
+
+            // Assert
+            Assert.Equal(ServiceStartType.Unknown, capture.Result);
+
+            // Both arms return Unknown, so the level and the wording are the only observable
+            // difference: a filter narrowed back to Win32Exception would land in the catch-all.
+            Assert.Contains($"Access denied or Win32 error reading StartType for '{serviceName}'", capture.Log);
+            Assert.DoesNotContain("Unexpected error mapping startup type", capture.Log);
+        }
+
+        [Fact]
+        public async Task GetServiceStartupType_ShouldLogErrorAndReturnUnknown_WhenStartTypeThrowsUnexpectedException()
+        {
+            // Arrange
+            // A type outside the filter (InvalidOperationException, Win32Exception) lands in MapStartupType's
+            // catch-all. It returns Unknown like its neighbours, so the Error-level line is its only mark,
+            // and the three Assert.DoesNotContain guards in this file rely on that text being emitted here.
+            const string serviceName = "UnexpectedFailure";
+
+            var mockController = new Mock<IServiceControllerWrapper>();
+            mockController.Setup(c => c.ServiceName).Returns(serviceName);
+            mockController.Setup(c => c.StartType).Throws(new NullReferenceException("unexpected"));
+
+            var manager = new ServiceManager(
+                _ => mockController.Object,
+                new Mock<IServiceControllerProvider>().Object,
+                new Mock<IWindowsServiceApi>().Object,
+                new Mock<IWin32ErrorProvider>().Object,
+                new Mock<IServiceRepository>().Object);
+
+            // Act
+            var capture = await LogCapture.RunAsync(() =>
+                Task.FromResult(manager.GetServiceStartupType(serviceName, TestContext.Current.CancellationToken)), LogLevel.Debug);
+
+            // Assert
+            Assert.Equal(ServiceStartType.Unknown, capture.Result);
+
+            // The [ERROR] | prefix pins the level as well as the wording; Logger writes
+            // "[<timestamp>] [<LEVEL>] | <message>".
+            Assert.Contains($"[ERROR] | Unexpected error mapping startup type for '{serviceName}'", capture.Log);
+            Assert.DoesNotContain("Access denied or Win32 error reading StartType", capture.Log);
+            Assert.DoesNotContain("Error getting service startup type", capture.Log);
+        }
+
+        #endregion
+
+        #region GetServiceStartupType outer catch-all
+
+        [Fact]
+        public async Task GetServiceStartupType_ShouldLogErrorAndReturnUnknown_WhenControllerFactoryThrows()
+        {
+            // Arrange
+            // Since the StartType switch moved into MapStartupType, a throwing StartType is caught
+            // there and never reaches GetServiceStartupType's own catch-all. The controller factory
+            // throwing before there is a controller to map is one of the two ways left in.
+            const string serviceName = "FactoryFails";
+
+            var manager = new ServiceManager(
+                _ => throw new InvalidOperationException("factory failed"),
+                new Mock<IServiceControllerProvider>().Object,
+                new Mock<IWindowsServiceApi>().Object,
+                new Mock<IWin32ErrorProvider>().Object,
+                new Mock<IServiceRepository>().Object);
+
+            // Act
+            var capture = await LogCapture.RunAsync(() =>
+                Task.FromResult(manager.GetServiceStartupType(serviceName, TestContext.Current.CancellationToken)), LogLevel.Debug);
+
+            // Assert
+            Assert.Equal(ServiceStartType.Unknown, capture.Result);
+
+            // The wording is what separates this arm from MapStartupType's own catch-all, which
+            // would have logged "Unexpected error mapping startup type" instead.
+            Assert.Contains($"Error getting service startup type for '{serviceName}'", capture.Log);
+            Assert.DoesNotContain("Unexpected error mapping startup type", capture.Log);
+        }
+
+        [Fact]
+        public async Task GetServiceStartupType_ShouldLogErrorAndReturnUnknown_WhenControllerDisposeThrowsAfterMapping()
+        {
+            // Arrange
+            // The other way into the outer catch: the using block's Dispose throws after the start
+            // type was already resolved. The return inside the using is abandoned, so the caller sees
+            // Unknown rather than the Manual the mapper had produced. Manual is deliberate - it keeps
+            // the delayed-auto-start probe (an Automatic-only refinement) out of this path.
+            const string serviceName = "DisposeFails";
+
+            var mockController = new Mock<IServiceControllerWrapper>();
+            mockController.Setup(c => c.ServiceName).Returns(serviceName);
+            mockController.Setup(c => c.StartType).Returns(ServiceStartMode.Manual);
+            mockController.Setup(c => c.Dispose()).Throws(new InvalidOperationException("handle already closed"));
+
+            var manager = new ServiceManager(
+                _ => mockController.Object,
+                new Mock<IServiceControllerProvider>().Object,
+                new Mock<IWindowsServiceApi>().Object,
+                new Mock<IWin32ErrorProvider>().Object,
+                new Mock<IServiceRepository>().Object);
+
+            // Act
+            var capture = await LogCapture.RunAsync(() =>
+                Task.FromResult(manager.GetServiceStartupType(serviceName, TestContext.Current.CancellationToken)), LogLevel.Debug);
+
+            // Assert
+            Assert.Equal(ServiceStartType.Unknown, capture.Result);
+            Assert.NotEqual(ServiceStartType.Manual, capture.Result);
+            Assert.Contains($"Error getting service startup type for '{serviceName}'", capture.Log);
+            Assert.DoesNotContain("Unexpected error mapping startup type", capture.Log);
+        }
+
+        #endregion
+
+        #region Test Helpers
+
+        /// <summary>
+        /// The smallest install arrangement that reaches the rollback: the service is created, then
+        /// the pre-shutdown configuration fails, so the finally block has an SCM entry to delete.
+        /// </summary>
+        private sealed class InstallMocks
+        {
+            public const string ServiceName = "TestService";
+
+            public InstallMocks(ServiceManagerDiagnosticsTests owner)
+            {
+                var scmHandle = owner._handles.Scm();
+                ServiceHandle = owner._handles.Service();
+
+                WindowsServiceApi = new Mock<IWindowsServiceApi>();
+                Win32ErrorProvider = new Mock<IWin32ErrorProvider>();
+
+                WindowsServiceApi.Setup(x => x.OpenSCManager(null, null, It.IsAny<uint>())).Returns(scmHandle);
+                WindowsServiceApi.Setup(x => x.CreateService(
+                        scmHandle,
+                        ServiceName,
+                        It.IsAny<string>(),
+                        It.IsAny<uint>(),
+                        It.IsAny<uint>(),
+                        It.IsAny<uint>(),
+                        It.IsAny<uint>(),
+                        It.IsAny<string>(),
+                        null,
+                        IntPtr.Zero,
+                        HostOnlyDependencies,
+                        ServiceAccounts.LocalSystem,
+                        null))
+                    .Returns(ServiceHandle);
+                WindowsServiceApi.Setup(x => x.OpenService(scmHandle, ServiceName, It.IsAny<uint>())).Returns(ServiceHandle);
+
+                // The pre-shutdown configuration is what fails, which is what sets needsRollback
+                WindowsServiceApi.Setup(x => x.ChangeServiceConfig2(It.IsAny<SafeServiceHandle>(), It.IsAny<uint>(), It.IsAny<IntPtr>()))
+                    .Returns(false);
+
+                Manager = new ServiceManager(
+                    _ => new Mock<IServiceControllerWrapper>().Object,
+                    new Mock<IServiceControllerProvider>().Object,
+                    WindowsServiceApi.Object,
+                    Win32ErrorProvider.Object,
+                    new Mock<IServiceRepository>().Object);
+
+                Options = new InstallServiceOptions
+                {
+                    ServiceName = ServiceName,
+                    Description = string.Empty,
+                    WrapperExePath = "wrapper.exe",
+                    RealExePath = "real.exe",
+                    StartType = ServiceStartType.Automatic,
+                    ProcessPriority = ProcessPriority.Normal
+                };
+            }
+
+            public Mock<IWindowsServiceApi> WindowsServiceApi { get; }
+
+            public Mock<IWin32ErrorProvider> Win32ErrorProvider { get; }
+
+            public SafeServiceHandle ServiceHandle { get; }
+
+            public ServiceManager Manager { get; }
+
+            public InstallServiceOptions Options { get; }
+        }
+
+        public void Dispose()
+        {
+            _handles.Dispose();
+        }
+
+        #endregion
+    }
+}

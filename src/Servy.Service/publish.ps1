@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Self-contained build and publish script for Servy.Service.
@@ -6,10 +7,14 @@
 .DESCRIPTION
     This script builds the Servy.Service project following the standard repository
     build pattern. It publishes to the default bin directory and optionally
-    signs the resulting executable using SignPath.
+    signs the published executable with SignPath when -BuildConfiguration is Release
+    and setup/signpath.ps1 is present; otherwise signing is skipped with a warning.
+
+    Servy.Service embeds no resources: Servy.Restarter.exe is embedded by the desktop app,
+    the Manager and the CLI, which extract it next to the service executable.
 
 .PARAMETER Tfm
-    Target framework for the build (default: net10.0-windows).
+    Target framework for the build. Defaults to the value in build-config.ps1.
 
 .PARAMETER Runtime
     Runtime identifier for the build (default: win-x64).
@@ -22,13 +27,24 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Tfm                = "net10.0-windows",
-    [string]$Runtime            = "win-x64",
+    [string]$Tfm                = "",
+    [ValidateSet('Debug', 'Release')]
     [string]$BuildConfiguration = "Release",
+    [string]$Runtime            = "win-x64",
     [switch]$Pause
 )
 
 $P_PublishDir = $PSScriptRoot
+
+# Load central defaults
+$configPath = Join-Path $P_PublishDir "..\..\setup\build-config.ps1"
+if (Test-Path -LiteralPath $configPath) {
+    $buildConfig = & $configPath
+    if (-not $Tfm) { $Tfm = $buildConfig.Tfm }
+} else {
+    throw "Central build configuration not found at $configPath"
+}
+
 . (Join-Path $P_PublishDir "..\..\setup\build-common.ps1")
 
 Invoke-StandardPublish `

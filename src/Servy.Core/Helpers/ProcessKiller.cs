@@ -1,8 +1,8 @@
 using Servy.Core.Config;
 using Servy.Core.Logging;
 using Servy.Core.Native;
+using Servy.Core.ProcessManagement;
 using System.ComponentModel;
-using System.Diagnostics;
 
 namespace Servy.Core.Helpers
 {
@@ -14,6 +14,24 @@ namespace Servy.Core.Helpers
     /// </remarks>
     public class ProcessKiller : IProcessKiller
     {
+        private readonly ISystemProcessAccessor _processAccessor;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ProcessKiller"/> class using standard production process accessors.
+        /// </summary>
+        public ProcessKiller() : this(new SystemProcessAccessor())
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ProcessKiller"/> class using the specified process accessor.
+        /// </summary>
+        /// <param name="processAccessor">The system process accessor to use for process querying and snapshots.</param>
+        internal ProcessKiller(ISystemProcessAccessor processAccessor)
+        {
+            _processAccessor = processAccessor ?? throw new ArgumentNullException(nameof(processAccessor));
+        }
+
         #region Safety Guardrails
 
         /// <summary>
@@ -47,16 +65,89 @@ namespace Servy.Core.Helpers
         };
 
         /// <summary>
+        /// Evaluates if an executable image path is located inside a recognized Windows system directory.
+        /// </summary>
+        /// <param name="executablePath">The full path of the executable image on disk.</param>
+        /// <returns><see langword="true"/> if the path resides in a Windows system folder; otherwise, <see langword="false"/>.</returns>
+        private static bool IsSystemDirectoryPath(string executablePath)
+        {
+            if (string.IsNullOrWhiteSpace(executablePath)) return false;
+
+            string systemRoot = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            if (string.IsNullOrEmpty(systemRoot))
+            {
+                systemRoot = @"C:\Windows";
+            }
+
+            string fullPath = Path.GetFullPath(executablePath);
+
+            // Valid system roots where legitimate Windows critical processes reside
+            string system32 = Path.Combine(systemRoot, "System32");
+            string sysWow64 = Path.Combine(systemRoot, "SysWOW64");
+            string systemApps = Path.Combine(systemRoot, "SystemApps");
+            string winSxS = Path.Combine(systemRoot, "WinSxS");
+
+            return fullPath.StartsWith(system32 + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                   fullPath.StartsWith(sysWow64 + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                   fullPath.StartsWith(systemApps + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                   fullPath.StartsWith(winSxS + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(fullPath, Path.Combine(systemRoot, "explorer.exe"), StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
         /// Centralized helper to evaluate if a process name belongs to the critical system safelist.
         /// Handles normalization of '.exe' suffixes to ensure consistent lookup regardless of the data source.
+        /// When executable path context is available, validates executable provenance to prevent name spoofing.
         /// </summary>
-        private bool IsCriticalProcess(string? processName)
+        /// <param name="processName">The process name to evaluate.</param>
+        /// <param name="pid">The process identifier for diagnostic logging.</param>
+        /// <param name="executablePath">Optional fully qualified path to the process executable image.</param>
+        /// <returns><see langword="true"/> if the process is a legitimate critical system process; otherwise, <see langword="false"/>.</returns>
+        private bool IsCriticalProcess(string? processName, int pid = 0, string? executablePath = null)
         {
             if (string.IsNullOrEmpty(processName)) return false;
 
             string cleanName = StripExe(processName);
 
-            return CriticalSystemProcesses.Contains(cleanName);
+            if (!CriticalSystemProcesses.Contains(cleanName))
+            {
+                return false;
+            }
+
+            // Pseudo-kernel processes carry no image path on disk
+            if (string.Equals(cleanName, "system", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(cleanName, "idle", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(cleanName, "registry", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(cleanName, "memcompression", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(cleanName, "secure system", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(cleanName, "vmmem", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(cleanName, "vmmemwsl", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // 1. Up-front name-only check (executablePath parameter was omitted by caller):
+            // Protect critical names from bulk name-based kill requests up-front.
+            if (executablePath == null)
+            {
+                return true;
+            }
+
+            // 2. Specific PID handle inspection (executablePath was provided, but is empty/unreadable or outside System32):
+            // Fail closed: reject safelist protection if the path is unreadable or outside valid system roots.
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                Logger.Warn($"SECURITY ALERT: Process PID {pid} ('{processName}') matched critical system process name but its executable path could not be read. Rejecting safelist protection.");
+                return false;
+            }
+
+            if (!IsSystemDirectoryPath(executablePath))
+            {
+                Logger.Warn($"SECURITY ALERT: Process PID {pid} ('{processName}') matched critical system process name but executes from non-system location '{executablePath}'. Rejecting safelist protection.");
+                return false;
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -65,13 +156,14 @@ namespace Servy.Core.Helpers
         /// <param name="pid">The process ID to evaluate.</param>
         /// <param name="processName">The name of the process.</param>
         /// <param name="protectedPids">A set of PIDs belonging to the current process or its parents.</param>
+        /// <param name="executablePath">Optional path to the process image file on disk.</param>
         /// <returns>A boolean indicating true if the process is protected, otherwise false.</returns>
-        private bool IsProtected(int pid, string processName, HashSet<int> protectedPids)
+        private bool IsProtected(int pid, string processName, HashSet<int> protectedPids, string? executablePath = null)
         {
             // Protection for system-level PIDs and the Servy process chain
             if (pid <= AppConfig.MaxReservedSystemPid || protectedPids.Contains(pid)) return true;
 
-            return IsCriticalProcess(processName);
+            return IsCriticalProcess(processName, pid, executablePath);
         }
 
         #endregion
@@ -86,15 +178,19 @@ namespace Servy.Core.Helpers
             DateTime parentStartTime = DateTime.MinValue;
             try
             {
-                using (var parent = Process.GetProcessById(parentPid))
+                using (var parent = _processAccessor.GetProcessById(parentPid))
                 {
                     parentStartTime = parent.StartTime;
                 }
             }
-            catch { /* parent already exited; first-level identity check is best-effort */ }
+            catch
+            {
+                // Parent already exited or its start time is unreadable: parentStartTime stays MinValue,
+                // so WalkAndKillChildren skips every child (the PID-reuse guard fails safe).
+            }
 
             // Step 1: Create a handle-less view of the entire system process table in a single pass
-            var (snapshot, byParent) = Toolhelp32Snapshot.BuildSnapshotAndChildMap();
+            var (snapshot, byParent) = _processAccessor.BuildSnapshotAndChildMap();
 
             // SECURITY: Get ancestor PIDs to prevent killing the Servy process chain if it happens
             // to be a descendant (e.g. through PID reuse or complex supervisor patterns)
@@ -136,11 +232,11 @@ namespace Servy.Core.Helpers
 
                 try
                 {
-                    using (var child = Process.GetProcessById(childPid))
+                    using (var child = _processAccessor.GetProcessById(childPid))
                     {
                         // SECURITY: Use centralized IsProtected as the single source of truth
                         // to guard against killing ancestors or system critical processes.
-                        if (IsProtected(childPid, child.ProcessName, protectedPids)) continue;
+                        if (IsProtected(childPid, child.ProcessName, protectedPids, child.ExecutablePath)) continue;
 
                         DateTime childStart = SafeStartTime(child);
 
@@ -172,6 +268,7 @@ namespace Servy.Core.Helpers
                     }
                 }
                 catch (ArgumentException) { /* Process already dead */ }
+                catch (InvalidOperationException) { /* Process exited mid-operation */ }
                 catch (Exception ex) { Logger.Warn($"Failed to kill descendant {childPid}.", ex); }
             }
         }
@@ -199,15 +296,15 @@ namespace Servy.Core.Helpers
 
                 int selfPid = GetCurrentPid();
 
-                var (completeSnapshot, byParent) = Toolhelp32Snapshot.BuildSnapshotAndChildMap();
+                var (completeSnapshot, byParent) = _processAccessor.BuildSnapshotAndChildMap();
                 var protectedPids = GetAncestorPids(completeSnapshot);
 
-                // Find target PIDs directly from the snapshot - no Process.GetProcesses() needed.
+                // Find target PIDs directly from the snapshot.
                 var targetPids = new List<int>();
                 var anyProtected = false;
                 foreach (var kvp in completeSnapshot)
                 {
-                    string snapName = StripExe(kvp.Value.Name ?? string.Empty);
+                    string snapName = StripExe(kvp.Value.Name);
 
                     if (string.Equals(snapName, normalizedName, StringComparison.OrdinalIgnoreCase))
                     {
@@ -224,14 +321,14 @@ namespace Servy.Core.Helpers
                 if (targetPids.Count == 0) return !anyProtected; // true only when genuinely nothing matched
 
                 // Open handles ONLY for the small subset we plan to act on.
-                var targets = new List<Process>();
+                var targets = new List<ISystemProcess>();
                 try
                 {
                     foreach (var pid in targetPids)
                     {
                         try
                         {
-                            targets.Add(Process.GetProcessById(pid));
+                            targets.Add(_processAccessor.GetProcessById(pid));
                         }
                         catch (ArgumentException)
                         {
@@ -285,17 +382,20 @@ namespace Servy.Core.Helpers
             try
             {
                 // Single Toolhelp32 walk populates both maps
-                var (completeSnapshot, byParent) = Toolhelp32Snapshot.BuildSnapshotAndChildMap();
+                var (completeSnapshot, byParent) = _processAccessor.BuildSnapshotAndChildMap();
                 var protectedPids = GetAncestorPids(completeSnapshot);
 
                 // SECURITY: Resolve process handle and apply full safety check
-                Process target;
-                try { target = Process.GetProcessById(pid); }
-                catch (ArgumentException) { return true; } // Already exited
+                ISystemProcess target;
+                try { target = _processAccessor.GetProcessById(pid); }
+                catch (Exception ex) when (ex is ArgumentException || ex is InvalidOperationException)
+                {
+                    return true; // Process exited before the handle could be opened
+                }
 
                 try
                 {
-                    if (IsProtected(target.Id, target.ProcessName, protectedPids))
+                    if (IsProtected(target.Id, target.ProcessName, protectedPids, target.ExecutablePath))
                     {
                         Logger.Warn($"Execution blocked: Attempted to kill protected process {target.ProcessName} (PID {pid}).");
                         return false;
@@ -304,8 +404,8 @@ namespace Servy.Core.Helpers
                     int selfPid = GetCurrentPid();
 
                     // ROBUSTNESS: Perform the parent kill walk BEFORE the tree kill walk.
-                    // Aligned with the string overload to use SafeStartTime wrapper to prevent Win32Exception
-                    // or InvalidOperationException from skipping the subsequent KillProcessTree execution.
+                    // SafeStartTime prevents a Win32Exception or InvalidOperationException from
+                    // skipping the subsequent KillProcessTree execution.
                     if (killParents) KillParentProcesses(target.Id, SafeStartTime(target), protectedPids, completeSnapshot, new HashSet<int>());
                     KillProcessTree(target, selfPid, protectedPids, byParent);
 
@@ -328,11 +428,11 @@ namespace Servy.Core.Helpers
         /// <summary>
         /// Safely retrieves the start time of a process without throwing an exception if the process has already exited or access is denied.
         /// </summary>
-        /// <param name="p">The <see cref="Process"/> instance to query.</param>
+        /// <param name="p">The <see cref="ISystemProcess"/> instance to query.</param>
         /// <returns>
         /// The <see cref="DateTime"/> when the process started, or <see cref="DateTime.MinValue"/> if the start time could not be retrieved.
         /// </returns>
-        private static DateTime SafeStartTime(Process p)
+        private static DateTime SafeStartTime(ISystemProcess p)
         {
             try
             {
@@ -351,25 +451,22 @@ namespace Servy.Core.Helpers
         /// <param name="selfPid">The numerical identifier of the current executing process to avoid suicide operations.</param>
         /// <param name="protectedPids">A set of numerical identifiers corresponding to protected ancestor paths.</param>
         /// <param name="byParent">A pre-computed native map establishing hierarchical relationships across the system.</param>
-        private void KillProcessTree(Process process, int selfPid, HashSet<int> protectedPids, Dictionary<int, List<int>> byParent)
+        private void KillProcessTree(ISystemProcess process, int selfPid, HashSet<int> protectedPids, Dictionary<int, List<int>> byParent)
         {
             try
             {
                 // SECURITY: Use IsProtected instead of a simple PID check to ensure system-critical names are never targeted.
-                if (IsProtected(process.Id, process.ProcessName, protectedPids)) return;
+                if (IsProtected(process.Id, process.ProcessName, protectedPids, process.ExecutablePath)) return;
 
                 var visited = new HashSet<int>();
 
                 // HARDENING: Resolve start time safely to prevent Win32Exception/InvalidOperationException from aborting the pipeline.
-                // If query access is denied or the process is short-lived, it falls back to MinValue to ensure the tree kill continues.
-                DateTime rootStartTime = DateTime.MinValue;
-                try
+                // If query access is denied or the process is short-lived, it falls back to MinValue: WalkAndKillChildren then skips the
+                // descendants (its PID-reuse guard fails safe) and only the root process below is killed.
+                DateTime rootStartTime = SafeStartTime(process);
+                if (rootStartTime == DateTime.MinValue)
                 {
-                    rootStartTime = process.StartTime;
-                }
-                catch (Exception ex)
-                {
-                    Logger.Debug($"Unable to query StartTime for process {process.Id}. Proceeding with best-effort validation. Details: {ex.Message}");
+                    Logger.Debug($"Unable to query StartTime for process {process.Id}. Its descendants are skipped by the PID-reuse guard; only the process itself is killed.");
                 }
 
                 // Thread protectedPids into the walk using the securely isolated timestamp
@@ -394,31 +491,40 @@ namespace Servy.Core.Helpers
         /// <inheritdoc />
         public bool KillProcessesUsingFile(string filePath)
         {
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                Logger.Warn("KillProcessesUsingFile called with a null or empty file path.");
+                return false;
+            }
+
             if (!File.Exists(filePath))
             {
                 Logger.Info($"File not found: {filePath}");
                 return true;
             }
 
-            var handleExePath = AppConfig.GetHandleExePath();
-            if (!File.Exists(handleExePath))
-            {
-                Logger.Error($"Handle.exe not found at: {handleExePath}");
-                return false;
-            }
-
             bool success = true;
 
             try
             {
-                var processes = HandleHelper.GetProcessesUsingFile(handleExePath, filePath);
+                var processes = HandleHelper.GetProcessesUsingFile(filePath);
 
                 foreach (var procInfo in processes)
                 {
                     if (procInfo.ProcessId <= 0) continue;
 
-                    // Using IsCriticalProcess ensures handle.exe output (with .exe) is correctly validated against the safelist
-                    if (IsCriticalProcess(procInfo.ProcessName))
+                    string? executablePath = null;
+                    try
+                    {
+                        using (var p = _processAccessor.GetProcessById(procInfo.ProcessId))
+                        {
+                            executablePath = p.ExecutablePath;
+                        }
+                    }
+                    catch { /* process might have exited */ }
+
+                    // IsCriticalProcess validates the executable name (with or without .exe) against the safelist
+                    if (IsCriticalProcess(procInfo.ProcessName, procInfo.ProcessId, executablePath))
                     {
                         Logger.Warn($"Skipping kill request for critical system process: {procInfo.ProcessName} (PID {procInfo.ProcessId})");
                         success = false;
@@ -454,9 +560,9 @@ namespace Servy.Core.Helpers
         /// Retrieves the process ID of the currently executing process safely within a managed handle context.
         /// </summary>
         /// <returns>The unique process identifier of the current process.</returns>
-        private static int GetCurrentPid()
+        private int GetCurrentPid()
         {
-            using (var current = Process.GetCurrentProcess()) return current.Id;
+            using (var current = _processAccessor.GetCurrentProcess()) return current.Id;
         }
 
         /// <summary>
@@ -483,6 +589,10 @@ namespace Servy.Core.Helpers
         /// <param name="protectedPids">A set of protected numerical identifiers corresponding to the executing platform infrastructure.</param>
         /// <param name="snapshot">A pre-computed native map establishing hierarchical relationships and names across the system.</param>
         /// <param name="visited">A tracking set of PIDs already evaluated in this walk to prevent StackOverflow exceptions from PID-reuse cycles.</param>
+        /// <remarks>
+        /// Intentionally retained to support callers invoking <see cref="KillProcessTreeAndParents(string, bool)"/>
+        /// or <see cref="KillProcessTreeAndParents(int, bool)"/> with <c>killParents: true</c> as part of the reusable <c>Servy.Core</c> API.
+        /// </remarks>
         private void KillParentProcesses(int childPid, DateTime childStartTime, HashSet<int> protectedPids, Dictionary<int, ProcessInfoNode> snapshot, HashSet<int> visited)
         {
             // CYCLE GUARD: Prevent infinite recursion if Windows PID reuse creates a cycle in the snapshot.
@@ -501,22 +611,16 @@ namespace Servy.Core.Helpers
 
             if (!snapshot.TryGetValue(parentId, out var parentNode)) return;
 
-            // SECURITY: Use the name from the snapshot to check protection, avoiding access denied exceptions.
-            if (IsProtected(parentId, parentNode.Name, protectedPids))
-            {
-                Logger.Debug($"Aborting parent kill walk: {parentNode.Name} (PID {parentId}) is protected.");
-                return;
-            }
-
-            DateTime parentStartTime = DateTime.MinValue;
-            Process? parentProcess = null;
+            string? parentPath = null;
+            ISystemProcess? parentProcess = null;
 
             try
             {
                 // Open the process handle exactly once to establish an unchangeable identity context
-                parentProcess = Process.GetProcessById(parentId);
+                parentProcess = _processAccessor.GetProcessById(parentId);
+                parentPath = parentProcess.ExecutablePath;
             }
-            catch (ArgumentException)
+            catch (Exception ex) when (ex is ArgumentException || ex is InvalidOperationException)
             {
                 // parent already dead - abort walk
                 return;
@@ -524,17 +628,27 @@ namespace Servy.Core.Helpers
 
             try
             {
-                // ROBUSTNESS: Perform temporal identity validation BEFORE walking up the ancestor tree.
-                // This isolates PID recycling exploits at the boundary and blocks the walk from leaking into unrelated trees.
+                // SECURITY: Use the name from the snapshot to check protection, avoiding access denied exceptions.
+                if (IsProtected(parentId, parentNode.Name, protectedPids, parentPath))
+                {
+                    Logger.Debug($"Aborting parent kill walk: {parentNode.Name} (PID {parentId}) is protected.");
+                    return;
+                }
+
+                DateTime parentStartTime;
+
                 try
                 {
-                    // Verify the handle context directly using a single live process start time
-                    // to completely eliminate the PID-recycling exploit window.
+                    // ROBUSTNESS: Perform temporal identity validation BEFORE walking up the ancestor tree.
+                    // This validates the immediate parent-child boundary before recursion so a recycled parent PID cannot pull the walk into an unrelated tree.
+                    // Re-read the start time from the open handle so the identity is pinned to this process, not to the
+                    // snapshot's PID. A parent that started after the child (beyond PidReuseToleranceSeconds) is a recycled
+                    // PID and aborts the walk; the tolerance leaves a deliberate slack window.
                     DateTime exactStartTime = parentProcess.StartTime;
 
-                    // If temporal attributes are inaccessible (exactStartTime or childStartTime is MinValue),
-                    // abort the upward walk immediately. This eliminates the "kill blindly" fallback loop.
-                    if (childStartTime == DateTime.MinValue || exactStartTime == DateTime.MinValue)
+                    // childStartTime arrives as SafeStartTime's MinValue sentinel when the caller could not read it.
+                    // An unreadable parent start time surfaces as an exception, handled by the Win32Exception catch below.
+                    if (childStartTime == DateTime.MinValue)
                     {
                         Logger.Warn($"KillParentProcesses: Aborting upward tree walk at parent PID {parentId}. Incomplete temporal identity metrics.");
                         return;
@@ -573,6 +687,7 @@ namespace Servy.Core.Helpers
                 }
             }
             catch (ArgumentException) { /* Already dead */ }
+            catch (InvalidOperationException) { /* Already dead mid-operation */ }
             catch (Exception ex)
             {
                 Logger.Warn($"Failed to kill parent {parentId}.", ex);
@@ -589,6 +704,13 @@ namespace Servy.Core.Helpers
         /// </summary>
         /// <param name="snapshot">A pre-computed native map establishing hierarchical relationships across the system.</param>
         /// <returns>A hash set representing the structural lineage mapping backward toward the root operating system session.</returns>
+        /// <remarks>
+        /// The upward walk stops at a link whose parent started after its child by more than
+        /// <see cref="AppConfig.PidReuseToleranceSeconds"/>. A parent PID that cannot be the real parent (the original parent
+        /// exited and its PID was recycled, as with the boot-time session manager PID above <c>wininit.exe</c>) must not pull
+        /// an unrelated process tree into the protected set. A start time that cannot be read keeps the previous behaviour:
+        /// the parent is protected and the walk continues, so protection fails closed.
+        /// </remarks>
         private HashSet<int> GetAncestorPids(Dictionary<int, ProcessInfoNode> snapshot)
         {
             var ancestors = new HashSet<int>();
@@ -599,13 +721,28 @@ namespace Servy.Core.Helpers
                 ancestors.Add(currentPid);
                 int currentSearchPid = currentPid;
 
+                DateTime currentStart;
+                using (var current = _processAccessor.GetCurrentProcess()) currentStart = SafeStartTime(current);
+
                 // Walk up the tree using the snapshot to avoid handle access restrictions
                 while (snapshot.TryGetValue(currentSearchPid, out var node))
                 {
                     int parentId = node.ParentId;
                     if (parentId <= AppConfig.MaxReservedSystemPid) break;
-                    if (!ancestors.Add(parentId)) break; // Prevent infinite loops
+                    if (ancestors.Contains(parentId)) break; // Prevent infinite loops
+
+                    // PID-reuse guard: a parent that started after its child is a recycled PID, not an ancestor.
+                    DateTime parentStart = SafeParentStartTime(parentId);
+                    if (currentStart != DateTime.MinValue && parentStart != DateTime.MinValue
+                        && parentStart > currentStart.AddSeconds(AppConfig.PidReuseToleranceSeconds))
+                    {
+                        Logger.Debug($"GetAncestorPids: Stopping ancestor walk at PID {parentId}; it started after its child (recycled PID).");
+                        break;
+                    }
+
+                    ancestors.Add(parentId);
                     currentSearchPid = parentId;
+                    if (parentStart != DateTime.MinValue) currentStart = parentStart;
                 }
             }
             catch (Exception ex) { Logger.Warn($"Could not fully resolve ancestor tree: {ex.Message}"); }
@@ -613,10 +750,27 @@ namespace Servy.Core.Helpers
         }
 
         /// <summary>
-        /// Ensures the configured timeout respects the system-wide minimum safety floor.
+        /// Reads the start time of a process by PID without letting a dead or inaccessible process abort the caller.
         /// </summary>
-        /// <param name="configuredMs">The timeout value from the user configuration.</param>
-        /// <returns>The larger of the configured value or <see cref="AppConfig.MinKillWaitMs"/>.</returns>
+        /// <param name="pid">The numerical identifier of the process whose start time is requested.</param>
+        /// <returns>The start time, or <see cref="DateTime.MinValue"/> when the process is gone or its start time cannot be read.</returns>
+        private DateTime SafeParentStartTime(int pid)
+        {
+            try
+            {
+                using (var p = _processAccessor.GetProcessById(pid)) return SafeStartTime(p);
+            }
+            catch
+            {
+                return DateTime.MinValue;
+            }
+        }
+
+        /// <summary>
+        /// Ensures a kill wait never drops below the system-wide minimum safety floor.
+        /// </summary>
+        /// <param name="configuredMs">The wait in milliseconds, one of the <see cref="AppConfig"/> kill-wait constants (<see cref="AppConfig.KillChildWaitMs"/>, <see cref="AppConfig.KillTreeWaitMs"/>, <see cref="AppConfig.KillParentWaitMs"/>); it is not a user setting.</param>
+        /// <returns>The larger of <paramref name="configuredMs"/> and <see cref="AppConfig.MinKillWaitMs"/>.</returns>
         private static int SafeWait(int configuredMs) => Math.Max(configuredMs, AppConfig.MinKillWaitMs);
 
         #endregion

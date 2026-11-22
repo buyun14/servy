@@ -1,9 +1,20 @@
 using Servy.Core.EnvironmentVariables;
+using Servy.Core.Resources;
 
 namespace Servy.Core.UnitTests.EnvironmentVariables
 {
     public class EnvironmentVariableParserTests
     {
+        [Fact]
+        public void Parse_Null_ReturnsEmptyList()
+        {
+            // Arrange & Act
+            var result = EnvironmentVariableParser.Parse(null);
+
+            // Assert
+            Assert.Empty(result);
+        }
+
         [Fact]
         public void Parse_EmptyString_ReturnsEmptyList()
         {
@@ -140,21 +151,6 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
         }
 
         [Fact]
-        public void Parse_SupportsEscapedEqualsInKey()
-        {
-            // Arrange
-            var input = "K\\=EY=VAL";
-
-            // Act
-            var result = EnvironmentVariableParser.Parse(input);
-
-            // Assert
-            Assert.Single(result);
-            Assert.Equal("K=EY", result[0].Name);
-            Assert.Equal("VAL", result[0].Value);
-        }
-
-        [Fact]
         public void Parse_SupportsEscapedEqualsInValue()
         {
             // Arrange
@@ -246,19 +242,20 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
 
             // Act & Assert
             var ex = Assert.Throws<FormatException>(() => EnvironmentVariableParser.Parse(input));
-            Assert.Contains("Environment variable key cannot be empty", ex.Message);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableKeyEmpty, 1), ex.Message);
         }
 
         [Theory]
-        [InlineData(@"KEY\=NOEQUAL")]
-        [InlineData(@"KEY\\\=NOEQUAL")]
-        public void Parse_NoUnescapedEquals_ThrowsFormatException(string input)
+        [InlineData(@"KEY\=NOEQUAL", 1)]
+        [InlineData(@"KEY\\\=NOEQUAL", 1)]
+        [InlineData("A=1;;NOEQUAL", 3)]
+        public void Parse_NoUnescapedEquals_ThrowsFormatException(string input, int recordPosition)
         {
             // Arrange & Act
             var ex = Assert.Throws<FormatException>(() => EnvironmentVariableParser.Parse(input));
 
             // Assert
-            Assert.Contains("no unescaped '='", ex.Message);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, recordPosition), ex.Message);
         }
 
         [Theory]
@@ -302,6 +299,21 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
 
             // Assert
             Assert.Equal(expectedValue, result[0].Value);
+        }
+
+        [Theory]
+        [InlineData("KEY=\"hello\\\"", "\"hello\"")] // the closing quote is escaped, so the pair is not structural (#1296)
+        [InlineData("KEY=\"", "\"")]                 // a lone quote is its own first and last character
+        [InlineData("KEY=\"\"", "")]                 // the shortest structural pair
+        public void Parse_StructuralQuoteStrip_HoldsAtItsBoundaries(string input, string expectedValue)
+        {
+            // Arrange & Act
+            var result = EnvironmentVariableParser.Parse(input);
+
+            // Assert
+            var variable = Assert.Single(result);
+            Assert.Equal("KEY", variable.Name);
+            Assert.Equal(expectedValue, variable.Value);
         }
 
         [Theory]
@@ -351,28 +363,61 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
         [InlineData("KEY=Line1\\\r\\\nLine2")]
         public void Parse_ValueContainsForbiddenNewline_ThrowsFormatException(string input)
         {
-            // Arrange & Act
+            // Arrange
             const string key = "KEY";
+
+            // Act
             var ex = Assert.Throws<FormatException>(() => EnvironmentVariableParser.Parse(input));
 
-            // Assert
-            Assert.Contains($"Environment variable '{key}' contains a forbidden newline character", ex.Message);
-            Assert.Contains("Multi-line values are not supported", ex.Message);
+            // Assert - the whole message, so a stray prefix or suffix around the resource fails the test
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableForbiddenNewline, key), ex.Message);
         }
 
         [Theory]
-        [InlineData("KEY=Line1\nLine2")]
-        [InlineData("KEY=Line1\rLine2")]
-        [InlineData("KEY=Line1\r\nLine2")]
-        public void Parse_UnquotedRawNewline_ThrowsStructuralFormatException(string input)
+        [InlineData("KEY=Line1\nLine2", 2)]
+        [InlineData("KEY=Line1\rLine2", 2)]
+        [InlineData("KEY=Line1\r\nLine2", 2)]
+        public void Parse_UnquotedRawNewline_ThrowsStructuralFormatException(string input, int recordPosition)
         {
-            // Arrange & Act
-            const string expectedFragmentInMessage = "Line2";
+            // Act
+            var ex = Assert.Throws<FormatException>(() => EnvironmentVariableParser.Parse(input));
+
+            // Assert - the message describes the missing '=' without echoing raw values
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, recordPosition), ex.Message);
+            Assert.DoesNotContain("Line2", ex.Message);
+        }
+
+        [Fact]
+        public void Parse_KeyContainingEquals_ThrowsFormatExceptionWithValidatorMessage()
+        {
+            // Arrange
+            var input = @"K\=EY=VAL";
+
+            // Act
             var ex = Assert.Throws<FormatException>(() => EnvironmentVariableParser.Parse(input));
 
             // Assert
-            Assert.Contains($"no unescaped '='", ex.Message);
-            Assert.Contains(expectedFragmentInMessage, ex.Message);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableKeyInvalidChars, "K=EY"), ex.Message);
+        }
+
+        [Theory]
+        // Value-side guard -> Msg_EnvironmentVariableValueInvalidChars, formatted with the key
+        [InlineData("KEY=VAL\0UE", "KEY", false)]
+        // Key-side guard -> Msg_EnvironmentVariableKeyInvalidChars, formatted with the unescaped key
+        [InlineData("K\0EY=VALUE", "K\0EY", true)]
+        public void Parse_NulCharacter_ThrowsFormatExceptionWithValidatorMessage(string input, string expectedName, bool keySide)
+        {
+            // Arrange & Act
+            var ex = Assert.Throws<FormatException>(() => EnvironmentVariableParser.Parse(input));
+
+            // Assert
+            var expected = string.Format(
+                keySide ? Strings.Msg_EnvironmentVariableKeyInvalidChars : Strings.Msg_EnvironmentVariableValueInvalidChars,
+                expectedName);
+
+            // The validator's own message has to survive the GeneralFailure arm unchanged,
+            // rather than being misreported as a newline failure.
+            Assert.Equal(expected, ex.Message);
         }
     }
 }

@@ -61,24 +61,6 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Browse to select the failure program startup directory..
-        /// </summary>
-        public static string Automation_ButtonBrowseFailureProgramDir_HelpText {
-            get {
-                return ResourceManager.GetString("Automation_ButtonBrowseFailureProgramDir_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Browse Failure Program Startup Directory.
-        /// </summary>
-        public static string Automation_ButtonBrowseFailureProgramDir_Name {
-            get {
-                return ResourceManager.GetString("Automation_ButtonBrowseFailureProgramDir_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Browse to select the failure program executable..
         /// </summary>
         public static string Automation_ButtonBrowseFailureProgramPath_HelpText {
@@ -93,6 +75,24 @@ namespace Servy.Resources {
         public static string Automation_ButtonBrowseFailureProgramPath_Name {
             get {
                 return ResourceManager.GetString("Automation_ButtonBrowseFailureProgramPath_Name", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Browse to select the failure program startup directory..
+        /// </summary>
+        public static string Automation_ButtonBrowseFailureProgramStartupDir_HelpText {
+            get {
+                return ResourceManager.GetString("Automation_ButtonBrowseFailureProgramStartupDir_HelpText", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Browse Failure Program Startup Directory.
+        /// </summary>
+        public static string Automation_ButtonBrowseFailureProgramStartupDir_Name {
+            get {
+                return ResourceManager.GetString("Automation_ButtonBrowseFailureProgramStartupDir_Name", resourceCulture);
             }
         }
         
@@ -169,38 +169,38 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Browse to select the pre-launch executable..
-        /// </summary>
-        public static string Automation_ButtonBrowsePreLaunchProcessPath_HelpText {
-            get {
-                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchProcessPath_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Browse Pre-Launch Process Path.
-        /// </summary>
-        public static string Automation_ButtonBrowsePreLaunchProcessPath_Name {
-            get {
-                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchProcessPath_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Browse to select the pre-launch startup directory..
         /// </summary>
-        public static string Automation_ButtonBrowsePreLaunchStartupDir_HelpText {
+        public static string Automation_ButtonBrowsePreLaunchDir_HelpText {
             get {
-                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchStartupDir_HelpText", resourceCulture);
+                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchDir_HelpText", resourceCulture);
             }
         }
         
         /// <summary>
         ///   Looks up a localized string similar to Browse Pre-Launch Startup Directory.
         /// </summary>
-        public static string Automation_ButtonBrowsePreLaunchStartupDir_Name {
+        public static string Automation_ButtonBrowsePreLaunchDir_Name {
             get {
-                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchStartupDir_Name", resourceCulture);
+                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchDir_Name", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Browse to select the pre-launch executable..
+        /// </summary>
+        public static string Automation_ButtonBrowsePreLaunchPath_HelpText {
+            get {
+                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchPath_HelpText", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Browse Pre-Launch Process Path.
+        /// </summary>
+        public static string Automation_ButtonBrowsePreLaunchPath_Name {
+            get {
+                return ResourceManager.GetString("Automation_ButtonBrowsePreLaunchPath_Name", resourceCulture);
             }
         }
         
@@ -315,41 +315,41 @@ namespace Servy.Resources {
         /// <summary>
         ///   Looks up a localized string similar to Browse to select the standard error log file..
         /// </summary>
-        public static string Automation_ButtonBrowseStderr_HelpText {
+        public static string Automation_ButtonBrowseStderrPath_HelpText {
             get {
-                return ResourceManager.GetString("Automation_ButtonBrowseStderr_HelpText", resourceCulture);
+                return ResourceManager.GetString("Automation_ButtonBrowseStderrPath_HelpText", resourceCulture);
             }
         }
         
         /// <summary>
         ///   Looks up a localized string similar to Browse Standard Error Path.
         /// </summary>
-        public static string Automation_ButtonBrowseStderr_Name {
+        public static string Automation_ButtonBrowseStderrPath_Name {
             get {
-                return ResourceManager.GetString("Automation_ButtonBrowseStderr_Name", resourceCulture);
+                return ResourceManager.GetString("Automation_ButtonBrowseStderrPath_Name", resourceCulture);
             }
         }
         
         /// <summary>
         ///   Looks up a localized string similar to Browse to select the standard output log file..
         /// </summary>
-        public static string Automation_ButtonBrowseStdout_HelpText {
+        public static string Automation_ButtonBrowseStdoutPath_HelpText {
             get {
-                return ResourceManager.GetString("Automation_ButtonBrowseStdout_HelpText", resourceCulture);
+                return ResourceManager.GetString("Automation_ButtonBrowseStdoutPath_HelpText", resourceCulture);
             }
         }
         
         /// <summary>
         ///   Looks up a localized string similar to Browse Standard Output Path.
         /// </summary>
-        public static string Automation_ButtonBrowseStdout_Name {
+        public static string Automation_ButtonBrowseStdoutPath_Name {
             get {
-                return ResourceManager.GetString("Automation_ButtonBrowseStdout_Name", resourceCulture);
+                return ResourceManager.GetString("Automation_ButtonBrowseStdoutPath_Name", resourceCulture);
             }
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Installs the configured service..
+        ///   Looks up a localized string similar to Install the configured service..
         /// </summary>
         public static string Automation_ButtonInstall_HelpText {
             get {
@@ -358,7 +358,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Shows help information for recovery actions..
+        ///   Looks up a localized string similar to Show help information for recovery actions..
         /// </summary>
         public static string Automation_ButtonRecoveryActionHelp_HelpText {
             get {
@@ -367,7 +367,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Restarts the configured service..
+        ///   Looks up a localized string similar to Restart the configured service..
         /// </summary>
         public static string Automation_ButtonRestart_HelpText {
             get {
@@ -376,7 +376,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Starts the configured service..
+        ///   Looks up a localized string similar to Start the configured service..
         /// </summary>
         public static string Automation_ButtonStart_HelpText {
             get {
@@ -385,7 +385,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Stops the configured service..
+        ///   Looks up a localized string similar to Stop the configured service..
         /// </summary>
         public static string Automation_ButtonStop_HelpText {
             get {
@@ -394,11 +394,20 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Uninstalls the configured service..
+        ///   Looks up a localized string similar to Uninstall the configured service..
         /// </summary>
         public static string Automation_ButtonUninstall_HelpText {
             get {
                 return ResourceManager.GetString("Automation_ButtonUninstall_HelpText", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Allow overridden runtime environment variables..
+        /// </summary>
+        public static string Automation_CheckBoxAllowOverriddenRuntimeVars_HelpText {
+            get {
+                return ResourceManager.GetString("Automation_CheckBoxAllowOverriddenRuntimeVars_HelpText", resourceCulture);
             }
         }
         
@@ -529,7 +538,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Main window for creating and configuring a Servy Windows service..
+        ///   Looks up a localized string similar to Create and configure a Servy Windows service..
         /// </summary>
         public static string Automation_ConfigMainWindow_HelpText {
             get {
@@ -565,7 +574,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Application menu for exporting, importing, and help options..
+        ///   Looks up a localized string similar to Access application menu options for exporting, importing, and help..
         /// </summary>
         public static string Automation_MainMenu_HelpText {
             get {
@@ -619,7 +628,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Export service configuration menu..
+        ///   Looks up a localized string similar to Open the service configuration export menu..
         /// </summary>
         public static string Automation_MenuExport_HelpText {
             get {
@@ -646,7 +655,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Help and documentation menu..
+        ///   Looks up a localized string similar to Open the help and documentation menu..
         /// </summary>
         public static string Automation_MenuHelp_HelpText {
             get {
@@ -655,7 +664,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Import service configuration menu..
+        ///   Looks up a localized string similar to Open the service configuration import menu..
         /// </summary>
         public static string Automation_MenuImport_HelpText {
             get {
@@ -763,7 +772,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to General configuration options for the service..
+        ///   Looks up a localized string similar to Configure general options for the service..
         /// </summary>
         public static string Automation_TabItemMain_HelpText {
             get {
@@ -826,29 +835,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Cpu Affinity.
-        /// </summary>
-        public static string Automation_TextBoxCpuAffinity_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxCpuAffinity_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter environment variables for the service..
         /// </summary>
         public static string Automation_TextBoxEnvVars_HelpText {
             get {
                 return ResourceManager.GetString("Automation_TextBoxEnvVars_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Environment Variables.
-        /// </summary>
-        public static string Automation_TextBoxEnvVars_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxEnvVars_Name", resourceCulture);
             }
         }
         
@@ -916,29 +907,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Heartbeat Interval.
-        /// </summary>
-        public static string Automation_TextBoxHeartbeatInterval_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxHeartbeatInterval_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the URL for the heartbeat endpoint..
         /// </summary>
         public static string Automation_TextBoxHeartbeatUrl_HelpText {
             get {
                 return ResourceManager.GetString("Automation_TextBoxHeartbeatUrl_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Heartbeat Url.
-        /// </summary>
-        public static string Automation_TextBoxHeartbeatUrl_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxHeartbeatUrl_Name", resourceCulture);
             }
         }
         
@@ -952,29 +925,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Heartbeat URL Timeout.
-        /// </summary>
-        public static string Automation_TextBoxHeartbeatUrlTimeoutSeconds_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxHeartbeatUrlTimeoutSeconds_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the maximum number of failed checks before triggering recovery..
         /// </summary>
         public static string Automation_TextBoxMaxFailedChecks_HelpText {
             get {
                 return ResourceManager.GetString("Automation_TextBoxMaxFailedChecks_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Max Failed Checks.
-        /// </summary>
-        public static string Automation_TextBoxMaxFailedChecks_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxMaxFailedChecks_Name", resourceCulture);
             }
         }
         
@@ -988,29 +943,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Max Restart Attempts.
-        /// </summary>
-        public static string Automation_TextBoxMaxRestartAttempts_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxMaxRestartAttempts_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the maximum number of rotated logs to keep..
         /// </summary>
         public static string Automation_TextBoxMaxRotations_HelpText {
             get {
                 return ResourceManager.GetString("Automation_TextBoxMaxRotations_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Max Rotations.
-        /// </summary>
-        public static string Automation_TextBoxMaxRotations_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxMaxRotations_Name", resourceCulture);
             }
         }
         
@@ -1123,6 +1060,24 @@ namespace Servy.Resources {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Enter the startup directory for the pre-launch process..
+        /// </summary>
+        public static string Automation_TextBoxPreLaunchDir_HelpText {
+            get {
+                return ResourceManager.GetString("Automation_TextBoxPreLaunchDir_HelpText", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Pre-Launch Startup Directory.
+        /// </summary>
+        public static string Automation_TextBoxPreLaunchDir_Name {
+            get {
+                return ResourceManager.GetString("Automation_TextBoxPreLaunchDir_Name", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Enter environment variables for the pre-launch process..
         /// </summary>
         public static string Automation_TextBoxPreLaunchEnvVars_HelpText {
@@ -1161,18 +1116,18 @@ namespace Servy.Resources {
         /// <summary>
         ///   Looks up a localized string similar to Enter the pre-launch executable path..
         /// </summary>
-        public static string Automation_TextBoxPreLaunchProcessPath_HelpText {
+        public static string Automation_TextBoxPreLaunchPath_HelpText {
             get {
-                return ResourceManager.GetString("Automation_TextBoxPreLaunchProcessPath_HelpText", resourceCulture);
+                return ResourceManager.GetString("Automation_TextBoxPreLaunchPath_HelpText", resourceCulture);
             }
         }
         
         /// <summary>
         ///   Looks up a localized string similar to Pre-Launch Process Path.
         /// </summary>
-        public static string Automation_TextBoxPreLaunchProcessPath_Name {
+        public static string Automation_TextBoxPreLaunchPath_Name {
             get {
-                return ResourceManager.GetString("Automation_TextBoxPreLaunchProcessPath_Name", resourceCulture);
+                return ResourceManager.GetString("Automation_TextBoxPreLaunchPath_Name", resourceCulture);
             }
         }
         
@@ -1191,24 +1146,6 @@ namespace Servy.Resources {
         public static string Automation_TextBoxPreLaunchRetries_Name {
             get {
                 return ResourceManager.GetString("Automation_TextBoxPreLaunchRetries_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Enter the startup directory for the pre-launch process..
-        /// </summary>
-        public static string Automation_TextBoxPreLaunchStartupDir_HelpText {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxPreLaunchStartupDir_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Pre-Launch Startup Directory.
-        /// </summary>
-        public static string Automation_TextBoxPreLaunchStartupDir_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxPreLaunchStartupDir_Name", resourceCulture);
             }
         }
         
@@ -1348,15 +1285,6 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Process Parameters.
-        /// </summary>
-        public static string Automation_TextBoxProcessParameters_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxProcessParameters_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the executable path for the service..
         /// </summary>
         public static string Automation_TextBoxProcessPath_HelpText {
@@ -1384,15 +1312,6 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Rotation Size.
-        /// </summary>
-        public static string Automation_TextBoxRotationSize_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxRotationSize_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter Windows service dependencies..
         /// </summary>
         public static string Automation_TextBoxServiceDependencies_HelpText {
@@ -1402,29 +1321,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service Dependencies.
-        /// </summary>
-        public static string Automation_TextBoxServiceDependencies_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxServiceDependencies_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the description of the service..
         /// </summary>
         public static string Automation_TextBoxServiceDescription_HelpText {
             get {
                 return ResourceManager.GetString("Automation_TextBoxServiceDescription_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Service Description.
-        /// </summary>
-        public static string Automation_TextBoxServiceDescription_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxServiceDescription_Name", resourceCulture);
             }
         }
         
@@ -1474,29 +1375,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Start Timeout.
-        /// </summary>
-        public static string Automation_TextBoxStartTimeout_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxStartTimeout_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the startup working directory..
         /// </summary>
         public static string Automation_TextBoxStartupDirectory_HelpText {
             get {
                 return ResourceManager.GetString("Automation_TextBoxStartupDirectory_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Startup Directory.
-        /// </summary>
-        public static string Automation_TextBoxStartupDirectory_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxStartupDirectory_Name", resourceCulture);
             }
         }
         
@@ -1510,15 +1393,6 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Stderr File Path.
-        /// </summary>
-        public static string Automation_TextBoxStderrPath_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxStderrPath_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the path for the standard output log file..
         /// </summary>
         public static string Automation_TextBoxStdoutPath_HelpText {
@@ -1528,29 +1402,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Stdout File Path.
-        /// </summary>
-        public static string Automation_TextBoxStdoutPath_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxStdoutPath_Name", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Enter the timeout in seconds for stopping the service..
         /// </summary>
         public static string Automation_TextBoxStopTimeout_HelpText {
             get {
                 return ResourceManager.GetString("Automation_TextBoxStopTimeout_HelpText", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Stop Timeout.
-        /// </summary>
-        public static string Automation_TextBoxStopTimeout_Name {
-            get {
-                return ResourceManager.GetString("Automation_TextBoxStopTimeout_Name", resourceCulture);
             }
         }
         
@@ -1690,7 +1546,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to JSON Configuration exported successfully..
+        ///   Looks up a localized string similar to JSON configuration exported successfully..
         /// </summary>
         public static string ExportJson_Success {
             get {
@@ -1699,7 +1555,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to XML Configuration exported successfully..
+        ///   Looks up a localized string similar to XML configuration exported successfully..
         /// </summary>
         public static string ExportXml_Success {
             get {
@@ -1735,7 +1591,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Enter variables in the format varName=varValue, one per line or separated by semicolons (;). Use \= to escape &apos;=&apos;, \&quot; to escape &apos;&quot;&apos;, \; to escape &apos;;&apos;, \\ to escape &apos;\&apos;, and %% to escape &apos;%&apos; (collapses to a single &apos;%&apos;). Supports environment variable expansion, example: VAR1=%ProgramData%\MyApp; VAR2=%VAR1%\bin.
+        ///   Looks up a localized string similar to Enter variables in the format varName=varValue, one per line or separated by semicolons (;). Use \= to escape &apos;=&apos;, \&quot; to escape &apos;&quot;&apos;, \; to escape &apos;;&apos;, \\ to escape &apos;\&apos;, and %% to escape &apos;%&apos; (collapses to a single &apos;%&apos;). Supports environment variable expansion. Example: VAR1=%ProgramData%\MyApp; VAR2=%VAR1%\bin.
         /// </summary>
         public static string Info_EnvironmentVariables {
             get {
@@ -1744,7 +1600,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Configure a script or executable to run when the process fails to start. If health monitoring is disabled, the program will run when the process fails to start. If health monitoring is enabled, the program will only run after all configured recovery action retries have failed..
+        ///   Looks up a localized string similar to Configure an optional script or executable to run when the process fails. If health monitoring is disabled, the program runs when the process exits with a non-zero code. If health monitoring is enabled, the program only runs after all configured recovery action retries have failed. It does not run when the process fails to start..
         /// </summary>
         public static string Info_FailureProgram {
             get {
@@ -1755,9 +1611,9 @@ namespace Servy.Resources {
         /// <summary>
         ///   Looks up a localized string similar to Optional. If not set, defaults to the service working directory..
         /// </summary>
-        public static string Info_FailureProgramStartupDirectory {
+        public static string Info_HookStartupDirectory {
             get {
-                return ResourceManager.GetString("Info_FailureProgramStartupDirectory", resourceCulture);
+                return ResourceManager.GetString("Info_HookStartupDirectory", resourceCulture);
             }
         }
         
@@ -1789,15 +1645,6 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Optional. If not set, defaults to the service working directory..
-        /// </summary>
-        public static string Info_PostLaunchStartupDirectory {
-            get {
-                return ResourceManager.GetString("Info_PostLaunchStartupDirectory", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   Looks up a localized string similar to Configure an optional script or executable to run after the wrapped process and all of its child processes have exited. The post-stop process is started in fire-and-forget mode and does not block service shutdown..
         /// </summary>
         public static string Info_PostStop {
@@ -1807,16 +1654,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Optional. If not set, defaults to the service working directory..
-        /// </summary>
-        public static string Info_PostStopStartupDirectory {
-            get {
-                return ResourceManager.GetString("Info_PostStopStartupDirectory", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Optional script to run before service start. If it fails, the service won&apos;t start unless Ignore Failure is enabled..
+        ///   Looks up a localized string similar to Configure an optional script or executable to run before the service starts. If it fails, the service won&apos;t start unless Ignore Failure is enabled..
         /// </summary>
         public static string Info_PreLaunch {
             get {
@@ -1825,16 +1663,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Optional. If not set, defaults to the service working directory..
-        /// </summary>
-        public static string Info_PreLaunchStartupDirectory {
-            get {
-                return ResourceManager.GetString("Info_PreLaunchStartupDirectory", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Set the timeout to 0 to run in fire-and-forget mode (disables retries and logging)..
+        ///   Looks up a localized string similar to The timeout in seconds to wait for the pre-launch process. Set the timeout to 0 to run in fire-and-forget mode. Stdout/Stderr redirection and retries are not available in this mode..
         /// </summary>
         public static string Info_PreLaunchTimeout {
             get {
@@ -1852,16 +1681,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Optional. If not set, defaults to the service working directory..
-        /// </summary>
-        public static string Info_PreStopStartupDirectory {
-            get {
-                return ResourceManager.GetString("Info_PreStopStartupDirectory", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Set the timeout to 0 to run in fire-and-forget mode..
+        ///   Looks up a localized string similar to The timeout in seconds to wait for the pre-stop process. Set the timeout to 0 to run in fire-and-forget mode..
         /// </summary>
         public static string Info_PreStopTimeout {
             get {
@@ -1879,7 +1699,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Supports environment variable expansion, example: %JAVA_HOME%\bin\java.exe.
+        ///   Looks up a localized string similar to Supports environment variable expansion. Example: %JAVA_HOME%\bin\java.exe.
         /// </summary>
         public static string Info_ProcessPath {
             get {
@@ -1888,7 +1708,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Restart service and restart computer actions are not available if the service runs under NT AUTHORITY\NetworkService, NT AUTHORITY\LocalService, or a user account without the required privileges. Only the restart process action will be available for these accounts..
+        ///   Looks up a localized string similar to Restart service and restart computer actions are not available if the service runs under NT AUTHORITY\LocalService, NT AUTHORITY\NetworkService, an IIS AppPool identity (IIS APPPOOL\...), or a user account without the required privileges..
         /// </summary>
         public static string Info_RecoveryAction {
             get {
@@ -1906,7 +1726,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Specify one or more Windows service names (not display names) that this service depends on. Enter each service name on a new line or separate them with semicolons (;). Use service key names without spaces or special characters. Each dependency service must be installed and running before this service can start. If a dependency&apos;s start type is Automatic, Windows will try to start it automatically before this service. If a dependency fails to start or is disabled, this service will not start..
+        ///   Looks up a localized string similar to Specify one or more Windows service names (not display names) that this service depends on. Enter each service name on a new line or separate them with semicolons (;). Each service name must contain only letters, digits, hyphens, underscores, periods, spaces, and dollar signs ($), optionally preceded by &apos;+&apos; to reference a load-order group, and must not exceed 256 characters. Windows starts stopped dependencies automatically when this service starts; if a dependency is disabled or fails to start, this servic [rest of string was truncated]&quot;;.
         /// </summary>
         public static string Info_ServiceDependencies {
             get {
@@ -1933,7 +1753,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Supports environment variable expansion, example: %PROGRAMDATA%\MyApp.
+        ///   Looks up a localized string similar to Supports environment variable expansion. Example: %ProgramData%\MyApp.
         /// </summary>
         public static string Info_StartupDirectory {
             get {
@@ -1951,20 +1771,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to The service account username (e.g., .\username, DOMAIN\username, or DOMAIN\gMSA$)..
+        ///   Looks up a localized string similar to The service account username (e.g., .\username, DOMAIN\username, DOMAIN\gMSA$, or a built-in identity such as NT AUTHORITY\LocalService, NT AUTHORITY\NetworkService, NT SERVICE\MyService or IIS APPPOOL\MyPool). Leave the password fields empty for built-in, virtual and gMSA accounts..
         /// </summary>
         public static string Info_UserAccount {
             get {
                 return ResourceManager.GetString("Info_UserAccount", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to If the service runs under an account other than Local System, you must grant write access to %ProgramData%\Servy for the account that runs the service..
-        /// </summary>
-        public static string Info_UserAccountRights {
-            get {
-                return ResourceManager.GetString("Info_UserAccountRights", resourceCulture);
             }
         }
         
@@ -1974,6 +1785,15 @@ namespace Servy.Resources {
         public static string Label_AdvancedTab {
             get {
                 return ResourceManager.GetString("Label_AdvancedTab", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Allow Overridden Runtime Environment Variables (e.g., JAVA_HOME, JAVA_OPTS).
+        /// </summary>
+        public static string Label_AllowOverriddenRuntimeVars {
+            get {
+                return ResourceManager.GetString("Label_AllowOverriddenRuntimeVars", resourceCulture);
             }
         }
         
@@ -2050,7 +1870,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Heartbeat URL Flags (/start, /fail).
+        ///   Looks up a localized string similar to Enable Heartbeat URL Flags (/start, /fail).
         /// </summary>
         public static string Label_EnableHeartbeatUrlFlags {
             get {
@@ -2347,6 +2167,15 @@ namespace Servy.Resources {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to See list of runtime variables..
+        /// </summary>
+        public static string Label_RuntimeVariablesLink {
+            get {
+                return ResourceManager.GetString("Label_RuntimeVariablesLink", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to seconds.
         /// </summary>
         public static string Label_Seconds {
@@ -2473,7 +2302,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Check for updates....
+        ///   Looks up a localized string similar to Check for updates.
         /// </summary>
         public static string Menu_CheckUpdates {
             get {
@@ -2482,7 +2311,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Clear All.
+        ///   Looks up a localized string similar to Clear All....
         /// </summary>
         public static string Menu_ClearAll {
             get {
@@ -2509,7 +2338,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Export JSON configuration.
+        ///   Looks up a localized string similar to Export JSON configuration....
         /// </summary>
         public static string Menu_ExportJson {
             get {
@@ -2518,7 +2347,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Export XML configuration.
+        ///   Looks up a localized string similar to Export XML configuration....
         /// </summary>
         public static string Menu_ExportXml {
             get {
@@ -2545,7 +2374,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Import JSON configuration.
+        ///   Looks up a localized string similar to Import JSON configuration....
         /// </summary>
         public static string Menu_ImportJson {
             get {
@@ -2554,7 +2383,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Import XML configuration.
+        ///   Looks up a localized string similar to Import XML configuration....
         /// </summary>
         public static string Menu_ImportXml {
             get {
@@ -2599,16 +2428,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service wrapper executable not found..
-        /// </summary>
-        public static string Msg_InvalidWrapperExePath {
-            get {
-                return ResourceManager.GetString("Msg_InvalidWrapperExePath", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Failed to launch the Manager application..
+        ///   Looks up a localized string similar to Failed to launch Servy Manager..
         /// </summary>
         public static string Msg_ManagerAppLaunchFailed {
             get {
@@ -2617,7 +2437,7 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Servy Manager App not found..
+        ///   Looks up a localized string similar to Servy Manager was not found..
         /// </summary>
         public static string Msg_ManagerAppNotFound {
             get {
@@ -2644,9 +2464,9 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to A service with this name already exists. Would you like to replace it?
+        ///   Looks up a localized string similar to A service &apos;{0}&apos; with this name already exists. Would you like to replace it?
         ///
-        ///If the service is disabled and marked for deletion, the installation will fail until you restart your PC..
+        ///If the service is disabled and marked for deletion, the installation will fail until you restart the computer..
         /// </summary>
         public static string Msg_ServiceAlreadyExists {
             get {
@@ -2664,47 +2484,11 @@ namespace Servy.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service was installed successfully..
-        /// </summary>
-        public static string Msg_ServiceInstalled {
-            get {
-                return ResourceManager.GetString("Msg_ServiceInstalled", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Service was removed successfully..
+        ///   Looks up a localized string similar to Service &apos;{0}&apos; was removed successfully..
         /// </summary>
         public static string Msg_ServiceRemoved {
             get {
                 return ResourceManager.GetString("Msg_ServiceRemoved", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Service was restarted successfully..
-        /// </summary>
-        public static string Msg_ServiceRestarted {
-            get {
-                return ResourceManager.GetString("Msg_ServiceRestarted", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Service was started successfully..
-        /// </summary>
-        public static string Msg_ServiceStarted {
-            get {
-                return ResourceManager.GetString("Msg_ServiceStarted", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Service was stopped successfully..
-        /// </summary>
-        public static string Msg_ServiceStopped {
-            get {
-                return ResourceManager.GetString("Msg_ServiceStopped", resourceCulture);
             }
         }
         
@@ -2723,15 +2507,6 @@ namespace Servy.Resources {
         public static string Msg_SqliteVersionWarningTitle {
             get {
                 return ResourceManager.GetString("Msg_SqliteVersionWarningTitle", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to An unexpected error occurred..
-        /// </summary>
-        public static string Msg_UnexpectedError {
-            get {
-                return ResourceManager.GetString("Msg_UnexpectedError", resourceCulture);
             }
         }
         
@@ -2900,8 +2675,7 @@ namespace Servy.Resources {
         ///
         ///Licensed under the MIT License.
         ///
-        ///Copyright © {2} Akram El Assas. All rights reserved.
-        ///    .
+        ///Copyright © {2} Akram El Assas. All rights reserved..
         /// </summary>
         public static string Text_About {
             get {

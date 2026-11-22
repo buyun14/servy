@@ -1,26 +1,25 @@
 using Servy.Core.Helpers;
+using Servy.Testing;
 using System.Diagnostics;
 using System.Globalization;
-using System.Text;
 
 namespace Servy.Core.IntegrationTests.Helpers
 {
     /// <summary>
-    /// Represents an exhaustive integration test suite for the ProcessKiller class, validating process tree termination, safelist protections, and file-lock release mechanisms.
+    /// Integration tests for ProcessKiller: process tree termination and file-lock release.
+    /// Guard-only checks that spawn no process (input validation, the critical-process safelist) live in ProcessKillerTests.
     /// </summary>
-    [Collection("ProcessIntegrationTests")]
-    public class ProcessKillerIntegrationTests : HandleExeIntegrationTestBase, IDisposable
+    [Collection(ProcessIntegrationTestsCollection.Name)]
+    public class ProcessKillerIntegrationTests : IDisposable
     {
-        private static readonly string PowerShellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
-
         private readonly ProcessKiller _processKiller;
         private readonly List<Process> _trackedProcesses;
         private readonly List<string> _tempFiles;
 
         /// <summary>
-        /// Initializes a new instance of the ProcessKillerIntegrationTests class, configuring tracking lists for safe teardown and ensuring necessary diagnostic utilities are extracted.
+        /// Initializes a new instance of the ProcessKillerIntegrationTests class, configuring tracking lists for safe teardown.
         /// </summary>
-        public ProcessKillerIntegrationTests() : base()
+        public ProcessKillerIntegrationTests()
         {
             _processKiller = new ProcessKiller();
             _trackedProcesses = new List<Process>();
@@ -55,63 +54,6 @@ namespace Servy.Core.IntegrationTests.Helpers
                     try { File.Delete(file); } catch { }
                 }
             }
-
-            // DO NOT delete handle64.exe here.
-            // Deleting an executable while another test's constructor is initializing causes the IOException.
-            // Leaving it in the bin folder is completely safe for integration tests.
-        }
-
-        /// <summary>
-        /// Verifies that providing a null, empty, or whitespace process name to the termination method results in a safe bypass returning false.
-        /// </summary>
-        /// <param name="invalidName">The invalid string input simulating a malformed process name.</param>
-        [Theory]
-        [InlineData(null)]
-        [InlineData("")]
-        [InlineData("    ")]
-        public void KillProcessTreeAndParents_NullOrEmptyName_ReturnsFalse(string? invalidName)
-        {
-            // Arrange & Act
-            bool result = _processKiller.KillProcessTreeAndParents(invalidName!, killParents: true);
-
-            // Assert
-            // Ensure bad/missing process name arrays safely report operational failure status indicators
-            Assert.False(result);
-        }
-
-        /// <summary>
-        /// Verifies that attempting to terminate a critical Windows system process by name is actively blocked by the internal guardrails.
-        /// </summary>
-        /// <param name="protectedName">The name of the critical system process, optionally including the executable extension.</param>
-        [Theory]
-        [InlineData("svchost")]
-        [InlineData("csrss.exe")]
-        [InlineData("explorer")]
-        public void KillProcessTreeAndParents_ProtectedProcessName_ReturnsFalse(string protectedName)
-        {
-            // Arrange & Act
-            bool result = _processKiller.KillProcessTreeAndParents(protectedName, killParents: true);
-
-            // Assert
-            // Baseline system structures must bypass structural process walk calls gracefully
-            Assert.False(result);
-        }
-
-        /// <summary>
-        /// Verifies that providing an invalid or non-positive process identifier results in a safe bypass returning false.
-        /// </summary>
-        /// <param name="invalidPid">The numerical identifier simulating an invalid process ID.</param>
-        [Theory]
-        [InlineData(0)]
-        [InlineData(-1)]
-        [InlineData(-999)]
-        public void KillProcessTreeAndParents_InvalidPid_ReturnsFalse(int invalidPid)
-        {
-            // Arrange & Act
-            bool result = _processKiller.KillProcessTreeAndParents(invalidPid, killParents: true);
-
-            // Assert
-            Assert.False(result);
         }
 
         /// <summary>
@@ -161,11 +103,11 @@ namespace Servy.Core.IntegrationTests.Helpers
             try
             {
                 // Act
-                _processKiller.KillChildren(parent!.Id);
+                _processKiller.KillChildren(parent.Id);
 
                 // Polling loop with refreshes to handle OS termination latency and eliminate CI flake
-                bool childExited = WaitForProcessExit(child, 5000);
-                parent!.Refresh();
+                bool childExited = WaitForProcessExit(child, TestTimeouts.CiGenerousMs);
+                parent.Refresh();
 
                 // Assert
                 Assert.True(childExited, "The child process should have been terminated.");
@@ -174,8 +116,39 @@ namespace Servy.Core.IntegrationTests.Helpers
             finally
             {
                 // Clean up processes safely if assertions fail to prevent runner zombie leaks
-                try { if (parent != null && !parent.HasExited) parent.Kill(); } catch { }
-                try { if (child != null && !child.HasExited) child.Kill(); } catch { }
+                TestProcessCleanup.KillAndDispose(parent);
+                TestProcessCleanup.KillAndDispose(child);
+            }
+        }
+
+        /// <summary>
+        /// Verifies that <see cref="ProcessKiller.KillChildren"/> tolerates a parent whose only child has already exited:
+        /// it does not throw and the parent survives. The catch arms for a child that exits during the walk are pinned in
+        /// ProcessKillerTests (WalkAndKillChildren_OneChildFailsToDie_StillKillsItsSiblingAndTheRoot).
+        /// </summary>
+        [Fact]
+        public void KillChildren_ChildAlreadyExited_DoesNotThrowAndLeavesParentAlive()
+        {
+            // Arrange
+            var (parent, child) = SpawnProcessTree();
+
+            try
+            {
+                child.Kill();
+                Assert.True(child.WaitForExit(TestTimeouts.CiGenerousMs), "The child must be dead before KillChildren runs.");
+
+                // Act
+                Exception? ex = Record.Exception(() => _processKiller.KillChildren(parent.Id));
+
+                // Assert
+                Assert.Null(ex);
+                parent.Refresh();
+                Assert.False(parent.HasExited, "The parent process should remain alive.");
+            }
+            finally
+            {
+                TestProcessCleanup.KillAndDispose(parent);
+                TestProcessCleanup.KillAndDispose(child);
             }
         }
 
@@ -187,8 +160,8 @@ namespace Servy.Core.IntegrationTests.Helpers
         {
             // Arrange
             var (parent, child) = SpawnProcessTree();
-            int parentId = parent!.Id;
-            int childId = child!.Id;
+            int parentId = parent.Id;
+            int childId = child.Id;
 
             try
             {
@@ -196,30 +169,22 @@ namespace Servy.Core.IntegrationTests.Helpers
                 bool result = _processKiller.KillProcessTreeAndParents(childId, killParents: true);
 
                 // Validation: Use a polling loop with refreshes to handle OS termination latency
-                bool childExited = WaitForProcessExit(child, 5000);
-                bool parentExited = WaitForProcessExit(parent, 5000);
+                bool childExited = WaitForProcessExit(child, TestTimeouts.CiGenerousMs);
+                bool parentExited = WaitForProcessExit(parent, TestTimeouts.CiGenerousMs);
 
                 // Assert
                 Assert.True(childExited, $"The child process (PID {childId}) should have exited within the timeout.");
                 Assert.True(parentExited, $"The parent process (PID {parentId}) should have been terminated through the upward walk.");
 
-                // Hardening: If both processes are dead, a false return value usually indicates an acceptable
-                // native race condition (e.g., trying to inspect a PID that vanished mid-walk).
-                if (!result)
-                {
-                    Debug.WriteLine("WARNING: KillProcessTreeAndParents returned false, but both processes were confirmed dead.");
-
-                    // Verify if the method returned false simply because the processes died ahead of the signal chain.
-                    // If they are dead, we bypass the result flag assertion to protect the CI runner pipeline.
-                    bool recordsConfirmDead = !IsPidActive(childId) && !IsPidActive(parentId);
-                    Assert.True(recordsConfirmDead, "The termination method returned false, and one or more processes are still running in the OS space.");
-                }
+                // The upward walk reports success unless a PID vanished mid-walk. Both processes are confirmed
+                // dead above, so a false here means the walk itself failed, not that a target raced ahead of it.
+                Assert.True(result, $"KillProcessTreeAndParents returned false and the target child process (PID {childId}) or parent process (PID {parentId}) was not cleanly handled.");
             }
             finally
             {
                 // Cleanup guard to prevent zombie leaks in the runner space if assertions fail
-                try { if (parent != null && !parent.HasExited) parent.Kill(); } catch { }
-                try { if (child != null && !child.HasExited) child.Kill(); } catch { }
+                TestProcessCleanup.KillAndDispose(parent);
+                TestProcessCleanup.KillAndDispose(child);
             }
         }
 
@@ -231,33 +196,29 @@ namespace Servy.Core.IntegrationTests.Helpers
         {
             // Arrange
             var (parent, child) = SpawnProcessTree();
+            int childId = child.Id;
 
             try
             {
                 // Act
-                bool result = _processKiller.KillProcessTreeAndParents(child!.Id, killParents: false);
+                bool result = _processKiller.KillProcessTreeAndParents(childId, killParents: false);
 
-                // IDIOM HARMONIZATION: Standardize exit checking pipeline onto the shared robust internal polling helper.
-                // This cleanly drops custom blocking WaitForExit branches and inconsistent manual tracking logic.
-                bool childExited = WaitForProcessExit(child, 5000);
-                parent!.Refresh();
+                bool childExited = WaitForProcessExit(child, TestTimeouts.CiGenerousMs);
+                parent.Refresh();
 
                 // Assert
-                Assert.True(childExited, "The target child process should have been terminated.");
+                Assert.True(childExited, $"The target child process (PID {childId}) should have been terminated. KillProcessTreeAndParents returned {result}; parent.HasExited={parent.HasExited}.");
                 Assert.False(parent.HasExited, "The parent process should remain alive because killParents was false.");
 
-                // If child exit took down the parent via unintended cascade, assert evaluation catches it here.
-                if (!result)
-                {
-                    bool isChildGenuinelyDead = !IsPidActive(child.Id);
-                    Assert.True(isChildGenuinelyDead, "The tracking core returned failure and the target thread is running.");
-                }
+                // The downward walk reports success unless a PID vanished mid-walk. The child is confirmed
+                // dead above, so a false here means the walk itself failed.
+                Assert.True(result, $"KillProcessTreeAndParents returned false although the target child process (PID {childId}) exited.");
             }
             finally
             {
                 // Cleanup guard to prevent zombie leaks in the runner space if assertions fail
-                try { if (parent != null && !parent.HasExited) parent.Kill(); } catch { }
-                try { if (child != null && !child.HasExited) child.Kill(); } catch { }
+                TestProcessCleanup.KillAndDispose(parent);
+                TestProcessCleanup.KillAndDispose(child);
             }
         }
 
@@ -284,8 +245,6 @@ namespace Servy.Core.IntegrationTests.Helpers
         public void KillProcessesUsingFile_FileLocked_TerminatesLockingProcess()
         {
             // Arrange
-            Assert.SkipWhen(!File.Exists(_handleExePath), "handle64.exe not available in this environment.");
-
             string testFile = Path.Combine(Path.GetTempPath(), $"lock_test_{Guid.NewGuid()}.tmp");
             File.WriteAllText(testFile, "Lock Data");
             _tempFiles.Add(testFile);
@@ -293,13 +252,13 @@ namespace Servy.Core.IntegrationTests.Helpers
             // 1. Spawn the process
             var lockingProcess = SpawnFileLockingProcess(testFile);
 
-            // Stabilization Step A: Ensure the process hasn't crashed before we proceed
-            if (lockingProcess == null || lockingProcess.HasExited)
+            // 2. The handshake succeeded; make sure the locker did not exit right after printing LOCKED
+            if (lockingProcess.HasExited)
             {
-                throw new InvalidOperationException("Failed to spawn a stable file-locking process.");
+                throw new InvalidOperationException("The file-locking process exited right after its LOCKED handshake.");
             }
 
-            // CRITICAL - Stabilization Step B: Wait for the child process to physically claim the file lock handle.
+            // 3. Wait for the child process to acquire the file lock.
             // We poll by trying to open the file exclusively. Once an IOException triggers, the lock is live.
             bool lockConfirmed = SpinWait.SpinUntil(() =>
             {
@@ -314,21 +273,21 @@ namespace Servy.Core.IntegrationTests.Helpers
                 }
                 catch (IOException)
                 {
-                    // Lock is officially verified in the OS handle table!
+                    // The exclusive open failed, so the child holds the lock
                     return true;
                 }
                 catch
                 {
                     return false;
                 }
-            }, TimeSpan.FromSeconds(10)); // Generous timeout for slow CI environments
+            }, TimeSpan.FromSeconds(TestTimeouts.ProcessKillerFileLockTimeoutSeconds)); // Generous timeout for slow CI environments
 
             if (!lockConfirmed)
             {
                 throw new InvalidOperationException("The background process failed to acquire the file lock within the allowed timeout window.");
             }
 
-            // 2 & 3. Act & Backoff/Retry Phase for Process Termination
+            // 4. Act: terminate the locking process, with backoff/retry
             bool result = false;
             bool exited = false;
             int killAttempts = 0;
@@ -337,26 +296,25 @@ namespace Servy.Core.IntegrationTests.Helpers
             // Act
             while (killAttempts < maxKillAttempts && !exited)
             {
+                // Count every attempt, so the failure message below reports what was actually tried
+                killAttempts++;
+
                 // Attempt to kill processes holding the lock
                 result = _processKiller.KillProcessesUsingFile(testFile);
 
                 // GitHub Actions runners can be slow; wait up to 3 seconds per attempt for the process to actually exit
-                exited = SpinWait.SpinUntil(() => lockingProcess.HasExited, TimeSpan.FromSeconds(3));
+                exited = SpinWait.SpinUntil(() => lockingProcess.HasExited, TimeSpan.FromSeconds(TestTimeouts.ProcessKillerPerAttemptExitWaitSeconds));
 
-                if (!exited)
+                if (!exited && killAttempts < maxKillAttempts)
                 {
-                    killAttempts++;
-                    if (killAttempts < maxKillAttempts)
-                    {
-                        // Give the OS handle table a moment to update before attempting the kill again
-                        Thread.Sleep(1000);
-                    }
+                    // Give the OS handle table a moment to update before attempting the kill again
+                    Thread.Sleep(1000);
                 }
             }
 
             // Assert
             Assert.True(result, "KillProcessesUsingFile should return true.");
-            Assert.True(exited, $"The background process holding the file lock should have been terminated after {killAttempts + 1} attempts.");
+            Assert.True(exited, $"The background process holding the file lock should have been terminated after {killAttempts} attempts.");
 
             // 5. Backoff/Retry Phase for File Deletion
             bool deleted = false;
@@ -377,7 +335,38 @@ namespace Servy.Core.IntegrationTests.Helpers
             }
 
             Assert.True(deleted, $"Failed to delete '{testFile}' after process termination. The lock was not genuinely released.");
-            Assert.False(File.Exists(testFile));
+        }
+
+        /// <summary>
+        /// Verifies that a lock holder the killer refuses to terminate (here the test process itself, which is always in the protected ancestor set)
+        /// makes <see cref="ProcessKiller.KillProcessesUsingFile"/> report that the lock was not released.
+        /// </summary>
+        [Fact]
+        public void KillProcessesUsingFile_HolderIsTheCurrentProcess_RefusesToKillItAndReturnsFalse()
+        {
+            // Arrange
+            string testFile = Path.Combine(Path.GetTempPath(), $"self_lock_{Guid.NewGuid()}.tmp");
+            File.WriteAllText(testFile, "Lock Data");
+            _tempFiles.Add(testFile);
+
+            int currentPid = Environment.ProcessId;
+
+            using (var holder = new FileStream(testFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                // Precondition: the Restart Manager must list this process as the holder. When a runner does not,
+                // the killer sees an empty list and returns true, so the case is skipped visibly instead of passing.
+                var holders = HandleHelper.GetProcessesUsingFile(testFile);
+                Assert.SkipUnless(
+                    holders.Exists(h => h.ProcessId == currentPid),
+                    "The Restart Manager did not list this process as the holder of the file, so the refusal path cannot be reached.");
+
+                // Act
+                bool result = _processKiller.KillProcessesUsingFile(testFile);
+
+                // Assert
+                Assert.False(result, "KillProcessesUsingFile should return false when the only lock holder is the current process, which must never be killed.");
+                Assert.True(holder.CanRead, "The current process must still be alive and its handle usable.");
+            }
         }
 
         #region Helpers & Tool Utilities
@@ -385,10 +374,8 @@ namespace Servy.Core.IntegrationTests.Helpers
         /// <summary>
         /// Helper to poll for process exit with a timeout and explicit state refreshes.
         /// </summary>
-        private bool WaitForProcessExit(Process? process, int timeoutMs)
+        private bool WaitForProcessExit(Process process, int timeoutMs)
         {
-            if (process == null) return true;
-
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < timeoutMs)
             {
@@ -400,27 +387,11 @@ namespace Servy.Core.IntegrationTests.Helpers
         }
 
         /// <summary>
-        /// Determines whether a specified process identifier (PID) is currently active and running in the operating system.
-        /// </summary>
-        private static bool IsPidActive(int pid)
-        {
-            try
-            {
-                using (var process = Process.GetProcessById(pid))
-                    return !process.HasExited;
-            }
-            catch (ArgumentException)
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
         /// Spawns a PowerShell instance that subsequently launches a nested PowerShell task.
         /// </summary>
-        private (Process? Parent, Process? Child) SpawnProcessTree()
+        private (Process Parent, Process Child) SpawnProcessTree()
         {
-            string psPath = PowerShellPath;
+            string psPath = TestProcessStarter.PowerShellPath;
 
             string childScript = "while ($true) { Start-Sleep -Seconds 1 }";
             string encodedChildScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(childScript));
@@ -449,49 +420,14 @@ namespace Servy.Core.IntegrationTests.Helpers
                 WorkingDirectory = tempPath,
             };
 
-            var parentProcess = Process.Start(psi);
-            _trackedProcesses.Add(parentProcess!);
+            const string marker = "CHILD_PID:";
+            var (parentProcess, handshakeLine) = TestProcessStarter.StartWithHandshake(
+                psi,
+                line => line.StartsWith(marker, StringComparison.Ordinal),
+                TimeSpan.FromSeconds(TestTimeouts.ProcessTreeTimeoutSeconds),
+                _trackedProcesses.Add);
 
-            var errBuilder = new StringBuilder();
-            parentProcess!.ErrorDataReceived += (s, e) =>
-            {
-                if (e.Data != null)
-                {
-                    lock (errBuilder)
-                    {
-                        errBuilder.AppendLine(e.Data);
-                    }
-                }
-            };
-            parentProcess.BeginErrorReadLine();
-
-            int childPid = -1;
-            var readTask = Task.Run(() =>
-            {
-                while (parentProcess != null && !parentProcess.HasExited)
-                {
-                    string? line = parentProcess.StandardOutput.ReadLine();
-                    const string marker = "CHILD_PID:";
-                    if (line != null && line.StartsWith(marker, StringComparison.Ordinal))
-                    {
-                        return int.Parse(line.Substring(marker.Length), CultureInfo.InvariantCulture);
-                    }
-                }
-                return -1;
-            });
-
-            if (readTask.Wait(TimeSpan.FromSeconds(15)))
-            {
-                childPid = readTask.Result;
-            }
-
-            string errOutput;
-            lock (errBuilder)
-            {
-                errOutput = errBuilder.ToString();
-            }
-
-            Assert.True(childPid > 0, $"Failed to resolve child process ID from the orchestration script. Stderr: {errOutput}");
+            int childPid = int.Parse(handshakeLine.Substring(marker.Length), CultureInfo.InvariantCulture);
 
             var childProcess = Process.GetProcessById(childPid);
             _trackedProcesses.Add(childProcess);
@@ -502,7 +438,7 @@ namespace Servy.Core.IntegrationTests.Helpers
             {
                 childProcess.Refresh();
                 return !childProcess.HasExited;
-            }, TimeSpan.FromSeconds(5));
+            }, TimeSpan.FromSeconds(TestTimeouts.CiGenerousSeconds));
 
             Assert.True(childAlive, "Spawned child process exited prematurely.");
 
@@ -512,7 +448,7 @@ namespace Servy.Core.IntegrationTests.Helpers
         /// <summary>
         /// Spawns a PowerShell instance that opens an exclusive read lock on the specified file path.
         /// </summary>
-        private Process? SpawnFileLockingProcess(string filePath)
+        private Process SpawnFileLockingProcess(string filePath)
         {
             string psScript = $@"
                 $fs = [System.IO.File]::Open('{filePath}', 'Open', 'Read', 'None')
@@ -522,30 +458,22 @@ namespace Servy.Core.IntegrationTests.Helpers
 
             var psi = new ProcessStartInfo
             {
-                FileName = PowerShellPath,
+                FileName = TestProcessStarter.PowerShellPath,
                 Arguments = $"-NoProfile -NonInteractive -Command \"{psScript}\"",
                 RedirectStandardOutput = true,
+                RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
 
-            var lockingProcess = Process.Start(psi);
-            _trackedProcesses.Add(lockingProcess!);
-
-            var readTask = Task.Run(() =>
-            {
-                while (lockingProcess != null && !lockingProcess.HasExited)
-                {
-                    string? line = lockingProcess.StandardOutput.ReadLine();
-                    if (line != null && line.Contains("LOCKED"))
-                    {
-                        return true;
-                    }
-                }
-                return false;
-            });
-
-            readTask.Wait(TimeSpan.FromSeconds(10));
+            // Validate the handshake the same way SpawnProcessTree validates its CHILD_PID one:
+            // a timeout, or a child that exited without ever printing LOCKED, is a failed spawn
+            // and is retried on a fresh instance.
+            var (lockingProcess, _) = TestProcessStarter.StartWithHandshake(
+                psi,
+                line => line.Contains("LOCKED"),
+                TimeSpan.FromSeconds(TestTimeouts.ProcessKillerFileLockTimeoutSeconds),
+                _trackedProcesses.Add);
 
             return lockingProcess;
         }

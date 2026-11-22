@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+
+    <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>false</IncludeAllContentForSelfExtract>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <IsTrimmable>true</IsTrimmable>
+    <PublishTrimmed>true</PublishTrimmed>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <TrimMode>partial</TrimMode>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+
+    <DebuggerSupport>true</DebuggerSupport>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>portable</DebugType>
+    <CopyOutputSymbolsToPublishDirectory>true</CopyOutputSymbolsToPublishDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <TrimmerRootAssembly Include="System.Threading.Thread" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <AssemblyTitle>Servy.Host</AssemblyTitle>
+    <Description>Servy Host Windows Service</Description>
+    <Product>Servy.Host</Product>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="appsettings.host.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Always include the shared base preserves -->
+    <TrimmerRootDescriptor Include="..\linker.shared.xml" />
+
+    <!-- Include project-specific preserves if the file exists in the project directory -->
+    <TrimmerRootDescriptor Include="linker.xml" Condition="Exists('linker.xml')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Servy.Host.UnitTests" />
+    <InternalsVisibleTo Include="Servy.Host.IntegrationTests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Servy.Core\Servy.Core.csproj" />
+    <ProjectReference Include="..\Servy.Infrastructure\Servy.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

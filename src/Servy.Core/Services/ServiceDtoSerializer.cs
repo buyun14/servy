@@ -29,29 +29,29 @@ namespace Servy.Core.Services
         protected abstract string? SerializeCore(ServiceDto dto);
 
         /// <summary>
-        /// Extracts and formats line, index, or position metadata from a format-specific processing exception.
+        /// When overridden in a derived class, extracts and formats line, index, or position metadata from a format-specific processing exception.
         /// </summary>
         /// <param name="ex">The thrown format runtime exception.</param>
         /// <returns>A formatted string detailing the exact exception location context, or an empty string if unavailable.</returns>
-        protected virtual string FormatLineInfo(Exception ex) => string.Empty;
+        protected abstract string FormatLineInfo(Exception ex);
 
         /// <summary>
         /// Deserializes a format-specific textual stream representation into a structured <see cref="ServiceDto"/>.
         /// </summary>
         /// <param name="input">The raw text block content.</param>
-        /// <returns>The DTO, or <c>null</c> if the input is null/empty or parsing fails.</returns>
+        /// <returns>The DTO, or <c>null</c> if the input is null, empty, or whitespace-only, or parsing fails.</returns>
         public ServiceDto? Deserialize(string? input)
         {
-            // Initial guard: null/empty input deserializes to null per contract
             if (string.IsNullOrWhiteSpace(input))
                 return null;
 
             try
             {
-                // Delegate to format-specific parsing engine
                 var dto = DeserializeCore(input);
 
-                // If deserialization succeeded, apply defaults (e.g., setting missing timeouts)
+                // Hydrate defaults for absent optional fields, then apply the Global Identity Reset on Import
+                // policy: a passwordless UserAccount is kept, any other identity is forced to the password-less
+                // LocalSystem baseline, and Password is always cleared. Id is kept out of the payload by [JsonIgnore]/[XmlIgnore] on ServiceDto.Id, not here.
                 if (dto != null)
                 {
                     ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
@@ -61,19 +61,12 @@ namespace Servy.Core.Services
             }
             catch (Exception ex)
             {
+                // FormatLineInfo returns string.Empty when the parser carried no coordinates, so a
+                // single interpolation renders both shapes and every import failure shares one phrase.
                 var lineInfoMessage = FormatLineInfo(ex);
 
-                if (!string.IsNullOrEmpty(lineInfoMessage))
-                {
-                    Logger.Error($"{FormatName} Deserialization failed{lineInfoMessage}.", ex);
-                }
-                else
-                {
-                    // Log a generic failure message when no line info is available
-                    Logger.Error($"{FormatName} Deserialization encountered a failure.", ex);
-                }
+                Logger.Error($"{FormatName} Deserialization failed{lineInfoMessage}.", ex);
 
-                // Returning null fulfills the contract: "returns null if deserialization fails"
                 return null;
             }
         }

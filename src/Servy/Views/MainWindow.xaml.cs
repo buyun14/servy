@@ -15,6 +15,12 @@ namespace Servy.Views
     [ExcludeFromCodeCoverage]
     public partial class MainWindow : Window
     {
+        /// <summary>The minimum vertical screen resolution threshold in pixels to trigger expanded window height constraints.</summary>
+        private const double FullHdScreenHeightThreshold = 1080;
+
+        /// <summary>The minimum window height enforced for displays meeting or exceeding Full HD vertical resolution.</summary>
+        private const double FullHdMinWindowHeight = 810;
+
         private readonly MainViewModel _mainViewModel;
         private readonly IProcessKiller _processKiller;
 
@@ -27,9 +33,22 @@ namespace Servy.Views
         {
             InitializeComponent();
 
+            AdjustWindowDimensionsForScreenResolution();
+
             _mainViewModel = mainViewModel ?? throw new ArgumentNullException(nameof(mainViewModel));
             _processKiller = processKiller ?? throw new ArgumentNullException(nameof(processKiller));
             DataContext = _mainViewModel;
+        }
+
+        /// <summary>
+        /// Adjusts the minimum height of the main window based on the primary screen's vertical resolution.
+        /// </summary>
+        private void AdjustWindowDimensionsForScreenResolution()
+        {
+            if (SystemParameters.PrimaryScreenHeight >= FullHdScreenHeightThreshold)
+            {
+                MinHeight = FullHdMinWindowHeight;
+            }
         }
 
         /// <summary>
@@ -37,13 +56,8 @@ namespace Servy.Views
         /// </summary>
         /// <param name="serviceName">Service Name.</param>
         /// <returns>A task representing the asynchronous load operation.</returns>
-        public async Task LoadServiceConfiguration(string serviceName)
-        {
-            if (!string.IsNullOrWhiteSpace(serviceName))
-            {
-                await _mainViewModel.LoadServiceConfigurationAsync(serviceName);
-            }
-        }
+        public Task LoadServiceConfigurationAsync(string serviceName)
+            => _mainViewModel.LoadServiceConfigurationAsync(serviceName);
 
         /// <summary>
         /// Handles the <see cref="Window.Closed"/> event.
@@ -55,7 +69,7 @@ namespace Servy.Views
         /// from remaining in the system after the application exits.
         ///
         /// The method retrieves the current process ID and passes it to
-        /// <see cref="ProcessKiller.KillChildren(int)"/> to terminate all descendants.
+        /// <see cref="IProcessKiller.KillChildren(int)"/> to terminate all descendants.
         /// Any exceptions thrown during this cleanup are caught and logged for debugging.
         /// </remarks>
         protected override void OnClosed(EventArgs e)
@@ -74,6 +88,7 @@ namespace Servy.Views
                 Logger.Error("Error killing child processes.", ex);
             }
 
+            _mainViewModel.Dispose();
             base.OnClosed(e);
         }
 
@@ -90,6 +105,8 @@ namespace Servy.Views
         protected override void OnClosing(CancelEventArgs e)
         {
             base.OnClosing(e);
+
+            // No handler currently sets e.Cancel, so the guard is a placeholder for a future "confirm before closing" feature rather than an active check today.
             if (!e.Cancel)
             {
                 Application.Current.Shutdown();

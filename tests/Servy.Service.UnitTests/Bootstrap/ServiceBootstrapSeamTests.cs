@@ -1,0 +1,590 @@
+using Microsoft.Extensions.Configuration;
+using Moq;
+using Servy.Core.Config;
+using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
+using Servy.Service.Bootstrap;
+using Servy.Service.ProcessManagement;
+using Servy.Service.StreamWriters;
+using Servy.Service.Timers;
+using Servy.Service.Validation;
+using Servy.Testing;
+using IServiceHelper = Servy.Service.Helpers.IServiceHelper;
+
+namespace Servy.Service.UnitTests.Bootstrap
+{
+    /// <summary>
+    /// Covers the production constructor of <see cref="Service"/> through
+    /// <see cref="IServiceBootstrapEnvironment"/>: the <c>Timing:*</c> parsing, the
+    /// <c>EnableEventLog</c> to <c>AutoLog</c> mapping, the per-service log folder and the exit-code rules of
+    /// the surrounding <c>catch</c>.
+    /// </summary>
+    /// <remarks>
+    /// Before the seam existed none of this was reachable from a unit test: every step touched the
+    /// event log, ProgramData, SQLite or the process-global logger.
+    /// </remarks>
+    [Collection(ExitCodeTestsCollection.Name)]
+    public class ServiceBootstrapSeamTests : IDisposable
+    {
+        private readonly List<IDisposable> _built = new List<IDisposable>();
+        private readonly ServiceTestContext _ctx = new ServiceTestContext();
+
+        /// <summary>
+        /// A positive <c>Timing:WaitChunkMs</c> replaces the default; a non-positive or unparsable one
+        /// leaves it alone.
+        /// </summary>
+        /// <param name="rawValue">The configured value, or <see langword="null"/> when the key is absent.</param>
+        /// <param name="expectDefault"><see langword="true"/> when the default must survive.</param>
+        [Theory]
+        [InlineData(null, true)]
+        [InlineData("", true)]
+        [InlineData("0", true)]
+        [InlineData("-1", true)]
+        [InlineData("not-a-number", true)]
+        [InlineData("1 500", true)]
+        [InlineData("1500", false)]
+        public void Constructor_WaitChunkMs_KeepsDefaultUnlessPositiveInteger(string? rawValue, bool expectDefault)
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            env.Settings["Timing:WaitChunkMs"] = rawValue;
+
+            // Act
+            var service = Build(env);
+
+            // Assert
+            var expected = expectDefault ? AppConfig.DefaultWaitChunkMs : 1500;
+            Assert.Equal(expected, TestReflection.GetField<int>(service, "_waitChunkMs"));
+        }
+
+        /// <summary>
+        /// A positive <c>Timing:ScmAdditionalTimeMs</c> replaces the default; a non-positive or unparsable one
+        /// leaves it alone.
+        /// </summary>
+        /// <param name="rawValue">The configured value, or <see langword="null"/> when the key is absent.</param>
+        /// <param name="expectDefault"><see langword="true"/> when the default must survive.</param>
+        [Theory]
+        [InlineData(null, true)]
+        [InlineData("", true)]
+        [InlineData("0", true)]
+        [InlineData("-1", true)]
+        [InlineData("not-a-number", true)]
+        [InlineData("2 500", true)]
+        [InlineData("2500", false)]
+        public void Constructor_ScmAdditionalTimeMs_KeepsDefaultUnlessPositiveInteger(string? rawValue, bool expectDefault)
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            env.Settings["Timing:ScmAdditionalTimeMs"] = rawValue;
+
+            // Act
+            var service = Build(env);
+
+            // Assert
+            var expected = expectDefault ? AppConfig.DefaultScmAdditionalTimeMs : 2500;
+            Assert.Equal(expected, TestReflection.GetField<int>(service, "_scmAdditionalTimeMs"));
+        }
+
+        /// <summary>
+        /// An invalid <c>Timing:WaitChunkMs</c> leaves its own default alone without affecting a valid
+        /// <c>Timing:ScmAdditionalTimeMs</c>: the two keys are parsed independently.
+        /// </summary>
+        [Fact]
+        public void Constructor_TimingKeys_AreParsedIndependently()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            env.Settings["Timing:WaitChunkMs"] = "0";
+            env.Settings["Timing:ScmAdditionalTimeMs"] = "2500";
+
+            // Act
+            var service = Build(env);
+
+            // Assert
+            Assert.Equal(AppConfig.DefaultWaitChunkMs, TestReflection.GetField<int>(service, "_waitChunkMs"));
+            Assert.Equal(2500, TestReflection.GetField<int>(service, "_scmAdditionalTimeMs"));
+        }
+
+        /// <summary>
+        /// Both parsed values are reported in the debug line the constructor writes, after parsing.
+        /// </summary>
+        [Fact]
+        public void Constructor_ReportsTheParsedTimingValues()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            env.Settings["Timing:WaitChunkMs"] = "1500";
+            env.Settings["Timing:ScmAdditionalTimeMs"] = "2500";
+
+            // Act
+            Build(env);
+
+            // Assert
+            var report = Assert.Single(env.DebugReports);
+            Assert.Equal("Servy Service Context Configuration Loaded:", report.Title);
+            Assert.Contains("WaitChunkMs: 1500", report.Body);
+            Assert.Contains("ScmAdditionalTimeMs: 2500", report.Body);
+        }
+
+        /// <summary>
+        /// <c>EnableEventLog</c> decides <see cref="System.ServiceProcess.ServiceBase.AutoLog"/>, and an
+        /// absent key falls back to <see cref="AppConfig.DefaultEnableEventLog"/>.
+        /// </summary>
+        /// <param name="rawValue">The configured value, or <see langword="null"/> when the key is absent.</param>
+        /// <param name="expected">The expected <c>AutoLog</c> value.</param>
+        [Theory]
+        [InlineData("true", true)]
+        [InlineData("false", false)]
+        [InlineData(null, AppConfig.DefaultEnableEventLog)]
+        public void Constructor_EnableEventLog_DecidesAutoLog(string? rawValue, bool expected)
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            env.Settings["EnableEventLog"] = rawValue;
+
+            // Act
+            var service = Build(env);
+
+            // Assert
+            Assert.Equal(expected, service.AutoLog);
+        }
+
+        /// <summary>
+        /// A successful construction enables shutdown notifications and names the service after the event source.
+        /// </summary>
+        [Fact]
+        public void Constructor_Success_EnablesShutdownAndUsesTheEventSourceName()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+
+            // Act
+            var service = Build(env);
+
+            // Assert
+            Assert.True(service.CanShutdown);
+            Assert.Equal(AppConfig.EventSource, service.ServiceName);
+        }
+
+        /// <summary>
+        /// The service log file is initialized before the <c>try</c>, which is what lets the catch-all log
+        /// a construction failure at all, and in the service's own folder, <c>logs\services\&lt;ServiceName&gt;\</c>,
+        /// the only log folder the service account can write.
+        /// </summary>
+        [Fact]
+        public void Constructor_InitializesTheServiceLogFileInTheServiceOwnLogFolder()
+        {
+            // Arrange: element 1 of the command line is the service name, as StartOptionsParser reads it
+            var env = new FakeBootstrapEnvironment();
+            _ctx.Helper.Setup(h => h.GetArgs()).Returns(new[] { "Servy.Service.exe", "My:Service" });
+
+            // Act
+            Build(env);
+
+            // Assert
+            var expected = Path.Combine(AppConfig.LogsFolderPath, "services", "My%3AService");
+            Assert.Equal(new[] { ("Servy.Service.log", expected) }, env.InitializedLoggers);
+            Assert.Equal(ServiceLogPaths.GetFolderPath("My:Service"), expected);
+        }
+
+        /// <summary>
+        /// A command line that names no service falls back to <c>logs\services\</c>; such a wrapper fails to
+        /// start in <c>OnStart</c> anyway.
+        /// </summary>
+        [Fact]
+        public void Constructor_NoServiceOnTheCommandLine_InitializesTheServiceLogFileInTheServiceLogsFolder()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            _ctx.Helper.Setup(h => h.GetArgs()).Returns(new[] { "Servy.Service.exe" });
+
+            // Act
+            Build(env);
+
+            // Assert
+            Assert.Equal(new[] { ("Servy.Service.log", AppConfig.ServiceLogsFolderPath) }, env.InitializedLoggers);
+            Assert.Equal(Path.Combine(AppConfig.LogsFolderPath, "services"), AppConfig.ServiceLogsFolderPath);
+        }
+
+        /// <summary>Command lines that name no service.</summary>
+        public static TheoryData<string[]> CommandLinesWithoutAService => new TheoryData<string[]>
+        {
+            new string[0],
+            new[] { "Servy.Service.exe" },
+            new[] { "Servy.Service.exe", "   " },
+        };
+
+        [Theory]
+        [MemberData(nameof(CommandLinesWithoutAService))]
+        public void GetLogDirectory_NoServiceName_IsTheServiceLogsFolder(string[] args)
+        {
+            // Act
+            var directory = Service.GetLogDirectory(args);
+
+            // Assert
+            Assert.Equal(AppConfig.ServiceLogsFolderPath, directory);
+        }
+
+        [Fact]
+        public void GetLogDirectory_NoCommandLine_IsTheServiceLogsFolder()
+        {
+            // Act
+            var directory = Service.GetLogDirectory(null);
+
+            // Assert
+            Assert.Equal(AppConfig.ServiceLogsFolderPath, directory);
+        }
+
+        [Fact]
+        public void GetLogDirectory_ServiceName_IsThatServiceFolder()
+        {
+            // Act
+            var directory = Service.GetLogDirectory(new[] { "Servy.Service.exe", "MyService", "ignored" });
+
+            // Assert
+            Assert.Equal(Path.Combine(AppConfig.ServiceLogsFolderPath, "MyService"), directory);
+        }
+
+        /// <summary>
+        /// Logging is configured with the instance logger the constructor was given, not with the
+        /// process-global one.
+        /// </summary>
+        [Fact]
+        public void Constructor_ConfiguresLoggingWithTheInstanceLogger()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+
+            // Act
+            Build(env);
+
+            // Assert
+            Assert.Same(_ctx.Logger.Object, Assert.Single(env.ConfiguredInstanceLoggers));
+        }
+
+        /// <summary>
+        /// Logging is configured with the configuration the constructor loaded from the settings file, not
+        /// with an empty one, so the log level, rotation and event-log settings take effect.
+        /// </summary>
+        [Fact]
+        public void Constructor_ConfiguresLoggingWithTheLoadedConfiguration()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            env.Settings["LogLevel"] = "Debug";
+
+            // Act
+            Build(env);
+
+            // Assert
+            Assert.Equal("Debug", Assert.Single(env.ConfiguredConfigurations)["LogLevel"]);
+        }
+
+        /// <summary>
+        /// A settings file that still relocates the database is told, through the instance logger, that the
+        /// setting is ignored.
+        /// </summary>
+        [Fact]
+        public void Constructor_SettingsFileStillRelocatesTheDatabase_WarnsThatTheSettingIsIgnored()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment();
+            env.Settings["ConnectionStrings:DefaultConnection"] = @"Data Source=D:\old\Servy.db";
+
+            // Act
+            Build(env);
+
+            // Assert
+            _ctx.Logger.Verify(l => l.Warn(
+                It.Is<string>(m => m.StartsWith(AppConfig.ServyServiceSettingsFileName + " sets ConnectionStrings:DefaultConnection, which Servy ignores since v10.2")),
+                null), Times.Once);
+        }
+
+        /// <summary>
+        /// A failing start-up step with no exit code already set terminates with
+        /// <see cref="AppConfig.ServiceSpecificErrorCode"/>, and the exception is logged.
+        /// </summary>
+        [Fact]
+        public void Constructor_FailingStep_WithoutPresetExitCode_TerminatesWithServiceSpecificErrorCode()
+        {
+            // Arrange
+            var failure = new InvalidOperationException("event source registration failed");
+            var env = new FakeBootstrapEnvironment { EventSourceFailure = failure };
+            var originalExitCode = Environment.ExitCode;
+            Environment.ExitCode = 0;
+
+            try
+            {
+                // Act
+                var termination = Assert.Throws<ProcessTerminatedException>(() => Build(env));
+
+                // Assert
+                Assert.Equal(AppConfig.ServiceSpecificErrorCode, termination.ExitCode);
+                Assert.Contains(env.Errors, e => ReferenceEquals(e.Exception, failure));
+            }
+            finally
+            {
+                Environment.ExitCode = originalExitCode;
+            }
+        }
+
+        /// <summary>
+        /// A failing start-up step preserves an exit code a lower layer has already set - the "13 from
+        /// ProtectedKeyProvider" case the constructor's comment names.
+        /// </summary>
+        [Fact]
+        public void Constructor_FailingStep_PreservesAnExitCodeAlreadySet()
+        {
+            // Arrange
+            var env = new FakeBootstrapEnvironment { EventSourceFailure = new InvalidOperationException("boom") };
+            var originalExitCode = Environment.ExitCode;
+            Environment.ExitCode = 13;
+
+            try
+            {
+                // Act
+                var termination = Assert.Throws<ProcessTerminatedException>(() => Build(env));
+
+                // Assert
+                Assert.Equal(13, termination.ExitCode);
+            }
+            finally
+            {
+                Environment.ExitCode = originalExitCode;
+            }
+        }
+
+        /// <summary>
+        /// The bootstrap environment is required, so a null one is rejected before any start-up call runs.
+        /// </summary>
+        [Fact]
+        public void Constructor_NullBootstrapEnvironment_Throws()
+        {
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>(() => new Service(
+                _ctx.Helper.Object,
+                _ctx.Logger.Object,
+                _ctx.StreamWriterFactory.Object,
+                _ctx.TimerFactory.Object,
+                _ctx.ProcessFactory.Object,
+                _ctx.PathValidator.Object,
+                _ctx.NamedPipesService.Object,
+                (IServiceBootstrapEnvironment)null!));
+        }
+
+        /// <summary>
+        /// Each of the seven core dependencies is required, so a null one is rejected with its own parameter
+        /// name before any start-up call runs.
+        /// </summary>
+        /// <param name="nullIndex">The position of the dependency passed as <see langword="null"/>.</param>
+        /// <param name="expectedParamName">The parameter name the exception must report.</param>
+        [Theory]
+        [InlineData(0, "serviceHelper")]
+        [InlineData(1, "logger")]
+        [InlineData(2, "streamWriterFactory")]
+        [InlineData(3, "timerFactory")]
+        [InlineData(4, "processFactory")]
+        [InlineData(5, "pathValidator")]
+        [InlineData(6, "namedPipesService")]
+        public void Constructor_BootstrapOverload_NullDependency_ThrowsArgumentNullException(int nullIndex, string expectedParamName)
+        {
+            // Arrange
+            var serviceHelper = nullIndex == 0 ? null : _ctx.Helper.Object;
+            var logger = nullIndex == 1 ? null : _ctx.Logger.Object;
+            var streamWriterFactory = nullIndex == 2 ? null : _ctx.StreamWriterFactory.Object;
+            var timerFactory = nullIndex == 3 ? null : _ctx.TimerFactory.Object;
+            var processFactory = nullIndex == 4 ? null : _ctx.ProcessFactory.Object;
+            var pathValidator = nullIndex == 5 ? null : _ctx.PathValidator.Object;
+            var namedPipesService = nullIndex == 6 ? null : _ctx.NamedPipesService.Object;
+            var env = new FakeBootstrapEnvironment();
+
+            // Act
+            var ex = Assert.Throws<ArgumentNullException>(() => new Service(
+                serviceHelper!,
+                logger!,
+                streamWriterFactory!,
+                timerFactory!,
+                processFactory!,
+                pathValidator!,
+                namedPipesService!,
+                (IServiceBootstrapEnvironment)env));
+
+            // Assert
+            Assert.Equal(expectedParamName, ex.ParamName);
+        }
+
+        /// <summary>
+        /// Builds a <see cref="TerminationRecordingService"/> wired to the shared mocks and the supplied
+        /// bootstrap environment, and registers it for disposal.
+        /// </summary>
+        /// <param name="env">The bootstrap environment the constructor must use.</param>
+        /// <returns>The constructed service.</returns>
+        private Service Build(IServiceBootstrapEnvironment env)
+        {
+            var service = new TerminationRecordingService(
+                _ctx.Helper.Object,
+                _ctx.Logger.Object,
+                _ctx.StreamWriterFactory.Object,
+                _ctx.TimerFactory.Object,
+                _ctx.ProcessFactory.Object,
+                _ctx.PathValidator.Object,
+                _ctx.NamedPipesService.Object,
+                env);
+
+            _built.Add(service);
+            return service;
+        }
+
+        /// <summary>
+        /// Disposes every service this test class built, and the shared context.
+        /// </summary>
+        public void Dispose()
+        {
+            foreach (var service in _built)
+            {
+                service.Dispose();
+            }
+
+            _built.Clear();
+            _ctx.Dispose();
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// A <see cref="Service"/> whose process-termination seam throws instead of ending the process,
+        /// so a constructor that reaches it can be asserted on.
+        /// </summary>
+        private sealed class TerminationRecordingService : Service
+        {
+            /// <summary>
+            /// Initializes a new instance of the <see cref="TerminationRecordingService"/> class.
+            /// </summary>
+            /// <param name="serviceHelper">The service helper.</param>
+            /// <param name="logger">The instance logger.</param>
+            /// <param name="streamWriterFactory">The stream writer factory.</param>
+            /// <param name="timerFactory">The timer factory.</param>
+            /// <param name="processFactory">The process factory.</param>
+            /// <param name="pathValidator">The path validator.</param>
+            /// <param name="namedPipesService">The named pipes service.</param>
+            /// <param name="bootstrapEnvironment">The bootstrap environment seam.</param>
+            public TerminationRecordingService(
+                IServiceHelper serviceHelper,
+                IServyLogger logger,
+                IStreamWriterFactory streamWriterFactory,
+                ITimerFactory timerFactory,
+                IProcessFactory processFactory,
+                IPathValidator pathValidator,
+                INamedPipesService namedPipesService,
+                IServiceBootstrapEnvironment bootstrapEnvironment)
+                : base(serviceHelper, logger, streamWriterFactory, timerFactory, processFactory, pathValidator, namedPipesService, bootstrapEnvironment)
+            {
+            }
+
+            /// <summary>
+            /// Throws instead of terminating the host process.
+            /// </summary>
+            /// <param name="exitCode">The exit code the service asked the host process to terminate with.</param>
+            /// <exception cref="ProcessTerminatedException">Always.</exception>
+            /// <remarks>
+            /// The production seam forwards to <c>Environment.Exit</c>, which does not return. The
+            /// constructor reaches it from its catch-all only, so throwing here ends the construction the
+            /// same way.
+            /// </remarks>
+            protected override void TerminateProcess(int exitCode)
+            {
+                throw new ProcessTerminatedException(exitCode);
+            }
+        }
+
+        /// <summary>
+        /// Sentinel thrown by <see cref="TerminationRecordingService.TerminateProcess(int)"/> in place of
+        /// the process termination the production seam performs. It carries no behaviour of its own
+        /// beyond the exit code it was raised with.
+        /// </summary>
+        private sealed class ProcessTerminatedException : Exception
+        {
+            /// <summary>
+            /// Initializes a new instance of the <see cref="ProcessTerminatedException"/> class.
+            /// </summary>
+            /// <param name="exitCode">The exit code the service asked the host process to terminate with.</param>
+            public ProcessTerminatedException(int exitCode)
+                : base($"Service requested process termination with exit code {exitCode}.")
+            {
+                ExitCode = exitCode;
+            }
+
+            /// <summary>
+            /// Gets the exit code the service asked the host process to terminate with.
+            /// </summary>
+            public int ExitCode { get; }
+        }
+
+        /// <summary>
+        /// An <see cref="IServiceBootstrapEnvironment"/> that records what the constructor asked of it and
+        /// answers from memory, so no start-up step touches the event log, ProgramData or the
+        /// process-global logger.
+        /// </summary>
+        private sealed class FakeBootstrapEnvironment : IServiceBootstrapEnvironment
+        {
+            /// <summary>Gets the in-memory configuration values <see cref="BuildConfiguration"/> serves.</summary>
+            public Dictionary<string, string?> Settings { get; } = new Dictionary<string, string?>();
+
+            /// <summary>Gets or sets the exception <see cref="EnsureEventSourceExists"/> raises, if any.</summary>
+            public Exception? EventSourceFailure { get; set; }
+
+            /// <summary>Gets the log file names and folders <see cref="InitializeLogger"/> was called with.</summary>
+            public List<(string FileName, string Directory)> InitializedLoggers { get; } = new List<(string FileName, string Directory)>();
+
+            /// <summary>Gets the debug reports <see cref="ReportDebug"/> was called with, in call order.</summary>
+            public List<(string Title, string Body)> DebugReports { get; } = new List<(string Title, string Body)>();
+
+            /// <summary>Gets the configurations <see cref="ConfigureLogging"/> was called with, in call order.</summary>
+            public List<IConfiguration> ConfiguredConfigurations { get; } = new List<IConfiguration>();
+
+            /// <summary>Gets the instance loggers <see cref="ConfigureLogging"/> was called with, in call order.</summary>
+            public List<IServyLogger?> ConfiguredInstanceLoggers { get; } = new List<IServyLogger?>();
+
+            /// <summary>Gets the errors <see cref="LogError"/> was called with, in call order.</summary>
+            public List<(string? Message, Exception? Exception)> Errors { get; } = new List<(string? Message, Exception? Exception)>();
+
+            /// <summary>Records the call and does nothing else.</summary>
+            /// <param name="logFileName">The log file name the constructor asked for.</param>
+            /// <param name="logDirectory">The folder the constructor asked for.</param>
+            public void InitializeLogger(string logFileName, string logDirectory) => InitializedLoggers.Add((logFileName, logDirectory));
+
+            /// <summary>Raises <see cref="EventSourceFailure"/> when one is configured.</summary>
+            /// <exception cref="Exception">The configured <see cref="EventSourceFailure"/>.</exception>
+            public void EnsureEventSourceExists()
+            {
+                if (EventSourceFailure != null)
+                {
+                    throw EventSourceFailure;
+                }
+            }
+
+            /// <summary>Serves <see cref="Settings"/> as an in-memory configuration.</summary>
+            /// <returns>The built configuration.</returns>
+            public IConfiguration BuildConfiguration() =>
+                new ConfigurationBuilder().AddInMemoryCollection(Settings).Build();
+
+            /// <summary>Records the configuration and the instance logger and does nothing else.</summary>
+            /// <param name="configuration">The configuration the constructor passed.</param>
+            /// <param name="instanceLogger">The instance logger the constructor passed.</param>
+            public void ConfigureLogging(IConfiguration configuration, IServyLogger? instanceLogger)
+            {
+                ConfiguredConfigurations.Add(configuration);
+                ConfiguredInstanceLoggers.Add(instanceLogger);
+            }
+
+            /// <summary>Records the report.</summary>
+            /// <param name="title">The first line of the report.</param>
+            /// <param name="body">The body of the report.</param>
+            public void ReportDebug(string title, string body) => DebugReports.Add((title, body));
+
+            /// <summary>Records the error.</summary>
+            /// <param name="message">The error message.</param>
+            /// <param name="exception">The exception recorded with it, if any.</param>
+            public void LogError(string? message, Exception? exception = null) => Errors.Add((message, exception));
+        }
+    }
+}

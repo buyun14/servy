@@ -8,8 +8,8 @@
 # ARM64 builds are fully verified via dedicated ARM64 test matrices: build.yml verifies build
 # compatibility, and test.yml verifies both unit tests and integration tests.
 #
-# Both x64 and ARM64 pipelines generate full CycloneDX Software Bills of Materials (SBOM),
-# executing cross-architecture dependency graph mapping directly on the windows-latest host.
+# Both x64 and ARM64 publishes generate a full CycloneDX Software Bill of Materials (SBOM);
+# the SBOM is derived from the project files, so one windows-latest run covers either architecture.
 # ==========================================================================================
 
 name: publish
@@ -195,7 +195,7 @@ jobs:
           & $exePath | Select-String "7-Zip"
 
       # -----------------------------------------------------
-      # Run unit tests
+      # Run all tests
       # -----------------------------------------------------
       # NOTE: Tests are skipped here for ARM64 because they are fully
       # covered by the dedicated ARM64 test matrices in test.yml.
@@ -213,7 +213,7 @@ jobs:
       - name: Run all tests
         if: ${{ inputs.arm64 == false }}
         shell: pwsh
-        run: dotnet test Servy.sln --configuration $env:CONFIGURATION --no-build
+        run: dotnet test Servy.sln --configuration $env:CONFIGURATION --no-build --filter "Category!=Stress"
 
       # -----------------------------------------------------
       # Build and Publish SBOM
@@ -231,6 +231,75 @@ jobs:
           path: servy-${{ env.VERSION }}-sbom.xml
           if-no-files-found: error
           retention-days: 1
+
+      # -----------------------------------------------------
+      # Build UNSIGNED Servy.Host.exe
+      # -----------------------------------------------------
+      - name: Build Servy.Host.exe
+        shell: pwsh
+        run: |
+          $configuration = $env:CONFIGURATION
+          $runtime       = $env:RUNTIME
+          $tfm           = $env:TFM
+          $projectPath   = Resolve-Path "src\Servy.Host\Servy.Host.csproj"
+          $publishDir    = "src\Servy.Host\bin\$configuration\$tfm\$runtime\publish"
+
+          dotnet publish $projectPath `
+              -c $configuration `
+              -r $runtime `
+              -f $tfm `
+              -o $publishDir `
+              --force `
+              --self-contained true `
+              /p:DeleteExistingFiles=true
+
+      # -----------------------------------------------------
+      # SIGN Servy.Host.exe
+      # -----------------------------------------------------
+      - name: Upload Servy.Host.exe (unsigned)
+        id: unsigned-host
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: unsigned-host
+          path: src/Servy.Host/bin/${{ env.CONFIGURATION }}/${{ env.TFM }}/${{ env.RUNTIME }}/publish/Servy.Host.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Submit Servy.Host.exe for signing
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd #v2.x
+        with:
+          organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          github-artifact-id: '${{ steps.unsigned-host.outputs.artifact-id }}'
+          artifact-configuration-slug: 'servy-host'
+          wait-for-completion: true
+          output-artifact-directory: 'signed/Servy.Host'
+
+      - name: Inject signed Servy.Host.exe
+        shell: pwsh
+        run: |
+          $signed = "signed/Servy.Host/Servy.Host.exe"
+          if (-not (Test-Path $signed)) { throw "Signed Servy.Host.exe not found!" }
+
+          $pdb = "src/Servy.Host/bin/$env:CONFIGURATION/$env:TFM/$env:RUNTIME/publish/Servy.Host.pdb"
+          if (-not (Test-Path $pdb)) { throw "Servy.Host.pdb not found!" }
+
+          # The desktop app, the Manager and the CLI each embed the host and extract it next to the service wrapper
+          $targets = @(
+              "src/Servy/Resources",
+              "src/Servy.Manager/Resources",
+              "src/Servy.CLI/Resources"
+          )
+
+          # Inject the signed EXE and matching PDB into each resource folder
+          foreach ($target in $targets) {
+              Write-Host "Injecting SIGNED Servy.Host.exe into $target"
+              Copy-Item $signed (Join-Path $target "Servy.Host.exe") -Force
+              Write-Host "Injecting matching Servy.Host.pdb into $target"
+              Copy-Item $pdb (Join-Path $target "Servy.Host.pdb") -Force
+          }
 
       # -----------------------------------------------------
       # Build UNSIGNED Servy.Restarter.exe
@@ -280,9 +349,26 @@ jobs:
       - name: Inject signed Servy.Restarter.exe
         shell: pwsh
         run: |
-          $file = "signed/Servy.Restarter/Servy.Restarter.exe"
-          if (-not (Test-Path $file)) { throw "Signed Servy.Restarter.exe not found!" }
-          Copy-Item $file src/Servy.Service/Resources/Servy.Restarter.exe -Force
+          $signed = "signed/Servy.Restarter/Servy.Restarter.exe"
+          if (-not (Test-Path $signed)) { throw "Signed Servy.Restarter.exe not found!" }
+
+          $pdb = "src/Servy.Restarter/bin/$env:CONFIGURATION/$env:TFM/$env:RUNTIME/publish/Servy.Restarter.pdb"
+          if (-not (Test-Path $pdb)) { throw "Servy.Restarter.pdb not found!" }
+
+          # The desktop app, the Manager and the CLI each embed the restarter and extract it next to the service wrapper
+          $targets = @(
+              "src/Servy/Resources",
+              "src/Servy.Manager/Resources",
+              "src/Servy.CLI/Resources"
+          )
+
+          # Inject the signed EXE and matching PDB into each resource folder
+          foreach ($target in $targets) {
+              Write-Host "Injecting SIGNED Servy.Restarter.exe into $target"
+              Copy-Item $signed (Join-Path $target "Servy.Restarter.exe") -Force
+              Write-Host "Injecting matching Servy.Restarter.pdb into $target"
+              Copy-Item $pdb (Join-Path $target "Servy.Restarter.pdb") -Force
+          }
 
       # -----------------------------------------------------
       # Build UNSIGNED Servy.Service.exe
@@ -335,16 +421,21 @@ jobs:
           $signed = "signed/Servy.Service/Servy.Service.exe"
           if (-not (Test-Path $signed)) { throw "Signed Servy.Service.exe not found!" }
 
+          $pdb = "src/Servy.Service/bin/$env:CONFIGURATION/$env:TFM/$env:RUNTIME/publish/Servy.Service.pdb"
+          if (-not (Test-Path $pdb)) { throw "Servy.Service.pdb not found!" }
+
           $targets = @(
-              "src/Servy/Resources/Servy.Service.exe",
-              "src/Servy.Manager/Resources/Servy.Service.exe",
-              "src/Servy.CLI/Resources/Servy.Service.CLI.exe"
+              @{ Exe = "src/Servy/Resources/Servy.Service.exe"; Pdb = "src/Servy/Resources/Servy.Service.pdb" },
+              @{ Exe = "src/Servy.Manager/Resources/Servy.Service.exe"; Pdb = "src/Servy.Manager/Resources/Servy.Service.pdb" },
+              @{ Exe = "src/Servy.CLI/Resources/Servy.Service.CLI.exe"; Pdb = "src/Servy.CLI/Resources/Servy.Service.CLI.pdb" }
           )
 
-          # Inject the signed EXE into each resource folder
-          foreach ($dst in $targets) {
-              Write-Host "Injecting SIGNED Servy.Service.exe into $dst"
-              Copy-Item $signed $dst -Force
+          # Inject the signed EXE and matching PDB into each resource folder
+          foreach ($target in $targets) {
+              Write-Host "Injecting SIGNED Servy.Service.exe into $($target.Exe)"
+              Copy-Item $signed $($target.Exe) -Force
+              Write-Host "Injecting matching Servy.Service.pdb into $($target.Pdb)"
+              Copy-Item $pdb $($target.Pdb) -Force
           }
 
       # -----------------------------------------------------
@@ -509,7 +600,7 @@ jobs:
       - name: Build unsigned installer
         shell: pwsh
         run: |
-          & "$env:ISCC" "$env:ISS_FILE" /DMyAppVersion=$env:VERSION /DArch=$env:ARCH
+          & "$env:ISCC" "$env:ISS_FILE" /DMyAppVersion=$env:VERSION /DArch=$env:ARCH /DBuildConfiguration=$env:CONFIGURATION /DTfm=$env:TFM
 
       # -----------------------------------------------------
       # SIGN installer
@@ -598,10 +689,12 @@ jobs:
           # CLI
           Copy-Item (Join-Path $cli 'Servy.CLI.exe') "$pkg\servy-cli.exe" -Force
 
-          # PowerShell module
+          # PowerShell module and Dump/Restore Scripts
           Copy-Item "src/Servy.CLI/Servy.psm1" $pkg -Force
           Copy-Item "src/Servy.CLI/Servy.psd1" $pkg -Force
           Copy-Item "src/Servy.CLI/servy-module-examples.ps1" $pkg -Force
+          Copy-Item "src/Servy.CLI/Servy-Dump.ps1" $pkg -Force
+          Copy-Item "src/Servy.CLI/Servy-Restore.ps1" $pkg -Force
 
           # Task Scheduler setup - Hardened Recursive Copy
           $destPath = Join-Path $pkg "taskschd"

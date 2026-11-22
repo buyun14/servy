@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Shared build and publish utilities for Servy projects.
@@ -13,59 +14,13 @@ $BC_ScriptDir = $PSScriptRoot
 # Import helpers
 . (Join-Path $BC_ScriptDir "common-helpers.ps1")
 
-<#
-.SYNOPSIS
-    Executes a scriptblock with automatic retries on failure.
-#>
-function Invoke-WithRetry {
-    param(
-        [Parameter(Mandatory=$true)]
-        [scriptblock]$Command,
-
-        [Parameter(Mandatory=$true)]
-        [string]$ErrorMessage,
-
-        [int]$MaxRetries = 3,
-        [int]$RetryDelaySeconds = 5
-    )
-
-    $attempt = 0
-    $success = $false
-
-    while ($attempt -lt $MaxRetries) {
-        $attempt++
-        if ($attempt -gt 1) {
-            Write-Host "Retrying command (Attempt $attempt of $MaxRetries)..." -ForegroundColor Yellow
-        }
-
-        # Reset exit code before execution
-        $global:LASTEXITCODE = 0
-
-        & $Command
-
-        if ($global:LASTEXITCODE -eq 0) {
-            $success = $true
-            break
-        } else {
-            Write-Warning "Command exited with code $($global:LASTEXITCODE)."
-            if ($attempt -lt $MaxRetries) {
-                Write-Host "Waiting $RetryDelaySeconds seconds before next attempt..." -ForegroundColor DarkGray
-                Start-Sleep -Seconds $RetryDelaySeconds
-            }
-        }
-    }
-
-    if (-not $success) {
-        throw "$ErrorMessage (Failed after $MaxRetries attempts)"
-    }
-}
-
 function Invoke-StandardPublish {
     param(
         [Parameter(Mandatory=$true)][string]$ProjectDir,
         [Parameter(Mandatory=$true)][string]$ProjectName,
-        [string]$Tfm = "net10.0-windows",
+        [Parameter(Mandatory=$true)][string]$Tfm,
         [string]$Runtime = "win-x64",
+        [ValidateSet('Debug', 'Release')]
         [string]$BuildConfiguration = "Release"
     )
 
@@ -73,7 +28,7 @@ function Invoke-StandardPublish {
     $resSuffix = if ($BuildConfiguration -eq "Debug") { "debug" } else { "release" }
     $publishResScript = Join-Path $ProjectDir "publish-res-$resSuffix.ps1"
 
-    if (Test-Path $publishResScript) {
+    if (Test-Path -LiteralPath $publishResScript) {
         Write-Host "=== Running publish-res-$resSuffix.ps1 ===" -ForegroundColor Cyan
         & $publishResScript -Tfm $Tfm -Runtime $Runtime
         Assert-LastExitCode "publish-res-$resSuffix.ps1 failed"
@@ -82,7 +37,7 @@ function Invoke-StandardPublish {
 
     # Step 1: Build and Publish
     $projectPath = Join-Path $ProjectDir "$ProjectName.csproj"
-    if (-not (Test-Path $projectPath)) {
+    if (-not (Test-Path -LiteralPath $projectPath)) {
         throw "Project file not found: $projectPath"
     }
 
@@ -105,7 +60,6 @@ function Invoke-StandardPublish {
             -r $Runtime `
             --self-contained true `
             --no-restore `
-            --force `
             /p:DeleteExistingFiles=true
     }
 
@@ -115,8 +69,8 @@ function Invoke-StandardPublish {
         $publishFolder = Join-Path $ProjectDir "bin\$BuildConfiguration\$Tfm\$Runtime\publish"
         $exePath       = Join-Path $publishFolder "$ProjectName.exe"
 
-        if (Test-Path $exePath) {
-            if (Test-Path $signPath) {
+        if (Test-Path -LiteralPath $exePath) {
+            if (Test-Path -LiteralPath $signPath) {
                 Write-Host "=== Signing $ProjectName.exe ===" -ForegroundColor Cyan
                 & $signPath $exePath
                 Assert-LastExitCode "Code signing failed"

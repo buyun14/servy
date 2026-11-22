@@ -4,8 +4,8 @@ using Servy.Manager.Models;
 using Servy.Manager.Services;
 using Servy.UI.Commands;
 using Servy.UI.Services;
+using Servy.UI.ViewModels;
 using System.ComponentModel;
-using System.Runtime.CompilerServices;
 
 namespace Servy.Manager.ViewModels
 {
@@ -13,7 +13,7 @@ namespace Servy.Manager.ViewModels
     /// ViewModel representing a single row in the Services DataGrid.
     /// Exposes the underlying Service model and row-level commands.
     /// </summary>
-    public class ServiceRowViewModel : INotifyPropertyChanged, IDisposable
+    public class ServiceRowViewModel : ViewModelBase, IDisposable
     {
         private readonly IServiceCommands _serviceCommands;
         private readonly ICursorService _cursorService;
@@ -27,24 +27,22 @@ namespace Servy.Manager.ViewModels
         /// <param name="service">The service model for this row.</param>
         /// <param name="serviceCommands">Service commands for row operations.</param>
         /// <param name="cursorService">Cursor service.</param>
-        public ServiceRowViewModel(Service? service, IServiceCommands? serviceCommands, ICursorService? cursorService)
+        public ServiceRowViewModel(Service service, IServiceCommands serviceCommands, ICursorService cursorService)
         {
             Service = service ?? throw new ArgumentNullException(nameof(service));
             _serviceCommands = serviceCommands ?? throw new ArgumentNullException(nameof(serviceCommands));
             _cursorService = cursorService ?? throw new ArgumentNullException(nameof(cursorService));
 
-            // Subscribe to property changes in the Service model
             Service.PropertyChanged += Service_PropertyChanged;
 
-            StartCommand = new AsyncCommand(
-                StartServiceAsync,
-                _ => CanExecuteServiceCommand(_) && Service.IsInstalled == true && Service.Status == ServiceStatus.Stopped,
+            StartCommand = new AsyncCommand(StartServiceAsync,
+                _ => CanExecuteServiceCommand(_) && Service.IsInstalled && Service.Status == ServiceStatus.Stopped,
                 name: nameof(StartCommand));
             StopCommand = new AsyncCommand(StopServiceAsync,
-                _ => CanExecuteServiceCommand(_) && Service.IsInstalled == true && Service.Status == ServiceStatus.Running,
+                _ => CanExecuteServiceCommand(_) && Service.IsInstalled && Service.Status == ServiceStatus.Running,
                 name: nameof(StopCommand));
             RestartCommand = new AsyncCommand(RestartServiceAsync,
-                _ => CanExecuteServiceCommand(_) && Service.IsInstalled == true && Service.Status == ServiceStatus.Running,
+                _ => CanExecuteServiceCommand(_) && Service.IsInstalled && Service.Status == ServiceStatus.Running,
                 name: nameof(RestartCommand));
             ConfigureCommand = new AsyncCommand(ConfigureServiceAsync,
                 CanExecuteServiceCommand,
@@ -53,7 +51,7 @@ namespace Servy.Manager.ViewModels
                 CanExecuteServiceCommand, // We don't check Service.IsInstalled != true to allow re-installing an installed service to update its configuration in DB and SCM
                 name: nameof(InstallCommand));
             UninstallCommand = new AsyncCommand(UninstallServiceAsync,
-                _ => CanExecuteServiceCommand(_) && Service.IsInstalled == true,
+                _ => CanExecuteServiceCommand(_) && Service.IsInstalled,
                 name: nameof(UninstallCommand));
             RemoveCommand = new AsyncCommand(RemoveServiceAsync,
                 CanExecuteServiceCommand,
@@ -62,7 +60,8 @@ namespace Servy.Manager.ViewModels
                 CanExecuteServiceCommand,
                 name: nameof(ExportXmlCommand));
             ExportJsonCommand = new AsyncCommand(ExportServiceToJsonAsync,
-                CanExecuteServiceCommand, name: nameof(ExportJsonCommand));
+                CanExecuteServiceCommand,
+                name: nameof(ExportJsonCommand));
 
             CopyPidCommand = new AsyncCommand(CopyPidAsync,
                 _ => CanExecuteServiceCommand(_) && Service.Pid != null,
@@ -82,14 +81,7 @@ namespace Servy.Manager.ViewModels
         public bool IsSelected
         {
             get => _isSelected;
-            set
-            {
-                if (_isSelected != value)
-                {
-                    _isSelected = value;
-                    OnPropertyChanged();
-                }
-            }
+            set => Set(ref _isSelected, value);
         }
 
         /// <summary>
@@ -98,45 +90,72 @@ namespace Servy.Manager.ViewModels
         public bool IsChecked
         {
             get => _isChecked;
-            set
-            {
-                if (_isChecked != value)
-                {
-                    _isChecked = value;
-                    OnPropertyChanged();
-                }
-            }
+            set => Set(ref _isChecked, value);
         }
 
+        /// <summary>
+        /// Gets the service name, or an empty string when the model has none.
+        /// </summary>
         public string Name => Service.Name ?? string.Empty;
+
+        /// <summary>
+        /// Gets the service display name, or an empty string when the model has none.
+        /// </summary>
+        public string DisplayName => Service.DisplayName ?? string.Empty;
+
+        /// <summary>
+        /// Gets the description of the service, or an empty string when the model has none.
+        /// </summary>
         public string Description => Service.Description ?? string.Empty;
+
+        /// <summary>
+        /// Gets the operational status of the service, or <see langword="null"/> when unknown or unavailable.
+        /// </summary>
         public ServiceStatus? Status => Service.Status;
+
+        /// <summary>
+        /// Gets the startup type of the service, or <see langword="null"/> when unconfigured or unavailable.
+        /// </summary>
         public ServiceStartType? StartupType => Service.StartupType;
+
+        /// <summary>
+        /// Gets the account identity under which the service runs, or an empty string when unconfigured.
+        /// </summary>
         public string LogOnAs => Service.LogOnAs ?? string.Empty;
+
+        /// <summary>
+        /// Gets a value indicating whether the service is currently installed in the Windows Service Control Manager (SCM).
+        /// </summary>
         public bool IsInstalled => Service.IsInstalled;
+
+        /// <summary>
+        /// Gets a value indicating whether an associated desktop application executable is available for this service.
+        /// </summary>
         public bool IsDesktopAppAvailable => Service.IsDesktopAppAvailable;
+
+        /// <summary>
+        /// Gets the Process ID of the service, or <see langword="null"/> when it is not running.
+        /// </summary>
         public int? Pid => Service.Pid;
+
+        /// <summary>
+        /// Gets a value indicating whether the Process ID column display is enabled for this row.
+        /// </summary>
         public bool IsPidEnabled => Service.IsPidEnabled;
+
+        /// <summary>
+        /// Gets the percentage of CPU usage for the service process, or <see langword="null"/> when monitoring is inactive or process is stopped.
+        /// </summary>
         public double? CpuUsage => Service.CpuUsage;
+
+        /// <summary>
+        /// Gets the RAM usage in bytes for the service process, or <see langword="null"/> when monitoring is inactive or process is stopped.
+        /// </summary>
         public long? RamUsage => Service.RamUsage;
 
         #endregion
 
         #region INotifyPropertyChanged
-
-        /// <summary>
-        /// Occurs when a property value changes.
-        /// </summary>
-        public event PropertyChangedEventHandler? PropertyChanged;
-
-        /// <summary>
-        /// Raises the <see cref="PropertyChanged"/> event.
-        /// </summary>
-        /// <param name="propertyName">Name of the changed property.</param>
-        private void OnPropertyChanged([CallerMemberName] string? propertyName = "")
-        {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-        }
 
         /// <summary>
         /// Handles property changes in the underlying <see cref="Service"/> and forwards them to the UI.
@@ -149,13 +168,8 @@ namespace Servy.Manager.ViewModels
         {
             if (string.IsNullOrEmpty(e?.PropertyName)) return;
 
-            // Forward the property change directly to the ViewModel.
-            // The default pass-through handles all 1:1 mapped properties (e.g., Description, Status, Pid).
             OnPropertyChanged(e.PropertyName);
 
-            // RE-EVALUATE COMMANDS:
-            // If status, PID or installation state changes, trigger a CanExecute re-check.
-            // This ensures UI buttons (Start, Stop, etc.) update their enabled state immediately.
             if (e.PropertyName == nameof(Service.Status) || e.PropertyName == nameof(Service.IsInstalled) || e.PropertyName == nameof(Service.Pid))
             {
                 // CommandManager.InvalidateRequerySuggested is global: one call re-queries every row command.
@@ -222,34 +236,38 @@ namespace Servy.Manager.ViewModels
         #region Command Handlers
 
         private async Task StartServiceAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.StartServiceAsync(Service));
+            await ExecuteSafeAsync(nameof(StartCommand), () => _serviceCommands.StartServiceAsync(Service));
 
         private async Task StopServiceAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.StopServiceAsync(Service));
+            await ExecuteSafeAsync(nameof(StopCommand), () => _serviceCommands.StopServiceAsync(Service));
 
         private async Task RestartServiceAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.RestartServiceAsync(Service));
+            await ExecuteSafeAsync(nameof(RestartCommand), () => _serviceCommands.RestartServiceAsync(Service));
 
         private async Task ConfigureServiceAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.ConfigureServiceAsync(Service));
+            // Bypasses auto cursor management to prevent ExecuteSafeAsync's finally block from
+            // immediately resetting the wait cursor. ServiceCommands.ConfigureServiceAsync manages
+            // its own cursor lifecycle with a delayed reset to keep visual loading feedback active
+            // until the Desktop application window initializes and paints.
+            await ExecuteSafeAsync(nameof(ConfigureCommand), () => _serviceCommands.ConfigureServiceAsync(Service), manageCursor: false);
 
         private async Task InstallServiceAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.InstallServiceAsync(Service));
+            await ExecuteSafeAsync(nameof(InstallCommand), () => _serviceCommands.InstallServiceAsync(Service));
 
         private async Task UninstallServiceAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.UninstallServiceAsync(Service));
+            await ExecuteSafeAsync(nameof(UninstallCommand), () => _serviceCommands.UninstallServiceAsync(Service));
 
         private async Task RemoveServiceAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.RemoveServiceAsync(Service));
+            await ExecuteSafeAsync(nameof(RemoveCommand), () => _serviceCommands.RemoveServiceAsync(Service));
 
         private async Task ExportServiceToXmlAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.ExportServiceToXmlAsync(Service));
+            await ExecuteSafeAsync(nameof(ExportXmlCommand), () => _serviceCommands.ExportServiceToXmlAsync(Service));
 
         private async Task ExportServiceToJsonAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.ExportServiceToJsonAsync(Service));
+            await ExecuteSafeAsync(nameof(ExportJsonCommand), () => _serviceCommands.ExportServiceToJsonAsync(Service));
 
         private async Task CopyPidAsync(object? parameter) =>
-            await ExecuteSafeAsync(() => _serviceCommands.CopyPidAsync(Service));
+            await ExecuteSafeAsync(nameof(CopyPidCommand), () => _serviceCommands.CopyPidAsync(Service));
 
         #endregion
 
@@ -268,21 +286,36 @@ namespace Servy.Manager.ViewModels
         /// <summary>
         /// Executes the given asynchronous action safely and logs any exceptions.
         /// </summary>
+        /// <param name="commandName">The name of the command being executed.</param>
         /// <param name="action">The asynchronous action to execute.</param>
-        private async Task ExecuteSafeAsync(Func<Task> action)
+        /// <param name="manageCursor">
+        /// <see langword="true"/> to automatically set and reset the wait cursor during execution;
+        /// <see langword="false"/> when the delegate handles its own cursor lifecycle (e.g., delayed reset routines).
+        /// </param>
+        private async Task ExecuteSafeAsync(string commandName, Func<Task> action, bool manageCursor = true)
         {
             try
             {
-                _cursorService.SetWaitCursor();
+                if (manageCursor)
+                {
+                    _cursorService.SetWaitCursor();
+                }
                 await action();
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on shutdown / tab switch
             }
             catch (Exception ex)
             {
-                Logger.Error($"Service command failed for {Service.Name}.", ex);
+                Logger.Error($"{commandName} failed for {Service.Name}.", ex);
             }
             finally
             {
-                _cursorService.ResetCursor();
+                if (manageCursor)
+                {
+                    _cursorService.ResetCursor();
+                }
             }
         }
 
@@ -309,7 +342,7 @@ namespace Servy.Manager.ViewModels
         /// </param>
         /// <remarks>
         /// This method is critical for breaking the strong reference held by the <see cref="Service"/> model
-        /// through the <see cref="Service.PropertyChanged"/> event. Without this unsubscription,
+        /// through the <see cref="ViewModelBase.PropertyChanged"/> event. Without this unsubscription,
         /// the ViewModel would remain rooted in memory, leading to a memory leak.
         /// </remarks>
         protected virtual void Dispose(bool disposing)
@@ -318,12 +351,9 @@ namespace Servy.Manager.ViewModels
             {
                 if (disposing)
                 {
-                    // CRITICAL: Unsubscribe to release the reference held by the Service model.
-                    // This allows the Garbage Collector to reclaim this ViewModel instance.
                     Service.PropertyChanged -= Service_PropertyChanged;
                 }
 
-                // Mark as disposed to prevent redundant disposal logic
                 _disposed = true;
             }
         }

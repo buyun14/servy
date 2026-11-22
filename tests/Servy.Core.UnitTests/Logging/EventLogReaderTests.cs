@@ -1,3 +1,4 @@
+using Servy.Core.Config;
 using Servy.Core.Enums;
 using System.Diagnostics.Eventing.Reader;
 using System.Security.Principal;
@@ -59,7 +60,7 @@ namespace Servy.Core.UnitTests.Logging
         [Fact]
         public void SafeToOffset_WhenNearMinValue_ReturnsDateTimeOffsetMinValue()
         {
-            // Arrange - Any timestamp within 1 day of DateTime.MinValue would overflow on negative local offset shifts
+            // Arrange - Any timestamp within 1 day of DateTime.MinValue would overflow on east-of-UTC (positive offset) shifts
             var nearMinTime = DateTime.MinValue.AddHours(12);
 
             // Act
@@ -69,21 +70,37 @@ namespace Servy.Core.UnitTests.Logging
             Assert.Equal(DateTimeOffset.MinValue, result);
         }
 
+        [Fact]
+        public void SafeToOffset_WhenNearMaxValue_ReturnsDateTimeOffsetMaxValue()
+        {
+            // Arrange - Any timestamp within 1 day of DateTime.MaxValue would overflow on west-of-UTC (negative offset) shifts
+            var nearMaxTime = DateTime.MaxValue.AddHours(-12);
+
+            // Act
+            var result = EventLogReader.SafeToOffset(nearMaxTime);
+
+            // Assert
+            Assert.Equal(DateTimeOffset.MaxValue, result);
+        }
+
         [Theory]
         [InlineData(DateTimeKind.Unspecified)]
         [InlineData(DateTimeKind.Local)]
         public void SafeToOffset_WhenUnspecifiedOrLocalKind_InheritsMachineLocalOffset(DateTimeKind kind)
         {
             // Arrange
+            // The expected offset comes from TimeZoneInfo, not from the 'new DateTimeOffset(raw.Value)'
+            // expression under test: computing it the SUT's own way made both assertions hold for any
+            // change to how the offset is derived, which is the one thing the test name promises.
             var testTime = new DateTime(2026, 6, 24, 12, 0, 0, kind);
-            var expected = new DateTimeOffset(testTime);
+            var expectedOffset = TimeZoneInfo.Local.GetUtcOffset(testTime);
 
             // Act
             var result = EventLogReader.SafeToOffset(testTime);
 
             // Assert
-            Assert.Equal(expected, result);
-            Assert.Equal(expected.Offset, result.Offset);
+            Assert.Equal(expectedOffset, result.Offset);
+            Assert.Equal(testTime, result.DateTime); // the wall-clock reading is stamped, not shifted
         }
 
         #endregion
@@ -94,10 +111,11 @@ namespace Servy.Core.UnitTests.Logging
         public void MapToDto_AllPropertiesValid_MapsCorrectly()
         {
             // Arrange
+            var timeCreated = new DateTime(2026, 6, 24, 15, 0, 0, DateTimeKind.Utc);
             var mockEvent = new TestableEventRecord
             {
                 IdValue = 42,
-                TimeCreatedValue = new DateTime(2026, 6, 24, 15, 0, 0, DateTimeKind.Utc),
+                TimeCreatedValue = timeCreated,
                 LevelValue = 3,
                 ProviderNameValue = "ServyEngine",
                 FormatDescriptionValue = "Service started successfully."
@@ -111,7 +129,11 @@ namespace Servy.Core.UnitTests.Logging
             Assert.Equal(EventLogLevel.Warning, result.Level);
             Assert.Equal("ServyEngine", result.ProviderName);
             Assert.Equal("Service started successfully.", result.Message);
-            Assert.Equal(TimeSpan.Zero, result.Time.Offset);
+            // The whole instant, not just the offset: DateTimeOffset.MinValue - the fallback MapToDto
+            // leaves in place when TimeCreated cannot be read - also has a Zero offset, so pinning
+            // .Offset alone stayed green even with the timestamp mapping deleted. An explicitly-UTC
+            // DateTime projects to a Zero offset, so the expected value is machine-independent.
+            Assert.Equal(new DateTimeOffset(timeCreated, TimeSpan.Zero), result.Time);
         }
 
         [Fact]
@@ -145,6 +167,12 @@ namespace Servy.Core.UnitTests.Logging
             // Arrange
             var mockEvent = new TestableEventRecord
             {
+                // Deliberately non-default: if a getter stopped throwing, these values would
+                // surface instead of the defaults asserted below.
+                IdValue = 4242,
+                TimeCreatedValue = new DateTime(2026, 6, 24, 15, 0, 0, DateTimeKind.Utc),
+                LevelValue = 2,                       // would map to Error, not Information
+                ProviderNameValue = "ServyEngine",
                 ThrowExceptionOnProperties = true,
                 FormatDescriptionValue = "Message survives a properties-only failure"
             };
@@ -156,7 +184,7 @@ namespace Servy.Core.UnitTests.Logging
             Assert.Equal(0, result.EventId);
             Assert.Equal(DateTimeOffset.MinValue, result.Time);
             Assert.Equal(EventLogLevel.Information, result.Level);
-            Assert.Equal("<unavailable>", result.ProviderName);
+            Assert.Equal(AppConfig.EventSource, result.ProviderName);
             Assert.Equal("Message survives a properties-only failure", result.Message);
         }
 
@@ -179,8 +207,12 @@ namespace Servy.Core.UnitTests.Logging
 
             // Assert
             Assert.Equal(500, result.EventId);
-            Assert.StartsWith("<unavailable:", result.Message);
-            Assert.EndsWith(">", result.Message);
+            // The whole wrapper, not just its prefix: the interpolated ex.Message is the entire
+            // diagnostic value of this branch, and dropping it or interpolating the wrong value
+            // left a prefix-only assertion green. The expected text is read from the arranged
+            // exception rather than spelled out, because EventLogException overrides Message and
+            // does not necessarily return the string its constructor was given.
+            Assert.Equal($"[{AppConfig.EventSource}] <message unavailable: {exception.Message}>", result.Message);
         }
 
         #endregion
@@ -191,6 +223,7 @@ namespace Servy.Core.UnitTests.Logging
         /// A test double for <see cref="EventRecord"/>. Every member is overridden directly, so no
         /// reflection or native event-log handle is required. Set <see cref="ThrowExceptionOnProperties"/>
         /// or <see cref="ExceptionToThrowOnFormat"/> to exercise MapToDto's per-property catch blocks.
+        /// Set <see cref="FormatDescriptionValue"/> to <c>null</c> to simulate missing provider metadata.
         /// </summary>
         private class TestableEventRecord : EventRecord
         {
@@ -258,6 +291,9 @@ namespace Servy.Core.UnitTests.Logging
 
             public override byte? Version => null;
 
+            // Deliberately returns null through a non-nullable signature: the real
+            // EventRecord.FormatDescription() can return null when provider metadata is
+            // missing, and MapToDto's '?? string.Empty' is what this covers. Do not "fix".
             public override string FormatDescription()
             {
                 if (ExceptionToThrowOnFormat != null)
@@ -269,7 +305,11 @@ namespace Servy.Core.UnitTests.Logging
 
             public override string FormatDescription(IEnumerable<object> values)
             {
-                return FormatDescriptionValue ?? string.Empty;
+                if (ExceptionToThrowOnFormat != null)
+                {
+                    throw ExceptionToThrowOnFormat;
+                }
+                return FormatDescriptionValue!;
             }
 
             public override string ToXml()

@@ -14,8 +14,11 @@ namespace Servy.Core.Validation
         /// </summary>
         /// <typeparam name="T">The type containing path properties to validate.</typeparam>
         /// <param name="target">The instance whose path properties should be inspected.</param>
-        /// <param name="validatePath">A delegate function that verifies whether a path string exists/is valid for files or directories.</param>
+        /// <param name="validatePath">Delegate invoked as <c>validatePath(path, isFile)</c>, returning whether the path
+        /// exists and is valid. <c>isFile</c> is <c>true</c> to validate the path as a file and <c>false</c> to validate
+        /// it as a directory; it is taken from <see cref="ServicePathAttribute.IsFile"/>.</param>
         /// <returns>A <see cref="ServicePathViolation"/> detailing the failure, or <c>null</c> if valid.</returns>
+        /// <exception cref="InvalidOperationException">Thrown when a property decorated with <see cref="ServicePathAttribute"/> is not a <see cref="string"/>.</exception>
         public static ServicePathViolation? FindFirstViolation<T>(T target, Func<string?, bool, bool> validatePath)
            => FindAllViolations(target, validatePath).FirstOrDefault();
 
@@ -25,18 +28,27 @@ namespace Servy.Core.Validation
         /// </summary>
         /// <typeparam name="T">The type containing path properties to validate.</typeparam>
         /// <param name="target">The instance whose path properties should be inspected.</param>
-        /// <param name="validatePath">A delegate function that verifies whether a path string exists/is valid for files or directories.</param>
+        /// <param name="validatePath">Delegate invoked as <c>validatePath(path, isFile)</c>, returning whether the path
+        /// exists and is valid. <c>isFile</c> is <c>true</c> to validate the path as a file and <c>false</c> to validate
+        /// it as a directory; it is taken from <see cref="ServicePathAttribute.IsFile"/>.</param>
         /// <returns>A collection of <see cref="ServicePathViolation"/> detailing all failures.</returns>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown, when the returned sequence is enumerated rather than when this method is called, if a property decorated with
+        /// <see cref="ServicePathAttribute"/> is not a <see cref="string"/>.
+        /// </exception>
         public static IEnumerable<ServicePathViolation> FindAllViolations<T>(T target, Func<string?, bool, bool> validatePath)
         {
             if (target == null) yield break;
 
-            foreach (var property in typeof(T).GetProperties().OrderBy(p => p.MetadataToken))
+            foreach (var property in target.GetType().GetProperties().OrderBy(p => p.MetadataToken))
             {
                 var attr = property.GetCustomAttribute<ServicePathAttribute>();
                 if (attr == null) continue;
 
-                var value = property.GetValue(target) as string;
+                if (property.PropertyType != typeof(string))
+                    throw new InvalidOperationException(
+                        $"[ServicePath] is only valid on string properties; {property.DeclaringType?.Name}.{property.Name} is {property.PropertyType.Name}.");
+                var value = (string?)property.GetValue(target);
                 bool isEmpty = string.IsNullOrWhiteSpace(value);
 
                 // 1. Mandatory presence check

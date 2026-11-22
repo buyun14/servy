@@ -5,6 +5,7 @@ using Servy.Core.DTOs;
 using Servy.Core.Helpers;
 using Servy.Manager.Config;
 using Servy.Manager.Models;
+using Servy.Manager.Resources;
 using Servy.Manager.Services;
 using Servy.Manager.Utils;
 using Servy.Manager.ViewModels;
@@ -21,6 +22,7 @@ namespace Servy.Manager.UnitTests.ViewModels
     {
         private readonly Mock<IServiceRepository> _serviceRepoMock;
         private readonly Mock<IServiceCommands> _serviceCommandsMock;
+        private readonly Mock<IMessageBoxService> _messageBoxServiceMock;
         private readonly Mock<IAppConfiguration> _appConfigMock;
         private readonly Mock<ICursorService> _cursorServiceMock;
         private readonly Mock<IUiDispatcher> _uiDispatcherMock;
@@ -30,6 +32,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         {
             _serviceRepoMock = new Mock<IServiceRepository>();
             _serviceCommandsMock = new Mock<IServiceCommands>();
+            _messageBoxServiceMock = new Mock<IMessageBoxService>();
             _cursorServiceMock = new Mock<ICursorService>();
             _uiDispatcherMock = new Mock<IUiDispatcher>();
             _mockProcessKiller = new Mock<IProcessKiller>();
@@ -43,7 +46,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             // Default configuration values
             _appConfigMock = new Mock<IAppConfiguration>();
             _appConfigMock.Setup(c => c.ConsoleMaxLines).Returns(500);
-            _appConfigMock.Setup(c => c.ConsoleRefreshIntervalInMs).Returns(100);
+            _appConfigMock.Setup(c => c.ConsoleRefreshIntervalMs).Returns(100);
             _appConfigMock.Setup(c => c.SearchDebounceDelayMs).Returns(10); // Short debounce for testing
         }
 
@@ -52,6 +55,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             return new ConsoleViewModel(
                 _serviceRepoMock.Object,
                 _serviceCommandsMock.Object,
+                _messageBoxServiceMock.Object,
                 _appConfigMock.Object,
                 _cursorServiceMock.Object,
                 _uiDispatcherMock.Object);
@@ -63,40 +67,48 @@ namespace Servy.Manager.UnitTests.ViewModels
         public void Constructor_NullServiceRepository_ThrowsArgumentNullException()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ConsoleViewModel(
-                null!, _serviceCommandsMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, _uiDispatcherMock.Object));
+            Assert.Throws<ArgumentNullException>("serviceRepository", () => new ConsoleViewModel(
+                null!, _serviceCommandsMock.Object, _messageBoxServiceMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, _uiDispatcherMock.Object));
         }
 
         [Fact]
         public void Constructor_NullAppConfig_ThrowsArgumentNullException()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ConsoleViewModel(
-                _serviceRepoMock.Object, _serviceCommandsMock.Object, null!, _cursorServiceMock.Object, _uiDispatcherMock.Object));
+            Assert.Throws<ArgumentNullException>("appConfig", () => new ConsoleViewModel(
+                _serviceRepoMock.Object, _serviceCommandsMock.Object, _messageBoxServiceMock.Object, null!, _cursorServiceMock.Object, _uiDispatcherMock.Object));
         }
 
         [Fact]
         public void Constructor_NullServiceCommand_ThrowsArgumentNullException()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ConsoleViewModel(
-                _serviceRepoMock.Object, null!, _appConfigMock.Object, _cursorServiceMock.Object, _uiDispatcherMock.Object));
+            Assert.Throws<ArgumentNullException>("serviceCommands", () => new ConsoleViewModel(
+                _serviceRepoMock.Object, null!, _messageBoxServiceMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, _uiDispatcherMock.Object));
         }
 
         [Fact]
         public void Constructor_NullCursorService_ThrowsArgumentNullException()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ConsoleViewModel(
-                _serviceRepoMock.Object, _serviceCommandsMock.Object, _appConfigMock.Object, null!, _uiDispatcherMock.Object));
+            Assert.Throws<ArgumentNullException>("cursorService", () => new ConsoleViewModel(
+                _serviceRepoMock.Object, _serviceCommandsMock.Object, _messageBoxServiceMock.Object, _appConfigMock.Object, null!, _uiDispatcherMock.Object));
         }
 
         [Fact]
         public void Constructor_NullUiDispatcher_ThrowsArgumentNullException()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ConsoleViewModel(
-                _serviceRepoMock.Object, _serviceCommandsMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, null!));
+            Assert.Throws<ArgumentNullException>("uiDispatcher", () => new ConsoleViewModel(
+                _serviceRepoMock.Object, _serviceCommandsMock.Object, _messageBoxServiceMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, null!));
+        }
+
+        [Fact]
+        public void Constructor_NullMessageBoxService_ThrowsArgumentNullException()
+        {
+            // Arrange & Act & Assert
+            Assert.Throws<ArgumentNullException>("messageBoxService", () => new ConsoleViewModel(
+                _serviceRepoMock.Object, _serviceCommandsMock.Object, null!, _appConfigMock.Object, _cursorServiceMock.Object, _uiDispatcherMock.Object));
         }
 
         [Fact]
@@ -123,6 +135,28 @@ namespace Servy.Manager.UnitTests.ViewModels
         #region Property & Command Lifecycle Tests
 
         [Fact]
+        public void SelectedService_SwitchFromRunningToStoppedService_ShowsTheNewSelectionsPidWithoutATick()
+        {
+            // Arrange, Act & Assert
+            Helper.RunOnSTA(() =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    vm.SelectedService = new ConsoleService { Name = "RunningService", Pid = 4321 };
+                    Assert.Equal("4321", vm.Pid);
+
+                    // Act - no monitoring tick runs between the two selections (#5591)
+                    vm.SelectedService = new ConsoleService { Name = "StoppedService", Pid = null };
+
+                    // Assert
+                    Assert.Equal(UiConstants.NotAvailable, vm.Pid);
+                }
+            });
+        }
+
+        [Fact]
         public void SelectedService_Change_ResetsStateAndTriggersMonitoring()
         {
             // Arrange, Act & Assert
@@ -133,6 +167,12 @@ namespace Servy.Manager.UnitTests.ViewModels
                 using (var vm = CreateViewModel())
                 {
                     var service = new ConsoleService { Name = "AppService", StdoutPath = "C:\\out.log" };
+
+                    // Seed the buffer so the reset half of this test can actually fail. SwitchServiceAsync
+                    // clears RawLines before its first await, so the clear has already happened when the
+                    // SelectedService setter returns.
+                    vm.RawLines.Add(new LogLine("Stale line from the previously selected service", LogType.StdOut));
+                    Assert.NotEmpty(vm.RawLines);
 
                     // Act
                     vm.SelectedService = service;
@@ -201,6 +241,27 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task ShowClipboardErrorAsync_InvokesMessageBoxServiceWithClipboardFailureMessage()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Act - the view calls this from the catch around its clipboard write
+                    await vm.ShowClipboardErrorAsync();
+
+                    // Assert - the failure is reported through the message box seam with the clipboard message and caption
+                    _messageBoxServiceMock.Verify(
+                        m => m.ShowErrorAsync(Strings.Msg_ClipboardCopyFailed, UiAppConfig.Caption),
+                        Times.Once);
+                }
+            });
+        }
+
+        [Fact]
         public async Task ConsoleSearchText_Filter_FiltersVisibleLinesAndTriggersDebounce()
         {
             // Arrange, Act & Assert (Kept Async Task - genuinely awaits Helper.WaitUntilAsync polling context)
@@ -219,7 +280,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                     // Wait for the debounce + dispatcher queue
                     await Helper.WaitUntilAsync(
                         () => vm.VisibleLines.Cast<LogLine>().Count() == 1,
-                        TimeSpan.FromSeconds(2),
+                        TestTimeouts.CiGenerous,
                         TimeSpan.FromMilliseconds(20),
                         TestContext.Current.CancellationToken);
 
@@ -227,6 +288,47 @@ namespace Servy.Manager.UnitTests.ViewModels
                     var filtered = vm.VisibleLines.Cast<LogLine>().ToList();
                     Assert.Single(filtered);
                     Assert.Contains("Crash", filtered[0].Text);
+                }
+            });
+        }
+
+        [Fact]
+        public async Task ConsoleSearchText_ClearedAfterSearch_RequestsForcedScrollToBottom()
+        {
+            // Arrange, Act & Assert (Kept Async Task - genuinely awaits Helper.WaitUntilAsync polling context)
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    vm.RawLines.Add(new LogLine("Operation successful", LogType.StdOut));
+                    vm.RawLines.Add(new LogLine("System Crash", LogType.StdErr));
+
+                    var scrolls = new List<bool>();
+                    vm.RequestScroll += (force) => scrolls.Add(force);
+
+                    vm.ConsoleSearchText = "Crash";
+                    await Helper.WaitUntilAsync(
+                        () => vm.VisibleLines.Cast<LogLine>().Count() == 1,
+                        TestTimeouts.CiGenerous,
+                        TimeSpan.FromMilliseconds(20),
+                        TestContext.Current.CancellationToken);
+
+                    // A non-empty search refreshes the view but must not scroll back to the tail
+                    Assert.Empty(scrolls);
+
+                    // Act - Clear the search
+                    vm.ConsoleSearchText = string.Empty;
+                    await Helper.WaitUntilAsync(
+                        () => scrolls.Count > 0,
+                        TestTimeouts.CiGenerous,
+                        TimeSpan.FromMilliseconds(20),
+                        TestContext.Current.CancellationToken);
+
+                    // Assert - exactly one FORCED scroll, and the full buffer is visible again
+                    Assert.Equal(new[] { true }, scrolls);
+                    Assert.Equal(2, vm.VisibleLines.Cast<LogLine>().Count());
                 }
             });
         }
@@ -291,6 +393,35 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task OnTickAsync_ValidService_PassesTheMonitoringSessionTokenToTheStateLookup()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new ConsoleService { Name = "ActiveService", Pid = 1234, StdoutPath = "log.txt", StderrPath = "err.log" };
+                    vm.SelectedService = service;
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+                    var sessionToken = TestReflection.GetField<CancellationTokenSource>(vm, "_monitoringCts").Token;
+
+                    _serviceRepoMock.Setup(r => r.GetServiceConsoleStateAsync("ActiveService", It.IsAny<CancellationToken>()))
+                                    .ReturnsAsync(new ServiceConsoleStateDto { Pid = null });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    await task;
+
+                    // Assert - the live session token, not CancellationToken.None
+                    Assert.True(sessionToken.CanBeCanceled);
+                    _serviceRepoMock.Verify(r => r.GetServiceConsoleStateAsync("ActiveService", sessionToken), Times.Once);
+                }
+            });
+        }
+
+        [Fact]
         public async Task OnTickAsync_PathsChanged_UpdatesPathsAndTriggersSwitch()
         {
             // Arrange, Act & Assert (Kept Async Task - genuinely awaits internal file parsing tick loops)
@@ -321,6 +452,144 @@ namespace Servy.Manager.UnitTests.ViewModels
                     // SwitchServiceAsync clears the existing console buffer before re-tailing the new path.
                     // Verifying the lines collection is empty proves the switch routine successfully ran.
                     Assert.Empty(vm.RawLines);
+                }
+            });
+        }
+
+        [Fact]
+        public async Task OnTickAsync_SelectionChangesDuringStateLookup_DropsTheTick()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new ConsoleService { Name = "ActiveService", Pid = 100, StdoutPath = "old.txt" };
+                    vm.SelectedService = service;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // The user switches service while the repository call is in flight. The backing field is
+                    // swapped directly so the switch does not restart the monitoring timer mid-test.
+                    _serviceRepoMock.Setup(r => r.GetServiceConsoleStateAsync("ActiveService", It.IsAny<CancellationToken>()))
+                                    .Callback(() => TestReflection.SetField(vm, "_selectedService",
+                                        new ConsoleService { Name = "OtherService", Pid = 1 }))
+                                    .ReturnsAsync(new ServiceConsoleStateDto { Pid = 200, ActiveStdoutPath = "stale.txt" });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    await task;
+
+                    // Assert - the superseded selection's PID and log paths are not applied, so the new
+                    // selection's console is not re-tailed onto the previous service's files
+                    Assert.Equal(100, service.Pid);
+                    Assert.Equal("old.txt", service.StdoutPath);
+                    Assert.Equal("old.txt", TestReflection.GetField<string>(vm, "_stdoutPath"));
+                }
+            });
+        }
+
+        [Fact]
+        public async Task OnTickAsync_MonitoringCancelledDuringStateLookup_DropsTheTick()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new ConsoleService { Name = "ActiveService", Pid = 100, StdoutPath = "old.txt" };
+                    vm.SelectedService = service;
+
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    // Monitoring is cancelled while the repository call is in flight, and the selection is
+                    // kept, so the token term of the drop guard is the only thing that can stop this tick.
+                    _serviceRepoMock.Setup(r => r.GetServiceConsoleStateAsync("ActiveService", It.IsAny<CancellationToken>()))
+                                    .Callback(() => TestReflection.GetField<CancellationTokenSource>(vm, "_monitoringCts").Cancel())
+                                    .ReturnsAsync(new ServiceConsoleStateDto { Pid = 200, ActiveStdoutPath = "stale.txt" });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    await task;
+
+                    // Assert - a tick whose monitoring session was cancelled during the state lookup
+                    // writes nothing back to the selection it was started for
+                    Assert.Equal(100, service.Pid);
+                    Assert.Equal("old.txt", service.StdoutPath);
+                    Assert.Equal("old.txt", TestReflection.GetField<string>(vm, "_stdoutPath"));
+                }
+            });
+        }
+
+        [Theory]
+        [InlineData(100, "old.txt", null, false)]       // nothing changed: no switch
+        [InlineData(100, "OLD.TXT", null, false)]       // case-only difference: no switch (#904)
+        [InlineData(200, "old.txt", null, true)]        // PID changed, same files
+        [InlineData(100, "old.txt", "err.txt", true)]   // only the stderr path changed
+        public async Task OnTickAsync_SnapshotComparedWithCurrentState_SwitchesOnlyWhenPidOrAPathChanged(
+            int snapshotPid, string snapshotStdout, string? snapshotStderr, bool expectSwitch)
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new ConsoleService { Name = "ActiveService", Pid = 100, StdoutPath = "old.txt" };
+                    vm.SelectedService = service;
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    _serviceRepoMock.Setup(r => r.GetServiceConsoleStateAsync("ActiveService", It.IsAny<CancellationToken>()))
+                                    .ReturnsAsync(new ServiceConsoleStateDto { Pid = snapshotPid, ActiveStdoutPath = snapshotStdout, ActiveStderrPath = snapshotStderr });
+
+                    // SwitchServiceAsync increments the session id once per call, so it is the "switch ran" observable
+                    int sessionBefore = TestReflection.GetField<int>(vm, "_currentSessionId");
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    await task;
+
+                    // Assert
+                    int sessionAfter = TestReflection.GetField<int>(vm, "_currentSessionId");
+                    Assert.Equal(expectSwitch ? sessionBefore + 1 : sessionBefore, sessionAfter);
+                    Assert.Equal(expectSwitch ? snapshotPid : 100, service.Pid);
+                    Assert.Equal(expectSwitch ? snapshotStdout : "old.txt", service.StdoutPath);
+                    Assert.Equal(expectSwitch ? snapshotStderr : null, service.StderrPath);
+                }
+            });
+        }
+
+        [Fact]
+        public async Task OnTickAsync_StderrPathDiffersInCaseOnly_DoesNotSwitch()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new ConsoleService { Name = "ActiveService", Pid = 100, StdoutPath = "old.txt", StderrPath = "err.txt" };
+                    vm.SelectedService = service;
+                    TestReflection.GetField<DispatcherTimer>(vm, "_timer")?.Stop();
+
+                    _serviceRepoMock.Setup(r => r.GetServiceConsoleStateAsync("ActiveService", It.IsAny<CancellationToken>()))
+                                    .ReturnsAsync(new ServiceConsoleStateDto { Pid = 100, ActiveStdoutPath = "old.txt", ActiveStderrPath = "ERR.TXT" });
+
+                    int sessionBefore = TestReflection.GetField<int>(vm, "_currentSessionId");
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "OnTickAsync")!;
+                    await task;
+
+                    // Assert: no switch ran and the selection kept its own spelling
+                    Assert.Equal(sessionBefore, TestReflection.GetField<int>(vm, "_currentSessionId"));
+                    Assert.Equal("err.txt", service.StderrPath);
                 }
             });
         }
@@ -434,12 +703,11 @@ namespace Servy.Manager.UnitTests.ViewModels
                         // Poll deterministically until history is fully loaded into RawLines
                         await Helper.WaitUntilAsync(
                             () => viewModel.RawLines.Count == 2,
-                            TimeSpan.FromSeconds(5),
+                            TestTimeouts.CiGenerous,
                             cancellationToken: TestContext.Current.CancellationToken);
 
                         // Assert
                         // Both lines share a timestamp, so stable-sort order must follow arrival order.
-                        Assert.NotEmpty(viewModel.RawLines);
                         Assert.Equal(2, viewModel.RawLines.Count);
 
                         // The LogLine loaded via LogTailer preserves the entire trace line format.
@@ -474,14 +742,44 @@ namespace Servy.Manager.UnitTests.ViewModels
                     var service = new Service { Name = "EngineService" };
 
                     // Act
-                    var result = TestReflection.InvokeNonPublic(vm, "CreateServiceItem", service) as ConsoleService;
+                    var result = TestReflection.InvokeNonPublic(vm, "CreateServiceItem", service);
 
                     // Assert
-                    var unused = result ?? throw new InvalidOperationException("Result mapping cannot be null");
-                    Assert.Equal("EngineService", result.Name);
-                    Assert.Null(result.Pid);
-                    Assert.Null(result.StdoutPath);
-                    Assert.Null(result.StderrPath);
+                    var item = Assert.IsType<ConsoleService>(result);
+                    Assert.Equal("EngineService", item.Name);
+                    Assert.Null(item.Pid);
+                    Assert.Null(item.StdoutPath);
+                    Assert.Null(item.StderrPath);
+                }
+            });
+        }
+
+        [Fact]
+        public async Task ApplyFilterWithDebounceAsync_DispatcherThrows_LogsTheFailureAndDoesNotPropagate()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    _uiDispatcherMock
+                        .Setup(d => d.InvokeAsync(It.IsAny<Action>(), It.IsAny<DispatcherPriority>()))
+                        .Throws(new InvalidOperationException("dispatcher unavailable"));
+
+                    // Act
+                    var thrown = new List<Exception>();
+                    var log = await LogCapture.RunAsync(async () =>
+                    {
+                        var ex = await Record.ExceptionAsync(
+                            () => (Task)TestReflection.InvokeNonPublic(vm, "ApplyFilterWithDebounceAsync")!);
+                        if (ex != null) thrown.Add(ex);
+                    });
+
+                    // Assert
+                    Assert.Empty(thrown);
+                    Assert.Contains("Failed to apply console filter.", log);
                 }
             });
         }
@@ -563,16 +861,401 @@ namespace Servy.Manager.UnitTests.ViewModels
                 using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
                 using (var vm = CreateViewModel())
                 {
-                    // Force a null _tailingCts via reflection so new CancellationTokenSource() fails or token access throws an exception
-                    var activeCts = TestReflection.GetField<CancellationTokenSource>(vm, "_tailingCts");
-                    activeCts?.Dispose();
-
-                    // Act - Invoke SwitchServiceAsync when internal cancellation token state causes an exception
-                    var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", "valid_path.log", null)!;
+                    // Act - Pass a path with invalid path characters (null byte) to force GetHistoryAsync/Task.WhenAll to throw an ArgumentException
+                    string invalidPathWithNullChar = "invalid\0path.log";
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", invalidPathWithNullChar, null)!;
                     var exception = await Record.ExceptionAsync(() => task);
 
-                    // Assert - Verify that the general catch block in SwitchServiceAsync swallows the exception safely
+                    // Assert - Verify that the general catch block in SwitchServiceAsync swallows the exception safely without throwing
                     Assert.Null(exception);
+                }
+            });
+        }
+
+        [Theory]
+        [InlineData(typeof(ObjectDisposedException), "Attempted to switch logs after disposal; ignoring.", false)]
+        [InlineData(typeof(OperationCanceledException), "Service switch cancelled (superseded or disposing); ignoring.", false)]
+        [InlineData(typeof(InvalidOperationException), "Failed to resume/switch logs.", true)]
+        public async Task SwitchServiceAsync_WhenTheConfiguredPathLookupThrows_CompletesWithoutThrowingAndLogsItsOwnArm(
+            Type exceptionType, string expectedLogLine, bool expectsErrorLine)
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: a UNC path makes SwitchServiceAsync read the configured paths before it opens anything
+                var thrown = Assert.IsAssignableFrom<Exception>(Activator.CreateInstance(exceptionType, "boom"));
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("UncService", false, It.IsAny<CancellationToken>()))
+                    .ThrowsAsync(thrown);
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "UncService" });
+
+                    // Act
+                    Exception? exception = null;
+                    var log = await LogCapture.RunAsync(async () =>
+                    {
+                        var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", @"\\server\share\out.log", null)!;
+                        exception = await Record.ExceptionAsync(() => task);
+                    }, Servy.Core.Logging.LogLevel.Debug);
+
+                    // Assert: swallowed, by the arm written for it - a disposal or a superseded switch is not reported as a failure
+                    Assert.Null(exception);
+                    Assert.Contains(expectedLogLine, log);
+                    Assert.Equal(expectsErrorLine, log.Contains("Failed to resume/switch logs."));
+                    _serviceRepoMock.Verify(r => r.GetByNameAsync("UncService", false, It.IsAny<CancellationToken>()), Times.Once);
+                }
+            });
+        }
+
+        [Theory]
+        [InlineData(true, true, false, new[] { "O3", "O4", "E3", "E4" })]   // two streams: half the budget each
+        [InlineData(true, false, false, new[] { "O1", "O2", "O3", "O4" })]  // stdout only: the whole budget (#3309)
+        [InlineData(false, true, false, new[] { "E1", "E2", "E3", "E4" })]  // stderr only: the whole budget (#5204)
+        [InlineData(true, true, true, new[] { "O1", "O2", "O3", "O4" })]    // both streams in ONE file: read once
+        public async Task SwitchServiceAsync_HistoryBudget_IsSplitOnlyBetweenTwoDistinctStreams(
+            bool hasStdout, bool hasStderr, bool sameFile, string[] expectedTexts)
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange - a budget of 4 lines, and 4 lines in each file
+                _appConfigMock.Setup(c => c.ConsoleMaxLines).Returns(4);
+                string outFile = Path.GetTempFileName();
+                string errFile = Path.GetTempFileName();
+                File.WriteAllLines(outFile, new[] { "O1", "O2", "O3", "O4" });
+                File.WriteAllLines(errFile, new[] { "E1", "E2", "E3", "E4" });
+
+                // The same-file row hands stderr the stdout path in another case, so the comparison mode is pinned too
+                string? stdoutPath = hasStdout ? outFile : string.Empty;
+                string? stderrPath = !hasStderr ? null : (sameFile ? outFile.ToUpperInvariant() : errFile);
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    try
+                    {
+                        // Act
+                        var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", stdoutPath, stderrPath)!;
+                        await task;
+
+                        // Assert - order between the two streams is the sort's business; the budget is about which lines
+                        Assert.Equal(expectedTexts.OrderBy(t => t), vm.RawLines.Select(l => l.Text).OrderBy(t => t));
+                        if (sameFile)
+                        {
+                            Assert.All(vm.RawLines, l => Assert.Equal(LogType.StdOut, l.Type));
+                        }
+                    }
+                    finally
+                    {
+                        try { File.Delete(outFile); } catch { /* fail-silent */ }
+                        try { File.Delete(errFile); } catch { /* fail-silent */ }
+                    }
+                }
+            });
+        }
+
+        [Fact]
+        public async Task SwitchServiceAsync_DevicePathThatDiffersFromTheConfiguredPath_IsNotOpened()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: a readable log reached through a device path, while the row configures another file
+                string logFile = Path.GetTempFileName();
+                File.WriteAllText(logFile, "Reported line" + Environment.NewLine);
+                string devicePath = @"\\?\" + Path.GetFullPath(logFile);
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("DeviceService", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = "DeviceService", StdoutPath = Path.Combine(Path.GetTempPath(), "configured-stdout.log") });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    try
+                    {
+                        TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "DeviceService" });
+
+                        // Act
+                        var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", devicePath, null)!;
+                        await task;
+
+                        // Assert: the reported path was not read
+                        Assert.Empty(vm.RawLines);
+                    }
+                    finally
+                    {
+                        try { File.Delete(logFile); } catch { /* fail-silent */ }
+                    }
+                }
+            });
+        }
+
+        [Fact]
+        public async Task SwitchServiceAsync_DevicePathAndConfiguredPathCannotBeResolved_IsNotOpened()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange - a readable log reached through a device path, while the row's configured path
+                // contains a NUL so Path.GetFullPath(configured) throws
+                string logFile = Path.GetTempFileName();
+                File.WriteAllText(logFile, "Reported line" + Environment.NewLine);
+                string devicePath = @"\\?\" + Path.GetFullPath(logFile);
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("DeviceService", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = "DeviceService", StdoutPath = "bad\0name.log" });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    try
+                    {
+                        TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "DeviceService" });
+
+                        // Act
+                        var log = await LogCapture.RunAsync(async () =>
+                        {
+                            var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", devicePath, null)!;
+                            await task;
+                        });
+
+                        // Assert - the reported path was refused through the warning, not opened
+                        Assert.Empty(vm.RawLines);
+                        Assert.Contains("Not opening the log path", log);
+                    }
+                    finally
+                    {
+                        try { File.Delete(logFile); } catch { /* fail-silent */ }
+                    }
+                }
+            });
+        }
+
+        [Fact]
+        public async Task SwitchServiceAsync_NtPrefixUncPathThatDiffersFromTheConfiguredPath_ConsultsTheRepositoryAndIsNotOpened()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: a stored active path that reaches a share through the \??\UNC\ object-manager prefix,
+                // while the row configures a local file
+                string ntUncPath = @"\??\UNC\server\share\out.log";
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("NtUncService", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = "NtUncService", StdoutPath = Path.Combine(Path.GetTempPath(), "configured-stdout.log") });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "NtUncService" });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", ntUncPath, null)!;
+                    await task;
+
+                    // Assert: the path was treated as UNC (the configured paths were read) and nothing was read from it
+                    _serviceRepoMock.Verify(r => r.GetByNameAsync("NtUncService", false, It.IsAny<CancellationToken>()), Times.Once);
+                    Assert.Empty(vm.RawLines);
+                }
+            });
+        }
+
+        [Fact]
+        public async Task SwitchServiceAsync_SupersededWhileTheConfiguredPathLookupIsPending_LeavesTheNewerSessionsBufferAlone()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    // Arrange: a newer switch "happens" while the lookup is in flight - the callback moves the session id on
+                    TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "UncService" });
+                    _serviceRepoMock.Setup(r => r.GetByNameAsync("UncService", false, It.IsAny<CancellationToken>()))
+                        .Callback(() => TestReflection.SetField(vm, "_currentSessionId", TestReflection.GetField<int>(vm, "_currentSessionId") + 1))
+                        .ReturnsAsync(new ServiceDto { Name = "UncService", StdoutPath = Path.Combine(Path.GetTempPath(), "configured-stdout.log") });
+                    vm.RawLines.Add(new LogLine("Line of the newer session", LogType.StdOut));
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", @"\\server\share\out.log", null)!;
+                    await task;
+
+                    // Assert: the superseded call returned before it cleared the buffer
+                    var line = Assert.Single(vm.RawLines);
+                    Assert.Equal("Line of the newer session", line.Text);
+                }
+            });
+        }
+
+        [Fact]
+        public async Task SwitchServiceAsync_SupersededWhileTheHistoryIsLoading_AddsNoLinesAndStartsNoLiveTail()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange - a log file with history the superseded call would otherwise show
+                string outFile = Path.GetTempFileName();
+                File.WriteAllLines(outFile, new[] { "O1", "O2" });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    try
+                    {
+                        // SwitchServiceAsync raises PropertyChanged(Pid) after it cleared the buffer and before it starts
+                        // the history read, so the handler moves the session id on where a newer switch would
+                        bool superseded = false;
+                        vm.PropertyChanged += (s, e) =>
+                        {
+                            if (e.PropertyName == nameof(ConsoleViewModel.Pid) && !superseded)
+                            {
+                                superseded = true;
+                                TestReflection.SetField(vm, "_currentSessionId", TestReflection.GetField<int>(vm, "_currentSessionId") + 1);
+                            }
+                        };
+
+                        // Act
+                        var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", outFile, null)!;
+                        await task;
+
+                        // Assert: the superseded call neither showed its history nor started tailing the old file
+                        Assert.True(superseded);
+                        Assert.Empty(vm.RawLines);
+                        Assert.Null(TestReflection.GetField<LogTailer>(vm, "_activeStdoutTailer"));
+                    }
+                    finally
+                    {
+                        try { File.Delete(outFile); } catch { /* fail-silent */ }
+                    }
+                }
+            });
+        }
+
+        [Theory]
+        [InlineData("//server/share/out.log")]
+        [InlineData(@"\/server\share\out.log")]
+        [InlineData(@"/\server\share\out.log")]
+        public async Task SwitchServiceAsync_UncPathWrittenWithForwardSlashes_ConsultsTheRepositoryAndIsNotOpened(string uncPath)
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the row configures a local file, so the reported share path must be refused
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("SlashService", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = "SlashService", StdoutPath = Path.Combine(Path.GetTempPath(), "configured-stdout.log") });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "SlashService" });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", uncPath, null)!;
+                    await task;
+
+                    // Assert: the path was treated as UNC (the configured paths were read) and nothing was read from it
+                    _serviceRepoMock.Verify(r => r.GetByNameAsync("SlashService", false, It.IsAny<CancellationToken>()), Times.Once);
+                    Assert.Empty(vm.RawLines);
+                }
+            });
+        }
+
+        [Theory]
+        [InlineData(" \\\\server\\share\\out.log")]     // a space before the two separators
+        [InlineData("\t\\\\server\\share\\out.log")]    // a tab
+        [InlineData(" \\??\\UNC\\server\\share\\out.log")] // whitespace before the NT prefix
+        public async Task SwitchServiceAsync_UncPathWithLeadingWhitespace_ConsultsTheRepositoryAndIsNotOpened(string uncPath)
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the row configures a local file, so the reported share path must be refused
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("PaddedService", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = "PaddedService", StdoutPath = Path.Combine(Path.GetTempPath(), "configured-stdout.log") });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "PaddedService" });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", uncPath, null)!;
+                    await task;
+
+                    // Assert: the path was treated as UNC (the configured paths were read) and nothing was read from it
+                    _serviceRepoMock.Verify(r => r.GetByNameAsync("PaddedService", false, It.IsAny<CancellationToken>()), Times.Once);
+                    Assert.Empty(vm.RawLines);
+                }
+            });
+        }
+
+        [Fact]
+        public async Task SwitchServiceAsync_NtPrefixPathThatDiffersFromTheConfiguredPath_IsNotOpened()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: a readable log reached through the \??\ object-manager prefix, while the row configures another file
+                string logFile = Path.GetTempFileName();
+                File.WriteAllText(logFile, "Reported line" + Environment.NewLine);
+                string ntPath = @"\??\" + Path.GetFullPath(logFile);
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("NtService", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = "NtService", StdoutPath = Path.Combine(Path.GetTempPath(), "configured-stdout.log") });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    try
+                    {
+                        TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "NtService" });
+
+                        // Act
+                        var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", ntPath, null)!;
+                        await task;
+
+                        // Assert: the configured paths were consulted and the reported path was not read
+                        _serviceRepoMock.Verify(r => r.GetByNameAsync("NtService", false, It.IsAny<CancellationToken>()), Times.Once);
+                        Assert.Empty(vm.RawLines);
+                    }
+                    finally
+                    {
+                        try { File.Delete(logFile); } catch { /* fail-silent */ }
+                    }
+                }
+            });
+        }
+
+        [Fact]
+        public async Task SwitchServiceAsync_DevicePathThatIsTheConfiguredPath_IsOpened()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the same device path is the one configured for stdout
+                string logFile = Path.GetTempFileName();
+                File.WriteAllText(logFile, "Configured line" + Environment.NewLine);
+                string devicePath = @"\\?\" + Path.GetFullPath(logFile);
+                _serviceRepoMock.Setup(r => r.GetByNameAsync("DeviceService", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = "DeviceService", StdoutPath = devicePath.ToUpperInvariant() });
+
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    try
+                    {
+                        TestReflection.SetField(vm, "_selectedService", new ConsoleService { Name = "DeviceService" });
+
+                        // Act
+                        var task = (Task)TestReflection.InvokeNonPublic(vm, "SwitchServiceAsync", devicePath, null)!;
+                        await task;
+
+                        // Assert: the configured path was read
+                        var line = Assert.Single(vm.RawLines);
+                        Assert.EndsWith("Configured line", line.Text);
+                    }
+                    finally
+                    {
+                        try { File.Delete(logFile); } catch { /* fail-silent */ }
+                    }
                 }
             });
         }
@@ -593,10 +1276,11 @@ namespace Servy.Manager.UnitTests.ViewModels
                     int activeSessionId = TestReflection.GetField<int>(vm, "_currentSessionId");
 
                     // Act - Start a live tailer for stdout
-                    TestReflection.InvokeNonPublic(vm, "StartLiveTail", "out.log", LogType.StdOut, 0L, DateTime.UtcNow, activeSessionId, CancellationToken.None);
+                    TestReflection.InvokeNonPublic(vm, "StartLiveTail", "out.log", LogType.StdOut, 0L, DateTime.UtcNow, activeSessionId, TestContext.Current.CancellationToken);
 
-                    // Pull the dynamic internal event handler delegate out via reflection
-                    var tailerInstance = TestReflection.GetField<LogTailer>(vm, "_activeStdoutTailer");
+                    // StartLiveTail must record the tailer, because StopActiveTailers relies on it to
+                    // sever the handler closure later.
+                    Assert.NotNull(TestReflection.GetField<LogTailer>(vm, "_activeStdoutTailer"));
 
                     // Construct a test payload batch block of 3 log lines to pass directly through the tailer's event handler pipeline
                     var newLinesBatch = new List<LogLine>
@@ -634,7 +1318,7 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                     int currentSessionId = TestReflection.GetField<int>(vm, "_currentSessionId");
 
-                    TestReflection.InvokeNonPublic(vm, "StartLiveTail", "out.log", LogType.StdOut, 0L, DateTime.UtcNow, currentSessionId, CancellationToken.None);
+                    TestReflection.InvokeNonPublic(vm, "StartLiveTail", "out.log", LogType.StdOut, 0L, DateTime.UtcNow, currentSessionId, TestContext.Current.CancellationToken);
 
                     var handlerDelegate = TestReflection.GetField<Delegate>(vm, "_stdoutTailerHandler");
                     var newLinesBatch = new List<LogLine> { new LogLine("Ignored live incoming console data string line", LogType.StdOut) };
@@ -661,7 +1345,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                     int currentSessionId = TestReflection.GetField<int>(vm, "_currentSessionId");
                     int staleSessionId = currentSessionId - 1; // A session id one behind the current one simulates a callback from a superseded switch
 
-                    TestReflection.InvokeNonPublic(vm, "StartLiveTail", "out.log", LogType.StdOut, 0L, DateTime.UtcNow, staleSessionId, CancellationToken.None);
+                    TestReflection.InvokeNonPublic(vm, "StartLiveTail", "out.log", LogType.StdOut, 0L, DateTime.UtcNow, staleSessionId, TestContext.Current.CancellationToken);
 
                     var handlerDelegate = TestReflection.GetField<Delegate>(vm, "_stdoutTailerHandler");
                     var newLinesBatch = new List<LogLine> { new LogLine("Obsolete service log line output", LogType.StdOut) };
@@ -671,6 +1355,30 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                     // Assert
                     Assert.Empty(vm.RawLines);
+                }
+            });
+        }
+
+        [Fact]
+        public void StartLiveTail_UnsupportedLogType_ThrowsAndTracksNoTailer()
+        {
+            // Arrange, Act & Assert
+            Helper.RunOnSTA(() =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_mockProcessKiller.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    int sessionId = TestReflection.GetField<int>(vm, "_currentSessionId");
+
+                    // Act
+                    var ex = Assert.Throws<ArgumentOutOfRangeException>(() =>
+                        TestReflection.InvokeNonPublic(vm, "StartLiveTail", "out.log", (LogType)99, 0L, DateTime.UtcNow, sessionId, TestContext.Current.CancellationToken));
+
+                    // Assert
+                    Assert.Equal("type", ex.ParamName);
+                    Assert.Null(TestReflection.GetField<LogTailer>(vm, "_activeStdoutTailer"));
+                    Assert.Null(TestReflection.GetField<LogTailer>(vm, "_activeStderrTailer"));
                 }
             });
         }
@@ -721,7 +1429,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 {
                     var vm = CreateViewModel();
 
-                    // Act - Verify initial state before disposal context
+                    // Arrange - Verify initial state before disposal context
                     bool isDisposedBefore = TestReflection.GetField<int>(vm, "_isDisposed") == 1;
                     Assert.False(isDisposedBefore, "A new ConsoleViewModel wrapper should not initialize in a pre-disposed state.");
 
@@ -732,13 +1440,21 @@ namespace Servy.Manager.UnitTests.ViewModels
                     bool isDisposedAfterFirst = TestReflection.GetField<int>(vm, "_isDisposed") == 1;
                     Assert.True(isDisposedAfterFirst, "The internal _isDisposed state guard was not toggled on the primary cleanup path execution.");
 
-                    // Act - Reset guard field back to 0 (alive) to verify re-entrancy and double dispose safety
-                    TestReflection.SetField(vm, "_isDisposed", 0);
-                    var doubleDisposeException = Record.Exception(vm.Dispose);
+                    using (var sentinelCts = new CancellationTokenSource())
+                    {
+                        // Arrange - a token planted after the first Dispose stands in for state that a
+                        // second, unguarded pass through ClearActiveSearchContext would cancel and dispose
+                        TestReflection.SetField(vm, "_searchCts", sentinelCts);
 
-                    // Assert
-                    Assert.Null(doubleDisposeException);
-                    Assert.True(TestReflection.GetField<int>(vm, "_isDisposed") == 1, "Second Dispose after guard reset did not set _isDisposed back to 1.");
+                        // Act - Second teardown pass, reached naturally; nothing resets the guard in between
+                        var doubleDisposeException = Record.Exception(vm.Dispose);
+
+                        // Assert - The early return leaves the planted token untouched; without the guard
+                        // the dispose body would run a second time and cancel it
+                        Assert.Null(doubleDisposeException);
+                        Assert.False(sentinelCts.IsCancellationRequested, "The disposed guard did not exit early: the second Dispose ran the dispose body again.");
+                        Assert.Equal(1, TestReflection.GetField<int>(vm, "_isDisposed"));
+                    }
                 }
             });
         }

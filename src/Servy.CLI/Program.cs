@@ -1,22 +1,20 @@
 using CommandLine;
 using Microsoft.Extensions.Configuration;
 using Servy.CLI.Commands;
-using Servy.CLI.Helpers;
 using Servy.CLI.Models;
 using Servy.CLI.Options;
+using Servy.CLI.Resources;
+using Servy.CLI.Runtime;
 using Servy.CLI.Validation;
 using Servy.Core.Config;
 using Servy.Core.Data;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Core.Validation;
 using Servy.Infrastructure.Data;
-using Servy.Infrastructure.Helpers;
-using System.Diagnostics.CodeAnalysis;
-using System.Reflection;
-using System.Runtime.InteropServices;
 using static Servy.CLI.Helpers.Helper;
 
 namespace Servy.CLI
@@ -47,14 +45,12 @@ namespace Servy.CLI
     /// Responsible for parsing command-line arguments and executing
     /// corresponding service management commands.
     /// </summary>
-    [ExcludeFromCodeCoverage]
     public static class Program
     {
         /// <summary>
-        /// The base namespace where embedded resource files are located.
-        /// Used for locating and extracting files such as the service executable.
+        /// The message written to standard error when the first Ctrl+C or Ctrl+Break starts a graceful cancellation.
         /// </summary>
-        private const string ResourcesNamespace = "Servy.CLI.Resources";
+        internal const string CancellingMessage = "Cancelling... press Ctrl+C again to force exit.";
 
         /// <summary>
         /// Parses command-line arguments, invokes the appropriate command handlers,
@@ -62,25 +58,32 @@ namespace Servy.CLI
         /// </summary>
         /// <param name="args">An array of command-line arguments.</param>
         /// <returns>Returns 0 on success; non-zero on error.</returns>
-        public static async Task<int> Main(string[] args)
+        public static Task<int> Main(string[] args) => RunAsync(args, new CliRuntime());
+
+        /// <summary>
+        /// Parses command-line arguments, invokes the appropriate command handlers,
+        /// and returns an exit code indicating the success or failure of the operation.
+        /// </summary>
+        /// <param name="args">An array of command-line arguments.</param>
+        /// <param name="runtime">
+        /// The machine-touching bootstrap steps: the SQLite version check, the database, the embedded binaries and the
+        /// console probes. <see cref="Main"/> passes <see cref="CliRuntime"/>; tests pass a fake.
+        /// </param>
+        /// <returns>Returns 0 on success; non-zero on error.</returns>
+        internal static async Task<int> RunAsync(string[] args, ICliRuntime runtime)
         {
+            // Record the System variables as they are at start, so one changed later is picked up (#7393)
+            SystemEnvironmentHelper.InitializeForApplication();
+
             using (var cts = new CancellationTokenSource())
             {
                 // Hook Ctrl+C and Ctrl+Break
-                Console.CancelKeyPress += (s, e) =>
-                {
-                    if (!cts.IsCancellationRequested)
-                    {
-                        e.Cancel = true;          // first press: graceful cancellation
-                        cts.Cancel();
-                        Console.Error.WriteLine("正在取消... 再次按 Ctrl+C 强制退出。");
-                    }
-                    // second press: leave e.Cancel = false -> process terminates
-                };
+                ConsoleCancelEventHandler onCancel = (s, e) => HandleCancelKeyPress(cts, () => e.Cancel = true, Console.Error);
+                Console.CancelKeyPress += onCancel;
 
                 IAppDbContext? dbContext = null;
                 ProtectedKeyProvider? protectedKeyProvider = null;
-                SecureData? secureData = null;
+                DeferredSecureData? secureData = null;
                 try
                 {
                     var verbs = GetVerbs();
@@ -91,11 +94,11 @@ namespace Servy.CLI
                         // Explicitly inject the default help verb only when no commands or arguments are provided
                         args = (new[] { GetVerbName<HelpOptions>() }).Concat(args).ToArray();
                     }
-                    else if (!verbs.Any(v => string.Equals(v, firstArg, StringComparison.OrdinalIgnoreCase)) && !(firstArg?.StartsWith("-") ?? false))
+                    else if (!verbs.Any(v => string.Equals(v, firstArg, StringComparison.OrdinalIgnoreCase)) && !firstArg!.StartsWith("-"))
                     {
                         // Detect a mistyped or unrecognized command that does not start with a global flag dash
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Error.WriteLine($"错误：未知命令 '{firstArg}'。运行 '--help' 查看可用选项。");
+                        Console.Error.WriteLine($"Error: Unknown command '{firstArg}'. See '--help' for available options.");
                         Console.ResetColor();
 
                         return (int)CliExitCode.Error;
@@ -103,42 +106,49 @@ namespace Servy.CLI
 
                     args[0] = args[0].ToLowerInvariant();
 
-                    // Load configuration from appsettings.json
+                    // Load configuration from appsettings.cli.json
                     var builder = new ConfigurationBuilder();
 #if DEBUG
-                    builder.AddJsonFile("appsettings.cli.json", optional: true, reloadOnChange: false);
+                    builder.AddJsonFile(AppConfig.ServyCliSettingsFileName, optional: true, reloadOnChange: false);
 #else
                     var baseDirectory = AppFoldersHelper.GetAppDirectory();
                     builder.SetBasePath(baseDirectory)
-                           .AddJsonFile("appsettings.cli.json", optional: true, reloadOnChange: false);
+                           .AddJsonFile(AppConfig.ServyCliSettingsFileName, optional: true, reloadOnChange: false);
 #endif
                     var config = builder.Build();
 
-                    var connectionString = config.GetConnectionString("DefaultConnection") ?? AppConfig.DefaultConnectionString;
-                    var aesKeyFilePath = config["Security:AESKeyFilePath"] ?? AppConfig.DefaultAESKeyPath;
-                    var aesIVFilePath = config["Security:AESIVFilePath"] ?? AppConfig.DefaultAESIVPath;
+                    var coreSettings = CoreSettingsLoader.Load();
+                    var connectionString = coreSettings.ConnectionString;
+                    var aesKeyFilePath = coreSettings.AESKeyFilePath;
+                    var aesIVFilePath = coreSettings.AESIVFilePath;
 
                     LoggerConfigurator.ConfigureFromAppSettings(config, "Servy.CLI.log");
+                    CoreSettingsLoader.WarnAboutIgnoredSettings(config, AppConfig.ServyCliSettingsFileName);
 
-                    if (!DatabaseValidator.IsSqliteVersionSafe(out var detectedVersion))
+                    if (!runtime.IsSqliteVersionSafe(out var detectedVersion))
                     {
                         Logger.Error($"[FATAL] Vulnerable SQLite version detected: {detectedVersion}. " +
                                      $"Minimum required: {AppConfig.MinRequiredSqliteVersion} (CVE-2025-6965 mitigation).");
 
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Error.WriteLine($"[严重] 检测到存在漏洞的 SQLite 版本：{detectedVersion}");
-                        Console.Error.WriteLine($"此版本的 Servy 需要 SQLite {AppConfig.MinRequiredSqliteVersion} 或更高版本。");
+                        Console.Error.WriteLine($"[CRITICAL] Vulnerable SQLite version detected: {detectedVersion}");
+                        Console.Error.WriteLine($"This version of Servy requires SQLite {AppConfig.MinRequiredSqliteVersion}+.");
                         Console.ResetColor();
 
                         // Exit with a CLI-specific sentinel instead of a SCM Win32 error code
                         return (int)CliExitCode.IncompatibleEnvironment;
                     }
 
-                    // Initialize shared dependencies
-                    dbContext = new AppDbContext(connectionString);
-                    var dapperExecutor = new DapperExecutor(dbContext);
-                    protectedKeyProvider = new ProtectedKeyProvider(aesKeyFilePath, aesIVFilePath);
-                    secureData = new SecureData(protectedKeyProvider);
+                    // Initialize database shared dependencies
+                    var appDbContext = new AppDbContext(connectionString);
+                    dbContext = appDbContext;
+                    var dapperExecutor = new DapperExecutor(appDbContext);
+                    var keyProvider = new ProtectedKeyProvider(aesKeyFilePath, aesIVFilePath);
+                    protectedKeyProvider = keyProvider;
+                    // Built on the first encrypt or decrypt, which every command reaches only after its
+                    // EnsureAdministrator check: an eager build created the key on an unelevated --help (#7531).
+                    var deferredSecureData = new DeferredSecureData(() => new SecureData(keyProvider));
+                    secureData = deferredSecureData;
                     var xmlSerializer = new XmlServiceSerializer();
                     var jsonSerializer = new JsonServiceSerializer();
                     var serviceRepository = new ServiceRepository(dapperExecutor, secureData, xmlSerializer, jsonSerializer);
@@ -149,11 +159,12 @@ namespace Servy.CLI
                         new ServiceControllerProvider(controllerFactory),
                         new WindowsServiceApi(),
                         new Win32ErrorProvider(),
-                        serviceRepository
+                        serviceRepository,
+                        new ServyExePermissionsHardener(),
+                        new NamedPipesService()
                         );
 
                     var processHelper = new ProcessHelper();
-                    var processKiller = new ProcessKiller();
                     var serviceValidationRules = new ServiceValidationRules(processHelper);
                     var installValidator = new ServiceInstallValidator(serviceValidationRules);
 
@@ -161,86 +172,49 @@ namespace Servy.CLI
                     var startCommand = new StartServiceCommand(serviceManager);
                     var stopCommand = new StopServiceCommand(serviceManager);
                     var restartCommand = new RestartServiceCommand(serviceManager);
-                    var uninstallCommand = new UninstallServiceCommand(serviceManager, serviceRepository);
+                    var uninstallCommand = new UninstallServiceCommand(serviceManager);
                     var serviceStatusCommand = new ServiceStatusCommand(serviceManager);
                     var exportCommand = new ExportServiceCommand(serviceRepository);
+                    var showCommand = new ShowServiceCommand(serviceRepository, serviceManager);
 
                     var xmlServiceValidator = new XmlServiceValidator(serviceValidationRules);
                     var jsonServiceValidator = new JsonServiceValidator(serviceValidationRules);
                     var importCommand = new ImportServiceCommand(
                         serviceRepository,
-                        xmlSerializer,
-                        jsonSerializer,
                         serviceManager,
                         xmlServiceValidator,
                         jsonServiceValidator,
                         processHelper
                         );
 
-                    void EnsureDatabase()
-                    {
-                        // Ensure db and security folders exist
-                        AppFoldersHelper.EnsureFolders(connectionString, aesKeyFilePath, aesIVFilePath);
-
-                        // Ensure event source exists
-                        Core.Helpers.Helper.EnsureEventSourceExists();
-
-                        // Initialize the database
-                        DatabaseInitializer.InitializeDatabase(dbContext, SQLiteDbInitializer.Initialize);
-                    }
-
-                    async Task EnsureServiceBinariesAsync()
-                    {
-                        var asm = Assembly.GetExecutingAssembly();
-
-                        var sh = new ServiceHelper(serviceRepository);
-                        var resourceHelper = new ResourceHelper(sh, processKiller);
-
-                        // Copy service executable from embedded resources
-                        if (!await resourceHelper.CopyEmbeddedResource(asm, ResourcesNamespace, AppConfig.ServyServiceCLIFileName, "exe", true, true, cancellationToken: cts.Token))
-                        {
-                            throw new InvalidOperationException($"Failed to extract embedded resource '{AppConfig.ServyServiceCLIExe}'. " +
-                                "CLI cannot start safely - see file log for details.");
-                        }
-
-                        // Copy Sysinternals from embedded resources
-                        var handleExeFileName = RuntimeInformation.OSArchitecture == Architecture.Arm64
-                            ? AppConfig.HandleExeARM64FileName
-                            : AppConfig.HandleExeX64FileName;
-                        if (!await resourceHelper.CopyEmbeddedResource(asm, ResourcesNamespace, handleExeFileName, "exe", false, cancellationToken: cts.Token))
-                        {
-                            Logger.Warn($"Failed copying embedded resource: {handleExeFileName}; process-tree handle features may be degraded.");
-                        }
-
-#if DEBUG
-                        // Copy debug symbols from embedded resources (only in debug builds)
-                        if (!await resourceHelper.CopyEmbeddedResource(asm, ResourcesNamespace, AppConfig.ServyServiceCLIFileName, "pdb", false, cancellationToken: cts.Token))
-                        {
-                            Logger.Warn($"Failed copying embedded resource: {AppConfig.ServyServiceCLIFileName}.pdb");
-                        }
-#endif
-                    }
-
                     // Helper to defer targeted runtime initialization until AFTER successful argument parsing
-                    async Task<int> ExecuteWithRuntimeAsync(Func<Task<CommandResult>> commandAction, bool isQuiet, bool requireDatabase = true, bool requireBinaries = false)
+                    async Task<int> ExecuteWithRuntimeAsync(Func<Task<CommandResult>> commandAction, string commandName, bool isQuiet, bool requireDatabase = true, bool requireBinaries = false)
                     {
+                        // The bootstrap opens the vault under ProgramData, which only an Administrator can open once an
+                        // elevated run has created it, so the elevation check runs first. Left to the command, it came after
+                        // the bootstrap, and an unelevated run reported the vault's access error instead of this message (#7573).
+                        if ((requireDatabase || requireBinaries) && !runtime.IsAdministrator())
+                        {
+                            return PrintAndReturn(CommandResult.Fail(string.Format(Strings.Msg_AdminPrivilegesRequired, commandName)));
+                        }
+
                         async Task BootstrapAsync()
                         {
-                            if (requireDatabase) EnsureDatabase();
-                            if (requireBinaries) await EnsureServiceBinariesAsync();
+                            if (requireDatabase) runtime.EnsureDatabase(connectionString, aesKeyFilePath, aesIVFilePath, appDbContext, deferredSecureData);
+                            if (requireBinaries) await runtime.EnsureServiceBinariesAsync(serviceRepository, controllerFactory, cts.Token);
                         }
 
                         if (!requireDatabase && !requireBinaries)
                         {
                             // Fast path: no initialization overhead needed
                         }
-                        else if (isQuiet || !IsRealConsole())
+                        else if (isQuiet || !runtime.IsRealConsole())
                         {
                             await BootstrapAsync();
                         }
                         else
                         {
-                            await ConsoleHelper.RunWithLoadingAnimation(BootstrapAsync);
+                            await runtime.RunWithLoadingAnimationAsync(BootstrapAsync);
                         }
 
                         return await PrintAndReturnAsync(commandAction());
@@ -259,17 +233,19 @@ namespace Servy.CLI
                         ServiceStatusOptions,
                         RestartServiceOptions,
                         ExportServiceOptions,
-                        ImportServiceOptions
+                        ImportServiceOptions,
+                        ShowServiceOptions
                         >(args)
                         .MapResult(
-                            async (Options.InstallServiceOptions opts) => await ExecuteWithRuntimeAsync(() => installCommand.ExecuteAsync(opts, cts.Token), opts.Quiet, requireDatabase: true, requireBinaries: true),
-                            async (UninstallServiceOptions opts) => await ExecuteWithRuntimeAsync(() => uninstallCommand.ExecuteAsync(opts, cts.Token), opts.Quiet, requireDatabase: true, requireBinaries: false),
-                            async (StartServiceOptions opts) => await ExecuteWithRuntimeAsync(() => startCommand.ExecuteAsync(opts, cts.Token), opts.Quiet, requireDatabase: true, requireBinaries: true),
-                            async (StopServiceOptions opts) => await ExecuteWithRuntimeAsync(() => stopCommand.ExecuteAsync(opts, cts.Token), opts.Quiet, requireDatabase: true, requireBinaries: false),
-                            async (RestartServiceOptions opts) => await ExecuteWithRuntimeAsync(() => restartCommand.ExecuteAsync(opts, cts.Token), opts.Quiet, requireDatabase: true, requireBinaries: true),
-                            async (ServiceStatusOptions opts) => await ExecuteWithRuntimeAsync(() => Task.FromResult(serviceStatusCommand.Execute(opts, cts.Token)), opts.Quiet, requireDatabase: false, requireBinaries: false),
-                            async (ExportServiceOptions opts) => await ExecuteWithRuntimeAsync(() => exportCommand.ExecuteAsync(opts, cts.Token), opts.Quiet, requireDatabase: true, requireBinaries: false),
-                            async (ImportServiceOptions opts) => await ExecuteWithRuntimeAsync(() => importCommand.ExecuteAsync(opts, cts.Token), opts.Quiet, requireDatabase: true, requireBinaries: true),
+                            async (Options.InstallServiceOptions opts) => await ExecuteWithRuntimeAsync(() => installCommand.ExecuteAsync(opts, cts.Token), "install", opts.Quiet, requireDatabase: true, requireBinaries: true),
+                            async (UninstallServiceOptions opts) => await ExecuteWithRuntimeAsync(() => uninstallCommand.ExecuteAsync(opts, cts.Token), "uninstall", opts.Quiet, requireDatabase: true, requireBinaries: false),
+                            async (StartServiceOptions opts) => await ExecuteWithRuntimeAsync(() => startCommand.ExecuteAsync(opts, cts.Token), "start", opts.Quiet, requireDatabase: true, requireBinaries: true),
+                            async (StopServiceOptions opts) => await ExecuteWithRuntimeAsync(() => stopCommand.ExecuteAsync(opts, cts.Token), "stop", opts.Quiet, requireDatabase: true, requireBinaries: false),
+                            async (RestartServiceOptions opts) => await ExecuteWithRuntimeAsync(() => restartCommand.ExecuteAsync(opts, cts.Token), "restart", opts.Quiet, requireDatabase: true, requireBinaries: true),
+                            async (ServiceStatusOptions opts) => await ExecuteWithRuntimeAsync(() => Task.FromResult(serviceStatusCommand.Execute(opts, cts.Token)), "status", opts.Quiet, requireDatabase: false, requireBinaries: false),
+                            async (ExportServiceOptions opts) => await ExecuteWithRuntimeAsync(() => exportCommand.ExecuteAsync(opts, cts.Token), "export", opts.Quiet, requireDatabase: true, requireBinaries: false),
+                            async (ImportServiceOptions opts) => await ExecuteWithRuntimeAsync(() => importCommand.ExecuteAsync(opts, cts.Token), "import", opts.Quiet, requireDatabase: true, requireBinaries: true),
+                            async (ShowServiceOptions opts) => await ExecuteWithRuntimeAsync(() => showCommand.ExecuteAsync(opts, cts.Token), "show", opts.Quiet, requireDatabase: true, requireBinaries: false),
                             // Wrap synchronous error result in Task
                             errs =>
                             {
@@ -284,17 +260,18 @@ namespace Servy.CLI
                 }
                 catch (OperationCanceledException)
                 {
-                    Console.Error.WriteLine("\n操作已被用户取消。");
+                    Console.Error.WriteLine("\nOperation cancelled by user.");
                     return (int)CliExitCode.Error;
                 }
                 catch (Exception ex)
                 {
                     Logger.Error("An unexpected error occurred in the main execution flow.", ex);
-                    Console.Error.WriteLine($"发生意外错误：{ex.Message}");
+                    Console.Error.WriteLine($"An unexpected error occurred: {ex.Message}");
                     return (int)CliExitCode.Error;
                 }
                 finally
                 {
+                    Console.CancelKeyPress -= onCancel;
                     TryRun(() => secureData?.Dispose(), nameof(secureData));
                     TryRun(() => protectedKeyProvider?.Dispose(), nameof(protectedKeyProvider));
                     TryRun(() => dbContext?.Dispose(), nameof(dbContext));
@@ -304,25 +281,38 @@ namespace Servy.CLI
         }
 
         /// <summary>
+        /// Handles a Ctrl+C or Ctrl+Break press: the first press starts a graceful cancellation, a later press is left
+        /// unhandled so the process terminates.
+        /// </summary>
+        /// <param name="cts">The source whose token cancels the running command.</param>
+        /// <param name="markHandled">Marks the key press as handled, so the process keeps running while the command cancels.</param>
+        /// <param name="error">The writer the cancellation notice is written to.</param>
+        /// <returns><see langword="true"/> when this press started the graceful cancellation; otherwise <see langword="false"/>.</returns>
+        internal static bool HandleCancelKeyPress(CancellationTokenSource cts, Action markHandled, TextWriter error)
+        {
+            if (!cts.IsCancellationRequested)
+            {
+                markHandled();          // first press: graceful cancellation
+                cts.Cancel();
+                error.WriteLine(CancellingMessage);
+                return true;
+            }
+
+            // second press: leave e.Cancel = false -> process terminates
+            return false;
+        }
+
+        /// <summary>
         /// Attempts to execute a cleanup action, suppressing any exceptions to ensure
         /// the teardown process proceeds.
         /// </summary>
         /// <param name="action">The delegate containing the cleanup logic to execute.</param>
         /// <param name="name">The descriptive name of the component for logging purposes.</param>
-        private static void TryRun(Action action, string name)
+        internal static void TryRun(Action action, string name)
         {
             try { action(); }
             catch (Exception ex) { Logger.Warn($"{name} cleanup failed.", ex); }
         }
-
-        /// <summary>
-        /// Retrieves the window handle used by the console associated with the calling process.
-        /// </summary>
-        /// <returns>
-        /// A handle to the window used by the console, or <see cref="IntPtr.Zero"/> if there is no such associated window.
-        /// </returns>
-        [DllImport("kernel32.dll")]
-        private static extern IntPtr GetConsoleWindow();
 
         /// <summary>
         /// Performs a multi-layered check to determine if the current process is running in a real,
@@ -350,22 +340,32 @@ namespace Servy.CLI
         /// </item>
         /// </list>
         /// </remarks>
-        public static bool IsRealConsole()
+        public static bool IsRealConsole() => IsRealConsole(new ConsoleEnvironment());
+
+        /// <summary>
+        /// Performs the checks of <see cref="IsRealConsole()"/> against the given console and session properties.
+        /// </summary>
+        /// <param name="console">The console and session properties to probe.</param>
+        /// <returns>
+        /// <c>true</c> if a physical or emulated terminal is attached that supports interactive
+        /// features (like cursor manipulation); otherwise <c>false</c>.
+        /// </returns>
+        internal static bool IsRealConsole(IConsoleEnvironment console)
         {
             // 1. Session 0 check (detects Services/SYSTEM account)
-            if (!Environment.UserInteractive) return false;
+            if (!console.UserInteractive) return false;
 
             // 2. Standard redirection check (detects '>' or '|')
-            if (Console.IsOutputRedirected || Console.IsErrorRedirected) return false;
+            if (console.IsOutputRedirected || console.IsErrorRedirected) return false;
 
             // 3. Win32 check: Is there actually a window handle?
-            if (GetConsoleWindow() == IntPtr.Zero) return false;
+            if (console.GetConsoleWindow() == IntPtr.Zero) return false;
 
             try
             {
                 // 4. Property check: Accessing buffer properties on a redirected
                 // handle will throw an IOException (Invalid Descriptor).
-                return Console.WindowHeight > 0;
+                return console.GetWindowHeight() > 0;
             }
             catch
             {

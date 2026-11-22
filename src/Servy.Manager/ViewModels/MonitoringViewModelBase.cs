@@ -47,6 +47,9 @@ namespace Servy.Manager.ViewModels
         /// </summary>
         private long _tickErrorCount = 0;
 
+        /// <summary>
+        /// Backing field for <see cref="Pid"/>; holds <see cref="UiConstants.NotAvailable"/> while no process is known.
+        /// </summary>
         private string _pid = UiConstants.NotAvailable;
 
         /// <summary>
@@ -139,7 +142,8 @@ namespace Servy.Manager.ViewModels
             }
             catch (Exception ex)
             {
-                // Increments atomically to maintain accurate tracking if multi-tab components ever fire concurrently.
+                // Interlocked keeps this consistent with the two Exchange resets above; ticks themselves
+                // are already serialised by _isTickRunningFlag, and the counter is per view model instance.
                 long currentErrorCount = Interlocked.Increment(ref _tickErrorCount);
 
                 if (currentErrorCount == 1 || currentErrorCount % AppConfig.MonitoringTickErrorLogThrottlingInterval == 0)
@@ -178,7 +182,7 @@ namespace Servy.Manager.ViewModels
                 {
                     ResetMonitoringState();
                     _hadSelectedService = false;
-                    CopyPidCommand?.RaiseCanExecuteChanged();
+                    CopyPidCommand.RaiseCanExecuteChanged();
                 }
                 return;
             }
@@ -207,10 +211,7 @@ namespace Servy.Manager.ViewModels
         {
             var newCts = new CancellationTokenSource();
             var oldCts = Interlocked.Exchange(ref _monitoringCts, newCts);
-            if (oldCts != null)
-            {
-                Helpers.Helper.CancelAndDisposeSafely(oldCts);
-            }
+            Helpers.Helper.CancelAndDisposeSafely(oldCts);
         }
 
         /// <summary>
@@ -251,8 +252,10 @@ namespace Servy.Manager.ViewModels
 
         /// <summary>
         /// Safely retrieves the current monitoring cancellation token.
-        /// If the monitoring source has not been initialized, returns <see cref="CancellationToken.None"/>.
-        /// If the source has been disposed, returns a pre-cancelled token to safely prevent new operations.
+        /// Returns <see cref="CancellationToken.None"/> when no monitoring session has been started yet,
+        /// and also after <see cref="Dispose(bool)"/>, which clears the source rather than leaving it in place.
+        /// Returns a pre-cancelled token if the source is observed mid-swap in <see cref="ResetMonitoringCts"/>
+        /// and has already been disposed by the time its token is read.
         /// </summary>
         /// <returns>A valid <see cref="CancellationToken"/> linked to the current monitoring lifecycle.</returns>
         protected CancellationToken GetCurrentMonitoringToken()
@@ -289,7 +292,7 @@ namespace Servy.Manager.ViewModels
             if (SelectedServiceItem?.Pid != null)
             {
                 var service = ServiceMapper.ToModel(SelectedServiceItem);
-                await ServiceCommands.CopyPidAsync(service);
+                await ServiceCommands.CopyPidAsync(service, cancellationToken: GetCurrentMonitoringToken());
             }
         }
 

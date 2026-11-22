@@ -4,6 +4,7 @@ using Servy.Core.Data;
 using Servy.Core.DTOs;
 using Servy.Core.Enums;
 using Servy.Core.Helpers;
+using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Manager.Config;
 using Servy.Manager.Models;
@@ -13,9 +14,9 @@ using Servy.Manager.ViewModels;
 using Servy.Testing;
 using Servy.UI;
 using Servy.UI.Services;
-using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Windows.Threading;
 using static Servy.Manager.ViewModels.MainViewModel;
 using Helper = Servy.Testing.Helper;
@@ -43,7 +44,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         private readonly Mock<LogsViewModel> _logsViewModelMock;
 
         // Track generated SUT view model instances to enforce complete memory containment cleanup
-        private readonly ConcurrentBag<MainViewModel> _allocatedViewModels = new ConcurrentBag<MainViewModel>();
+        private readonly TrackedViewModels _allocatedViewModels = new TrackedViewModels();
 
         public MainViewModelTests()
         {
@@ -61,10 +62,10 @@ namespace Servy.Manager.UnitTests.ViewModels
 
             _appConfigMock = new Mock<IAppConfiguration>();
             _appConfigMock.Setup(c => c.RefreshIntervalInSeconds).Returns(5);
-            _appConfigMock.Setup(c => c.PerformanceRefreshIntervalInMs).Returns(1000);
+            _appConfigMock.Setup(c => c.PerformanceRefreshIntervalMs).Returns(1000);
             _appConfigMock.Setup(c => c.ConsoleMaxLines).Returns(500);
-            _appConfigMock.Setup(c => c.DependenciesRefreshIntervalInMs).Returns(1000);
-            _appConfigMock.Setup(c => c.ConsoleRefreshIntervalInMs).Returns(500);
+            _appConfigMock.Setup(c => c.DependenciesRefreshIntervalMs).Returns(1000);
+            _appConfigMock.Setup(c => c.ConsoleRefreshIntervalMs).Returns(500);
             _appConfigMock.Setup(c => c.IsDesktopAppAvailable).Returns(true);
             _appConfigMock.Setup(c => c.MaxBulkOperationParallelism).Returns(2);
 
@@ -79,6 +80,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             _consoleViewModelMock = new Mock<ConsoleViewModel>(
                 _serviceRepositoryMock.Object,
                 _serviceCommandsMock.Object,
+                _messageBoxServiceMock.Object,
                 _appConfigMock.Object,
                 _cursorServiceMock.Object,
                 uiDispatcherMock.Object);
@@ -121,7 +123,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 dispatcher ?? Dispatcher.CurrentDispatcher
             );
 
-            _allocatedViewModels.Add(vm);
+            _allocatedViewModels.Track(vm);
             return vm;
         }
 
@@ -134,6 +136,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         private static void RunOnPump(Dispatcher dispatcher, Func<Task> action)
         {
             var frame = new DispatcherFrame();
+            ExceptionDispatchInfo? pumpFailure = null;
 
             _ = dispatcher.InvokeAsync(async () =>
             {
@@ -141,9 +144,12 @@ namespace Servy.Manager.UnitTests.ViewModels
                 {
                     await action();
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
-                    // Suppress expected target exceptions to let the frame unwind cleanly
+                    // Capture rather than swallow, so the frame still unwinds cleanly but a command that
+                    // throws fails its test instead of disappearing. Callers that expect an exception
+                    // catch it inside their own action before it reaches here.
+                    pumpFailure = ExceptionDispatchInfo.Capture(ex);
                 }
                 finally
                 {
@@ -154,13 +160,14 @@ namespace Servy.Manager.UnitTests.ViewModels
             var sw = Stopwatch.StartNew();
             var watchdog = new DispatcherTimer(DispatcherPriority.Send)
             {
-                Interval = TimeSpan.FromSeconds(10)
+                Interval = TestTimeouts.CiGenerous
             };
             watchdog.Tick += (s, e) => { frame.Continue = false; };
             watchdog.Start();
             try { Dispatcher.PushFrame(frame); }
             finally { watchdog.Stop(); }
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), "Pump timed out");
+            Assert.True(sw.Elapsed < TestTimeouts.CiGenerous, "Pump timed out");
+            pumpFailure?.Throw();
         }
 
         #endregion
@@ -211,7 +218,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             Helper.RunOnSTA(() =>
             {
                 var vm = new MainViewModel();
-                _allocatedViewModels.Add(vm);
+                _allocatedViewModels.Track(vm);
                 Assert.NotNull(vm);
             }, createApp: true);
         }
@@ -284,7 +291,10 @@ namespace Servy.Manager.UnitTests.ViewModels
                     new Service { Name = "S2", IsInstalled = true }
                 };
 
-                _serviceCommandsMock.Setup(c => c.SearchServicesAsync(It.IsAny<string>(), true, It.IsAny<CancellationToken>()))
+                // The query is pinned: the loose mock returns no rows for any other text, so a search that
+                // drops what the user typed fails the row count below
+                vm.SearchText = "Servy";
+                _serviceCommandsMock.Setup(c => c.SearchServicesAsync("Servy", true, It.IsAny<CancellationToken>()))
                     .ReturnsAsync(services);
 
                 // Act
@@ -321,6 +331,205 @@ namespace Servy.Manager.UnitTests.ViewModels
                 await Task.CompletedTask;
             }, createApp: true);
         }
+        [Fact]
+        public async Task SearchCommand_HandsThePipelineTokenToTheFetch()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                // Capture, during the fetch, both the token the search received and the token of the
+                // source the pipeline swapped in. A search that passes CancellationToken.None gets a token
+                // that cannot be canceled and is not equal to the source's token.
+                var currentDispatcher = Dispatcher.CurrentDispatcher;
+                var vm = CreateViewModel(currentDispatcher);
+                CancellationToken received = default;
+                CancellationToken expected = default;
+
+                _serviceCommandsMock.Setup(c => c.SearchServicesAsync(It.IsAny<string>(), true, It.IsAny<CancellationToken>()))
+                    .Callback<string, bool, CancellationToken>((query, calculatePerf, token) =>
+                    {
+                        received = token;
+                        expected = TestReflection.GetField<CancellationTokenSource>(vm, "_searchCts").Token;
+                    })
+                    .ReturnsAsync(new List<Service>());
+
+                // Act
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+
+                // Assert
+                Assert.True(received.CanBeCanceled);
+                Assert.Equal(expected, received);
+
+                await Task.CompletedTask;
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_SecondSearch_DisposesAndUnhooksPreviousRows()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var currentDispatcher = Dispatcher.CurrentDispatcher;
+                var vm = CreateViewModel(currentDispatcher);
+
+                _serviceCommandsMock.SetupSequence(c => c.SearchServicesAsync(It.IsAny<string>(), true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new List<Service> { new Service { Name = "Old", IsInstalled = true } })
+                    .ReturnsAsync(new List<Service> { new Service { Name = "New", IsInstalled = true } });
+
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+
+                var oldRow = vm.ServicesView.Cast<ServiceRowViewModel>().Single();
+                Assert.Equal("Old", oldRow.Name);
+
+                // Act
+                // The second search rebuilds the collection, which is the only path that runs the
+                // dispose-and-unhook loop over the rows the first search created.
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+
+                // Assert
+                Assert.Equal("New", vm.ServicesView.Cast<ServiceRowViewModel>().Single().Name);
+
+                // The previous row was disposed, so it no longer holds its subscription to its Service model
+                Assert.True(TestReflection.GetField<bool>(oldRow, "_disposed"));
+
+                // And it was unhooked from the parent, so a stale row can no longer drive the parent's
+                // selection state. ServiceRowViewModel.Dispose does not clear its own PropertyChanged
+                // invocation list, so this is what pins the explicit unsubscription rather than the Dispose.
+                var raised = false;
+                vm.PropertyChanged += (s, e) => { if (e.PropertyName == nameof(vm.HasSelectedServices)) raised = true; };
+                oldRow.IsChecked = true;
+                Assert.False(raised);
+
+                await Task.CompletedTask;
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_RunThreeTimes_ReportsEachRowCountInTheFooterWithItsOwnTemplate()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange - two rows for the first search, one for the second, none for the third
+                var currentDispatcher = Dispatcher.CurrentDispatcher;
+                var vm = CreateViewModel(currentDispatcher);
+
+                _serviceCommandsMock.SetupSequence(c => c.SearchServicesAsync(It.IsAny<string>(), true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new List<Service>
+                    {
+                        new Service { Name = "A", IsInstalled = true },
+                        new Service { Name = "B", IsInstalled = true },
+                    })
+                    .ReturnsAsync(new List<Service> { new Service { Name = "C", IsInstalled = true } })
+                    .ReturnsAsync(new List<Service>());
+
+                // Act
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+                var rowsAfterFirst = vm.ServicesView.Cast<ServiceRowViewModel>().Count();
+                var footerAfterFirst = vm.FooterText;
+
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+                var rowsAfterSecond = vm.ServicesView.Cast<ServiceRowViewModel>().Count();
+                var footerAfterSecond = vm.FooterText;
+
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+                var rowsAfterThird = vm.ServicesView.Cast<ServiceRowViewModel>().Count();
+                var footerAfterThird = vm.FooterText;
+
+                // Assert - the rows are the ones the pipeline counted
+                Assert.Equal(2, rowsAfterFirst);
+                Assert.Equal(1, rowsAfterSecond);
+                Assert.Equal(0, rowsAfterThird);
+
+                // Assert - each count picked its own template ({1} is the duration, so compare the part before it)
+                Assert.StartsWith(string.Format(Strings.Footer_Service_Many, "2", "|").Split('|')[0], footerAfterFirst);
+                Assert.StartsWith(string.Format(Strings.Footer_Service_One, "1", "|").Split('|')[0], footerAfterSecond);
+                Assert.StartsWith(string.Format(Strings.Footer_Service_None, "0", "|").Split('|')[0], footerAfterThird);
+
+                await Task.CompletedTask;
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_SupersededWhileApplyIsQueued_KeepsGridAndStartsNoRefresh()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var currentDispatcher = Dispatcher.CurrentDispatcher;
+                var vm = CreateViewModel(currentDispatcher);
+
+                _serviceCommandsMock.SetupSequence(c => c.SearchServicesAsync(It.IsAny<string>(), true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new List<Service> { new Service { Name = "Old", IsInstalled = true } })
+                    .ReturnsAsync(new List<Service> { new Service { Name = "New", IsInstalled = true } });
+
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+
+                var oldRow = vm.ServicesView.Cast<ServiceRowViewModel>().Single();
+                var ctsBefore = TestReflection.GetField<CancellationTokenSource>(vm, "_cts");
+
+                // When the second search queues its Background apply callback (after the rows-built check),
+                // cancel it at Normal priority so the cancellation lands before the callback runs.
+                var cancelPosted = false;
+                DispatcherHookEventHandler onPosted = (s, e) =>
+                {
+                    var searches = _serviceCommandsMock.Invocations.Count(i => i.Method.Name == nameof(IServiceCommands.SearchServicesAsync));
+                    if (!cancelPosted && searches == 2 && e.Operation.Priority == DispatcherPriority.Background)
+                    {
+                        cancelPosted = true;
+                        currentDispatcher.BeginInvoke(DispatcherPriority.Normal,
+                            new Action(() => TestReflection.InvokeNonPublic(vm, "ClearActiveSearchContext")));
+                    }
+                };
+                currentDispatcher.Hooks.OperationPosted += onPosted;
+
+                try
+                {
+                    // Act
+                    RunOnPump(currentDispatcher, async () =>
+                    {
+                        await vm.SearchCommand.ExecuteAsync(null);
+                    });
+                }
+                finally
+                {
+                    currentDispatcher.Hooks.OperationPosted -= onPosted;
+                }
+
+                // Assert
+                Assert.True(cancelPosted, "The second search never queued its apply callback.");
+
+                // The superseded search did not replace the grid or dispose the rows it holds
+                Assert.Same(oldRow, vm.ServicesView.Cast<ServiceRowViewModel>().Single());
+                Assert.False(TestReflection.GetField<bool>(oldRow, "_disposed"));
+
+                // And it did not swap the refresh token source, so no refresh was started
+                Assert.Same(ctsBefore, TestReflection.GetField<CancellationTokenSource>(vm, "_cts"));
+
+                await Task.CompletedTask;
+            }, createApp: true);
+        }
 
         [Fact]
         public async Task SearchCommand_NullDispatcher_ExitsWithoutSearching()
@@ -336,6 +545,36 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                 // Assert
                 _serviceCommandsMock.Verify(c => c.SearchServicesAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task SearchCommand_ServiceCommandsThrows_ShowsTheUnexpectedErrorWarning()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var currentDispatcher = Dispatcher.CurrentDispatcher;
+                var vm = CreateViewModel(currentDispatcher);
+
+                _serviceCommandsMock.Setup(c => c.SearchServicesAsync(It.IsAny<string>(), true, It.IsAny<CancellationToken>()))
+                    .ThrowsAsync(new InvalidOperationException("SCM unavailable"));
+                _messageBoxServiceMock.Setup(m => m.ShowWarningAsync(It.IsAny<string>(), It.IsAny<string>()))
+                    .Returns(Task.CompletedTask);
+
+                // Act
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.SearchCommand.ExecuteAsync(null);
+                });
+
+                // Assert
+                _messageBoxServiceMock.Verify(
+                    m => m.ShowWarningAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption),
+                    Times.Once);
+                Assert.False(vm.IsBusy);
+
+                await Task.CompletedTask;
             }, createApp: true);
         }
 
@@ -356,6 +595,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 Assert.NotNull(timer);
                 Assert.True(timer.IsEnabled);
 
+                // Act & Assert - each step below acts on the timer, then asserts the field it leaves behind
                 // Stop -> field nulled
                 vm.StopRefreshTimer();
                 Assert.Null(TestReflection.GetField<DispatcherTimer?>(vm, "_refreshTimer"));
@@ -396,7 +636,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                     .Returns(() =>
                     {
                         // Bounded: a missing release must fail the test, not park a pool thread forever.
-                        Assert.True(unblockGetAllServicesTcs.Task.Wait(TimeSpan.FromSeconds(10)),
+                        Assert.True(unblockGetAllServicesTcs.Task.Wait(TestTimeouts.CiGenerous),
                             "Test never released the first tick.");
                         return new List<ServiceInfo>();
                     });
@@ -417,7 +657,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 TestReflection.InvokeNonPublic(vm, "OnTick", null!, EventArgs.Empty);
 
                 // Wait until the first tick has actually entered GetAllServices
-                var completedTask = await Task.WhenAny(getAllServicesCalledTcs.Task, Task.Delay(2000));
+                var completedTask = await Task.WhenAny(getAllServicesCalledTcs.Task, Task.Delay(TestTimeouts.CiGenerous));
                 Assert.Same(getAllServicesCalledTcs.Task, completedTask); // Ensure tick 1 entered GetAllServices before proceeding
 
                 try
@@ -450,6 +690,11 @@ namespace Servy.Manager.UnitTests.ViewModels
                 using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
                 using (var vm = CreateViewModel())
                 {
+                    // Seed one row: with an empty snapshot RefreshAllServicesAsync returns before
+                    // GetAllServices is ever called (#6492), so the arranged failure would never fire.
+                    TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services")!
+                        .Add(new ServiceRowViewModel(new Service { Name = "TestService" }, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
                     // Setup the service manager to throw a generic exception during status refresh
                     _serviceManagerMock
                         .Setup(r => r.GetAllServices(It.IsAny<CancellationToken>()))
@@ -463,9 +708,11 @@ namespace Servy.Manager.UnitTests.ViewModels
                     {
                         int flag = TestReflection.GetField<int>(vm, "_isRefreshingFlag");
                         return flag == 0;
-                    }, TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+                    }, TestTimeouts.CiGenerous, cancellationToken: TestContext.Current.CancellationToken);
 
-                    // Assert
+                    // Assert - the arranged failure really fired, and the flag was released after it
+                    _serviceManagerMock.Verify(m => m.GetAllServices(It.IsAny<CancellationToken>()), Times.Once);
+
                     int isRefreshingFlag = TestReflection.GetField<int>(vm, "_isRefreshingFlag");
                     Assert.Equal(0, isRefreshingFlag);
                 }
@@ -511,7 +758,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 };
 
                 // Act
-                var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", targetService, osMockPayload, databaseDto, CancellationToken.None);
+                var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", targetService, osMockPayload, databaseDto, TestContext.Current.CancellationToken);
 
                 var resultType = result!.GetType();
                 var uiUpdateInfo = resultType.GetField("Item1")!.GetValue(result);
@@ -543,19 +790,33 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
-        public async Task RefreshAllServicesAsync_DependencyNullChecks_ExitEarly()
+        public async Task RefreshAllServicesAsync_MissingDependencyThrowsNre_IsSwallowedByCatchAll()
         {
             await Helper.RunOnSTA(async () =>
             {
                 // Arrange
                 var vm = CreateViewModel();
 
-                // Act 1: Force an early exit by removing the _serviceManager dependency field slot entirely
-                TestReflection.SetField(vm, "_serviceManager", null);
-                var task1 = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None)!;
-                await task1;
+                // Seed one row for BOTH acts: with an empty snapshot RefreshAllServicesAsync returns
+                // before it dereferences either dependency (#6492), so no act would reach the catch-all.
+                TestReflection.SetField(vm, "_services",
+                    new BulkObservableCollection<ServiceRowViewModel>()
+                    {
+                        new ServiceRowViewModel(new Service { Name = "TestService" }, _serviceCommandsMock.Object, _cursorServiceMock.Object)
+                    });
 
-                // Assert 1: The engine must abort immediately. Downstream repository calls are never touched.
+                // Act 1: Force a NullReferenceException inside Task.Run by nulling the _serviceManager dependency field
+                TestReflection.SetField(vm, "_serviceManager", null);
+                var log1 = await LogCapture.RunAsync(async () =>
+                {
+                    var task1 = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", TestContext.Current.CancellationToken)!;
+                    await task1;
+                });
+
+                // Assert 1: The NullReferenceException is caught by the generic exception handler and logged with its cause.
+                // Downstream repository calls are never reached.
+                Assert.Contains("Failed to refresh all services.", log1);
+                Assert.Contains(nameof(NullReferenceException), log1);
                 _serviceRepositoryMock.Verify(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
                 _serviceManagerMock.Verify(m => m.GetAllServices(It.IsAny<CancellationToken>()), Times.Never);
 
@@ -567,11 +828,16 @@ namespace Servy.Manager.UnitTests.ViewModels
                 TestReflection.SetField(vm, "_serviceManager", _serviceManagerMock.Object);
                 TestReflection.SetField(vm, "_serviceRepository", null);
 
-                var task2 = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None)!;
-                await task2;
+                var log2 = await LogCapture.RunAsync(async () =>
+                {
+                    var task2 = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", TestContext.Current.CancellationToken)!;
+                    await task2;
+                });
 
-                // Assert 2: The manager is queried for OS info, but execution safely short-circuits
-                // before pulling DTO snapshots out of the database repository layer.
+                // Assert 2: The manager is queried for OS info, but the resulting NullReferenceException on the repository call
+                // is caught by the generic exception handler (and logged with its cause), preventing DTO snapshot loading.
+                Assert.Contains("Failed to refresh all services.", log2);
+                Assert.Contains(nameof(NullReferenceException), log2);
                 _serviceManagerMock.Verify(m => m.GetAllServices(It.IsAny<CancellationToken>()), Times.Once);
                 _serviceRepositoryMock.Verify(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
             }, createApp: true);
@@ -627,7 +893,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                         .Returns(new ProcessMetrics(10.0, 1024));
 
                     // Act - Invoke RefreshAllServicesAsync to process service updates
-                    var task = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None)!;
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", TestContext.Current.CancellationToken)!;
                     await task;
 
                     // Assert 1: Verify ApplyServiceUpdate updated the target service's UI state
@@ -636,6 +902,620 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                     // Assert 2: Verify UpdateSelectAllState ran and stabilized selection state
                     Assert.True(vm.SelectAll);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_ScmDisplayNameDiffersFromRow_UpdatesTheRowDisplayName()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        DisplayName = "Old display name",
+                        Status = ServiceStatus.Stopped,
+                        Pid = null
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services")!;
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo
+                            {
+                                Name = "TestService",
+                                DisplayName = "New display name",
+                                Status = ServiceStatus.Stopped
+                            }
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto> { new ServiceDto { Name = "TestService" } });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", TestContext.Current.CancellationToken)!;
+                    await task;
+
+                    // Assert
+                    Assert.Equal("New display name", service.DisplayName);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_MetadataDrift_WritesOnlyTheTwoColumnsAndReadsWithoutDecrypting()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the stored description has drifted from the one the SCM reports, which is what the
+                // tick syncs. The DTO also carries the stored ciphertext of two sensitive fields, so a write
+                // back of the whole row would be visible (#7328).
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        Status = ServiceStatus.Stopped,
+                        Pid = null
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services")!;
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo
+                            {
+                                Name = "TestService",
+                                Status = ServiceStatus.Running,
+                                Description = "from the SCM",
+                                StartupType = ServiceStartType.Manual,
+                            }
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                Description = "stale",
+                                StartupType = (int)ServiceStartType.Automatic,
+                                Parameters = "SERVY_ENC:v2:stored-parameters",
+                                EnvironmentVariables = "SERVY_ENC:v2:stored-environment",
+                            }
+                        });
+
+                    // Act
+                    var token = TestContext.Current.CancellationToken;
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", token)!;
+                    await task;
+
+                    // Assert: the tick's token reaches the SCM read, the DB read and the write-back
+                    _serviceManagerMock.Verify(m => m.GetAllServices(token), Times.Once);
+
+                    // the read does not decrypt, the drift is written through the two-column update, and
+                    // the whole-row upsert that re-encrypted and nulled the sensitive columns is never reached
+                    _serviceRepositoryMock.Verify(r => r.GetAllAsync(false, token), Times.Once);
+                    _serviceRepositoryMock.Verify(r => r.GetAllAsync(true, It.IsAny<CancellationToken>()), Times.Never);
+                    _serviceRepositoryMock.Verify(r => r.UpdateDescriptionAndStartupTypeAsync(
+                        "TestService", "from the SCM", (int)ServiceStartType.Manual, token), Times.Once);
+                    _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_StoredDescriptionCarriesDecryptionFailureMarker_WritesNothing()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the stored description is a persisted marker (#5186) in front of the original
+                // description, so both columns drift from what the SCM reports. The marker is read from the
+                // stored text before GetServiceUpdateInfo overwrites it, so the row stays out of the
+                // write-back instead of having its stored description replaced (#7377)
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        Status = ServiceStatus.Stopped,
+                        Pid = null
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services")!;
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo
+                            {
+                                Name = "TestService",
+                                Status = ServiceStatus.Running,
+                                Description = "from the SCM",
+                                StartupType = ServiceStartType.Manual,
+                            }
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                Description = DecryptionFailureMarker.LegacyBlocked
+                                    + DecryptionFailureMarker.OriginalDescriptionSeparator
+                                    + "the original description",
+                                StartupType = (int)ServiceStartType.Automatic,
+                            }
+                        });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", TestContext.Current.CancellationToken)!;
+                    await task;
+
+                    // Assert: nothing is written for the marked row, although the stored description and the
+                    // stored startup type both differ from what the SCM reports
+                    _serviceRepositoryMock.Verify(r => r.UpdateDescriptionAndStartupTypeAsync(
+                        It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
+                    _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_NoMetadataDrift_WritesNothing()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the stored description and startup type already match what the SCM reports
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        Status = ServiceStatus.Stopped,
+                        Pid = null
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services")!;
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo
+                            {
+                                Name = "TestService",
+                                Status = ServiceStatus.Running,
+                                Description = "in sync",
+                                StartupType = ServiceStartType.Manual,
+                            }
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                Description = "in sync",
+                                StartupType = (int)ServiceStartType.Manual,
+                            }
+                        });
+
+                    // Act
+                    var task = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", TestContext.Current.CancellationToken)!;
+                    await task;
+
+                    // Assert
+                    _serviceRepositoryMock.Verify(r => r.UpdateDescriptionAndStartupTypeAsync(
+                        It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
+                }
+            }, createApp: true);
+        }
+
+        [Theory]
+        [InlineData("B", "B")]
+        [InlineData(null, "")]
+        public async Task RefreshAllServicesAsync_NotInstalledRowWithNewerStoredDescription_KeepsTheStoredDescription(string? storedDescription, string expectedRowDescription)
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the row was loaded with "A"; the database now holds a different value (a null one included); the SCM does not know the service (#8042)
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        Description = "A"
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>());
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                Description = storedDescription,
+                            }
+                        });
+
+                    // Act
+                    var task = TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None) as Task;
+                    Assert.NotNull(task);
+                    await task;
+
+                    // Assert: the stored description is not overwritten, and the row follows it (a null one shows as empty)
+                    _serviceRepositoryMock.Verify(r => r.UpdateDescriptionAndStartupTypeAsync(
+                        It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
+                    Assert.Equal(expectedRowDescription, service.Description);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_NotInstalledRowWithNewerStoredDisplayName_ShowsTheStoredDisplayName()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the row was loaded with "Old Name"; the database now holds "New Name"; the SCM does not know the service (#8046)
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        DisplayName = "Old Name"
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>());
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                DisplayName = "New Name",
+                            }
+                        });
+
+                    // Act
+                    var task = TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None) as Task;
+                    Assert.NotNull(task);
+                    await task;
+
+                    // Assert: the row follows the stored display name
+                    Assert.Equal("New Name", service.DisplayName);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_NotInstalledRowWithNewerStoredUserAccount_ShowsTheStoredLogOnAs()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the row was loaded as LocalSystem; the database now holds a custom account; the SCM does not know the service (#8046)
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        LogOnAs = "OldUser"
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>());
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                RunAsLocalSystem = false,
+                                UserAccount = "NewUser",
+                            }
+                        });
+
+                    // Act
+                    var task = TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None) as Task;
+                    Assert.NotNull(task);
+                    await task;
+
+                    // Assert: the row shows the stored account the way the load maps it
+                    Assert.Equal("NewUser", service.LogOnAs);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_ScmDetailsUnavailable_ShowsThePlaceholderAndStoresNothing()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the SCM lists the service, but its native details could not be read (#8044)
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        Description = "Real description"
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo
+                            {
+                                Name = "TestService",
+                                Status = ServiceStatus.Running,
+                                StartupType = ServiceStartType.Automatic,
+                                Description = Servy.Core.Resources.Strings.Msg_DetailsUnavailableTimedOut,
+                                DetailsUnavailable = true,
+                            }
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                Description = "Real description",
+                                StartupType = (int)ServiceStartType.AutomaticDelayedStart,
+                            }
+                        });
+
+                    // Act
+                    var task = TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None) as Task;
+                    Assert.NotNull(task);
+                    await task;
+
+                    // Assert: the row shows the placeholder, and neither it nor the unrefined start type is stored
+                    _serviceRepositoryMock.Verify(r => r.UpdateDescriptionAndStartupTypeAsync(
+                        It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
+                    Assert.Equal(Servy.Core.Resources.Strings.Msg_DetailsUnavailableTimedOut, service.Description);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_ScmDetailsUnavailableAndAccountUnread_KeepsTheRowLogOnAs()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the row was loaded with a custom account; the SCM lists the service but returned no account (#8051)
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        LogOnAs = @".\svc-account"
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo
+                            {
+                                Name = "TestService",
+                                Status = ServiceStatus.Running,
+                                StartupType = ServiceStartType.Automatic,
+                                Description = Servy.Core.Resources.Strings.Msg_DetailsUnavailableTimedOut,
+                                DetailsUnavailable = true,
+                            }
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                RunAsLocalSystem = false,
+                                UserAccount = @".\svc-account",
+                            }
+                        });
+
+                    // Act
+                    var task = TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None) as Task;
+                    Assert.NotNull(task);
+                    await task;
+
+                    // Assert: an unread account is not shown as Local System; the row keeps the account it had
+                    Assert.Equal(@".\svc-account", service.LogOnAs);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_ScmDetailsUnavailableButAccountRead_ShowsTheReadAccount()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange: the SCM read the account, then a later detail query failed (#8051)
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        LogOnAs = "OldUser"
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                    collection.Add(new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo
+                            {
+                                Name = "TestService",
+                                Status = ServiceStatus.Running,
+                                StartupType = ServiceStartType.Automatic,
+                                LogOnAs = @".\svc-account",
+                                Description = Servy.Core.Resources.Strings.Msg_DetailsUnavailableTimedOut,
+                                DetailsUnavailable = true,
+                            }
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto
+                            {
+                                Name = "TestService",
+                                RunAsLocalSystem = false,
+                                UserAccount = "OldUser",
+                            }
+                        });
+
+                    // Act
+                    var task = TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", CancellationToken.None) as Task;
+                    Assert.NotNull(task);
+                    await task;
+
+                    // Assert: the account the SCM did return is shown
+                    Assert.Equal(@".\svc-account", service.LogOnAs);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RefreshAllServicesAsync_BlankAndDuplicateNamedOsServices_SkipsThemAndKeepsFirstOccurrence()
+        {
+            // Arrange, Act & Assert
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                using (new AmbientAppServicesScope(sc => sc.AddSingleton(_processKillerMock.Object)))
+                using (var vm = CreateViewModel())
+                {
+                    var service = new Service
+                    {
+                        Name = "TestService",
+                        Status = ServiceStatus.Stopped,
+                        Pid = null
+                    };
+
+                    var rowVm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object)
+                    {
+                        IsChecked = true
+                    };
+
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services")!;
+                    collection.Add(rowVm);
+
+                    // The OS enumeration carries a null name and a blank name, which must be skipped,
+                    // then the tracked service followed by a case-insensitive duplicate of it that
+                    // must be ignored rather than overwrite the first occurrence.
+                    _serviceManagerMock
+                        .Setup(m => m.GetAllServices(It.IsAny<CancellationToken>()))
+                        .Returns(new List<ServiceInfo>
+                        {
+                            new ServiceInfo { Name = null, Status = ServiceStatus.Running },
+                            new ServiceInfo { Name = "   ", Status = ServiceStatus.Running },
+                            new ServiceInfo { Name = "TestService", Status = ServiceStatus.Running },
+                            new ServiceInfo { Name = "TESTSERVICE", Status = ServiceStatus.Stopped },
+                        });
+
+                    _serviceRepositoryMock
+                        .Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                        .ReturnsAsync(new List<ServiceDto>
+                        {
+                            new ServiceDto { Name = "TestService", Pid = 4321 },
+                        });
+
+                    _processHelperMock
+                        .Setup(p => p.GetProcessTreeMetrics(4321))
+                        .Returns(new ProcessMetrics(10.0, 1024));
+
+                    // Act
+                    var log = await LogCapture.RunAsync(async () =>
+                    {
+                        var task = (Task)TestReflection.InvokeNonPublic(vm, "RefreshAllServicesAsync", TestContext.Current.CancellationToken)!;
+                        await task;
+                    });
+
+                    // Assert: the blank name and the case-insensitive duplicate are each logged
+                    Assert.Contains("Service with no name ignored during refresh.", log);
+                    Assert.Contains("Duplicate service name under OrdinalIgnoreCase ignored during refresh: 'TESTSERVICE'.", log);
+
+                    // Assert: the refresh completed - the unnamed entries were skipped instead of
+                    // being used as dictionary keys - and the first "TestService" occurrence won,
+                    // so the later "TESTSERVICE" duplicate did not push the status back to Stopped.
+                    Assert.Equal(ServiceStatus.Running, service.Status);
+                    Assert.Equal(4321, service.Pid);
                 }
             }, createApp: true);
         }
@@ -659,7 +1539,8 @@ namespace Servy.Manager.UnitTests.ViewModels
                     _processHelperMock.Setup(p => p.GetProcessTreeMetrics(1234)).Throws(new Exception("Process performance counter corrupt"));
 
                     // Act
-                    var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, serviceDto, CancellationToken.None);
+                    var (result, log) = LogCapture.Run(() =>
+                        TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, serviceDto, TestContext.Current.CancellationToken));
 
                     // Assert
                     Assert.NotNull(result);
@@ -670,6 +1551,38 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                     Assert.Null(updateInfo);
                     Assert.Null(updatedDto);
+
+                    // The swallowed failure is logged with its cause
+                    Assert.Contains("Failed to prepare refresh for CrashService.", log);
+                    Assert.Contains("Process performance counter corrupt", log);
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public void GetServiceUpdateInfo_TokenAlreadyCancelled_RethrowsInsteadOfReturningNulls()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                using (new AmbientAppServicesScope(services => services.AddSingleton(_processKillerMock.Object)))
+                {
+                    // Arrange
+                    var vm = CreateViewModel();
+                    var service = new Service { Name = "CancelledService", Pid = 1234, Status = ServiceStatus.Running };
+                    var allServices = new Dictionary<string, ServiceInfo>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        { "CancelledService", new ServiceInfo { Name = "CancelledService", Status = ServiceStatus.Running } }
+                    };
+                    var serviceDto = new ServiceDto { Name = "CancelledService", Pid = 1234 };
+                    var cancelled = new CancellationToken(canceled: true);
+
+                    // Act & Assert
+                    Assert.Throws<OperationCanceledException>(() =>
+                        TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, serviceDto, cancelled));
+
+                    // Assert - the method stopped at the entry check, before any metric collection
+                    _processHelperMock.Verify(p => p.MaintainCache(), Times.Never);
+                    _processHelperMock.Verify(p => p.GetProcessTreeMetrics(It.IsAny<int>()), Times.Never);
                 }
             }, createApp: true);
         }
@@ -740,6 +1653,60 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task BulkOperations_MixedRows_StartsOnlyCheckedAndInstalledServices()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                _messageBoxServiceMock.Setup(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
+
+                // Act - the helper adds S1 and S2 (installed and checked); two more rows each fail one term of the filter
+                var exception = await SetupAndRunBulkOperation(vm =>
+                {
+                    var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                    collection.Add(new ServiceRowViewModel(new Service { Name = "Unchecked", IsInstalled = true }, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+                    collection.Add(new ServiceRowViewModel(new Service { Name = "NotInstalled", IsInstalled = false }, _serviceCommandsMock.Object, _cursorServiceMock.Object) { IsChecked = true });
+
+                    _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+                    _serviceCommandsMock.Setup(c => c.StartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                }, async vm => await vm.StartSelectedCommand.ExecuteAsync(null));
+
+                // Assert - only the two checked and installed rows were started
+                Assert.Null(exception);
+                _serviceCommandsMock.Verify(c => c.StartServiceAsync(It.Is<Service>(s => s.Name == "S1"), false, It.IsAny<CancellationToken>()), Times.Once);
+                _serviceCommandsMock.Verify(c => c.StartServiceAsync(It.Is<Service>(s => s.Name == "S2"), false, It.IsAny<CancellationToken>()), Times.Once);
+                _serviceCommandsMock.Verify(c => c.StartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>()), Times.Exactly(2));
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task BulkOperations_RowsPresentButNoneEligible_ShowsInfoMessageAndAsksNothing()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange - one installed row that is not checked, one checked row that is not installed
+                var currentDispatcher = Dispatcher.CurrentDispatcher;
+                var vm = CreateViewModel(currentDispatcher);
+                var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                collection.Add(new ServiceRowViewModel(new Service { Name = "Unchecked", IsInstalled = true }, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+                collection.Add(new ServiceRowViewModel(new Service { Name = "NotInstalled", IsInstalled = false }, _serviceCommandsMock.Object, _cursorServiceMock.Object) { IsChecked = true });
+
+                _messageBoxServiceMock.Setup(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
+
+                // Act
+                RunOnPump(currentDispatcher, async () =>
+                {
+                    await vm.StopSelectedCommand.ExecuteAsync(null);
+                });
+
+                // Assert
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(Strings.Msg_NoServicesSelected, It.IsAny<string>()), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+                _serviceCommandsMock.Verify(c => c.StopServiceAsync(It.IsAny<Service>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            }, createApp: true);
+        }
+
+        [Fact]
         public async Task BulkOperations_NullMessageBoxService_ExitsEarly()
         {
             await Helper.RunOnSTA(async () =>
@@ -782,14 +1749,57 @@ namespace Servy.Manager.UnitTests.ViewModels
                 _messageBoxServiceMock.Setup(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
 
                 // Act
-                await SetupAndRunBulkOperation(vm =>
+                var exception = await SetupAndRunBulkOperation(vm =>
                 {
                     _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
                     _serviceCommandsMock.Setup(c => c.StartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>())).ReturnsAsync(true);
                 }, async vm => await vm.StartSelectedCommand.ExecuteAsync(null));
 
                 // Assert
+                Assert.Null(exception);
                 _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(Strings.Msg_OperationCompletedSuccessfully, It.IsAny<string>()), Times.Once);
+
+                // The Start command asks the Start question, not the Stop or Restart one
+                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(Strings.Confirm_StartSelectedServices, UiAppConfig.Caption), Times.Once);
+            }, createApp: true);
+        }
+
+        [Theory]
+        [InlineData("Start")]
+        [InlineData("Stop")]
+        [InlineData("Restart")]
+        public async Task BulkOperations_EachVerb_HandsTheSessionTokenToTheServiceCommand(string verb)
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                _messageBoxServiceMock.Setup(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
+                CancellationToken sessionToken = default;
+
+                // Act
+                var exception = await SetupAndRunBulkOperation(vm =>
+                {
+                    sessionToken = TestReflection.GetField<CancellationTokenSource>(vm, "_cts").Token;
+                    _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+                    _serviceCommandsMock.Setup(c => c.StartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                    _serviceCommandsMock.Setup(c => c.StopServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                    _serviceCommandsMock.Setup(c => c.RestartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                }, async vm =>
+                {
+                    if (verb == "Start") await vm.StartSelectedCommand.ExecuteAsync(null);
+                    else if (verb == "Stop") await vm.StopSelectedCommand.ExecuteAsync(null);
+                    else await vm.RestartSelectedCommand.ExecuteAsync(null);
+                });
+
+                // Assert - the live session token, not CancellationToken.None, reaches every row's command
+                Assert.Null(exception);
+                Assert.True(sessionToken.CanBeCanceled);
+                if (verb == "Start")
+                    _serviceCommandsMock.Verify(c => c.StartServiceAsync(It.IsAny<Service>(), false, sessionToken), Times.Exactly(2));
+                else if (verb == "Stop")
+                    _serviceCommandsMock.Verify(c => c.StopServiceAsync(It.IsAny<Service>(), false, sessionToken), Times.Exactly(2));
+                else
+                    _serviceCommandsMock.Verify(c => c.RestartServiceAsync(It.IsAny<Service>(), false, sessionToken), Times.Exactly(2));
             }, createApp: true);
         }
 
@@ -802,7 +1812,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 _messageBoxServiceMock.Setup(m => m.ShowWarningAsync(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
 
                 // Act
-                await SetupAndRunBulkOperation(vm =>
+                var exception = await SetupAndRunBulkOperation(vm =>
                 {
                     _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
 
@@ -811,7 +1821,11 @@ namespace Servy.Manager.UnitTests.ViewModels
                 }, async vm => await vm.StopSelectedCommand.ExecuteAsync(null));
 
                 // Assert
+                Assert.Null(exception);
                 _messageBoxServiceMock.Verify(m => m.ShowWarningAsync(It.Is<string>(msg => msg.Contains("S2")), It.IsAny<string>()), Times.Once);
+
+                // The Stop command asks the Stop question, not the Start or Restart one
+                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(Strings.Confirm_StopSelectedServices, UiAppConfig.Caption), Times.Once);
             }, createApp: true);
         }
 
@@ -824,14 +1838,76 @@ namespace Servy.Manager.UnitTests.ViewModels
                 _messageBoxServiceMock.Setup(m => m.ShowWarningAsync(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
 
                 // Act
-                await SetupAndRunBulkOperation(vm =>
+                var exception = await SetupAndRunBulkOperation(vm =>
                 {
                     _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
                     _serviceCommandsMock.Setup(c => c.RestartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>())).ReturnsAsync(false);
                 }, async vm => await vm.RestartSelectedCommand.ExecuteAsync(null));
 
                 // Assert
+                Assert.Null(exception);
                 _messageBoxServiceMock.Verify(m => m.ShowWarningAsync(Strings.Msg_AllOperationsFailed, It.IsAny<string>()), Times.Once);
+
+                // The Restart command asks the Restart question, not the Start or Stop one
+                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(Strings.Confirm_RestartSelectedServices, UiAppConfig.Caption), Times.Once);
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task BulkOperations_RestartSelected_RestartsEachSelectedServiceAndReportsSuccess()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                _messageBoxServiceMock.Setup(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
+
+                // Act
+                var exception = await SetupAndRunBulkOperation(vm =>
+                {
+                    _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+                    _serviceCommandsMock.Setup(c => c.RestartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                }, async vm => await vm.RestartSelectedCommand.ExecuteAsync(null));
+
+                // Assert - success is only reachable through RestartServiceAsync: Start and Stop are not set up and answer false
+                Assert.Null(exception);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(Strings.Msg_OperationCompletedSuccessfully, It.IsAny<string>()), Times.Once);
+                _serviceCommandsMock.Verify(c => c.RestartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>()), Times.Exactly(2));
+                _serviceCommandsMock.Verify(c => c.StartServiceAsync(It.IsAny<Service>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+                _serviceCommandsMock.Verify(c => c.StopServiceAsync(It.IsAny<Service>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            }, createApp: true);
+        }
+
+        [Theory]
+        [InlineData(false, "Failed to stop selected services.")]
+        [InlineData(true, "Failed to restart selected services.")]
+        public async Task BulkOperations_StopOrRestartThrows_LogsItsOwnOperationName(bool restart, string expectedLogLine)
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                Exception? exception = null;
+
+                // Act
+                var log = await LogCapture.RunAsync(async () =>
+                {
+                    exception = await SetupAndRunBulkOperation(vm =>
+                    {
+                        _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+                        _serviceCommandsMock.Setup(c => c.StopServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>()))
+                                            .ThrowsAsync(new InvalidOperationException("stop blew up"));
+                        _serviceCommandsMock.Setup(c => c.RestartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>()))
+                                            .ThrowsAsync(new InvalidOperationException("restart blew up"));
+                    }, async vm =>
+                    {
+                        if (restart) await vm.RestartSelectedCommand.ExecuteAsync(null);
+                        else await vm.StopSelectedCommand.ExecuteAsync(null);
+                    });
+                });
+
+                // Assert
+                Assert.Null(exception);
+                Assert.Contains(expectedLogLine, log);
+                Assert.DoesNotContain("Failed to start selected services", log);
             }, createApp: true);
         }
 
@@ -842,26 +1918,73 @@ namespace Servy.Manager.UnitTests.ViewModels
             {
                 // Arrange
                 var vmRef = (MainViewModel)null!;
+                Exception? exception = null;
 
                 // Act
-                await SetupAndRunBulkOperation(vm =>
+                var log = await LogCapture.RunAsync(async () =>
                 {
-                    vmRef = vm;
+                    exception = await SetupAndRunBulkOperation(vm =>
+                    {
+                        vmRef = vm;
 
-                    _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>()))
-                                          .ReturnsAsync(true);
+                        _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>()))
+                                              .ReturnsAsync(true);
 
-                    _messageBoxServiceMock.Setup(m => m.ShowWarningAsync(It.IsAny<string>(), It.IsAny<string>()))
-                                          .Returns(Task.CompletedTask);
-
-                    _serviceCommandsMock.Setup(c => c.StartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>()))
-                                          .ThrowsAsync(new InvalidOperationException("Fatal Access Violation"));
-                }, async vm =>
-                {
-                    await vm.StartSelectedCommand.ExecuteAsync(null);
+                        _serviceCommandsMock.Setup(c => c.StartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>()))
+                                              .ThrowsAsync(new InvalidOperationException("Fatal Access Violation"));
+                    }, async vm =>
+                    {
+                        await vm.StartSelectedCommand.ExecuteAsync(null);
+                    });
                 });
 
-                // Assert
+                // Assert - the "Handled" half: the catch swallowed it, so nothing escaped the command.
+                // Without this the IsBusy and ResetCursor assertions are satisfied by the finally block
+                // alone, and deleting ExecuteBulkOperationAsync's catch keeps the test green.
+                Assert.Null(exception);
+                Assert.False(vmRef.IsBusy);
+                _cursorServiceMock.Verify(c => c.ResetCursor(), Times.AtLeastOnce);
+
+                // Assert - the failure is attributed in the log, with the cause. Also the positive control
+                // for the cancellation test: the same capture does see the line.
+                Assert.Contains("Failed to start selected services.", log);
+                Assert.Contains("Fatal Access Violation", log);
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task BulkOperations_OperationCanceled_IsSwallowedWithoutErrorLog()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var vmRef = (MainViewModel)null!;
+                Exception? exception = null;
+
+                // Act
+                var log = await LogCapture.RunAsync(async () =>
+                {
+                    exception = await SetupAndRunBulkOperation(vm =>
+                    {
+                        vmRef = vm;
+
+                        _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>()))
+                                              .ReturnsAsync(true);
+
+                        _serviceCommandsMock.Setup(c => c.StartServiceAsync(It.IsAny<Service>(), false, It.IsAny<CancellationToken>()))
+                                              .ThrowsAsync(new OperationCanceledException());
+                    }, async vm =>
+                    {
+                        await vm.StartSelectedCommand.ExecuteAsync(null);
+                    });
+                });
+
+                // Assert - cancellation is the expected shutdown path: nothing escapes, nothing is logged as a
+                // failure, no result dialog is shown, and the busy state is released.
+                Assert.Null(exception);
+                Assert.DoesNotContain("Failed to start selected services", log);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+                _messageBoxServiceMock.Verify(m => m.ShowWarningAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
                 Assert.False(vmRef.IsBusy);
                 _cursorServiceMock.Verify(c => c.ResetCursor(), Times.AtLeastOnce);
             }, createApp: true);
@@ -924,8 +2047,8 @@ namespace Servy.Manager.UnitTests.ViewModels
                 try
                 {
                     // Assert: Prove exactly 2 worker slots fill concurrently, while the 3rd slot is held back by the cap
-                    Assert.True(await arrived.WaitAsync(TimeSpan.FromSeconds(5)), "First task failed to reach execution gate.");
-                    Assert.True(await arrived.WaitAsync(TimeSpan.FromSeconds(5)), "Second task failed to reach execution gate.");
+                    Assert.True(await arrived.WaitAsync(TestTimeouts.CiGenerous), "First task failed to reach execution gate.");
+                    Assert.True(await arrived.WaitAsync(TestTimeouts.CiGenerous), "Second task failed to reach execution gate.");
                     Assert.False(await arrived.WaitAsync(TimeSpan.FromMilliseconds(200)), "Throttling cap violated! Third task entered execution gate concurrently.");
                 }
                 finally
@@ -979,6 +2102,58 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                 // Assert
                 Assert.Empty(collection);
+
+                await Task.CompletedTask;
+
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RemoveService_LastCheckedRowRemoved_RaisesHasSelectedServices()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var vm = CreateViewModel(Dispatcher.CurrentDispatcher);
+                var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+                collection.Add(new ServiceRowViewModel(new Service { Name = "Checked" }, _serviceCommandsMock.Object, _cursorServiceMock.Object) { IsChecked = true });
+                collection.Add(new ServiceRowViewModel(new Service { Name = "Unchecked" }, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+                Assert.True(vm.HasSelectedServices);
+
+                var raised = false;
+                vm.PropertyChanged += (s, e) => { if (e.PropertyName == nameof(vm.HasSelectedServices)) raised = true; };
+
+                // Act
+                vm.RemoveService("Checked");
+
+                // Assert
+                Assert.False(vm.HasSelectedServices);
+                Assert.True(raised, "HasSelectedServices was not raised after the last checked row was removed.");
+
+                await Task.CompletedTask;
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task RemoveService_NameNotFound_LeavesCollectionUnchanged()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var currentDispatcher = Dispatcher.CurrentDispatcher;
+                var vm = CreateViewModel(currentDispatcher);
+                var collection = TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services");
+
+                collection.Add(new ServiceRowViewModel(new Service { Name = "Present" }, _serviceCommandsMock.Object, _cursorServiceMock.Object));
+
+                // Act - the locked lookup matches nothing, so the method logs a warning and returns
+                // without unsubscribing, removing or disposing anything.
+                var log = LogCapture.Run(() => vm.RemoveService("DoesNotExist"));
+
+                // Assert - the collection still holds the one unrelated row, untouched
+                Assert.Single(collection);
+                Assert.Equal("Present", collection[0].Service?.Name);
+                Assert.Contains("RemoveService(DoesNotExist) called, but no matching service found in the collection.", log);
 
                 await Task.CompletedTask;
 
@@ -1066,7 +2241,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 });
 
                 // Assert
-                _helpServiceMock.Verify(h => h.OpenDocumentationAsync(It.IsAny<string>()), Times.Once);
+                _helpServiceMock.Verify(h => h.OpenDocumentationAsync(UiAppConfig.Caption), Times.Once);
                 await Task.CompletedTask;
             }, createApp: true);
         }
@@ -1088,7 +2263,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 });
 
                 // Assert
-                _helpServiceMock.Verify(h => h.CheckUpdatesAsync(It.IsAny<string>()), Times.Once);
+                _helpServiceMock.Verify(h => h.CheckUpdatesAsync(UiAppConfig.Caption), Times.Once);
                 await Task.CompletedTask;
             }, createApp: true);
         }
@@ -1110,7 +2285,11 @@ namespace Servy.Manager.UnitTests.ViewModels
                 });
 
                 // Assert
-                _helpServiceMock.Verify(h => h.OpenAboutDialogAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Once);
+                _helpServiceMock.Verify(h => h.OpenAboutDialogAsync(
+                    It.Is<string>(text =>
+                        text.Contains("Servy Manager " + Core.Config.AppConfig.Version) &&
+                        text.Contains("Built with " + Core.Helpers.Helper.GetBuiltWithFramework())),
+                    UiAppConfig.Caption), Times.Once);
                 await Task.CompletedTask;
             }, createApp: true);
         }
@@ -1390,7 +2569,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                     _processHelperMock.Setup(p => p.GetProcessTreeMetrics(4321)).Returns(new ProcessMetrics(12.5, 2048576));
 
                     // Act
-                    var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, serviceDto, CancellationToken.None);
+                    var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, serviceDto, TestContext.Current.CancellationToken);
 
                     // Assert
                     Assert.NotNull(result);
@@ -1405,8 +2584,11 @@ namespace Servy.Manager.UnitTests.ViewModels
             }, createApp: true);
         }
 
-        [Fact]
-        public void GetServiceUpdateInfo_StartupTypeNullInOsButPresentInDto_FallbackToDtoStartupType()
+        [Theory]
+        [InlineData((int)ServiceStartType.Manual, ServiceStartType.Manual)] // a valid stored value wins over the default
+        [InlineData(99, ServiceStartType.Automatic)] // out of range falls back to AppConfig.DefaultStartupType (#6073)
+        public void GetServiceUpdateInfo_StartupTypeNullInOsButPresentInDto_FallsBackToTheValidatedDtoStartupType(
+            int storedStartupType, ServiceStartType expected)
         {
             // Arrange
             Helper.RunOnSTA(() =>
@@ -1420,19 +2602,18 @@ namespace Servy.Manager.UnitTests.ViewModels
                 // forcing the calculation pipeline to execute its ServiceDto fallback path.
                 var allServices = new Dictionary<string, ServiceInfo>(StringComparer.OrdinalIgnoreCase);
 
-                // Provide a distinct configuration setting type profile in the database DTO layer
-                var serviceDto = new ServiceDto { Name = "FallbackSvc", StartupType = (int)ServiceStartType.Automatic };
+                // Store a non-default member or an out-of-range integer: Automatic is AppConfig.DefaultStartupType,
+                // so it could not tell the stored value from the default.
+                var serviceDto = new ServiceDto { Name = "FallbackSvc", StartupType = storedStartupType };
 
                 // Act
-                var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, serviceDto, CancellationToken.None);
+                var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, serviceDto, TestContext.Current.CancellationToken);
 
                 // Assert
                 Assert.NotNull(result);
                 var updateInfo = (ServiceUpdateInfo)result.GetType().GetField("Item1")!.GetValue(result)!;
 
-                // Asserting Automatic explicitly proves that the data payload bypassed the missing OS lookup frame
-                // and correctly unrolled into the database DTO fallback value layer.
-                Assert.Equal(ServiceStartType.Automatic, updateInfo.StartupType);
+                Assert.Equal(expected, updateInfo.StartupType);
             }, createApp: true);
         }
 
@@ -1448,7 +2629,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 var allServices = new Dictionary<string, ServiceInfo>(StringComparer.OrdinalIgnoreCase);
 
                 // Act
-                var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, null!, CancellationToken.None);
+                var result = TestReflection.InvokeNonPublic(vm, "GetServiceUpdateInfo", service, allServices, null!, TestContext.Current.CancellationToken);
 
                 // Assert
                 Assert.NotNull(result);
@@ -1568,7 +2749,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
-        public void Dispose_PerformanceAndChildViewModels_DisposesAllChildrenWithoutThrowing()
+        public void Dispose_DisposesAllFourChildViewModelsTheRowVmsAndTheCommandEngine()
         {
             // Arrange
             Helper.RunOnSTA(() =>
@@ -1578,8 +2759,12 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                 // Set CallBase = true so Moq executes MonitoringViewModelBase.Dispose() and sets _isDisposed = 1
                 var mockPerformance = new Mock<PerformanceViewModel>(_serviceRepositoryMock.Object, _serviceCommandsMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, _processHelperMock.Object, uiDispatcherMock.Object) { CallBase = true };
-                var mockConsole = new Mock<ConsoleViewModel>(_serviceRepositoryMock.Object, _serviceCommandsMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, uiDispatcherMock.Object) { CallBase = true };
+                var mockConsole = new Mock<ConsoleViewModel>(_serviceRepositoryMock.Object, _serviceCommandsMock.Object, _messageBoxServiceMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, uiDispatcherMock.Object) { CallBase = true };
                 var mockDependencies = new Mock<DependenciesViewModel>(_serviceRepositoryMock.Object, _serviceManagerMock.Object, _serviceCommandsMock.Object, _appConfigMock.Object, _cursorServiceMock.Object, uiDispatcherMock.Object, _messageBoxServiceMock.Object) { CallBase = true };
+
+                // The class-level _logsViewModelMock has no CallBase, so its generated Dispose(bool) does
+                // nothing and _isDisposed stays 0 whatever MainViewModel does. LogsVM needs its own mock.
+                var mockLogs = new Mock<LogsViewModel>(_appConfigMock.Object, _eventLogServiceMock.Object, _cursorServiceMock.Object, _messageBoxServiceMock.Object) { CallBase = true };
 
                 var vm = new MainViewModel(
                     _serviceManagerMock.Object,
@@ -1590,14 +2775,18 @@ namespace Servy.Manager.UnitTests.ViewModels
                     mockPerformance.Object,
                     mockConsole.Object,
                     mockDependencies.Object,
-                    _logsViewModelMock.Object,
+                    mockLogs.Object,
                     _appConfigMock.Object,
                     _cursorServiceMock.Object,
                     _processHelperMock.Object,
                     Dispatcher.CurrentDispatcher
                 );
 
-                _allocatedViewModels.Add(vm);
+                _allocatedViewModels.Track(vm);
+
+                // Seed one row so the drain loop's per-row Dispose is reached
+                var rowVm = new ServiceRowViewModel(new Service(), _serviceCommandsMock.Object, _cursorServiceMock.Object);
+                TestReflection.GetField<BulkObservableCollection<ServiceRowViewModel>>(vm, "_services").Add(rowVm);
 
                 // Act
                 var exception = Record.Exception(() => vm.Dispose());
@@ -1607,6 +2796,13 @@ namespace Servy.Manager.UnitTests.ViewModels
                 Assert.Equal(1, TestReflection.GetField<int>(mockPerformance.Object, "_isDisposed"));
                 Assert.Equal(1, TestReflection.GetField<int>(mockConsole.Object, "_isDisposed"));
                 Assert.Equal(1, TestReflection.GetField<int>(mockDependencies.Object, "_isDisposed"));
+                Assert.Equal(1, TestReflection.GetField<int>(mockLogs.Object, "_isDisposed"));
+
+                // The per-row Dispose is what runs each row's Service.PropertyChanged unsubscription
+                Assert.True(TestReflection.GetField<bool>(rowVm, "_disposed"));
+
+                // The shared command engine is torn down last, after the child VMs stopped referencing it
+                _serviceCommandsMock.Verify(c => c.Dispose(), Times.Once);
             }, createApp: true);
         }
 
@@ -1660,17 +2856,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         /// </summary>
         public void Dispose()
         {
-            foreach (var vm in _allocatedViewModels)
-            {
-                try
-                {
-                    vm.Dispose();
-                }
-                catch
-                {
-                    // Catch-all block to guarantee adjacent cleanup executions complete safely
-                }
-            }
+            _allocatedViewModels.Dispose();
         }
 
         #endregion

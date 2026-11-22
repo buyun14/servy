@@ -1,16 +1,30 @@
+using Microsoft.Win32.SafeHandles;
 using Servy.Core.Resources;
+using Servy.Core.UnitTests.Logging;
 using Servy.Core.Validation;
 using Servy.Testing;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 
 namespace Servy.Core.UnitTests.Validation
 {
+    [Collection(LoggerCollection.Name)] // WarnIfDirectoryAclNotHardened is asserted through the static Logger
     public class PathSecurityGuardTests : TempDirectoryTestBase
     {
         private static class NativeTestMethods
         {
             [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
             public static extern bool DefineDosDevice(uint dwFlags, string lpDeviceName, string? lpTargetPath);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern uint GetShortPathName(string lpszLongPath, System.Text.StringBuilder lpszShortPath, uint cchBuffer);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern SafeFileHandle CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
         }
 
         #region Common Security Rules
@@ -32,6 +46,22 @@ namespace Servy.Core.UnitTests.Validation
             Assert.Null(stream);
         }
 
+        [Fact]
+        public void ValidatePathOnly_InvalidPathChars_ReturnsFail()
+        {
+            // Arrange
+            string invalidPath = new string(Path.GetInvalidPathChars());
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(invalidPath, FileMode.Open);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+            Assert.Contains(Strings.Msg_InvalidPath, result.ErrorMessage);
+        }
+
         [Theory]
         [InlineData(@"\\server\share\config.json", FileMode.Open, FileAccess.Read, FileShare.Read)]
         [InlineData(@"\\127.0.0.1\c$\config.json", FileMode.Open, FileAccess.Read, FileShare.Read)]
@@ -46,6 +76,26 @@ namespace Servy.Core.UnitTests.Validation
             Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
             Assert.NotNull(result.ErrorMessage);
             Assert.Null(stream);
+            var expected = mode == FileMode.Open
+                ? Strings.Msg_SecurityUncPathProhibited
+                : Strings.Msg_SecurityUncPathExportProhibited;
+
+            Assert.Equal(expected, result.ErrorMessage);
+        }
+
+        [Theory]
+        [InlineData(@"\\server\share\config.json", FileMode.Open)]
+        [InlineData(@"\\127.0.0.1\c$\config.json", FileMode.Open)]
+        [InlineData(@"\\server\share\export.json", FileMode.OpenOrCreate)]
+        public void ValidatePathOnly_UncPath_ReturnsFail(string uncPath, FileMode mode)
+        {
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(uncPath, mode);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
             var expected = mode == FileMode.Open
                 ? Strings.Msg_SecurityUncPathProhibited
                 : Strings.Msg_SecurityUncPathExportProhibited;
@@ -77,6 +127,27 @@ namespace Servy.Core.UnitTests.Validation
         }
 
         [Theory]
+        [InlineData("CON.json", FileMode.Open)]
+        [InlineData("PRN.xml", FileMode.OpenOrCreate)]
+        [InlineData("COM1.json", FileMode.Open)]
+        [InlineData("LPT1.xml", FileMode.OpenOrCreate)]
+        public void ValidatePathOnly_ReservedDeviceName_ReturnsFail(string fileName, FileMode mode)
+        {
+            // Arrange & Act
+            var result = PathSecurityGuard.ValidatePathOnly(fileName, mode);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+
+            bool hitDosGuard = result.ErrorMessage.IndexOf(Path.GetFileNameWithoutExtension(fileName), StringComparison.OrdinalIgnoreCase) >= 0;
+
+            Assert.True(hitDosGuard,
+                $"Expected DOS device payload to be intercepted directly by the local reserved device name guard filter. Actual error message: {result.ErrorMessage}");
+        }
+
+        [Theory]
         [InlineData(FileMode.Open, FileAccess.Read, FileShare.Read)]
         [InlineData(FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)]
         public void ValidatePath_ProtectedFolder_ReturnsFail(FileMode mode, FileAccess access, FileShare share)
@@ -97,6 +168,101 @@ namespace Servy.Core.UnitTests.Validation
         }
 
         [Theory]
+        [InlineData(FileMode.Open)]
+        [InlineData(FileMode.OpenOrCreate)]
+        public void ValidatePathOnly_ProtectedFolder_ReturnsFail(FileMode mode)
+        {
+            // Arrange
+            string protectedDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string filePath = Path.Combine(protectedDir, "sys_config.json");
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, mode);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+            Assert.Contains(protectedDir, result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Theory]
+        [InlineData("CON.backup.json", "CON")]   // the first dot ends the segment, not the last
+        [InlineData("NUL.tar.xml", "NUL")]
+        [InlineData("CON .json", "CON")]         // padded segment: blocked, and the message names the bare device
+        public void ValidatePathOnly_ReservedDeviceNameWithExtraSegmentOrPadding_ReturnsFailNamingTheDevice(string fileName, string device)
+        {
+            // Arrange
+            string filePath = Path.Combine(TempDirectory, fileName);
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, FileMode.OpenOrCreate);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
+            Assert.Equal(string.Format(Strings.Msg_SecurityReservedDeviceName, device), result.ErrorMessage);
+        }
+
+        [Theory]
+        [InlineData(FileMode.Open)]
+        [InlineData(FileMode.OpenOrCreate)]
+        public void ValidatePathOnly_FileNameWithoutExtension_ReturnsInvalidFileType(FileMode mode)
+        {
+            // Arrange: an existing file, so the import row cannot be rejected as missing
+            string filePath = Path.Combine(TempDirectory, "export_without_extension");
+            File.WriteAllText(filePath, "{}");
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, mode);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
+            Assert.Equal(string.Format(Strings.Msg_SecurityInvalidFileType, string.Empty), result.ErrorMessage);
+        }
+
+        [Theory]
+        [InlineData(Environment.SpecialFolder.Windows, FileMode.Open)]
+        [InlineData(Environment.SpecialFolder.Windows, FileMode.OpenOrCreate)]
+        [InlineData(Environment.SpecialFolder.ProgramFiles, FileMode.Open)]
+        [InlineData(Environment.SpecialFolder.ProgramFiles, FileMode.OpenOrCreate)]
+        [InlineData(Environment.SpecialFolder.ProgramFilesX86, FileMode.Open)]
+        [InlineData(Environment.SpecialFolder.ProgramFilesX86, FileMode.OpenOrCreate)]
+        public void ValidatePathOnly_EachProtectedRoot_ReturnsTheMessageOfItsMode(Environment.SpecialFolder root, FileMode mode)
+        {
+            // Arrange
+            string protectedDir = Environment.GetFolderPath(root);
+            Assert.SkipWhen(string.IsNullOrEmpty(protectedDir), $"{root} is not defined on this host.");
+            string filePath = Path.Combine(protectedDir, "servy_config.json");
+            string expectedFormat = mode == FileMode.Open
+                ? Strings.Msg_SecurityProtectedDirectory
+                : Strings.Msg_SecurityProtectedDirectoryExport;
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, mode);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.Equal(string.Format(expectedFormat, protectedDir), result.ErrorMessage);
+        }
+
+        [Fact]
+        public void ValidatePathOnly_SiblingFolderSharingAProtectedPrefix_IsNotTreatedAsProtected()
+        {
+            // Arrange: "<WINDIR>_backup" starts with the Windows directory's text but is not under it
+            string siblingDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows) + "_backup";
+            string filePath = Path.Combine(siblingDir, "export.json");
+
+            // Act: export mode, so a file that does not exist is not a reason to fail
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, FileMode.OpenOrCreate);
+
+            // Assert
+            Assert.True(result.IsValid, result.ErrorMessage);
+        }
+
+        [Theory]
         [InlineData("config.txt", FileMode.Open, FileAccess.Read, FileShare.Read)]
         [InlineData("export.exe", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)]
         [InlineData("config.yaml", FileMode.Open, FileAccess.Read, FileShare.Read)]
@@ -114,6 +280,25 @@ namespace Servy.Core.UnitTests.Validation
             Assert.NotNull(result.ErrorMessage);
             Assert.Contains(Path.GetExtension(fileName).ToLowerInvariant(), result.ErrorMessage);
             Assert.Null(stream);
+        }
+
+        [Theory]
+        [InlineData("config.txt", FileMode.Open)]
+        [InlineData("export.exe", FileMode.OpenOrCreate)]
+        [InlineData("config.yaml", FileMode.Open)]
+        public void ValidatePathOnly_InvalidExtension_ReturnsFail(string fileName, FileMode mode)
+        {
+            // Arrange
+            string filePath = Path.Combine(TempDirectory, fileName);
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, mode);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+            Assert.Contains(Path.GetExtension(fileName).ToLowerInvariant(), result.ErrorMessage);
         }
 
         [Fact]
@@ -144,6 +329,35 @@ namespace Servy.Core.UnitTests.Validation
             Assert.NotNull(result.ErrorMessage);
             Assert.Equal(Strings.Msg_SecurityFileReparsePointProhibited, result.ErrorMessage);
             Assert.Null(stream);
+        }
+
+        [Fact]
+        public void ValidatePathOnly_Symlink_ReturnsFail()
+        {
+            // Arrange
+            string targetPath = Path.Combine(TempDirectory, "real_target.json");
+            string symlinkPath = Path.Combine(TempDirectory, "symlink_target.json");
+
+            File.WriteAllText(targetPath, "{}");
+
+            try
+            {
+                File.CreateSymbolicLink(symlinkPath, targetPath);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                // Skip test gracefully if the runner platform environment lacks symlink creation tokens
+                Assert.Skip("Symlink creation unavailable on this runner");
+            }
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(symlinkPath, FileMode.Open);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+            Assert.Equal(Strings.Msg_SecurityFileReparsePointProhibited, result.ErrorMessage);
         }
 
         [Fact]
@@ -245,8 +459,176 @@ namespace Servy.Core.UnitTests.Validation
         }
 
         [Fact]
+        public void ValidatePath_ExportMode_PostResolutionRejection_DeletesStubFile()
+        {
+            // Arrange
+            string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string targetDir = Path.Combine(winDir, "System32");
+
+            char driveLetter = GetUnusedDriveLetter();
+            if (driveLetter == '\0')
+            {
+                Assert.Skip("No unused drive letter available for subst mapping.");
+            }
+
+            string drivePath = $"{driveLetter}:";
+            if (!NativeTestMethods.DefineDosDevice(0, drivePath, targetDir))
+            {
+                Assert.Skip($"Failed to define virtual drive {drivePath}. Win32 Error: {Marshal.GetLastWin32Error()}");
+            }
+
+            string stubName = $"servy_stub_{Guid.NewGuid():N}.json";
+            string substFilePath = Path.Combine($"{drivePath}\\", stubName);
+            string realFilePath = Path.Combine(targetDir, stubName);
+
+            try
+            {
+                // Act: Open file with OpenOrCreate mode targeting a non-existent path on a virtual drive that maps to a protected system folder.
+                // Pre-open checks pass (as the virtual drive path hides System32), allowing the stream to be opened/created.
+                // Post-resolution check unrolls the kernel path to System32, failing security validation and triggering the cleanup block.
+                var result = PathSecurityGuard.ValidatePath(
+                    substFilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, out var stream);
+
+                // Assert
+                Assert.False(result.IsValid);
+                Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+                Assert.Null(stream);
+
+                // The stub must actually have been created before the post-resolution check rejected it
+                // (Msg_SecurityProtectedDirectoryExport names the resolved Windows directory). If the runner
+                // cannot create files under System32, the FileStream constructor throws first and the result
+                // carries Msg_SecurityHandleValidationFailed instead: the cleanup branch was never entered,
+                // and File.Exists would be false for a reason this test is not about, so skip rather than pass.
+                string errorMessage = result.ErrorMessage ?? string.Empty;
+                if (errorMessage.IndexOf(winDir, StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    Assert.Skip($"Runner cannot create files under {targetDir}; the stub-cleanup branch is unreachable here. Actual: {errorMessage}");
+                }
+
+                // Verify the stub file created during handle resolution was cleaned up upon validation failure.
+                Assert.False(File.Exists(realFilePath), "Rejected export left a stub file behind in the target directory.");
+            }
+            finally
+            {
+                try { File.Delete(realFilePath); } catch { }
+                NativeTestMethods.DefineDosDevice(2, drivePath, null);
+            }
+        }
+
+        [Fact]
+        public void ValidatePath_OpenFailsOnAPreExistingFile_KeepsTheFile()
+        {
+            // Arrange: a file that already exists at the target path, so createdByUs is false. A second
+            // handle holds it with a sharing mode that allows Delete, which is what makes an unguarded
+            // File.Delete in the finally really remove the caller's file rather than fail silently.
+            const string originalContents = "original contents";
+            string filePath = Path.Combine(TempDirectory, "existing_export.json");
+            File.WriteAllText(filePath, originalContents);
+            string validationFailureFormat = Strings.Msg_SecurityHandleValidationFailed;
+            string validationFailurePrefix = validationFailureFormat.Substring(
+                0, validationFailureFormat.IndexOf("{0}", StringComparison.Ordinal));
+            PathSecurityResult result;
+            FileStream? stream;
+
+            // Act: the FileShare.None request cannot be granted while the handle below is open, so the
+            // FileStream constructor throws a sharing violation and the catch runs. That is the only way to
+            // reach the finally's cleanup branch on a path that existed before the call.
+            using (new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                result = PathSecurityGuard.ValidatePath(
+                    filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, out stream);
+            }
+
+            // Assert
+            // The premise is the sharing violation. If this runner let the open through, the cleanup branch
+            // was never entered and the File.Exists assert below would pass for a reason this test is not
+            // about, so skip rather than pass.
+            string errorMessage = result.ErrorMessage ?? string.Empty;
+            if (stream != null || !errorMessage.StartsWith(validationFailurePrefix, StringComparison.Ordinal))
+            {
+                stream?.Dispose();
+                Assert.Skip($"The FileShare.None open over a held file did not fail on this runner. Actual: {errorMessage}");
+            }
+
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.Null(stream);
+            Assert.True(File.Exists(filePath), "A rejected open must not delete a file that existed before the call.");
+            Assert.Equal(originalContents, File.ReadAllText(filePath));
+        }
+
+        [Fact]
+        public void ValidatePath_HandleResolvesToAnotherPath_ReturnsFail()
+        {
+            // Arrange: an existing file in an unprotected folder, reached through a virtual drive. Every pre-handle
+            // check passes on "<X>:\<file>.json" and the protected-folder re-check passes on the resolved path, so
+            // only the final-path equality check refuses a handle that resolves to a path the caller did not name.
+            string fileName = "redirected_target.json";
+            File.WriteAllText(Path.Combine(TempDirectory, fileName), "{}");
+
+            char driveLetter = GetUnusedDriveLetter();
+            if (driveLetter == '\0')
+            {
+                Assert.Skip("No unused drive letter available for subst mapping.");
+            }
+
+            string drivePath = $"{driveLetter}:";
+            if (!NativeTestMethods.DefineDosDevice(0, drivePath, TempDirectory))
+            {
+                Assert.Skip($"Failed to define virtual drive {drivePath}. Win32 Error: {Marshal.GetLastWin32Error()}");
+            }
+
+            try
+            {
+                string substFilePath = Path.Combine($"{drivePath}\\", fileName);
+
+                // Act
+                var result = PathSecurityGuard.ValidatePath(substFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, out var stream);
+
+                // Assert
+                stream?.Dispose();
+                Assert.False(result.IsValid);
+                Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+                Assert.Equal(Strings.Msg_SecurityDirReparsePointProhibited, result.ErrorMessage);
+                Assert.Null(stream);
+            }
+            finally
+            {
+                // Clean up virtual DOS drive mapping (DDD_REMOVE_DEFINITION = 0x2)
+                NativeTestMethods.DefineDosDevice(2, drivePath, null);
+            }
+        }
+
+        [Fact]
+        public void ValidatePath_TargetHasASecondHardLink_ReturnsFailAndKeepsTheFile()
+        {
+            // Arrange: a hard link names the same file under a second path, which the final path does not reveal.
+            const string originalContents = "{\"original\":true}";
+            string filePath = Path.Combine(TempDirectory, "linked_export.json");
+            string linkPath = Path.Combine(TempDirectory, "second_name.json");
+            File.WriteAllText(filePath, originalContents);
+
+            if (!NativeTestMethods.CreateHardLink(linkPath, filePath, IntPtr.Zero))
+            {
+                Assert.Skip($"Failed to create a hard link. Win32 Error: {Marshal.GetLastWin32Error()}");
+            }
+
+            // Act
+            var result = PathSecurityGuard.ValidatePath(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, out var stream);
+
+            // Assert
+            stream?.Dispose();
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.Contains("hard link", result.ErrorMessage);
+            Assert.Null(stream);
+            Assert.Equal(originalContents, File.ReadAllText(filePath));
+        }
+
+        [Fact]
         public void ValidatePath_AncestorDirectorySymlink_ReturnsFail()
         {
+            // Arrange
             string realDir = Path.Combine(TempDirectory, "real_dir");
             string linkDir = Path.Combine(TempDirectory, "link_dir");
             Directory.CreateDirectory(realDir);
@@ -261,13 +643,76 @@ namespace Servy.Core.UnitTests.Validation
                 Assert.Skip("Symlink creation unavailable on this runner");
             }
 
+            // Act
             var result = PathSecurityGuard.ValidatePath(
                 Path.Combine(linkDir, "config.json"), FileMode.Open, FileAccess.Read, FileShare.Read, out var stream);
 
+            // Assert
             Assert.False(result.IsValid);
             Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
             Assert.Equal(Strings.Msg_SecurityDirReparsePointProhibited, result.ErrorMessage);
             Assert.Null(stream);
+        }
+
+        [Fact]
+        public void ValidatePathOnly_AncestorDirectorySymlink_ReturnsFail()
+        {
+            // Arrange
+            string realDir = Path.Combine(TempDirectory, "real_dir");
+            string linkDir = Path.Combine(TempDirectory, "link_dir");
+            Directory.CreateDirectory(realDir);
+            File.WriteAllText(Path.Combine(realDir, "config.json"), "{}");
+
+            try
+            {
+                Directory.CreateSymbolicLink(linkDir, realDir);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                Assert.Skip("Symlink creation unavailable on this runner");
+            }
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(
+                Path.Combine(linkDir, "config.json"), FileMode.Open);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.Equal(Strings.Msg_SecurityDirReparsePointProhibited, result.ErrorMessage);
+        }
+
+        [Fact(Skip = "Requires a physical or virtual mapped network drive (DriveType.Network) mounted in the test runner environment.")]
+        public void ValidatePath_MappedNetworkDrive_ReturnsFail()
+        {
+            // Arrange: Path on a mapped network drive (e.g. M:\config.json where M: is DriveType.Network)
+            string networkDrivePath = @"M:\config.json";
+
+            // Act
+            var result = PathSecurityGuard.ValidatePath(networkDrivePath, FileMode.Open, FileAccess.Read, FileShare.Read, out var stream);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+            Assert.Equal(Strings.Msg_SecurityNetworkDriveProhibited, result.ErrorMessage);
+            Assert.Null(stream);
+        }
+
+        [Fact(Skip = "Requires a physical or virtual mapped network drive (DriveType.Network) mounted in the test runner environment.")]
+        public void ValidatePathOnly_MappedNetworkDrive_ReturnsFail()
+        {
+            // Arrange: Path on a mapped network drive (e.g. M:\config.json where M: is DriveType.Network)
+            string networkDrivePath = @"M:\config.json";
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(networkDrivePath, FileMode.Open);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.Security, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+            Assert.Equal(Strings.Msg_SecurityNetworkDriveProhibited, result.ErrorMessage);
         }
 
         /// <summary>
@@ -348,6 +793,24 @@ namespace Servy.Core.UnitTests.Validation
         }
 
         [Theory]
+        [InlineData("missing_import.json")]
+        [InlineData("missing_import.xml")]
+        public void ValidatePathOnly_ImportMode_FileDoesNotExist_ReturnsFail(string fileName)
+        {
+            // Arrange
+            string filePath = Path.Combine(TempDirectory, fileName);
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, FileMode.Open);
+
+            // Assert
+            Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
+            Assert.NotNull(result.ErrorMessage);
+            Assert.Contains(filePath, result.ErrorMessage);
+        }
+
+        [Theory]
         [InlineData("new_export.json")]
         [InlineData("new_export.xml")]
         public void ValidatePath_ExportMode_FileDoesNotExist_CreatesHandleAndSucceeds(string fileName)
@@ -371,6 +834,86 @@ namespace Servy.Core.UnitTests.Validation
             }
         }
 
+        [Fact]
+        public void TryGetFinalPathByHandle_OpenLocalFile_ReturnsNormalizedPath()
+        {
+            // Arrange
+            string filePath = Path.Combine(TempDirectory, "resolved_path.json");
+            File.WriteAllText(filePath, "{}");
+
+            using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                // Act
+                bool resolved = PathSecurityGuard.TryGetFinalPathByHandle(stream.SafeFileHandle, out string finalPath);
+
+                // Assert
+                Assert.True(resolved);
+                Assert.Equal(Path.GetFullPath(filePath), Path.GetFullPath(finalPath), ignoreCase: true);
+            }
+        }
+
+        [Fact]
+        public void TryGetFinalPathByHandle_NullHandle_ReturnsFalse()
+        {
+            // Act
+            bool resolved = PathSecurityGuard.TryGetFinalPathByHandle(null!, out string finalPath);
+
+            // Assert
+            Assert.False(resolved);
+            Assert.Equal(string.Empty, finalPath);
+        }
+
+        [Fact]
+        public void TryGetFinalPathByHandle_InvalidHandle_ReturnsFalse()
+        {
+            // Arrange: a zero handle is IsInvalid without ever reaching the native call
+            var handle = new SafeFileHandle(IntPtr.Zero, ownsHandle: false);
+
+            // Act
+            bool resolved = PathSecurityGuard.TryGetFinalPathByHandle(handle, out string finalPath);
+
+            // Assert
+            Assert.False(resolved);
+            Assert.Equal(string.Empty, finalPath);
+        }
+
+        [Fact]
+        public void TryGetFinalPathByHandle_ClosedHandle_ReturnsFalse()
+        {
+            // Arrange
+            string filePath = Path.Combine(TempDirectory, "closed_handle.json");
+            File.WriteAllText(filePath, "{}");
+
+            var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var handle = stream.SafeFileHandle;
+            stream.Dispose();
+
+            // Act
+            bool resolved = PathSecurityGuard.TryGetFinalPathByHandle(handle, out string finalPath);
+
+            // Assert
+            Assert.False(resolved);
+            Assert.Equal(string.Empty, finalPath);
+        }
+
+        [Theory]
+        [InlineData("new_export.json")]
+        [InlineData("new_export.xml")]
+        public void ValidatePathOnly_ExportMode_FileDoesNotExist_SucceedsWithoutCreatingFile(string fileName)
+        {
+            // Arrange
+            string filePath = Path.Combine(TempDirectory, fileName);
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, FileMode.OpenOrCreate);
+
+            // Assert
+            Assert.True(result.IsValid);
+            Assert.NotNull(result.ValidPath);
+            Assert.Equal(filePath, result.ValidPath!.ResolvedPath);
+            Assert.False(File.Exists(filePath), "ValidatePathOnly should audit path metadata without creating stub files.");
+        }
+
         [Theory]
         [InlineData("valid_engine_config.json", "{}")]
         [InlineData("valid_engine_config.xml", "<root/>")]
@@ -388,7 +931,10 @@ namespace Servy.Core.UnitTests.Validation
             {
                 Assert.True(result.IsValid);
                 Assert.NotNull(result.ValidPath);
-                Assert.Equal(filePath, result.ValidPath!.ResolvedPath);
+                // ResolvedPath is the kernel-resolved target (GetFinalPathNameByHandle), not the caller's string:
+                // 8.3 components such as C:\Users\RUNNER~1 are expanded, so assert same file rather than same text.
+                Assert.Equal(Path.GetFileName(filePath), Path.GetFileName(result.ValidPath!.ResolvedPath));
+                Assert.True(File.Exists(result.ValidPath.ResolvedPath));
                 using (var reader = new StreamReader(stream!))
                 {
                     Assert.Equal(fileContent, reader.ReadToEnd());
@@ -398,6 +944,501 @@ namespace Servy.Core.UnitTests.Validation
             {
                 stream?.Dispose();
             }
+        }
+
+        [Fact]
+        public void HandleNamesValidatedPath_HandleOpenedByShortName_AcceptsTheOpenedName()
+        {
+            // Arrange
+            // Path.GetFullPath (and so FileStream and ValidatePath) expands 8.3 components before the guard runs, so the
+            // opened-name fallback is reached only through a handle opened by the raw short name, via CreateFile.
+            string filePath = Path.Combine(TempDirectory, "a_rather_long_export_name.json");
+            File.WriteAllText(filePath, "{}");
+
+            var shortPathBuffer = new System.Text.StringBuilder(260);
+            uint written = NativeTestMethods.GetShortPathName(filePath, shortPathBuffer, (uint)shortPathBuffer.Capacity);
+            string shortPath = shortPathBuffer.ToString();
+            if (written == 0 || written >= shortPathBuffer.Capacity ||
+                string.Equals(shortPath, filePath, StringComparison.OrdinalIgnoreCase))
+            {
+                Assert.Skip("8.3 short names are not available for this volume or path.");
+            }
+
+            const uint GenericRead = 0x80000000;
+            const uint FileShareRead = 0x00000001;
+            const uint OpenExisting = 3;
+            const uint FileAttributeNormal = 0x00000080;
+
+            using (SafeFileHandle handle = NativeTestMethods.CreateFile(shortPath, GenericRead, FileShareRead, IntPtr.Zero, OpenExisting, FileAttributeNormal, IntPtr.Zero))
+            {
+                Assert.False(handle.IsInvalid);
+                Assert.True(PathSecurityGuard.TryGetFinalPathByHandle(handle, out string normalizedPath));
+
+                // The normalized final path expands the short name, so the first comparison cannot match the validated short path.
+                Assert.NotEqual(shortPath, normalizedPath, StringComparer.OrdinalIgnoreCase);
+
+                // Act
+                bool result = PathSecurityGuard.HandleNamesValidatedPath(handle, normalizedPath, shortPath);
+
+                // Assert
+                Assert.True(result);
+            }
+        }
+
+        [Theory]
+        [InlineData("valid_engine_config.json", "{}")]
+        [InlineData("valid_engine_config.xml", "<root/>")]
+        public void ValidatePathOnly_ValidLocalAllowedFile_PassesAllGuards(string fileName, string fileContent)
+        {
+            // Arrange
+            string filePath = Path.Combine(TempDirectory, fileName);
+            File.WriteAllText(filePath, fileContent);
+
+            // Act
+            var result = PathSecurityGuard.ValidatePathOnly(filePath, FileMode.Open);
+
+            // Assert
+            Assert.True(result.IsValid);
+            Assert.NotNull(result.ValidPath);
+            Assert.Equal(filePath, result.ValidPath!.ResolvedPath);
+        }
+
+        #endregion
+
+        #region Application Containment Guards
+
+        [Theory]
+        [InlineData(null, @"C:\Program Files\Servy")]
+        [InlineData("", @"C:\Program Files\Servy")]
+        [InlineData("   ", @"C:\Program Files\Servy")]
+        [InlineData("Servy.Manager.exe", null)]
+        [InlineData("Servy.Manager.exe", "")]
+        [InlineData("Servy.Manager.exe", "   ")]
+        public void IsSafelyContainedWithinAppDirectory_NullOrWhitespace_ReturnsFalse(string? targetPath, string? baseDir)
+        {
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(targetPath!, baseDir!);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Theory]
+        [InlineData(@"\\server\share\payload.exe")]
+        [InlineData(@"//remote/share/payload.exe")]
+        public void IsSafelyContainedWithinAppDirectory_UncPath_ReturnsFalse(string uncPath)
+        {
+            // Arrange
+            string baseDir = TempDirectory;
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(uncPath, baseDir);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Theory]
+        [InlineData(@"\\server\share\payload.exe")]
+        [InlineData(@"//remote/share/payload.exe")]
+        public void IsSafelyContainedWithinAppDirectory_UncPath_IsRefusedByTheUncGuardItself(string uncPath)
+        {
+            // Arrange
+            string baseDir = TempDirectory;
+
+            // Act
+            var (result, log) = LogCapture.Run(() => PathSecurityGuard.IsSafelyContainedWithinAppDirectory(uncPath, baseDir));
+
+            // Assert: refused as a UNC path, not by falling through to the containment check
+            Assert.False(result);
+            Assert.Contains($"Security refusal: Path '{uncPath}' is a UNC path.", log);
+            Assert.DoesNotContain("resolves outside application directory", log);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public void IsSafelyContainedWithinAppDirectory_BlankBaseDirectory_IsRefusedByTheEmptyGuardNotByAnException(string? baseDir)
+        {
+            // Arrange & Act
+            var (result, log) = LogCapture.Run(() => PathSecurityGuard.IsSafelyContainedWithinAppDirectory("Servy.Manager.exe", baseDir!));
+
+            // Assert
+            Assert.False(result);
+            Assert.Contains("Path security validation failed: Target path or base directory is empty.", log);
+            Assert.DoesNotContain("Exception during path containment validation", log);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_RelativeChildPath_ReturnsTrue()
+        {
+            // Arrange
+            string baseDir = TempDirectory;
+            string targetPath = "Servy.Manager.exe";
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(targetPath, baseDir);
+
+            // Assert
+            Assert.True(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_SubdirectoryChildPath_ReturnsTrue()
+        {
+            // Arrange
+            string baseDir = TempDirectory;
+            string subDir = Path.Combine(baseDir, "bin");
+            Directory.CreateDirectory(subDir);
+            string targetPath = Path.Combine("bin", "Servy.Manager.exe");
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(targetPath, baseDir);
+
+            // Assert
+            Assert.True(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_AbsoluteChildPath_ReturnsTrue()
+        {
+            // Arrange
+            string baseDir = Path.Combine(TempDirectory, "App");
+            Directory.CreateDirectory(baseDir);
+            string targetPath = Path.Combine(baseDir, "Servy.Manager.exe");
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(targetPath, baseDir);
+
+            // Assert
+            Assert.True(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_ExternalRootedPath_ReturnsFalse()
+        {
+            // Arrange
+            string baseDir = Path.Combine(TempDirectory, "App");
+            Directory.CreateDirectory(baseDir);
+            string externalPath = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(externalPath, baseDir);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_DirectoryTraversal_ReturnsFalse()
+        {
+            // Arrange
+            string baseDir = Path.Combine(TempDirectory, "App");
+            Directory.CreateDirectory(baseDir);
+            string traversalPath = @"..\..\Windows\System32\cmd.exe";
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(traversalPath, baseDir);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_SiblingDirectoryWithBasePrefix_ReturnsFalse()
+        {
+            // Arrange
+            string baseDir = Path.Combine(TempDirectory, "App");
+            string siblingDir = Path.Combine(TempDirectory, "AppEvil");
+            Directory.CreateDirectory(baseDir);
+            Directory.CreateDirectory(siblingDir);
+            string targetPath = Path.Combine(siblingDir, "payload.exe");
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(targetPath, baseDir);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_InvalidPathChars_ReturnsFalse()
+        {
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory("Servy.Manager\0.exe", TempDirectory);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_ReparsePointInPath_ReturnsFalse()
+        {
+            // Arrange
+            string realDir = Path.Combine(TempDirectory, "real_app_dir");
+            string linkDir = Path.Combine(TempDirectory, "link_app_dir");
+            Directory.CreateDirectory(realDir);
+
+            try
+            {
+                Directory.CreateSymbolicLink(linkDir, realDir);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                Assert.Skip("Symlink creation unavailable on this runner");
+            }
+
+            string targetFile = Path.Combine(linkDir, "Servy.Manager.exe");
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(targetFile, linkDir);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Fact]
+        public void IsSafelyContainedWithinAppDirectory_FileSymlink_ReturnsFalse()
+        {
+            // Arrange
+            string targetFile = Path.Combine(TempDirectory, "target.exe");
+            string linkFile = Path.Combine(TempDirectory, "Servy.Manager.exe");
+            File.WriteAllText(targetFile, "placeholder");
+
+            try
+            {
+                File.CreateSymbolicLink(linkFile, targetFile);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                Assert.Skip("Symlink creation unavailable on this runner");
+            }
+
+            // Act
+            bool result = PathSecurityGuard.IsSafelyContainedWithinAppDirectory(linkFile, TempDirectory);
+
+            // Assert
+            Assert.False(result);
+        }
+
+        [Fact]
+        public void TryResolveWithinAppDirectory_RelativeChildPath_ReturnsTheResolvedAbsolutePath()
+        {
+            // Arrange
+            string baseDir = TempDirectory;
+            string targetPath = "Servy.Manager.exe";
+
+            // Act
+            bool result = PathSecurityGuard.TryResolveWithinAppDirectory(targetPath, baseDir, out string resolvedPath);
+
+            // Assert
+            Assert.True(result);
+            Assert.Equal(Path.Combine(baseDir, targetPath), resolvedPath);
+        }
+
+        [Fact]
+        public void TryResolveWithinAppDirectory_SubdirectoryChildPath_ReturnsTheResolvedAbsolutePath()
+        {
+            // Arrange
+            string baseDir = TempDirectory;
+            string subDir = Path.Combine(baseDir, "bin");
+            Directory.CreateDirectory(subDir);
+            string targetPath = Path.Combine("bin", "Servy.Manager.exe");
+
+            // Act
+            bool result = PathSecurityGuard.TryResolveWithinAppDirectory(targetPath, baseDir, out string resolvedPath);
+
+            // Assert
+            Assert.True(result);
+            Assert.Equal(Path.Combine(subDir, "Servy.Manager.exe"), resolvedPath);
+        }
+
+        [Fact]
+        public void TryResolveWithinAppDirectory_AbsoluteChildPath_ReturnsTheSameAbsolutePath()
+        {
+            // Arrange
+            string baseDir = TempDirectory;
+            string targetPath = Path.Combine(baseDir, "Servy.Manager.exe");
+
+            // Act
+            bool result = PathSecurityGuard.TryResolveWithinAppDirectory(targetPath, baseDir, out string resolvedPath);
+
+            // Assert
+            Assert.True(result);
+            Assert.Equal(targetPath, resolvedPath);
+        }
+
+        [Fact]
+        public void TryResolveWithinAppDirectory_ExternalRootedPath_ReturnsFalseAndEmptyPath()
+        {
+            // Arrange
+            string baseDir = Path.Combine(TempDirectory, "App");
+            Directory.CreateDirectory(baseDir);
+            string externalPath = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+
+            // Act
+            bool result = PathSecurityGuard.TryResolveWithinAppDirectory(externalPath, baseDir, out string resolvedPath);
+
+            // Assert
+            Assert.False(result);
+            Assert.Equal(string.Empty, resolvedPath);
+        }
+
+        #endregion
+
+        #region Directory ACL Hardening Guards
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public void WarnIfDirectoryAclNotHardened_NullOrWhitespace_LogsNothing(string? path)
+        {
+            // Act
+            string log = CaptureAclCheckLog(() => PathSecurityGuard.WarnIfDirectoryAclNotHardened(path!));
+
+            // Assert
+            Assert.DoesNotContain("ACL", log, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void WarnIfDirectoryAclNotHardened_NonExistentDirectory_LogsNothing()
+        {
+            // Arrange
+            string nonExistent = Path.Combine(TempDirectory, $"missing_dir_{Guid.NewGuid():N}");
+
+            // Act
+            string log = CaptureAclCheckLog(() => PathSecurityGuard.WarnIfDirectoryAclNotHardened(nonExistent));
+
+            // Assert
+            // A directory that does not exist is no longer reported as hardened; nothing was checked,
+            // so nothing is claimed.
+            Assert.DoesNotContain("ACL", log, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void WarnIfDirectoryAclNotHardened_UsersReadExecuteOnly_LogsNothing()
+        {
+            // Arrange
+            string testDir = Path.Combine(TempDirectory, "acl_read_execute_dir");
+            Directory.CreateDirectory(testDir);
+            SetBuiltinUsersAccessRule(testDir, FileSystemRights.ReadAndExecute);
+
+            // Act
+            string log = CaptureAclCheckLog(() => PathSecurityGuard.WarnIfDirectoryAclNotHardened(testDir));
+
+            // Assert
+            Assert.DoesNotContain("ACL", log, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void WarnIfDirectoryAclNotHardened_UsersModify_LogsSecurityNotice()
+        {
+            // Arrange
+            string testDir = Path.Combine(TempDirectory, "acl_modify_dir");
+            Directory.CreateDirectory(testDir);
+            SetBuiltinUsersAccessRule(testDir, FileSystemRights.Modify);
+
+            // Act
+            string log = CaptureAclCheckLog(() => PathSecurityGuard.WarnIfDirectoryAclNotHardened(testDir));
+
+            // Assert
+            Assert.Contains("ACL Security Notice", log, StringComparison.Ordinal);
+            Assert.Contains(testDir, log, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void WarnIfDirectoryAclNotHardened_ExecutablePathInUsersModifyDirectory_LogsNoticeForItsDirectory()
+        {
+            // Arrange
+            // Both production callers (Servy App.xaml.cs, Servy.Manager App.xaml.cs) pass the path of an
+            // existing .exe, not a directory, so the check must resolve the file to its containing
+            // directory. Every other test here passes a directory, which takes the other arm of the
+            // ternary. SetBuiltinUsersAccessRule keeps FullControl for the current user, so the file is
+            // written before the DACL is replaced.
+            string testDir = Path.Combine(TempDirectory, "acl_modify_exe_dir");
+            Directory.CreateDirectory(testDir);
+            string exePath = Path.Combine(testDir, "Servy.Manager.exe");
+            File.WriteAllText(exePath, "placeholder");
+            SetBuiltinUsersAccessRule(testDir, FileSystemRights.Modify);
+
+            // Act
+            string log = CaptureAclCheckLog(() => PathSecurityGuard.WarnIfDirectoryAclNotHardened(exePath));
+
+            // Assert
+            // The resolved directory, not the file, is the subject of the notice.
+            Assert.Contains("ACL Security Notice", log, StringComparison.Ordinal);
+            Assert.Contains($"Directory '{testDir}'", log, StringComparison.Ordinal);
+        }
+
+        [Theory]
+        [InlineData(WellKnownSidType.AuthenticatedUserSid)]
+        [InlineData(WellKnownSidType.WorldSid)]
+        public void WarnIfDirectoryAclNotHardened_OtherBroadUnprivilegedSidsModify_LogsSecurityNotice(WellKnownSidType sidType)
+        {
+            // Arrange
+            // SecurityHelper.BroadUnprivilegedSids holds three principals and WarnIfDirectoryAclNotHardened
+            // warns about a write-class ACE for any of them. The tests above put only the BuiltinUsers SID
+            // on a directory, so this theory covers the other two.
+            string testDir = Path.Combine(TempDirectory, $"acl_modify_dir_{sidType}");
+            Directory.CreateDirectory(testDir);
+            SetAccessRuleForSid(testDir, new SecurityIdentifier(sidType, null), FileSystemRights.Modify);
+
+            // Act
+            string log = CaptureAclCheckLog(() => PathSecurityGuard.WarnIfDirectoryAclNotHardened(testDir));
+
+            // Assert
+            Assert.Contains("ACL Security Notice", log, StringComparison.Ordinal);
+            Assert.Contains(testDir, log, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void WarnIfDirectoryAclNotHardened_UsersWriteDenied_LogsNothing()
+        {
+            // Arrange
+            // A Deny ACE for a broad principal narrows access, so it must not be reported as a grant.
+            // WriteData alone is denied on purpose: the current user is normally a member of
+            // BUILTIN\Users, and WriteData keeps the recursive cleanup of the temporary directory working.
+            string testDir = Path.Combine(TempDirectory, "acl_deny_write_dir");
+            Directory.CreateDirectory(testDir);
+            SetAccessRuleForSid(
+                testDir,
+                new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+                FileSystemRights.WriteData,
+                AccessControlType.Deny);
+
+            // Act
+            string log = CaptureAclCheckLog(() => PathSecurityGuard.WarnIfDirectoryAclNotHardened(testDir));
+
+            // Assert
+            Assert.DoesNotContain("ACL", log, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Runs <paramref name="act"/> with the static logger redirected into a private temporary
+        /// directory and returns what it wrote. <see cref="PathSecurityGuard.WarnIfDirectoryAclNotHardened"/>
+        /// is diagnostic only, so its log output is the only thing a test can observe.
+        /// </summary>
+        /// <param name="act">The call under test.</param>
+        /// <returns>The captured log text.</returns>
+        private static string CaptureAclCheckLog(Action act)
+        {
+            return LogCapture.Run(() => { act(); });
+        }
+
+        private static void SetBuiltinUsersAccessRule(string directoryPath, FileSystemRights rights)
+        {
+            SetAccessRuleForSid(directoryPath, new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), rights);
+        }
+
+        private static void SetAccessRuleForSid(string directoryPath, SecurityIdentifier sid, FileSystemRights rights, AccessControlType type = AccessControlType.Allow)
+        {
+            var security = new DirectorySecurity();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            security.AddAccessRule(new FileSystemAccessRule(sid, rights, type));
+            security.AddAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User!, FileSystemRights.FullControl, AccessControlType.Allow));
+            new DirectoryInfo(directoryPath).SetAccessControl(security);
         }
 
         #endregion

@@ -14,17 +14,8 @@ namespace Servy.UI.Design
     /// Provides a concrete <see cref="ProcessHelper"/> subtype used purely so the designer can instantiate a stand-in
     /// (the real metric methods are simply never invoked at design time).
     /// </summary>
-    /// <remarks>
-    /// This class inherits from <see cref="ProcessHelper"/> to satisfy dependency requirements
-    /// in ViewModels and validators without invoking real Windows process management logic
-    /// during a design-time session.
-    /// </remarks>
     public class DesignTimeProcessHelper : ProcessHelper
     {
-        public DesignTimeProcessHelper()
-        {
-            // Empty constructor to allow instantiation by the XAML designer.
-        }
     }
 
     /// <summary>
@@ -32,31 +23,11 @@ namespace Servy.UI.Design
     /// </summary>
     public class DesignTimeServiceRepository : IServiceRepository
     {
-        public ServiceDto? GetByName(string? name, bool decrypt = true) => null;
-        public void Upsert(ServiceDto service) { /* no-op */ }
-        public void Delete(string name) { /* no-op */ }
-        public int Update(ServiceDto service, bool preserveExistingRuntimeState, bool preserveExistingCredentials) => 0;
-
-        public Task<int> AddAsync(ServiceDto service, CancellationToken cancellationToken = default)
-            => Task.FromResult(0);
-
-        public Task<int> UpdateAsync(ServiceDto service, bool preserveExistingRuntimeState, bool preserveExistingCredentials, CancellationToken cancellationToken = default)
-            => Task.FromResult(0);
-
         public Task<int> UpsertAsync(ServiceDto service, bool preserveExistingRuntimeState, bool preserveExistingCredentials, CancellationToken cancellationToken = default)
-            => Task.FromResult(0);
-
-        public Task<int> UpsertBatchAsync(IEnumerable<ServiceDto> services, CancellationToken cancellationToken = default)
-            => Task.FromResult(0);
-
-        public Task<int> DeleteAsync(int id, CancellationToken cancellationToken = default)
             => Task.FromResult(0);
 
         public Task<int> DeleteAsync(string? name, CancellationToken cancellationToken = default)
             => Task.FromResult(0);
-
-        public Task<ServiceDto?> GetByIdAsync(int id, bool decrypt = true, CancellationToken cancellationToken = default)
-            => Task.FromResult<ServiceDto?>(null);
 
         public Task<ServiceDto?> GetByNameAsync(string? name, bool decrypt = true, CancellationToken cancellationToken = default)
             => Task.FromResult<ServiceDto?>(null);
@@ -67,6 +38,18 @@ namespace Servy.UI.Design
         public Task<ServiceConsoleStateDto?> GetServiceConsoleStateAsync(string? name, CancellationToken cancellationToken = default)
             => Task.FromResult<ServiceConsoleStateDto?>(null);
 
+        public Task<int> UpdateRuntimeStateAsync(string? name, ServiceRuntimeStateDto state, CancellationToken cancellationToken = default)
+            => Task.FromResult(0);
+
+        public Task<int> UpdateDescriptionAndStartupTypeAsync(string? name, string? description, int? startupType, CancellationToken cancellationToken = default)
+            => Task.FromResult(0);
+
+        public Task<RestartAttemptsDto?> GetRestartAttemptsAsync(string? name, CancellationToken cancellationToken = default)
+            => Task.FromResult<RestartAttemptsDto?>(null);
+
+        public Task<int> UpdateRestartAttemptsAsync(string? name, int attempts, DateTime updatedAtUtc, CancellationToken cancellationToken = default)
+            => Task.FromResult(0);
+
         public Task<IEnumerable<ServiceDto>> GetAllAsync(bool decrypt = true, CancellationToken cancellationToken = default)
             => Task.FromResult(Enumerable.Empty<ServiceDto>());
 
@@ -76,14 +59,9 @@ namespace Servy.UI.Design
         public Task<string> ExportXmlAsync(string? name, CancellationToken cancellationToken = default)
             => Task.FromResult(string.Empty);
 
-        public Task<OperationResult> ImportXmlAsync(string xml, CancellationToken cancellationToken = default)
-            => Task.FromResult(OperationResult.Success());
-
         public Task<string> ExportJsonAsync(string? name, CancellationToken cancellationToken = default)
             => Task.FromResult(string.Empty);
 
-        public Task<OperationResult> ImportJsonAsync(string json, CancellationToken cancellationToken = default)
-            => Task.FromResult(OperationResult.Success());
     }
 
     /// <summary>
@@ -101,6 +79,12 @@ namespace Servy.UI.Design
         public Task<OperationResult> UninstallServiceAsync(string? serviceName, CancellationToken cancellationToken = default)
             => Task.FromResult(OperationResult.Success());
 
+        /// <summary>
+        /// Does nothing: there is no vault to revoke access to at design time.
+        /// </summary>
+        public Task RevokeVaultAccessIfUnusedAsync(ServiceDto? formerService, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
         public Task<OperationResult> StartServiceAsync(string? serviceName, bool logSuccessfulStart = true, CancellationToken cancellationToken = default)
             => Task.FromResult(OperationResult.Success());
 
@@ -110,8 +94,13 @@ namespace Servy.UI.Design
         public Task<OperationResult> RestartServiceAsync(string? serviceName, bool logSuccessfulRestart = true, CancellationToken cancellationToken = default)
             => Task.FromResult(OperationResult.Success());
 
+        /// <summary>
+        /// Returns null to agree with <see cref="IsServiceInstalled"/> and <see cref="GetAllServices"/>:
+        /// a non-null status is the real implementation's signal that the service is present, so
+        /// returning one here would preview a state the SCM cannot be in.
+        /// </summary>
         public ServiceControllerStatus? GetServiceStatus(string? serviceName, CancellationToken cancellationToken = default)
-            => ServiceControllerStatus.Stopped;
+            => null;
 
         public bool IsServiceInstalled(string? serviceName, CancellationToken cancellationToken = default) => false;
 
@@ -132,17 +121,17 @@ namespace Servy.UI.Design
     /// </summary>
     public class DesignTimeHelpService : IHelpService
     {
-        public Task OpenDocumentationAsync(string caption)
+        public Task OpenDocumentationAsync(string caption, CancellationToken cancellationToken = default)
         {
             return Task.CompletedTask;
         }
 
-        public Task CheckUpdatesAsync(string caption)
+        public Task CheckUpdatesAsync(string caption, CancellationToken cancellationToken = default)
         {
             return Task.CompletedTask;
         }
 
-        public Task OpenAboutDialogAsync(string about, string caption)
+        public Task OpenAboutDialogAsync(string about, string caption, CancellationToken cancellationToken = default)
         {
             return Task.CompletedTask;
         }
@@ -228,8 +217,9 @@ namespace Servy.UI.Design
 
         public Task<T> InvokeAsync<T>(Func<T> callback)
         {
-            // Task.FromResult requires a value.
-            // Returning default(T) allows the caller to proceed without a NullReferenceException.
+            // Design-time stand-in: the callback is not invoked, matching the two Action overloads.
+            // Returns default(T), i.e. null for a reference type - the '!' only suppresses the
+            // nullability warning and gives no runtime protection.
             return Task.FromResult(default(T)!);
         }
 

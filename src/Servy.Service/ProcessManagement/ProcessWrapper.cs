@@ -1,6 +1,7 @@
 using Servy.Core.Config;
 using Servy.Core.Logging;
 using Servy.Core.Native;
+using Servy.Service.Native;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -17,6 +18,66 @@ namespace Servy.Service.ProcessManagement
         private readonly Process _process;
         private readonly IServyLogger? _logger;
         private bool _disposed;
+
+        #region Internal Test Seams
+
+        /// <summary>
+        /// Gets or sets the enumerator <see cref="StopTree"/> and <see cref="StopDescendants"/> resolve a
+        /// process's direct children through. Defaults to <see cref="ProcessExtensions.GetChildren"/>;
+        /// substituted by tests so the cascade can be handed a controlled child set, which is the only way
+        /// to observe how often each enumerated child is disposed and to drive a child whose disposal throws.
+        /// </summary>
+        internal Func<int, DateTime, List<Process>> ChildEnumerator { get; set; } = ProcessExtensions.GetChildren;
+
+        /// <summary>
+        /// Gets or sets how <see cref="TryStopGracefullyOrKill"/> asks a process to close its main window.
+        /// Defaults to <see cref="Process.CloseMainWindow"/>; substituted by tests to drive the window
+        /// request's success and both of its failure arms without a process whose window call really fails.
+        /// </summary>
+        /// <remarks>
+        /// The default forwards unchanged to <see cref="Process.CloseMainWindow"/> on the calling thread, so
+        /// an unconfigured wrapper behaves exactly as it did before this seam existed.
+        /// </remarks>
+        internal Func<Process, bool> MainWindowCloser { get; set; } = p => p.CloseMainWindow();
+
+        /// <summary>
+        /// Gets or sets how <see cref="TryStopGracefullyOrKill"/> force-kills a process. Defaults to
+        /// <see cref="Process.Kill()"/>; substituted by tests to drive the kill-failure arm.
+        /// </summary>
+        /// <remarks>
+        /// The default forwards unchanged to <see cref="Process.Kill()"/> on the calling thread, so an
+        /// unconfigured wrapper behaves exactly as it did before this seam existed. <see cref="Kill(bool)"/>
+        /// keeps its own <see cref="Process.Kill(bool)"/> call, whose failure arm is already covered.
+        /// </remarks>
+        internal Action<Process> ProcessKiller { get; set; } = p => p.Kill();
+
+        /// <summary>
+        /// Gets or sets how <see cref="TryStopGracefullyOrKill"/> and <see cref="Kill(bool)"/> wait for a
+        /// process to exit. Defaults to <see cref="Process.WaitForExit(int)"/>; substituted by tests to drive
+        /// the graceful-exit and post-kill-timeout arms deterministically.
+        /// </summary>
+        /// <remarks>
+        /// The default forwards unchanged to <see cref="Process.WaitForExit(int)"/> with the same timeout, on
+        /// the calling thread, so an unconfigured wrapper behaves exactly as it did before this seam existed.
+        /// The public <see cref="WaitForExit(int)"/> member is deliberately not routed through it.
+        /// </remarks>
+        internal Func<Process, int, bool> ExitWaiter { get; set; } = (p, ms) => p.WaitForExit(ms);
+
+        /// <summary>
+        /// Gets or sets the console calls <see cref="SendCtrlC"/> delivers a CTRL+C through.
+        /// Defaults to <see cref="ConsoleCtrlNative"/>; substituted by tests so the attach, signal and
+        /// detach sequence and each of its failure arms can be observed without a real
+        /// <c>GenerateConsoleCtrlEvent</c>, which would reach the test host's own console group.
+        /// </summary>
+        /// <remarks>
+        /// The default forwards every member unchanged to <see cref="NativeMethods"/> and
+        /// <see cref="Marshal.GetLastWin32Error"/>, with the same arguments, in the same order and on
+        /// the calling thread, so an unconfigured wrapper behaves exactly as it did before this seam
+        /// existed.
+        /// </remarks>
+        internal IConsoleCtrlNative ConsoleNative { get; set; } = new ConsoleCtrlNative();
+
+        #endregion
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ProcessWrapper"/> class with the specified <see cref="ProcessStartInfo"/>.
@@ -97,32 +158,12 @@ namespace Servy.Service.ProcessManagement
         }
 
         /// <inheritdoc />
-        public IntPtr Handle
-        {
-            get
-            {
-                ThrowIfDisposed();
-                return _process.Handle;
-            }
-        }
-
-        /// <inheritdoc />
         public int ExitCode
         {
             get
             {
                 ThrowIfDisposed();
                 return _process.ExitCode;
-            }
-        }
-
-        /// <inheritdoc />
-        public IntPtr MainWindowHandle
-        {
-            get
-            {
-                ThrowIfDisposed();
-                return _process.MainWindowHandle;
             }
         }
 
@@ -182,26 +223,6 @@ namespace Servy.Service.ProcessManagement
         }
 
         /// <inheritdoc />
-        public StreamReader StandardOutput
-        {
-            get
-            {
-                ThrowIfDisposed();
-                return _process.StandardOutput;
-            }
-        }
-
-        /// <inheritdoc />
-        public StreamReader StandardError
-        {
-            get
-            {
-                ThrowIfDisposed();
-                return _process.StandardError;
-            }
-        }
-
-        /// <inheritdoc />
         public ProcessStartInfo StartInfo
         {
             get
@@ -254,7 +275,7 @@ namespace Servy.Service.ProcessManagement
         public bool? Stop(int timeoutMs)
         {
             ThrowIfDisposed();
-            return TryStopGracefullyOrKill(_process, timeoutMs: timeoutMs, postKillWaitMs: AppConfig.DefaultDescendantPostKillWaitMs);
+            return TryStopGracefullyOrKill(_process, timeoutMs: timeoutMs, postKillWaitMs: AppConfig.DefaultPostKillWaitMs);
         }
 
         /// <summary>
@@ -297,7 +318,7 @@ namespace Servy.Service.ProcessManagement
             {
                 try
                 {
-                    sent = process.CloseMainWindow();
+                    sent = MainWindowCloser(process);
                 }
                 catch (InvalidOperationException ex) when (process.HasExited)
                 {
@@ -313,7 +334,7 @@ namespace Servy.Service.ProcessManagement
                 }
             }
 
-            if (sent.Value && process.WaitForExit(timeoutMs))
+            if (sent.Value && ExitWaiter(process, timeoutMs))
             {
                 return true;
             }
@@ -323,14 +344,14 @@ namespace Servy.Service.ProcessManagement
 
             try
             {
-                process.Kill();
+                ProcessKiller(process);
             }
             catch (Exception ex)
             {
                 _logger?.Warn($"Kill failed for '{process.Format()}': {ex.Message}");
             }
 
-            if (!process.WaitForExit(postKillWaitMs))
+            if (!ExitWaiter(process, postKillWaitMs))
             {
                 _logger?.Warn($"Process '{process.Format()}' killed, but did not exit within {postKillWaitMs / (double)AppConfig.MillisecondsPerSecond}s.");
             }
@@ -358,19 +379,40 @@ namespace Servy.Service.ProcessManagement
             }
 
             // 1. RECURSION: Hunt down grandchildren first
-            foreach (var child in ProcessExtensions.GetChildren(parentPid, parentStartTime))
+            List<Process> children;
+            try
             {
-                using (child)
+                children = ChildEnumerator(parentPid, parentStartTime);
+            }
+            catch (Exception ex)
+            {
+                _logger?.Warn($"Descendant enumeration for PID {parentPid} failed; skipping sub-tree stop: {ex.Message}");
+                children = new List<Process>();
+            }
+
+            // The finally below owns the whole enumerated set, including the children this loop never
+            // reaches when the cascade throws, so the loop body must not dispose its own child as well.
+            try
+            {
+                foreach (var child in children)
                 {
                     _logger?.Info($"Cascading stop to deeper descendant: {child.Format()}...");
                     StopTree(child, timeoutMs);
+                }
+            }
+            finally
+            {
+                foreach (var child in children)
+                {
+                    try { child.Dispose(); }
+                    catch (Exception ex) { _logger?.Debug($"Failed to dispose enumerated child handle: {ex.Message}"); }
                 }
             }
 
             // 2. TERMINATION: Kill the current node now that its children are dead
             _logger?.Info($"Terminating node: {process.Format()}");
 
-            bool? result = TryStopGracefullyOrKill(process, timeoutMs, AppConfig.DefaultDescendantPostKillWaitMs);
+            bool? result = TryStopGracefullyOrKill(process, timeoutMs, AppConfig.DefaultPostKillWaitMs);
 
             if (result == null)
             {
@@ -409,9 +451,24 @@ namespace Servy.Service.ProcessManagement
         {
             ThrowIfDisposed();
 
+            if (parentPid <= 0 || parentStartTime == DateTime.MinValue)
+            {
+                _logger?.Warn("Descendant sweep skipped: the parent PID/StartTime could not be captured, so orphans (if any) were not enumerated.");
+                return;
+            }
+
             _logger?.Info($"Scanning for top-level descendants of PID {parentPid}...");
 
-            var children = ProcessExtensions.GetChildren(parentPid, parentStartTime);
+            List<Process> children;
+            try
+            {
+                children = ChildEnumerator(parentPid, parentStartTime);
+            }
+            catch (Exception ex)
+            {
+                _logger?.Warn($"Descendant enumeration for PID {parentPid} failed; skipping cascaded stop: {ex.Message}");
+                return;
+            }
 
             if (children.Count == 0)
             {
@@ -419,12 +476,22 @@ namespace Servy.Service.ProcessManagement
                 return;
             }
 
-            foreach (var child in children)
+            // The finally below owns the whole enumerated set, including the children this loop never
+            // reaches when the cascade throws, so the loop body must not dispose its own child as well.
+            try
             {
-                using (child) // We no longer need to dispose a native Handle, just the Process object
+                foreach (var child in children)
                 {
                     _logger?.Info($"Found descendant: {child.Format()}. Initiating cascaded kill...");
                     StopTree(child, timeoutMs);
+                }
+            }
+            finally
+            {
+                foreach (var child in children)
+                {
+                    try { child.Dispose(); }
+                    catch (Exception ex) { _logger?.Debug($"Failed to dispose enumerated child handle: {ex.Message}"); }
                 }
             }
         }
@@ -437,18 +504,27 @@ namespace Servy.Service.ProcessManagement
         }
 
         /// <inheritdoc />
-        public void Kill(bool entireProcessTree = false)
+        public bool Kill(bool entireProcessTree = false)
         {
             ThrowIfDisposed();
             try
             {
-                if (_process.HasExited) return;
+                if (_process.HasExited) return true;
                 _process.Kill(entireProcessTree);
             }
             catch (Exception ex)
             {
-                _logger?.Warn($"Kill failed: {ex.Message}");
+                _logger?.Warn($"Kill failed for '{_process.Format()}': {ex.Message}");
+                return false;
             }
+
+            if (!ExitWaiter(_process, AppConfig.DefaultPostKillWaitMs))
+            {
+                _logger?.Warn($"Process '{_process.Format()}' killed, but did not exit within {AppConfig.DefaultPostKillWaitMs / (double)AppConfig.MillisecondsPerSecond}s.");
+                return false;
+            }
+
+            return true;
         }
 
         /// <inheritdoc />
@@ -464,13 +540,6 @@ namespace Servy.Service.ProcessManagement
         {
             ThrowIfDisposed();
             _process.WaitForExit();
-        }
-
-        /// <inheritdoc />
-        public bool CloseMainWindow()
-        {
-            ThrowIfDisposed();
-            return _process.CloseMainWindow();
         }
 
         /// <inheritdoc />
@@ -512,7 +581,8 @@ namespace Servy.Service.ProcessManagement
         /// Releases unmanaged and optionally managed resources.
         /// </summary>
         /// <param name="disposing">
-        /// True if called from <see cref="Dispose()"/>; false if called from a finalizer.
+        /// <see langword="true"/> when called from <see cref="Dispose()"/>. This type has no finalizer,
+        /// so it is never <see langword="false"/>; the parameter exists for derived types to override.
         /// </param>
         protected virtual void Dispose(bool disposing)
         {
@@ -542,8 +612,8 @@ namespace Servy.Service.ProcessManagement
         /// <param name="error">The Win32 error code returned by <see cref="Marshal.GetLastWin32Error"/>.</param>
         /// <returns>
         /// <see langword="true"/> if the process shares a console (e.g., <see cref="Errors.ERROR_PIPE_NOT_CONNECTED"/>);
-        /// <see langword="false"/> if the attach failed due to handle issues or unexpected error conditions;
-        /// <see langword="null"/> if the attach failed because the target process has already exited (<see cref="Errors.ERROR_INVALID_PARAMETER"/>).
+        /// <see langword="false"/> if the attach failed due to handle issues (<see cref="Errors.ERROR_INVALID_HANDLE"/>, <see cref="Errors.ERROR_GEN_FAILURE"/>) or unexpected error conditions;
+        /// <see langword="null"/> if the target process has already exited (<see cref="Errors.ERROR_INVALID_PARAMETER"/>).
         /// </returns>
         internal static bool? ClassifyAttachFailure(int error)
         {
@@ -569,7 +639,9 @@ namespace Servy.Service.ProcessManagement
         /// </summary>
         /// <param name="process">The native process to which the signal will be sent.</param>
         /// <returns>
-        /// <see langword="true"/> if the signal was successfully generated;
+        /// <see langword="true"/> if the signal was successfully generated, or if the process shares a console
+        /// the service cannot attach to (<see cref="Errors.ERROR_PIPE_NOT_CONNECTED"/>), in which case no signal is
+        /// generated here and the process is assumed to have received the root wrapper's earlier broadcast;
         /// <see langword="false"/> if the process does not have a console or the signal could not be sent;
         /// <see langword="null"/> if the process has already exited.
         /// </returns>
@@ -582,21 +654,25 @@ namespace Servy.Service.ProcessManagement
         /// <para>
         /// <b>Safety:</b> To prevent the calling service from terminating itself when the signal is broadcast,
         /// the service's own Ctrl+C handler is suppressed using <c>SetConsoleCtrlHandler(null, true)</c>
-        /// for the duration of the signal generation.
+        /// before the signal is generated, and the same ignore flag is re-asserted afterwards rather than
+        /// cleared, because ignoring Ctrl+C is the service's steady state (set in <c>OnStart</c>).
         /// </para>
         /// </remarks>
         private bool? SendCtrlC(Process process)
         {
-            // The ConsoleStateLock lock serializes graceful-shutdown signals across services.
-            // That is a feature: the SetConsoleCtrlHandler API is process-wide,
-            // so the only correct execution model is one-at-a-time.
+            // ConsoleStateLock serializes Ctrl+C delivery inside THIS service host (main child, hooks
+            // and the descendant cascade). FreeConsole/AttachConsole/SetConsoleCtrlHandler are
+            // process-wide state, so two signals in flight at once would corrupt each other. Other
+            // Servy services run in their own Servy.Service.exe process and need no coordination.
             lock (ConsoleStateLock)
             {
                 // ALWAYS free the console first to prevent stale locks from previous iterations
-                _ = FreeConsole();
+                _ = ConsoleNative.FreeConsole();
 
-                if (!AttachConsole(process.Id))
+                if (!ConsoleNative.AttachConsole(process.Id))
                 {
+                    int error = ConsoleNative.GetLastWin32Error();   // must be first - HasExited clobbers the last-error slot
+
                     // Double check if the process has actually exited under our feet.
                     // If the process is dead, any attach failure means it's already gone.
                     if (process.HasExited)
@@ -604,11 +680,14 @@ namespace Servy.Service.ProcessManagement
                         return null;
                     }
 
-                    int error = Marshal.GetLastWin32Error();
                     bool? outcome = ClassifyAttachFailure(error);
 
                     if (error == Errors.ERROR_PIPE_NOT_CONNECTED)
                     {
+                        // No signal is generated here: the process shares the root's console, so it has
+                        // already received the broadcast Service.cs sends to the root wrapper first.
+                        // The 'true' returned below therefore means "assumed already signalled", which is
+                        // why the caller is allowed to wait out the graceful timeout.
                         _logger?.Info($"Process '{process.Format()}' shares a console group. Awaiting graceful shutdown...");
                     }
                     else if (outcome == false)
@@ -619,14 +698,15 @@ namespace Servy.Service.ProcessManagement
                     return outcome;
                 }
 
-                // CRITICAL: Temporarily ignore Ctrl+C in the calling process (the service).
-                // Passing 'null' as the handler and 'true' as the add flag tells the OS
-                // to ignore CTRL_C_EVENT for this specific process.
-                if (!SetConsoleCtrlHandler(null, true))
+                // CRITICAL: Make sure Ctrl+C is ignored in the calling process (the service) before the signal
+                // is generated. Passing 'null' as the handler and 'true' as the add flag tells the OS to ignore
+                // CTRL_C_EVENT for this specific process. The flag is not undone afterwards: the finally block
+                // below re-asserts it, because ignoring Ctrl+C is the service's steady state (set in OnStart).
+                if (!ConsoleNative.SetConsoleCtrlHandler(IntPtr.Zero, true))
                 {
-                    int error = Marshal.GetLastWin32Error();
+                    int error = ConsoleNative.GetLastWin32Error();
                     _logger?.Error($"Failed to suppress console control handlers in the service (Win32 Error: {error}). Aborting signal to prevent service self-termination.");
-                    _ = FreeConsole();
+                    _ = ConsoleNative.FreeConsole();
                     return false;
                 }
 
@@ -644,9 +724,9 @@ namespace Servy.Service.ProcessManagement
                     // the CTRL + C signal will not be received by processes within
                     // the specified process group.
                     // So passing the specific process group ID instead of 0 will not work.
-                    if (!GenerateConsoleCtrlEvent(CtrlEvents.CTRL_C_EVENT, 0))
+                    if (!ConsoleNative.GenerateConsoleCtrlEvent(CtrlEvents.CTRL_C_EVENT, 0))
                     {
-                        int error = Marshal.GetLastWin32Error();
+                        int error = ConsoleNative.GetLastWin32Error();
                         _logger?.Warn(
                             $"GenerateConsoleCtrlEvent failed for '{process.Format()}': " +
                             $"{new Win32Exception(error).Message} (Error: {error}). " +
@@ -659,13 +739,13 @@ namespace Servy.Service.ProcessManagement
                 finally
                 {
                     // Detach from the child's console
-                    _ = FreeConsole();
+                    _ = ConsoleNative.FreeConsole();
 
                     // Re-assert the service's own ignore flag (set in OnStart) - the service must not be
                     // killable by a console control event outside of child-process creation.
-                    if (!SetConsoleCtrlHandler(null, true))
+                    if (!ConsoleNative.SetConsoleCtrlHandler(IntPtr.Zero, true))
                     {
-                        int error = Marshal.GetLastWin32Error();
+                        int error = ConsoleNative.GetLastWin32Error();
                         _logger?.Error($"Failed to re-assert the service's console control handler (Win32 Error: {error}).");
                     }
                 }

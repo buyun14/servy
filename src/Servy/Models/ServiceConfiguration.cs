@@ -1,3 +1,4 @@
+using Servy.Core.Config;
 using Servy.Core.Enums;
 
 namespace Servy.Models
@@ -56,6 +57,7 @@ namespace Servy.Models
         /// <summary>
         /// Gets or sets a value indicating whether to enable the console user interface for the service.
         /// When enabled, stdout/stderr redirection is disabled, and the service runs in a console window.
+        /// Default is <see cref="AppConfig.DefaultEnableConsoleUI"/>.
         /// </summary>
         public bool EnableConsoleUI { get; set; }
 
@@ -71,16 +73,19 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets a value indicating whether size-based log rotation is enabled.
+        /// Default is <see cref="AppConfig.DefaultEnableSizeRotation"/>.
         /// </summary>
         public bool EnableSizeRotation { get; set; }
 
         /// <summary>
         /// Gets or sets the rotation size in MB.
+        /// Default is <see cref="AppConfig.DefaultRotationSizeMB"/>.
         /// </summary>
         public string? RotationSize { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether date-based log rotation is enabled.
+        /// Default is <see cref="AppConfig.DefaultEnableDateRotation"/>.
         /// </summary>
         public bool EnableDateRotation { get; set; }
 
@@ -91,6 +96,7 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets the maximum number of rotated log files to keep.
+        /// Default is <see cref="AppConfig.DefaultMaxRotations"/>.
         /// </summary>
         public string? MaxRotations { get; set; }
 
@@ -98,7 +104,7 @@ namespace Servy.Models
         /// Gets or sets a value indicating whether to use local system time for log rotation.
         /// </summary>
         /// <remarks>
-        /// <para>Default is <c>false</c> (UTC).</para>
+        /// <para>Default is <see cref="AppConfig.DefaultUseLocalTimeForRotation"/> (UTC).</para>
         /// <para>Set to <c>true</c> to rotate logs based on the server's local time (e.g., exactly at local midnight).
         /// This is often preferred for manual log inspection but can be affected by Daylight Saving Time transitions.</para>
         /// <para>Set to <c>false</c> to use Coordinated Universal Time (UTC).
@@ -108,16 +114,19 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets a value indicating whether health monitoring is enabled.
+        /// Default is <see cref="AppConfig.DefaultEnableHealthMonitoring"/>.
         /// </summary>
         public bool EnableHealthMonitoring { get; set; }
 
         /// <summary>
         /// Gets or sets the heartbeat interval in seconds.
+        /// Default is <see cref="AppConfig.DefaultHeartbeatInterval"/>.
         /// </summary>
         public string? HeartbeatInterval { get; set; }
 
         /// <summary>
         /// Gets or sets the maximum number of allowed failed health checks.
+        /// Default is <see cref="AppConfig.DefaultMaxFailedChecks"/>.
         /// </summary>
         public string? MaxFailedChecks { get; set; }
 
@@ -128,11 +137,13 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets a flag for running recovery action even if the process exits successfully.
+        /// Default is <see cref="AppConfig.DefaultRecoveryOnCleanExit"/>.
         /// </summary>
         public bool RecoveryOnCleanExit { get; set; }
 
         /// <summary>
         /// Gets or sets the maximum number of restart attempts.
+        /// Default is <see cref="AppConfig.DefaultMaxRestartAttempts"/>.
         /// </summary>
         public string? MaxRestartAttempts { get; set; }
 
@@ -143,11 +154,13 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets the maximum time in seconds allowed for the heartbeat URL request to complete before it is cancelled.
+        /// Default is <see cref="AppConfig.DefaultHeartbeatUrlTimeoutSeconds"/> (Allowed range: <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> to <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/> seconds).
         /// </summary>
         public string? HeartbeatUrlTimeoutSeconds { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether start/fail status suffixes are appended to the heartbeat URL.
+        /// Default is <see cref="AppConfig.DefaultEnableHeartbeatUrlFlags"/>.
         /// </summary>
         public bool EnableHeartbeatUrlFlags { get; set; }
 
@@ -173,6 +186,11 @@ namespace Servy.Models
         public string? EnvironmentVariables { get; set; }
 
         /// <summary>
+        /// Gets or sets a value indicating whether to allow overriding of protected runtime variables (e.g., <c>JAVA_HOME</c>, <c>JAVA_OPTS</c>, <c>CATALINA_OPTS</c>) by the service's environment variables.
+        /// </summary>
+        public bool AllowOverriddenRuntimeVars { get; set; }
+
+        /// <summary>
         /// Gets or sets the defined Windows service dependencies.
         /// Format: ServiceName, one per line or separated by semicolons.
         /// </summary>
@@ -180,6 +198,7 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets a value indicating whether to run the Windows Service as the Local System account.
+        /// Default is <see cref="AppConfig.DefaultRunAsLocalSystem"/>.
         /// </summary>
         public bool RunAsLocalSystem { get; set; }
 
@@ -196,7 +215,7 @@ namespace Servy.Models
         /// <summary>
         /// Gets or sets the confirmation copy of the service account password.
         /// </summary>
-        public string? ConfirmPassword { get; set; } = string.Empty;
+        public string? ConfirmPassword { get; set; }
 
         /// <summary>
         /// Gets or sets the path to the pre-launch executable process to run.
@@ -231,19 +250,19 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets the timeout in seconds for each pre-launch execution attempt.
-        /// Default is 30 seconds.
+        /// Default is <see cref="AppConfig.DefaultPreLaunchTimeoutSeconds"/> seconds.
         /// </summary>
         public string? PreLaunchTimeoutSeconds { get; set; }
 
         /// <summary>
         /// Gets or sets the number of retry attempts if the pre-launch process fails.
-        /// Default is 0.
+        /// Default is <see cref="AppConfig.DefaultPreLaunchRetryAttempts"/>.
         /// </summary>
         public string? PreLaunchRetryAttempts { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether to start the main service even if the pre-launch process fails.
-        /// Default is false.
+        /// Default is <see cref="AppConfig.DefaultPreLaunchIgnoreFailure"/>.
         /// </summary>
         public bool PreLaunchIgnoreFailure { get; set; }
 
@@ -266,16 +285,19 @@ namespace Servy.Models
         /// Gets or sets a value indicating whether debug logs are enabled.
         /// When enabled, environment variables and process parameters are recorded in the Servy.Service.log file.
         /// Not recommended for production environments, as these logs may contain sensitive information.
+        /// Default is <see cref="AppConfig.DefaultEnableDebugLogs"/>.
         /// </summary>
         public bool EnableDebugLogs { get; set; }
 
         /// <summary>
         /// Gets or sets the timeout in seconds to wait for the process to start successfully before considering the startup as failed.
+        /// Default is <see cref="AppConfig.DefaultStartTimeout"/> seconds.
         /// </summary>
         public string? StartTimeout { get; set; }
 
         /// <summary>
         /// Gets or sets the timeout in seconds to wait for the process to exit.
+        /// Default is <see cref="AppConfig.DefaultStopTimeout"/> seconds.
         /// </summary>
         public string? StopTimeout { get; set; }
 
@@ -296,11 +318,13 @@ namespace Servy.Models
 
         /// <summary>
         /// Gets or sets the maximum time in seconds to wait for the pre-stop executable to complete.
+        /// Default is <see cref="AppConfig.DefaultPreStopTimeoutSeconds"/> seconds (Allowed range: <see cref="AppConfig.MinPreStopTimeoutSeconds"/> to <see cref="AppConfig.MaxPreStopTimeoutSeconds"/> seconds).
         /// </summary>
         public string? PreStopTimeoutSeconds { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether to log pre-stop failure as an error.
+        /// Default is <see cref="AppConfig.DefaultPreStopLogAsError"/>.
         /// </summary>
         public bool PreStopLogAsError { get; set; }
 

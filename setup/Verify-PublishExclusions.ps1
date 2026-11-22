@@ -1,19 +1,21 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
+
 <#
 .SYNOPSIS
-    Validates that the Task Scheduler publish.yml exclusion filtering logic works correctly.
+    Validates publish-common.ps1's Copy-TaskSchdArtifacts exclusion filter.
 .DESCRIPTION
-    Creates an ephemeral local sandbox environment, runs the hardened recursive copy block,
-    and verifies that excluded items (*.test.ps1, .dat, .log, smtp-cred.xml) are blocked
-    while standard payloads are preserved.
+    Creates an ephemeral local sandbox, invokes the shared Copy-TaskSchdArtifacts function,
+    and verifies that the five excluded patterns (smtp-cred.xml, temp.ps1, *.dat, *.log,
+    *.test.ps1) are blocked - including inside subdirectories - while standard payloads
+    are preserved.
 #>
 
-$ScriptDir = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
+$ScriptDir = $PSScriptRoot
 
 # Dot-source publish-common.ps1 to import Copy-TaskSchdArtifacts under test
 . (Join-Path $ScriptDir "publish-common.ps1")
 
-Push-Location -Path $ScriptDir
+Push-Location -LiteralPath $ScriptDir
 
 # ---------------------------------------------------------------------
 # SETUP TEMPORARY SANDBOX ENVIRONMENT
@@ -27,32 +29,36 @@ $Passed = 0
 $Failed = 0
 
 try {
-    if (Test-Path $SandboxRoot) { Remove-Item -Path $SandboxRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $SandboxRoot) { Remove-Item -LiteralPath $SandboxRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
     New-Item -Path $sourcePath -ItemType Directory -Force | Out-Null
     New-Item -Path (Join-Path $sourcePath "SubFolder") -ItemType Directory -Force | Out-Null
 
-    Write-Host "==========================================================" -ForegroundColor Cyan
-    Write-Host "Testing publish.yml taskschd copy-exclusion filter..."      -ForegroundColor Cyan
-    Write-Host "==========================================================" -ForegroundColor Cyan
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+    Write-Host "Testing publish-common.ps1 Copy-TaskSchdArtifacts exclusion filter..." -ForegroundColor Cyan
+    Write-Host "=====================================================================" -ForegroundColor Cyan
 
     # Define mock test matrix data pairs [Relative Path, Should Copy]
     $MockFiles = @(
         @("ServySecurity.ps1", $true),
         @("TaskConfig.xml", $true),
         @("SubFolder\NestedScript.ps1", $true),
-        @("smtp-cred.xml", $false),          # Blacklisted file rule
-        @("ServySecurity.test.ps1", $false), # Hardened exclusion wildcard rule
-        @("SubFolder\Nested.test.ps1", $false), # Nested wildcard rule
-        @("state.dat", $false),              # Prohibited extension rule
-        @("trace.log", $false),              # Prohibited extension rule
-        @("temp.ps1", $false)                # Prohibited temp.ps1 rule
+        @("smtp-cred.xml", $false),                # Blacklisted file rule
+        @("SubFolder\smtp-cred.xml", $false),      # Nested blacklisted file rule
+        @("ServySecurity.test.ps1", $false),       # Hardened exclusion wildcard rule
+        @("SubFolder\Nested.test.ps1", $false),    # Nested wildcard rule
+        @("state.dat", $false),                    # Prohibited extension rule
+        @("SubFolder\nested.dat", $false),         # Nested extension rule
+        @("trace.log", $false),                    # Prohibited extension rule
+        @("SubFolder\nested.log", $false),         # Nested extension rule
+        @("temp.ps1", $false),                     # Prohibited temp.ps1 rule
+        @("SubFolder\temp.ps1", $false)            # Nested temp.ps1 rule
     )
 
     foreach ($file in $MockFiles) {
         $filePath = Join-Path $sourcePath $file[0]
         $parentDir = Split-Path $filePath -Parent
-        if (-not (Test-Path $parentDir)) { New-Item -Path $parentDir -ItemType Directory -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $parentDir)) { New-Item -Path $parentDir -ItemType Directory -Force | Out-Null }
         [System.IO.File]::WriteAllText($filePath, "Mock Publish Target Data Payload context.")
     }
 
@@ -61,7 +67,7 @@ try {
     # ---------------------------------------------------------------------
     Write-Host "Executing filter staging copy block..." -ForegroundColor Gray
 
-    if (-not (Test-Path $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
 
     # Invoke shared function under test
     Copy-TaskSchdArtifacts -SourcePath $sourcePath -DestPath $destPath
@@ -74,7 +80,7 @@ try {
 
     foreach ($file in $MockFiles) {
         $expectedPath = Join-Path $destPath $file[0]
-        $exists = Test-Path $expectedPath
+        $exists = Test-Path -LiteralPath $expectedPath
         $shouldExist = $file[1]
 
         if ($exists -eq $shouldExist) {
@@ -111,7 +117,7 @@ try {
     Write-Host "==========================================================" -ForegroundColor Cyan
 }
 finally {
-    if (Test-Path $SandboxRoot) { Remove-Item -Path $SandboxRoot -Recurse -Force | Out-Null }
+    if (Test-Path -LiteralPath $SandboxRoot) { Remove-Item -LiteralPath $SandboxRoot -Recurse -Force -ErrorAction SilentlyContinue }
     Pop-Location
 }
 

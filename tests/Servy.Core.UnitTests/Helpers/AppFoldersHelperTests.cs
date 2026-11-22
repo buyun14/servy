@@ -1,39 +1,130 @@
 using Servy.Core.Helpers;
+using Servy.Testing;
 
 namespace Servy.Core.UnitTests.Helpers
 {
-    public class AppFoldersHelperTests : IDisposable
+    public class AppFoldersHelperTests : TempDirectoryTestBase
     {
-        private readonly string _tempDir;
         private const string TempToken = "{tmp}";
 
-        public AppFoldersHelperTests()
-        {
-            _tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
-            Directory.CreateDirectory(_tempDir);
-        }
-
-        public void Dispose()
-        {
-            // Clean up temporary files after each test
-            try { if (Directory.Exists(_tempDir)) Directory.Delete(_tempDir, true); }
-            catch { /* Prevent teardown exceptions from hiding test results */ }
-        }
+        #region EnsureFolders Tests
 
         [Theory]
-        [InlineData(null, "key.aes", "iv.aes")]
-        [InlineData("Data Source=db.db;", null, "iv.aes")]
-        [InlineData("Data Source=db.db;", "key.aes", null)]
-        [InlineData("", "key.aes", "iv.aes")]
-        [InlineData("Data Source=db.db;", "", "iv.aes")]
-        [InlineData("Data Source=db.db;", "key.aes", "")]
-        [InlineData("   ", "key.aes", "iv.aes")]
-        [InlineData("Data Source=db.db;", "   ", "iv.aes")]
-        [InlineData("Data Source=db.db;", "key.aes", "   ")]
-        public void EnsureFolders_NullOrWhitespaceArgs_Throws(string? conn, string? key, string? iv)
+        [InlineData(null, "key.aes", "iv.aes", null)]
+        [InlineData("Data Source=db.db;", null, "iv.aes", null)]
+        [InlineData("Data Source=db.db;", "key.aes", null, null)]
+        [InlineData("", "key.aes", "iv.aes", null)]
+        [InlineData("Data Source=db.db;", "", "iv.aes", null)]
+        [InlineData("Data Source=db.db;", "key.aes", "", null)]
+        [InlineData("    ", "key.aes", "iv.aes", null)]
+        [InlineData("Data Source=db.db;", "    ", "iv.aes", null)]
+        [InlineData("Data Source=db.db;", "key.aes", "    ", null)]
+        [InlineData("Data Source=db.db;", "key.aes", "iv.aes", "")]
+        [InlineData("Data Source=db.db;", "key.aes", "iv.aes", "    ")]
+        public void EnsureFolders_NullOrWhitespaceArgs_Throws(string? conn, string? key, string? iv, string? rootVaultPath)
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentException>(() => AppFoldersHelper.EnsureFolders(conn!, key!, iv!));
+            Assert.Throws<ArgumentException>(() => AppFoldersHelper.EnsureFolders(conn!, key!, iv!, rootVaultPath));
+        }
+
+        // The theory above only asserts the exception TYPE, and its "key.aes" is relative, so every row using it
+        // throws at the aesKeyFilePath absolute-path guard before the iv/rootVaultPath value is ever inspected.
+        // These four give every parameter but the one under test an absolute, non-root path and assert the
+        // message, so each guard below is genuinely the first one that can fire.
+
+        [Fact]
+        public void EnsureFolders_WhitespaceAesIVFilePath_ThrowsForCorrectReason()
+        {
+            // Arrange
+            var conn = $"Data Source={Path.Combine(TempDirectory, "Servy.db")};";
+            var key = Path.Combine(TempDirectory, "key.aes");
+
+            // Act
+            var ex = Assert.Throws<ArgumentException>(() =>
+                AppFoldersHelper.EnsureFolders(conn, key, "    ", rootVaultPath: TempDirectory));
+
+            // Assert
+            Assert.StartsWith("aesIVFilePath cannot be null or whitespace", ex.Message);
+        }
+
+        [Fact]
+        public void EnsureFolders_WhitespaceRootVaultPath_ThrowsForCorrectReason()
+        {
+            // Arrange
+            var conn = $"Data Source={Path.Combine(TempDirectory, "Servy.db")};";
+            var key = Path.Combine(TempDirectory, "key.aes");
+            var iv = Path.Combine(TempDirectory, "iv.aes");
+
+            // Act
+            var ex = Assert.Throws<ArgumentException>(() =>
+                AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: "   "));
+
+            // Assert
+            Assert.StartsWith("rootVaultPath cannot be whitespace", ex.Message);
+        }
+
+        [Fact]
+        public void EnsureFolders_RelativeRootVaultPath_ThrowsForCorrectReason()
+        {
+            // Arrange
+            var conn = $"Data Source={Path.Combine(TempDirectory, "Servy.db")};";
+            var key = Path.Combine(TempDirectory, "key.aes");
+            var iv = Path.Combine(TempDirectory, "iv.aes");
+
+            // Act
+            var ex = Assert.Throws<ArgumentException>(() =>
+                AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: "CustomVault"));
+
+            // Assert
+            Assert.StartsWith("rootVaultPath must be an absolute path", ex.Message);
+        }
+
+        [Fact]
+        public void EnsureFolders_AesKeyFilePathIsDriveRoot_ThrowsCannotDetermineFolder()
+        {
+            // Arrange
+            var conn = $"Data Source={Path.Combine(TempDirectory, "Servy.db")};";
+            var key = Path.GetPathRoot(TempDirectory)!; // absolute, but Path.GetDirectoryName has no parent to return
+            var iv = Path.Combine(TempDirectory, "iv.aes");
+
+            // Act
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory));
+
+            // Assert
+            Assert.Equal("Cannot determine AES key folder path.", ex.Message);
+        }
+
+        [Fact]
+        public void EnsureFolders_AesIVFilePathIsDriveRoot_ThrowsCannotDetermineFolder()
+        {
+            // Arrange
+            var conn = $"Data Source={Path.Combine(TempDirectory, "Servy.db")};";
+            var key = Path.Combine(TempDirectory, "key.aes");
+            var iv = Path.GetPathRoot(TempDirectory)!;
+
+            // Act
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory));
+
+            // Assert
+            Assert.Equal("Cannot determine AES IV folder path.", ex.Message);
+        }
+
+        [Fact]
+        public void EnsureFolders_MalformedConnectionString_ThrowsInvalidOperationException()
+        {
+            // Arrange
+            var conn = "==;;";
+            var key = Path.Combine(TempDirectory, "key.aes");
+            var iv = Path.Combine(TempDirectory, "iv.aes");
+
+            // Act
+            var ex = Assert.Throws<InvalidOperationException>(() => AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory));
+
+            // Assert
+            Assert.Equal("Connection string format is invalid.", ex.Message);
+            Assert.IsType<ArgumentException>(ex.InnerException);
         }
 
         [Fact]
@@ -41,78 +132,276 @@ namespace Servy.Core.UnitTests.Helpers
         {
             // Arrange
             var conn = "Server=myserver;Database=mydb;";
-            var key = Path.Combine(_tempDir, "key.aes");
-            var iv = Path.Combine(_tempDir, "iv.aes");
+            var key = Path.Combine(TempDirectory, "key.aes");
+            var iv = Path.Combine(TempDirectory, "iv.aes");
 
             // Act
-            var ex = Assert.Throws<InvalidOperationException>(() => AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: _tempDir));
+            var ex = Assert.Throws<InvalidOperationException>(() => AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory));
 
             // Assert
             Assert.Contains("Data Source", ex.Message);
         }
 
         [Fact]
-        public void EnsureFolders_InvalidDbFilePath_ThrowsInvalidOperationException()
+        public void EnsureFolders_EmptyDataSourceValue_ThrowsInvalidOperationException()
         {
             // Arrange
-            var conn = "Data Source=:db:"; // invalid path will fail Path.GetDirectoryName
-            var key = Path.Combine(_tempDir, "key.aes");
-            var iv = Path.Combine(_tempDir, "iv.aes");
+            // A quoted blank value is kept by DbConnectionStringBuilder; an unquoted empty
+            // one is dropped, which lands on the missing-key guard instead (covered above).
+            var conn = "Data Source=\"   \";";
+            var key = Path.Combine(TempDirectory, "key.aes");
+            var iv = Path.Combine(TempDirectory, "iv.aes");
 
             // Act
-            var ex = Assert.Throws<InvalidOperationException>(() => AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: _tempDir));
+            var ex = Assert.Throws<InvalidOperationException>(() => AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory));
 
             // Assert
-            Assert.Equal("Cannot determine database folder path.", ex.Message);
+            Assert.Equal("The database path provided in the connection string is empty.", ex.Message);
+        }
+
+        [Fact]
+        public void EnsureFolders_RelativeDataSource_ThrowsInvalidOperation()
+        {
+            // Arrange
+            var conn = "Data Source=db\\Servy.db;";
+            var key = Path.Combine(TempDirectory, "key.aes");
+            var iv = Path.Combine(TempDirectory, "iv.aes");
+
+            // Act
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => AppFoldersHelper.EnsureFolders(conn, key, iv, TempDirectory));
+
+            // Assert
+            Assert.Contains("absolute", ex.Message);
+        }
+
+        [Fact]
+        public void EnsureFolders_DataSourceKeySpelling_Succeeds()
+        {
+            // Arrange
+            var dbFolder = Path.Combine(TempDirectory, "db");
+            var keyFolder = Path.Combine(TempDirectory, "keys");
+            var ivFolder = Path.Combine(TempDirectory, "iv");
+
+            var conn = $"DataSource={Path.Combine(dbFolder, "Servy.db")};";
+            var key = Path.Combine(keyFolder, "key.aes");
+            var iv = Path.Combine(ivFolder, "iv.aes");
+
+            // Act
+            AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory);
+
+            // Assert
+            Assert.True(Directory.Exists(dbFolder));
+            Assert.True(Directory.Exists(keyFolder));
+            Assert.True(Directory.Exists(ivFolder));
         }
 
         [Fact]
         public void EnsureFolders_ValidPaths_CreatesAllFoldersUnderCustomRoot()
         {
             // Arrange
-            var dbFolder = Path.Combine(_tempDir, "db");
-            var keyFolder = Path.Combine(_tempDir, "keys");
-            var ivFolder = Path.Combine(_tempDir, "iv");
+            var dbFolder = Path.Combine(TempDirectory, "db");
+            var keyFolder = Path.Combine(TempDirectory, "keys");
+            var ivFolder = Path.Combine(TempDirectory, "iv");
 
             var conn = $"Data Source={Path.Combine(dbFolder, "Servy.db")};";
             var key = Path.Combine(keyFolder, "key.aes");
             var iv = Path.Combine(ivFolder, "iv.aes");
 
             // Act: Supply custom rootVaultPath so tests execute deterministically without touching system C:\ProgramData\Servy
-            AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: _tempDir);
+            AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory);
 
             // Assert: Verify all operational directories exist under the scoped test root
             Assert.True(Directory.Exists(dbFolder));
             Assert.True(Directory.Exists(keyFolder));
             Assert.True(Directory.Exists(ivFolder));
-            Assert.True(Directory.Exists(Path.Combine(_tempDir, "recovery")));
-            Assert.True(Directory.Exists(Path.Combine(_tempDir, "logs")));
+            Assert.True(Directory.Exists(Path.Combine(TempDirectory, "logs")));
+            Assert.True(Directory.Exists(Path.Combine(TempDirectory, "logs", "services")));
+
+            // Assert: The legacy recovery folder is no longer created; its counters live in Servy.db
+            Assert.False(Directory.Exists(Path.Combine(TempDirectory, "recovery")));
 
             // Assert: Folders nested inside the root vault maintain inheritance
-            if (OperatingSystem.IsWindows())
+            var dbSecurity = new DirectoryInfo(dbFolder).GetAccessControl();
+            Assert.False(dbSecurity.AreAccessRulesProtected); // child of root -> inheritance preserved
+        }
+
+        [Fact]
+        public void EnsureFolders_ChildFolderInDifferentCasingThanTheRoot_KeepsInheritance()
+        {
+            // Arrange: the same vault directory, spelled in upper case for the root and in its
+            // original casing for the database folder. Windows treats both as one directory.
+            var upperRoot = TempDirectory.ToUpperInvariant();
+            Assert.NotEqual(TempDirectory, upperRoot);
+
+            var dbFolder = Path.Combine(TempDirectory, "db");
+            var conn = $"Data Source={Path.Combine(dbFolder, "Servy.db")};";
+            var key = Path.Combine(TempDirectory, "keys", "key.aes");
+            var iv = Path.Combine(TempDirectory, "iv", "iv.aes");
+
+            // Act
+            AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: upperRoot);
+
+            // Assert: a case-sensitive prefix match would call the folder external and break inheritance.
+            Assert.True(Directory.Exists(dbFolder));
+            var dbSecurity = new DirectoryInfo(dbFolder).GetAccessControl();
+            Assert.False(dbSecurity.AreAccessRulesProtected); // child of root in another casing -> inheritance preserved
+        }
+
+        [Fact]
+        public void EnsureFolders_ExternalFolder_BreaksInheritance()
+        {
+            // Arrange: Place root vault and database folder in separate root directories
+            var externalTempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            try
             {
+                var dbFolder = Path.Combine(externalTempDir, "external_db");
+                var keyFolder = Path.Combine(TempDirectory, "keys");
+                var ivFolder = Path.Combine(TempDirectory, "iv");
+
+                var conn = $"Data Source={Path.Combine(dbFolder, "Servy.db")};";
+                var key = Path.Combine(keyFolder, "key.aes");
+                var iv = Path.Combine(ivFolder, "iv.aes");
+
+                // Act
+                AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory);
+
+                // Assert: External folder must break inheritance as its own security root
+                Assert.True(Directory.Exists(dbFolder));
                 var dbSecurity = new DirectoryInfo(dbFolder).GetAccessControl();
-                Assert.False(dbSecurity.AreAccessRulesProtected); // child of root -> inheritance preserved
+                Assert.True(dbSecurity.AreAccessRulesProtected); // external folder -> inheritance broken
             }
+            finally
+            {
+                try { if (Directory.Exists(externalTempDir)) Directory.Delete(externalTempDir, true); }
+                catch { /* Prevent teardown exceptions */ }
+            }
+        }
+
+        [Fact]
+        public void EnsureFolders_SiblingFolderSharingTheRootPrefix_BreaksInheritance()
+        {
+            // Arrange: a folder BESIDE the vault whose name starts with the vault's name.
+            // TempDirectory carries no trailing separator, so TempDirectory + "Sibling" is a
+            // real sibling and not a child. Only the separator appended to normalizedRoot
+            // (the `+ Path.DirectorySeparatorChar` in AppFoldersHelper.EnsureFolders) keeps StartsWith from calling it a child.
+            var siblingDir = TempDirectory + "Sibling";
+            try
+            {
+                var dbFolder = Path.Combine(siblingDir, "db");
+                var conn = $"Data Source={Path.Combine(dbFolder, "Servy.db")};";
+                var key = Path.Combine(TempDirectory, "keys", "key.aes");
+                var iv = Path.Combine(TempDirectory, "iv", "iv.aes");
+
+                // Act
+                AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory);
+
+                // Assert: a prefix match without the trailing separator would treat the sibling as a
+                // child and keep inheritance, which would leave it reading C:\ProgramData ACLs.
+                Assert.True(Directory.Exists(dbFolder));
+                var dbSecurity = new DirectoryInfo(dbFolder).GetAccessControl();
+                Assert.True(dbSecurity.AreAccessRulesProtected); // sibling of root -> inheritance broken
+            }
+            finally
+            {
+                try { if (Directory.Exists(siblingDir)) Directory.Delete(siblingDir, true); }
+                catch { /* Prevent teardown exceptions */ }
+            }
+        }
+
+        [Fact]
+        public void EnsureFolders_DbFolderIsRootVault_StillCreatesTheFoldersQueuedBehindTheRoot()
+        {
+            // Arrange: Put the database file directly in the root vault, so dbFolder is the root itself
+            // and the loop reaches its self-skip branch. Every other success test nests all three files
+            // in dedicated subfolders, so this is the only arrangement that gets there.
+            var keyFolder = Path.Combine(TempDirectory, "keys");
+            var ivFolder = Path.Combine(TempDirectory, "iv");
+
+            var conn = $"Data Source={Path.Combine(TempDirectory, "Servy.db")};";
+            var key = Path.Combine(keyFolder, "key.aes");
+            var iv = Path.Combine(ivFolder, "iv.aes");
+
+            // Act
+            AppFoldersHelper.EnsureFolders(conn, key, iv, rootVaultPath: TempDirectory);
+
+            // Assert: The loop does not abandon the entries queued behind the root. The root is the
+            // first element of subFolders, so a self-skip that left the loop instead of stepping over
+            // one entry would leave all four of these uncreated.
+            Assert.True(Directory.Exists(keyFolder));
+            Assert.True(Directory.Exists(ivFolder));
+            Assert.True(Directory.Exists(Path.Combine(TempDirectory, "logs")));
+            Assert.True(Directory.Exists(Path.Combine(TempDirectory, "logs", "services")));
+
+            // Assert: The loop leaves the protection the root was given before it in place. This is a
+            // regression guard, not evidence that the self-skip fired: with the skip removed, canonicalRoot
+            // still does not start with normalizedRoot (which carries a trailing separator), so the root
+            // would be re-secured with the same breakInheritance: true and the end state would be identical.
+            var rootSecurity = new DirectoryInfo(TempDirectory).GetAccessControl();
+            Assert.True(rootSecurity.AreAccessRulesProtected); // root vault -> inheritance broken
         }
 
         [Theory]
         [InlineData("Data Source=Servy.db;", "{tmp}\\key.aes", "{tmp}\\iv.aes", "Cannot determine database folder path.")]
-        [InlineData("Data Source={tmp}\\db\\Servy.db;", "key.aes", "{tmp}\\iv\\iv.aes", "Cannot determine AES key folder path.")]
-        [InlineData("Data Source={tmp}\\db\\Servy.db;", "{tmp}\\key\\key.aes", "iv.aes", "Cannot determine AES IV folder path.")]
+        [InlineData("Data Source=:db:;", "{tmp}\\key.aes", "{tmp}\\iv.aes", "Cannot determine database folder path.")]
         public void EnsureFolders_PathWithoutDirectory_ThrowsInvalidOperationException(string conn, string key, string iv, string expectedMessage)
         {
             // Arrange
-            string resolvedConn = conn.Replace(TempToken, _tempDir);
-            string resolvedKey = key.Replace(TempToken, _tempDir);
-            string resolvedIv = iv.Replace(TempToken, _tempDir);
+            string resolvedConn = conn.Replace(TempToken, TempDirectory);
+            string resolvedKey = key.Replace(TempToken, TempDirectory);
+            string resolvedIv = iv.Replace(TempToken, TempDirectory);
 
             // Act
             var ex = Assert.Throws<InvalidOperationException>(() =>
-                AppFoldersHelper.EnsureFolders(resolvedConn, resolvedKey, resolvedIv, rootVaultPath: _tempDir));
+                AppFoldersHelper.EnsureFolders(resolvedConn, resolvedKey, resolvedIv, rootVaultPath: TempDirectory));
 
             // Assert
             Assert.Equal(expectedMessage, ex.Message);
         }
+
+        [Theory]
+        [InlineData("Data Source={tmp}\\db\\Servy.db;", "key.aes", "{tmp}\\iv\\iv.aes", "aesKeyFilePath must be an absolute path")]
+        [InlineData("Data Source={tmp}\\db\\Servy.db;", "{tmp}\\key\\key.aes", "iv.aes", "aesIVFilePath must be an absolute path")]
+        public void EnsureFolders_PathNotRooted_ThrowsArgumentException(string conn, string key, string iv, string expectedMessage)
+        {
+            // Arrange
+            string resolvedConn = conn.Replace(TempToken, TempDirectory);
+            string resolvedKey = key.Replace(TempToken, TempDirectory);
+            string resolvedIv = iv.Replace(TempToken, TempDirectory);
+
+            // Act
+            var ex = Assert.Throws<ArgumentException>(() =>
+                AppFoldersHelper.EnsureFolders(resolvedConn, resolvedKey, resolvedIv, rootVaultPath: TempDirectory));
+
+            // Assert
+            Assert.Contains(expectedMessage, ex.Message);
+        }
+
+        #endregion
+
+        #region GetAppDirectory Tests
+
+        [Fact]
+        public void GetAppDirectory_ReturnsDirectoryContainingProcessOrBaseDir()
+        {
+            // Arrange: the SUT prefers the process path and falls back to the base directory
+            var expected = !string.IsNullOrEmpty(Environment.ProcessPath)
+                ? Path.GetDirectoryName(Environment.ProcessPath)!
+                : AppContext.BaseDirectory;
+
+            // Act
+            var appDir = AppFoldersHelper.GetAppDirectory();
+
+            // Assert
+            Assert.False(string.IsNullOrWhiteSpace(appDir));
+            Assert.True(Directory.Exists(appDir));
+
+            // AppContext.BaseDirectory carries a trailing separator and Path.GetDirectoryName does not
+            Assert.Equal(
+                expected.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                appDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        }
+
+        #endregion
     }
 }

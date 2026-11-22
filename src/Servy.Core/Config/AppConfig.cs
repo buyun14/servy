@@ -26,8 +26,16 @@ namespace Servy.Core.Config
         public const string EventLogName = "Application";
 
         /// <summary>
-        /// The name of the Windows service and the associated Event Log source.
-        /// Used for service registration and writing logs to the Windows Event Viewer.
+        /// Suffix appended to an event-log message that was cut at <see cref="EventLogMessageMaxChars"/>.
+        /// </summary>
+        public const string EventLogTruncationSuffix = "...[truncated]";
+
+        /// <summary>
+        /// The Event Log source under which Servy writes to the <see cref="EventLogName"/> log in the
+        /// Windows Event Viewer, and the <c>ServiceBase.ServiceName</c> the Servy.Service host process
+        /// reports to the Service Control Manager. It is not what registers a service: the Servy host
+        /// service is registered under <see cref="ServyHostServiceName"/>, and a user service under the
+        /// name its own configuration carries.
         /// </summary>
         public const string EventSource = "Servy";
 
@@ -40,6 +48,11 @@ namespace Servy.Core.Config
         /// Latest GitHub release link.
         /// </summary>
         public const string LatestReleaseLink = "https://github.com/aelassas/servy/releases/latest";
+
+        /// <summary>
+        /// The URL to the Servy wiki page that documents the runtime environment variables.
+        /// </summary>
+        public const string RuntimeVariablesUrl = "https://github.com/aelassas/servy/wiki/Environment-Variables#protected-variables";
 
         /// <summary>
         /// Command-line argument used to bypass hardware acceleration and force
@@ -94,32 +107,15 @@ namespace Servy.Core.Config
 #endif
 
         /// <summary>
-        /// The default file name of the Sysinternals Handle executable used to detect
-        /// processes holding handles to files. Typically <c>handle64.exe</c> on 64-bit systems.
+        /// The file names of the Sysinternals Handle executables (<c>handle64.exe</c> on x64, <c>handle64a.exe</c> on
+        /// ARM64) that earlier versions extracted to <see cref="ProgramDataPath"/> to find the processes locking a file.
         /// </summary>
-        public const string HandleExeX64FileName = "handle64";
-
-        /// <summary>
-        /// Gets the full file name of the Sysinternals Handle executable (x64), including the ".exe" extension.
-        /// </summary>
-        public static readonly string HandleExeX64 = $"{HandleExeX64FileName}.exe";
-
-        /// <summary>
-        /// The default file name of the Sysinternals Handle executable used to detect
-        /// processes holding handles to files. Typically <c>handle64a.exe</c> on ARM64 systems.
-        /// </summary>
-        public const string HandleExeARM64FileName = "handle64a";
-
-        /// <summary>
-        /// Gets the full file name of the Sysinternals Handle executable (ARM64), including the ".exe" extension.
-        /// </summary>
-        public static readonly string HandleExeARM64 = $"{HandleExeARM64FileName}.exe";
-
-        /// <summary>
-        /// The file name of the Servy.Core assembly (without extension).
-        /// Used when copying or loading the core library dynamically.
-        /// </summary>
-        public const string ServyCoreDllName = "Servy.Core";
+        /// <remarks>
+        /// Servy no longer ships or runs them: the lock holders are found through the Windows Restart Manager
+        /// (<see cref="Helpers.HandleHelper"/>). The Desktop app, the Manager and the CLI delete any copy an earlier
+        /// version left in the vault when they extract their binaries.
+        /// </remarks>
+        public static readonly IReadOnlyList<string> LegacyHandleExeFileNames = new[] { "handle64.exe", "handle64a.exe" };
 
         /// <summary>
         /// The base file name (without extension) of the Servy Service UI executable.
@@ -171,7 +167,7 @@ namespace Servy.Core.Config
         /// <summary>
         /// The base file name (without extension) of the Servy Service CLI executable.
         /// </summary>
-        public static readonly string ServyServiceCLIFileName = "Servy.Service.CLI";
+        public const string ServyServiceCLIFileName = "Servy.Service.CLI";
 
         /// <summary>
         /// The full file name (with extension) of the Servy Service CLI executable.
@@ -179,9 +175,19 @@ namespace Servy.Core.Config
         public static readonly string ServyServiceCLIExe = $"{ServyServiceCLIFileName}.exe";
 
         /// <summary>
+        /// The base file name (without extension) of the Servy Restarter executable.
+        /// </summary>
+        public const string ServyRestarterFileName = "Servy.Restarter";
+
+        /// <summary>
+        /// The full file name (with extension) of the Servy Restarter executable.
+        /// </summary>
+        public static readonly string ServyRestarterExe = $"{ServyRestarterFileName}.exe";
+
+        /// <summary>
         /// The root folder name under ProgramData.
         /// </summary>
-        public static readonly string AppFolderName = "Servy";
+        public const string AppFolderName = "Servy";
 
         /// <summary>
         /// The full root path under ProgramData where Servy stores its data.
@@ -190,18 +196,49 @@ namespace Servy.Core.Config
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), AppFolderName);
 
         /// <summary>
+        /// The name of the database folder under <see cref="ProgramDataPath"/>.
+        /// </summary>
+        public const string DbFolderName = "db";
+
+        /// <summary>
+        /// The file name of the SQLite configuration database in <see cref="DbFolderPath"/>.
+        /// </summary>
+        public const string DatabaseFileName = "Servy.db";
+
+        /// <summary>
+        /// The name of the security folder under <see cref="ProgramDataPath"/>.
+        /// </summary>
+        public const string SecurityFolderName = "security";
+
+        /// <summary>
+        /// The file name of the AES encryption key in <see cref="SecurityFolderPath"/>.
+        /// </summary>
+        public const string AESKeyFileName = "aes_key.dat";
+
+        /// <summary>
+        /// The file name of the legacy AES initialization vector in <see cref="SecurityFolderPath"/>.
+        /// </summary>
+        public const string AESIVFileName = "aes_iv.dat";
+
+        /// <summary>
         /// Path to the database folder.
         /// </summary>
-        public static readonly string DbFolderPath = Path.Combine(ProgramDataPath, "db");
+        public static readonly string DbFolderPath = Path.Combine(ProgramDataPath, DbFolderName);
 
         /// <summary>
         /// Path to the security folder containing AES key/IV files.
         /// </summary>
-        public static readonly string SecurityFolderPath = Path.Combine(ProgramDataPath, "security");
+        public static readonly string SecurityFolderPath = Path.Combine(ProgramDataPath, SecurityFolderName);
 
         /// <summary>
-        /// The folder name for storing service recovery and restart attempt files.
+        /// The name of the legacy folder in which earlier versions of the wrapper kept one restart-attempts counter file
+        /// per service.
         /// </summary>
+        /// <remarks>
+        /// The counters now live in <c>Servy.db</c> and are read and written by the Servy host service on the wrapper's
+        /// behalf. The folder is only read once, by the database migration that imports its counters, and is deleted once
+        /// that migration has succeeded.
+        /// </remarks>
         public const string RecoveryFolderName = "recovery";
 
         /// <summary>
@@ -210,14 +247,46 @@ namespace Servy.Core.Config
         public const string LogsFolderName = "logs";
 
         /// <summary>
-        /// Path to the recovery folder containing service restart attempts files.
+        /// Path to the legacy recovery folder; see <see cref="RecoveryFolderName"/>.
         /// </summary>
         public static readonly string RecoveryFolderPath = Path.Combine(ProgramDataPath, RecoveryFolderName);
 
         /// <summary>
         /// Path to the logs folder containing log files.
         /// </summary>
+        /// <remarks>
+        /// Only administrators and Local System can read or write this folder. The logs the wrappers write under their
+        /// service accounts live in the folder of each service under <see cref="ServiceLogsFolderPath"/>.
+        /// </remarks>
         public static readonly string LogsFolderPath = Path.Combine(ProgramDataPath, LogsFolderName);
+
+        /// <summary>
+        /// The name of the folder, under <see cref="LogsFolderPath"/>, that holds one folder per service,
+        /// <c>&lt;ServiceName&gt;\</c> (<see cref="Logging.ServiceLogPaths"/>), in which that service's wrapper and restarter
+        /// write their logs under its service account. A service account can write in the folders of its own services
+        /// only, and not in this folder itself.
+        /// </summary>
+        public const string ServiceLogsFolderName = "services";
+
+        /// <summary>
+        /// The path of the folder that holds the per-service log folders; see <see cref="ServiceLogsFolderName"/>.
+        /// </summary>
+        public static readonly string ServiceLogsFolderPath = Path.Combine(LogsFolderPath, ServiceLogsFolderName);
+
+        /// <summary>
+        /// The file name of the log a service wrapper writes in its service's log folder under <see cref="ServiceLogsFolderPath"/>.
+        /// </summary>
+        public const string ServyServiceLogFileName = "Servy.Service.log";
+
+        /// <summary>
+        /// The file name of the log the restarter writes in its service's log folder under <see cref="ServiceLogsFolderPath"/>.
+        /// </summary>
+        public const string ServyRestarterLogFileName = "Servy.Restarter.log";
+
+        /// <summary>
+        /// The file name of the log the Servy host service writes in <see cref="LogsFolderPath"/>.
+        /// </summary>
+        public const string ServyHostLogFileName = "Servy.Host.log";
 
         /// <summary>
         /// The default SQLite connection string for the Servy application.
@@ -225,9 +294,9 @@ namespace Servy.Core.Config
         /// <remarks>
         /// This string configures the connection to <c>Servy.db</c> within the <see cref="DbFolderPath"/>.
         /// It includes performance and resilience settings such as <c>Journal Mode=WAL</c> and a 5000ms busy timeout.
-        /// This value serves as the hardcoded fallback if no override is provided in the <c>ConnectionStrings:DefaultConnection</c> configuration of the application settings.
+        /// It is not configurable: <see cref="CoreSettingsLoader.Load"/> always returns it and ignores a <c>ConnectionStrings:DefaultConnection</c> key in the application settings.
         /// </remarks>
-        public static readonly string DefaultConnectionString = $"Data Source={Path.Combine(DbFolderPath, "Servy.db")};Busy Timeout=5000;Journal Mode=WAL;Pooling=True;";
+        public static readonly string DefaultConnectionString = $"Data Source={Path.Combine(DbFolderPath, DatabaseFileName)};Busy Timeout=5000;Journal Mode=WAL;Pooling=True;";
 
         /// <summary>
         /// The default file path for the AES encryption key.
@@ -235,9 +304,9 @@ namespace Servy.Core.Config
         /// <remarks>
         /// Points to <c>aes_key.dat</c> within the <see cref="SecurityFolderPath"/>.
         /// This path is used by all Servy components (UI, CLI, and Service) to locate the master encryption key.
-        /// This value serves as the hardcoded fallback if no override is provided in the <c>Security:AESKeyFilePath</c> configuration of the application settings.
+        /// It is not configurable: <see cref="CoreSettingsLoader.Load"/> always returns it and ignores a <c>Security:AESKeyFilePath</c> key in the application settings.
         /// </remarks>
-        public static readonly string DefaultAESKeyPath = Path.Combine(SecurityFolderPath, "aes_key.dat");
+        public static readonly string DefaultAESKeyPath = Path.Combine(SecurityFolderPath, AESKeyFileName);
 
         /// <summary>
         /// The default file path for the AES initialization vector (IV).
@@ -245,9 +314,9 @@ namespace Servy.Core.Config
         /// <remarks>
         /// Points to <c>aes_iv.dat</c> within the <see cref="SecurityFolderPath"/>.
         /// Maintaining a single source of truth for this path prevents "split-brain" encryption issues between the configuration UI and the Windows Service.
-        /// This value serves as the hardcoded fallback if no override is provided in the <c>Security:AESIVFilePath</c> configuration of the application settings.
+        /// It is not configurable: <see cref="CoreSettingsLoader.Load"/> always returns it and ignores a <c>Security:AESIVFilePath</c> key in the application settings.
         /// </remarks>
-        public static readonly string DefaultAESIVPath = Path.Combine(SecurityFolderPath, "aes_iv.dat");
+        public static readonly string DefaultAESIVPath = Path.Combine(SecurityFolderPath, AESIVFileName);
 
         #endregion
 
@@ -259,14 +328,9 @@ namespace Servy.Core.Config
         public const int DefaultRefreshIntervalInSeconds = 4;
 
         /// <summary>
-        /// Default performance (CPU/RAM graphs) refresh interval when not set in appsettings. Default is 800 ms.
+        /// Default monitoring refresh interval when not set in appsettings. Default is 800 ms.
         /// </summary>
-        public const int DefaultPerformanceRefreshIntervalInMs = 800;
-
-        /// <summary>
-        /// Default console refresh interval when not set in appsettings. Default is 800 ms.
-        /// </summary>
-        public const int DefaultConsoleRefreshIntervalInMs = 800;
+        public const int DefaultMonitoringRefreshIntervalMs = 800;
 
         /// <summary>
         /// The default maximum number of log lines to retain in the console tab.
@@ -274,7 +338,7 @@ namespace Servy.Core.Config
         /// <remarks>
         /// This value balances visibility of historical logs with application performance.
         /// Increasing this beyond the default may lead to increased memory usage and UI virtualization lag
-        /// in the <see cref="Servy.Manager"/> views.
+        /// in the <c>Servy.Manager</c> views.
         /// </remarks>
         public const int DefaultConsoleMaxLines = 20_000;
 
@@ -287,11 +351,6 @@ namespace Servy.Core.Config
         /// unresponsiveness in the WPF rendering thread.
         /// </remarks>
         public const int MaxConsoleMaxLines = 2 * DefaultConsoleMaxLines;
-
-        /// <summary>
-        /// Default dependencies tab refresh interval when not set in appsettings. Default is 800 ms.
-        /// </summary>
-        public const int DefaultDependenciesRefreshIntervalInMs = 800;
 
         /// <summary>
         /// Default Wait chunk in milliseconds. Used in pre-launch and pre-stop hooks.
@@ -422,13 +481,19 @@ namespace Servy.Core.Config
         public const int DefaultStopTimeout = 5;
 
         /// <summary>
-        /// The maximum time, in milliseconds, the restarter executable will wait for the
-        /// main service process to terminate.
+        /// Default flag for allowing overridden runtime environment variables. Default is <c>false</c>.
+        /// </summary>
+        public const bool DefaultAllowOverriddenRuntimeVars = false;
+
+        /// <summary>
+        /// The maximum time, in milliseconds, that the service wrapper (<c>Servy.Service.exe</c>) will wait for a launched
+        /// Servy.Restarter.exe process to exit before force-terminating it.
         /// </summary>
         /// <remarks>
-        /// Defaults to 240,000ms (4 minutes). This provides a significant buffer for
-        /// the service to perform a graceful shutdown, flush logs, and release
-        /// file handles before the restarter attempts to perform maintenance or a restart.
+        /// Defaults to 240,000ms (4 minutes). This is a hard deadline imposed on the restarter
+        /// from outside: a <c>RestartTimeoutSeconds</c> larger than this (see
+        /// <see cref="MaxRestarterTimeoutSeconds"/>) cannot be spent when the restart is driven
+        /// by the service's own recovery path.
         /// </remarks>
         public const int RestarterExeMaxWaitMs = 240_000;
 
@@ -567,7 +632,7 @@ namespace Servy.Core.Config
 
         /// <summary>
         /// The cooperative cancellation timeout for update checks.
-        /// NOTE: This value must be ≤ UpdateCheckHttpTimeoutSeconds.
+        /// NOTE: This value must be strictly less than UpdateCheckHttpTimeoutSeconds.
         /// If this is greater than the HTTP timeout, the user will see a generic
         /// connection error instead of the friendly 'Update check timed out' message.
         /// </summary>
@@ -617,7 +682,8 @@ namespace Servy.Core.Config
         /// </summary>
         /// <remarks>
         /// To prevent thread starvation and SCM contention, the actual degree of parallelism is
-        /// throttled by a hardware-aware ceiling: <c>Math.Min(Environment.ProcessorCount * 2, DefaultMaxBulkOperationParallelism)</c>.
+        /// throttled by a hardware-aware ceiling: <c>Math.Max(1, Math.Min(Environment.ProcessorCount * 2, MaxBulkOperationParallelism))</c>,
+        /// where <c>MaxBulkOperationParallelism</c> is the configured value and this constant is its default.
         /// </remarks>
         public const int DefaultMaxBulkOperationParallelism = 8;
 
@@ -649,6 +715,16 @@ namespace Servy.Core.Config
         public const int LogTailerHistoryScanBufferSize = 4_096;
 
         /// <summary>
+        /// The allocation buffer size in bytes used by the log tailer when reading forward from the
+        /// committed offset during live tailing.
+        /// </summary>
+        /// <remarks>
+        /// The live pass splits raw bytes on the encoded newline sequence, so this is the chunk size of
+        /// its sequential reads. A line longer than this buffer is simply completed by a later chunk.
+        /// </remarks>
+        public const int LogTailerTailReadBufferSize = 4_096;
+
+        /// <summary>
         /// Defines the minimum execution duration threshold (in milliseconds) required to keep the splash screen visible.
         /// </summary>
         /// <remarks>
@@ -659,20 +735,24 @@ namespace Servy.Core.Config
         public const int SplashMinDisplayThresholdMs = 1_000;
 
         /// <summary>
-        /// Specifies the minimum splash screen display delay (in milliseconds) enforced when initialization completes quickly.
+        /// Defines the delay (in milliseconds) before resetting the wait cursor after launching the Servy Desktop application
+        /// from the Servy Manager (either to open the general application window or to edit a specific service configuration).
         /// </summary>
         /// <remarks>
-        /// When application startup completes faster than this threshold, a brief pause is added to ensure
-        /// the splash screen displays long enough to prevent a jarring visual flicker before transitioning to the main UI.
+        /// Spawning the external Desktop process returns asynchronously before its WPF visual tree finishes initializing.
+        /// This delay prevents the cursor from prematurely reverting to default while the Desktop window is painting.
         /// </remarks>
-        public const int SplashMinDisplayPaddingMs = 500;
+        public const int DesktopAppLaunchCursorDelayMs = 3_000;
 
         /// <summary>
         /// The positional launch argument string passed to indicate whether the splash screen should be bypassed on application startup.
         /// </summary>
         /// <remarks>
-        /// This string value binds the producer contract in <c>ServiceCommands.OpenManager</c> directly with the consumer parsing engine
-        /// in <c>AppBootstrapper.OnStartup</c>. Changing this configuration field guarantees that both boundaries remain synchronized.
+        /// Passed as the first positional argument by <c>ServiceCommands.OpenManagerAsync</c> in
+        /// <c>Servy</c> and by <c>ServiceCommands.ConfigureServiceAsync</c> in <c>Servy.Manager</c>.
+        /// The consumer, <c>AppBootstrapper.OnStartup</c>, parses that argument with
+        /// <see cref="bool.TryParse(string, out bool)"/> and does not read
+        /// this constant, so the value must remain a string <c>bool.TryParse</c> accepts as false.
         /// </remarks>
         public const string SkipSplashArgument = "false";
 
@@ -737,27 +817,6 @@ namespace Servy.Core.Config
         public static readonly TimeSpan InputRegexTimeout = TimeSpan.FromMilliseconds(InputRegexTimeoutMs);
 
         /// <summary>
-        /// Gets the timeout duration for Regex operations used to parse output from handle.exe.
-        /// </summary>
-        /// <remarks>
-        /// Uses a 10x multiplier over standard input regex timeout to accommodate large system handle tables.
-        /// A longer budget is intentional to accommodate cases where handle.exe produces voluminous output,
-        /// such as when a single large file is associated with thousands of owners or handles.
-        /// </remarks>
-        public static readonly TimeSpan HandleExeRegexTimeout = TimeSpan.FromMilliseconds(InputRegexTimeoutMs * 10);
-
-        /// <summary>
-        /// Specifies the maximum duration, in milliseconds, allowed for standard output and error streams
-        /// of <c>handle.exe</c> to completely flush and drain after a termination event.
-        /// </summary>
-        /// <remarks>
-        /// This timeout provides a best-effort structural buffer to ensure that diagnostic traces are fully
-        /// written to logs before resources are cleaned up, preventing deadlocks if the underlying stream is blocked
-        /// during a forced <see cref="TimeoutException"/> escalation.
-        /// </remarks>
-        public const int HandleExeKillDrainTimeoutMs = 2_000;
-
-        /// <summary>
         /// Timeout in milliseconds to wait for an individual child process to exit after a termination signal.
         /// </summary>
         /// <remarks>
@@ -787,9 +846,10 @@ namespace Servy.Core.Config
         public const int KillParentWaitMs = 5_000;
 
         /// <summary>
-        /// Timeout in milliseconds for external handle-utility execution (e.g., handle.exe).
+        /// The number of times the Restart Manager is asked for the processes holding a file open before the lookup
+        /// gives up, when the list keeps growing between the call that sizes the buffer and the call that fills it.
         /// </summary>
-        public const int HandleExeTimeoutMs = 10_000;
+        public const int RestartManagerGetListMaxAttempts = 5;
 
         /// <summary>
         /// The maximum character length for a Windows Service display name.
@@ -907,7 +967,9 @@ namespace Servy.Core.Config
         public const int LoggerDefaultMaxBackupLogFiles = 10;
 
         /// <summary>
-        /// The maximum number of fallback log writes allowed per process lifetime.
+        /// The maximum number of fallback log writes allowed while the primary log writer is unavailable.
+        /// Initialization failures and write failures each have their own budget of this size, and both
+        /// budgets are reset whenever the primary writer is initialized successfully again.
         /// Prevents unbounded growth of fallback log files if the primary logger continuously fails.
         /// </summary>
         public const int LoggerMaxFallbackWrites = 10;
@@ -923,21 +985,20 @@ namespace Servy.Core.Config
         /// </para>
         /// <para>
         /// When a log message exceeds this limit, the <c>SafeWriteToEventLog</c> method in <see cref="EventLogLogger"/> will truncate the string
-        /// and append a "[truncated]" suffix to maintain forensic visibility while ensuring the write operation succeeds.
+        /// and append a <see cref="EventLogTruncationSuffix"/> suffix to maintain forensic visibility while ensuring the write operation succeeds.
         /// </para>
         /// </remarks>
         public const int EventLogMessageMaxChars = 31_000;
 
         /// <summary>
-        /// Specifies the default duration in milliseconds to wait for the operating system
-        /// to finalize the cleanup of a process and its descendant tree after a forced kill is issued.
+        /// Specifies the time to wait for a process to disappear after a forced Kill(), for the root child and each descendant.
         /// </summary>
         /// <remarks>
         /// This delay helps prevent race conditions where subsequent file system operations
         /// (like re-extracting resources) fail because the OS hasn't fully released file
         /// handles held by the terminated process tree.
         /// </remarks>
-        public const int DefaultDescendantPostKillWaitMs = 3_000;
+        public const int DefaultPostKillWaitMs = 3_000;
 
         /// <summary>
         /// Specifies the delay in milliseconds to wait after registering the PRESHUTDOWN notification
@@ -994,12 +1055,6 @@ namespace Servy.Core.Config
         public const int ServiceRestarterPollIntervalMs = 500;
 
         /// <summary>
-        /// Specifies the polling interval in milliseconds used to check if a managed process
-        /// has successfully exited during a teardown sequence.
-        /// </summary>
-        public const int ProcessExitPollIntervalMs = 500;
-
-        /// <summary>
         /// Specifies the refresh interval in milliseconds for the CLI progress spinner
         /// to maintain a smooth visual frame rate during long-running commands.
         /// </summary>
@@ -1013,7 +1068,8 @@ namespace Servy.Core.Config
 
         /// <summary>
         /// The maximum time, in milliseconds, the service will wait for a tracked hook process tree
-        /// (pre-launch, post-launch, or pre-stop) to exit after a kill signal has been issued.
+        /// (a fire-and-forget pre-launch hook or the post-launch hook) to exit after a kill signal
+        /// has been issued.
         /// </summary>
         /// <remarks>
         /// This timeout prevents the service teardown sequence from hanging indefinitely if an auxiliary
@@ -1030,13 +1086,13 @@ namespace Servy.Core.Config
         /// Set to 120 seconds to ensure maximum resiliency for background operations.
         /// This extended duration allows the restarter to wait out long 'Pending' transitions
         /// (e.g., heavy I/O cleanup or database flushes) without triggering a timeout
-        /// exception in the host service.
+        /// exception in the restarter (<c>Servy.Restarter.exe</c>), which is the process that waits.
         /// </remarks>
         public const int DefaultRestarterTimeoutSeconds = 120;
 
         /// <summary>
         /// The number of bytes read from the beginning of a file to generate a prefix digest.
-        /// 4096 bytes is the default to clear common application log headers and prologues.
+        /// 4096 bytes, chosen to clear common application log headers and prologues.
         /// </summary>
         public const int FileIdentityPrefixBytes = 4_096;
 
@@ -1048,11 +1104,13 @@ namespace Servy.Core.Config
         /// operation might inadvertently target a new, unrelated process that has claimed the PID
         /// of a recently terminated child or parent.
         ///
-        /// This constant defines the maximum allowed drift between the creation time of a parent
-        /// and its detected children. If a "child" process has a <see cref="System.Diagnostics.Process.StartTime"/>
-        /// that is significantly older or younger than its parent beyond this threshold (accounting for
-        /// kernel-scheduling jitter), it is flagged as a recycled PID and excluded from the operation
-        /// to prevent "process suicide" or the accidental termination of system-critical infrastructure.
+        /// This constant defines the clock tolerance applied to the creation times of a parent and its
+        /// detected children. A real child can never be created before its parent, so a "child" whose
+        /// <see cref="System.Diagnostics.Process.StartTime"/> predates its parent's by more than this threshold
+        /// (accounting for kernel-scheduling jitter) is flagged as a recycled PID and excluded from the operation;
+        /// a child that started later than its parent is normal and is never flagged. When walking upward, a
+        /// "parent" that started more than this threshold after its child is flagged the same way. This prevents
+        /// "process suicide" or the accidental termination of system-critical infrastructure.
         /// </remarks>
         public const int PidReuseToleranceSeconds = 2;
 
@@ -1078,7 +1136,7 @@ namespace Servy.Core.Config
         /// would pollute event streams with non-actionable noise.
         /// </para>
         /// <para>
-        /// If the cleanup loop encounters <value>10</value> consecutive deletion failures without a successful pass,
+        /// If the cleanup loop encounters <c>10</c> consecutive deletion failures without a successful pass,
         /// it escalates the log level to <c>Logger.Error</c> to notify administrators that rotated log files are
         /// no longer being pruned and disk space may grow unbounded.
         /// </para>
@@ -1091,7 +1149,7 @@ namespace Servy.Core.Config
         /// <remarks>
         /// Protects against transient I/O conflicts during atomic file replacement. While content is written to a temporary file,
         /// the final file move via <see cref="File.Move(string, string, bool)"/> can hit temporary locks if background OS processes
-        /// (like file indexers or antivirus filters) inspect the destination. This setting allows up to <value>3</value> retries
+        /// (like file indexers or antivirus filters) inspect the destination. This setting allows up to <c>3</c> retries
         /// before propagating an exception.
         /// </remarks>
         public const int WriteFileAtomicMaxRetries = 3;
@@ -1107,7 +1165,7 @@ namespace Servy.Core.Config
         /// <para>
         /// If a lock is active during an atomic file move, the operation fails with a Win32 Error 5
         /// (<see cref="UnauthorizedAccessException"/>) or Error 32 (<see cref="IOException"/> sharing violation). This
-        /// <value>100</value> millisecond delay gives external locks time to release before the next retry.
+        /// <c>100</c> millisecond delay gives external locks time to release before the next retry.
         /// </para>
         /// </remarks>
         public const int WriteFileAtomicRetryDelayMs = 100;
@@ -1169,6 +1227,11 @@ namespace Servy.Core.Config
         public const int KeyProviderMutexTimeoutSeconds = 30;
 
         /// <summary>
+        /// Maximum number of retry attempts when reading protected key files before failing.
+        /// </summary>
+        public const int KeyProviderReadMaxRetries = 3;
+
+        /// <summary>
         /// The base backoff delay period in milliseconds used inside the exponential backoff
         /// strategy when retrying file-read IO operations on cryptographic keys.
         /// </summary>
@@ -1177,6 +1240,35 @@ namespace Servy.Core.Config
         /// during retry loops, helping to safely resolve concurrent file-system access races on the raw key storage layer.
         /// </remarks>
         public const int KeyProviderReadRetryBackoffBaseMs = 100;
+
+        /// <summary>
+        /// The number of consecutive DPAPI key-migration failures before escalation from a Warning
+        /// to a system-level Error and Windows Event Log entry.
+        /// </summary>
+        /// <remarks>
+        /// The counterpart of <see cref="LogRotationDeletionFailureEscalationThreshold"/> for key
+        /// migration: below this count a failure is transient noise and is logged as a Warning, at or
+        /// above it the machine is treated as persistently stuck in v7.8 null-entropy compatibility
+        /// mode and an Error is raised. It must stay above 1, or the transient Warning branch is dead.
+        /// </remarks>
+        public const int KeyProviderMigrationFailureEscalationThreshold = 3;
+
+        /// <summary>
+        /// The AES key length in bytes generated and cached by the protected key provider.
+        /// </summary>
+        /// <remarks>
+        /// 32 bytes is AES-256, which is the key size the <c>SecureData</c> consumer of this material
+        /// expects; changing it here without changing that consumer breaks decryption at runtime.
+        /// </remarks>
+        public const int AesKeySizeBytes = 32;
+
+        /// <summary>
+        /// The AES initialization vector length in bytes generated and cached by the protected key provider.
+        /// </summary>
+        /// <remarks>
+        /// 16 bytes is the AES block size and is independent of the key size.
+        /// </remarks>
+        public const int AesIvSizeBytes = 16;
 
         /// <summary>
         /// The collection of lowercase file extensions allowed for service configuration file operations.
@@ -1197,6 +1289,11 @@ namespace Servy.Core.Config
         /// </remarks>
         public const int Toolhelp32SnapshotMaxRetries = 5;
 
+        /// <summary>
+        /// The lifetime, in minutes, for pooled HTTP connections used by the heartbeat client.
+        /// </summary>
+        public const int HeartbeatConnectionLifetimeMinutes = 15;
+
         #endregion
 
         #region Manager Configuration Bounds
@@ -1207,22 +1304,22 @@ namespace Servy.Core.Config
         public const int MaxRefreshIntervalInSeconds = 3_600;
 
         /// <summary>Minimum allowed interval for performance metric updates.</summary>
-        public const int MinPerformanceRefreshIntervalInMs = 100;
+        public const int MinPerformanceRefreshIntervalMs = 100;
         /// <summary>Maximum allowed interval for performance metric updates (5 minutes).</summary>
-        public const int MaxPerformanceRefreshIntervalInMs = 300_000;
+        public const int MaxPerformanceRefreshIntervalMs = 300_000;
 
         /// <summary>Minimum allowed interval for log console tailing updates.</summary>
-        public const int MinConsoleRefreshIntervalInMs = 100;
+        public const int MinConsoleRefreshIntervalMs = 100;
         /// <summary>Maximum allowed interval for log console tailing updates (5 minutes).</summary>
-        public const int MaxConsoleRefreshIntervalInMs = 300_000;
+        public const int MaxConsoleRefreshIntervalMs = 300_000;
 
         /// <summary>Minimum number of lines maintained in the log console buffer.</summary>
         public const int MinConsoleMaxLines = 100;
 
         /// <summary>Minimum allowed interval for refreshing service dependency trees.</summary>
-        public const int MinDependenciesRefreshIntervalInMs = 100;
+        public const int MinDependenciesRefreshIntervalMs = 100;
         /// <summary>Maximum allowed interval for refreshing service dependency trees (5 minutes).</summary>
-        public const int MaxDependenciesRefreshIntervalInMs = 300_000;
+        public const int MaxDependenciesRefreshIntervalMs = 300_000;
 
         /// <summary>Minimum delay for search input debouncing to prevent UI flicker.</summary>
         public const int MinSearchDebounceDelayMs = 100;
@@ -1251,7 +1348,7 @@ namespace Servy.Core.Config
         /// </para>
         /// <para>
         /// To handle these transient locks without crashing or freezing the UI dispatcher thread,
-        /// the application retries up to <value>5</value> times before logging a warning and giving up.
+        /// the application retries up to <c>5</c> times before logging a warning and giving up.
         /// </para>
         /// </remarks>
         public const int ClipboardComMaxRetries = 5;
@@ -1272,6 +1369,7 @@ namespace Servy.Core.Config
 
         /// <summary>
         /// Specifies the minimum allowed value, in seconds, for the pre-stop timeout setting.
+        /// A value of 0 is valid and explicitly triggers fire-and-forget execution mode.
         /// </summary>
         public const int MinPreStopTimeoutSeconds = 0;
 
@@ -1308,7 +1406,7 @@ namespace Servy.Core.Config
 
         /// <summary>
         /// Minimum pre-launch timeout in seconds.
-        /// Set to 0 to run the pre-launch hook in fire-and-forget mode.
+        /// A value of 0 is valid and explicitly triggers fire-and-forget execution mode.
         /// </summary>
         public const int MinPreLaunchTimeoutSeconds = 0;
 
@@ -1408,9 +1506,10 @@ namespace Servy.Core.Config
         public const int RestarterKillGracePeriodMs = 3_000;
 
         /// <summary>
-        /// Max retries for asynchronous SQLite operations encountering "Database is locked".
+        /// Total attempts (initial call plus retries) for asynchronous SQLite operations
+        /// encountering "Database is locked". A value of 1 disables retrying.
         /// </summary>
-        public const int DbAsyncMaxRetries = 3;
+        public const int DbAsyncMaxAttempts = 3;
 
         /// <summary>
         /// Initial exponential backoff delay for async database retries.
@@ -1423,12 +1522,15 @@ namespace Servy.Core.Config
         public const int DbAsyncMaxJitterMs = 50;
 
         /// <summary>
-        /// Max retries for synchronous SQLite operations (intentionally lower to avoid UI thread hangs).
+        /// Total attempts (initial call plus retries) for synchronous SQLite operations.
+        /// A value of 1 disables retrying.
         /// </summary>
-        public const int DbSyncMaxRetries = 3;
+        public const int DbSyncMaxAttempts = 3;
 
         /// <summary>
-        /// Initial delay for synchronous database retries.
+        /// Initial delay for synchronous database retries. Intentionally a quarter of
+        /// <see cref="DbAsyncInitialDelayMs"/> because the sync path can run on the UI thread:
+        /// this bounds the worst-case block to roughly 95 ms rather than 400 ms.
         /// </summary>
         public const int DbSyncInitialDelayMs = 25;
 
@@ -1448,10 +1550,13 @@ namespace Servy.Core.Config
         public const int DbBackoffMaxMs = 5_000;
 
         /// <summary>
-        /// Max DTOs per chunk when re-querying generated IDs after a batch upsert.
-        /// Kept under SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999) parameter limit.
+        /// The maximum number of SQL characters written to a database retry log line before truncation.
         /// </summary>
-        public const int DbBatchIdSyncChunkSize = 900;
+        /// <remarks>
+        /// This constant bounds how much of a failing query an operator sees in the log, keeping the
+        /// retry warnings readable on a single line without hiding the statement that caused them.
+        /// </remarks>
+        public const int DbSqlLogMaxLength = 60;
 
         /// <summary>
         /// Interval at which the CPU metrics cache is pruned of dead/recycled process entries.
@@ -1469,7 +1574,7 @@ namespace Servy.Core.Config
         public const int PreLaunchRetryInitialDelayMs = 1_000;
 
         /// <summary>
-        /// The maximum cumulative delay in milliseconds allowed between pre-launch process retry attempts.
+        /// The cap, in milliseconds, on the delay before each pre-launch process retry attempt; the delays are not summed against it.
         /// </summary>
         public const int PreLaunchRetryMaxDelayMs = 10_000;
 
@@ -1584,12 +1689,24 @@ namespace Servy.Core.Config
         public const string PostStopParametersEnvVarName = "SERVY_POST_STOP_PARAMETERS";
 
         /// <summary>
+        /// Specifies the name of the environment variable used to securely pass the heartbeat URL from the CLI.
+        /// SYNC WITH: src/Servy.CLI/Servy.psm1 ($script:ServyHeartbeatUrlEnvVar)
+        /// </summary>
+        /// <remarks>
+        /// A heartbeat URL is usually a capability URL (for example <c>https://hc-ping.com/&lt;uuid&gt;</c>) whose path
+        /// alone lets anyone send a fake "service is alive" ping, which is why the service masks it in its logs.
+        /// Using an environment variable keeps it out of command-line history and system process lists.
+        /// </remarks>
+        public const string HeartbeatUrlEnvVarName = "SERVY_HEARTBEAT_URL";
+
+        /// <summary>
         /// Controls whether the system will process legacy v1 (unauthenticated) ciphertexts.
         /// </summary>
         /// <remarks>
         /// This flag is maintained as a hardcoded compile-time constant <c>false</c> to mitigate ciphertext
         /// downgrade attack vectors. Automated runtime migration windows are no longer supported. Older
-        /// configurations must be modernized by re-saving them through the Servy Manager UI or the CLI tool.
+        /// configurations must be modernized by exporting them with a v1-compatible version of Servy, removing
+        /// the service, then importing the exported file through the Servy Manager UI or the CLI tool.
         /// </remarks>
         public const bool AllowLegacyV1Decryption = false;
 
@@ -1602,23 +1719,176 @@ namespace Servy.Core.Config
 
         #endregion
 
-        #region Public Methods
+        #region Servy Host IPC Constants
 
         /// <summary>
-        /// Gets the full path to the Sysinternals Handle executable (<c>handle64.exe</c> on x64, or
-        /// <c>handle64a.exe</c> on ARM64). In DEBUG mode, it looks in the application's base directory;
-        /// in RELEASE mode, it looks in the ProgramData folder.
+        /// The official Windows Service name for the primary Servy host service.
         /// </summary>
-        /// <returns>The full path to the Handle executable.</returns>
-        public static string GetHandleExePath() =>
-            ResolveExe(RuntimeInformation.OSArchitecture == Architecture.Arm64 ? HandleExeARM64FileName : HandleExeX64FileName);
+        public const string ServyHostServiceName = "Servy";
+
+        /// <summary>
+        /// The display name of the Servy host service in the Services console.
+        /// </summary>
+        public const string ServyHostDisplayName = "Servy";
+
+        /// <summary>
+        /// The description of the Servy host service in the Services console.
+        /// </summary>
+        public const string ServyHostDescription = "Serves each Servy service its own configuration and runtime state over a local named pipe, so service accounts never access the Servy database.";
+
+        /// <summary>
+        /// The file name, without extension, of the Servy host service executable.
+        /// </summary>
+        public const string ServyHostFileName = "Servy.Host";
+
+        /// <summary>
+        /// The file name of the Servy host service executable.
+        /// </summary>
+        public static readonly string ServyHostExe = $"{ServyHostFileName}.exe";
+
+        /// <summary>
+        /// The file name of the service wrapper executable of the .NET Framework 4.8 build, which shares
+        /// <see cref="ProgramDataPath"/> with this build (#7941).
+        /// </summary>
+        public const string OtherBuildServiceUIExe = "Servy.Service.Net48.exe";
+
+        /// <summary>
+        /// The file name of the CLI service wrapper executable of the .NET Framework 4.8 build, which shares
+        /// <see cref="ProgramDataPath"/> with this build (#7941).
+        /// </summary>
+        public const string OtherBuildServiceCLIExe = "Servy.Service.CLI.Net48.exe";
+
+        /// <summary>
+        /// The file name of the restarter executable of the .NET Framework 4.8 build, which shares
+        /// <see cref="ProgramDataPath"/> with this build (#7941).
+        /// </summary>
+        public const string OtherBuildRestarterExe = "Servy.Restarter.Net48.exe";
+
+        /// <summary>
+        /// The file name of the Servy host service executable of the .NET Framework 4.8 build, which shares
+        /// <see cref="ProgramDataPath"/> with this build (#7941).
+        /// </summary>
+        public const string OtherBuildHostExe = "Servy.Host.Net48.exe";
+
+        /// <summary>
+        /// The file name of the Servy host service's settings file.
+        /// </summary>
+        public const string ServyHostSettingsFileName = "appsettings.host.json";
+
+        /// <summary>
+        /// The file name of the Servy service wrapper's settings file.
+        /// </summary>
+        public const string ServyServiceSettingsFileName = "appsettings.service.json";
+
+        /// <summary>
+        /// The file name of the Servy restarter's settings file.
+        /// </summary>
+        public const string ServyRestarterSettingsFileName = "appsettings.restarter.json";
+
+        /// <summary>
+        /// The file name of the Servy CLI's settings file.
+        /// </summary>
+        public const string ServyCliSettingsFileName = "appsettings.cli.json";
+
+        /// <summary>
+        /// The name of the local Named Pipe used for inter-process communication between wrapped services and the Servy host.
+        /// </summary>
+        public const string ServyHostNamedPipeName = "SERVY_HOST_IPC_PIPE";
+
+        /// <summary>
+        /// The IPC action identifier for retrieving service configuration and state by service name.
+        /// </summary>
+        public const string ServyHostGetByNameAction = "GetByName";
+
+        /// <summary>
+        /// The IPC action identifier for updating a service's runtime state (PID, previous stop timeout and active
+        /// stdout/stderr paths). The configuration of the service cannot be changed over the pipe.
+        /// </summary>
+        public const string ServyHostUpdateRuntimeStateAction = "UpdateRuntimeState";
+
+        /// <summary>
+        /// The IPC action identifier for reading a service's persisted restart attempts counter.
+        /// </summary>
+        public const string ServyHostGetRestartAttemptsAction = "GetRestartAttempts";
+
+        /// <summary>
+        /// The IPC action identifier for updating a service's persisted restart attempts counter.
+        /// </summary>
+        public const string ServyHostUpdateRestartAttemptsAction = "UpdateRestartAttempts";
+
+        /// <summary>
+        /// The IPC action identifier with which an administrator asks the host to rebuild the named pipe's DACL from the
+        /// accounts of the installed services.
+        /// </summary>
+        public const string ServyHostRefreshPipeAccessAction = "RefreshPipeAccess";
+
+        /// <summary>
+        /// The default connection timeout in milliseconds when connecting to the Servy host Named Pipe server.
+        /// </summary>
+        public const int ServyHostDefaultConnectTimeoutMs = 5000;
+
+        /// <summary>
+        /// The time in milliseconds a client waits for the Servy host to answer a request once it is connected, and the
+        /// time the Servy host gives a connected client to send its request and read the answer before it closes the
+        /// connection (<c>RequestTimeoutMs</c> in Servy.Host). Changing it changes both sides.
+        /// </summary>
+        public const int ServyHostDefaultRequestTimeoutMs = 30000;
+
+        /// <summary>
+        /// The time in seconds the desktop app, the Manager and the CLI wait for the Servy host service to reach the
+        /// state they asked for when they install, stop or start it.
+        /// </summary>
+        public const int ServyHostServiceTimeoutSeconds = 30;
+
+        /// <summary>
+        /// The time in milliseconds the Servy host service waits, when it stops, for its listener and for each of the
+        /// requests it is handling to finish.
+        /// </summary>
+        public const int ServyHostStopWaitMs = 2000;
+
+        /// <summary>
+        /// The number of pipe instances the Servy host keeps waiting for a client at once, so a burst of services
+        /// starting together (at boot) is accepted in parallel rather than one connection at a time.
+        /// </summary>
+        public const int ServyHostListenerCount = 4;
+
+        /// <summary>
+        /// The time in milliseconds the Servy host waits before rebuilding its named pipe's DACL again when a service account
+        /// could not be resolved, for example a domain or gMSA account while no domain controller is reachable at boot.
+        /// </summary>
+        public const int ServyHostUnresolvedAccountRetryDelayMs = 30000;
+
+        /// <summary>
+        /// The number of times the Servy host retries the accounts it could not resolve before it waits for the next install,
+        /// reconfiguration or restart; with <see cref="ServyHostUnresolvedAccountRetryDelayMs"/>, ten minutes.
+        /// </summary>
+        public const int ServyHostUnresolvedAccountRetryCount = 20;
+
+        /// <summary>
+        /// The maximum permitted IPC message payload size in bytes (10 MB) to prevent heap overflow exploits or excessive memory allocation.
+        /// Request frames are held to the smaller <see cref="ServyHostMaxAllowedRequestSizeBytes"/>.
+        /// </summary>
+        public const long ServyHostMaxAllowedMessageSizeBytes = 10 * BytesInMegabyte;
+
+        /// <summary>
+        /// The maximum permitted size in bytes (256 KB) of a request frame sent to the Servy host, which reads it before it
+        /// identifies the caller. The largest legitimate request carries two extended-length paths of up to 32,767 UTF-16
+        /// units each, about 197 KB as UTF-8 JSON in the worst case. Responses keep <see cref="ServyHostMaxAllowedMessageSizeBytes"/>.
+        /// </summary>
+        public const long ServyHostMaxAllowedRequestSizeBytes = 256 * 1_024;
+
+        #endregion
+
+        #region Public Methods
 
         /// <summary>
         /// Gets the absolute path to the Servy CLI service executable.
         /// </summary>
         /// <remarks>
         /// In <c>DEBUG</c> builds, the path points to the executable located in the application’s base directory.
-        /// In <c>RELEASE</c> builds, the path points to the executable located in the ProgramData folder.
+        /// In <c>RELEASE</c> builds, the path points to the hardened <c>ProgramData</c> vault, where installed
+        /// and portable versions of Servy place the service executables; the base directory is probed first
+        /// only when a test sets <see cref="TestAllowBaseDirectoryProbe"/>.
         /// </remarks>
         /// <returns>The full file path to <c>Servy.Service.CLI.exe</c>.</returns>
         public static string GetServyCLIServicePath() => ResolveExe(ServyServiceCLIFileName);
@@ -1628,10 +1898,24 @@ namespace Servy.Core.Config
         /// </summary>
         /// <remarks>
         /// In <c>DEBUG</c> builds, the path points to the executable located in the application’s base directory.
-        /// In <c>RELEASE</c> builds, the path points to the executable located in the ProgramData folder.
+        /// In <c>RELEASE</c> builds, the path points to the hardened <c>ProgramData</c> vault, where installed
+        /// and portable versions of Servy place the service executables; the base directory is probed first
+        /// only when a test sets <see cref="TestAllowBaseDirectoryProbe"/>.
         /// </remarks>
         /// <returns>The full file path to <c>Servy.Service.exe</c>.</returns>
         public static string GetServyUIServicePath() => ResolveExe(ServyServiceUIFileName);
+
+        /// <summary>
+        /// Gets the absolute path to the Servy Restarter executable.
+        /// </summary>
+        /// <remarks>
+        /// In <c>DEBUG</c> builds, the path points to the executable located in the application’s base directory.
+        /// In <c>RELEASE</c> builds, the path points to the hardened <c>ProgramData</c> vault, where installed
+        /// and portable versions of Servy place the service executables; the base directory is probed first
+        /// only when a test sets <see cref="TestAllowBaseDirectoryProbe"/>.
+        /// </remarks>
+        /// <returns>The full file path to <c>Servy.Restarter.exe</c>.</returns>
+        public static string GetServyRestarterPath() => ResolveExe(ServyRestarterFileName);
 
         /// <summary>
         /// Converts a size in megabytes (MB) to bytes.
@@ -1645,14 +1929,30 @@ namespace Servy.Core.Config
         #region Private Helpers
 
         /// <summary>
+        /// Test-only switch that lets <c>RELEASE</c> builds resolve the Servy service and restarter
+        /// executables from the application's base directory when a file of that name exists there, so tests
+        /// can run against binaries extracted next to the test assembly.
+        /// <see langword="false"/> (the default) means only the hardened <c>ProgramData</c> vault is used.
+        /// Not reachable from any settings file, environment variable or command-line option.
+        /// </summary>
+        /// <remarks>
+        /// A file next to <c>servy-cli.exe</c> or <c>Servy.exe</c> must never win over the vault copy in
+        /// production: that folder may be writable by a non-admin user, and the resolved path becomes the
+        /// binPath of a LocalSystem service (#7528).
+        /// <c>DEBUG</c> builds always use the base directory and ignore this switch.
+        /// </remarks>
+        internal static bool TestAllowBaseDirectoryProbe { get; set; }
+
+        /// <summary>
         /// Resolves the absolute path for an executable based on the current environment and build configuration.
         /// </summary>
         /// <param name="fileName">The base name of the executable (without the .exe extension).</param>
         /// <returns>The fully qualified path to the executable; callers must verify with File.Exists.</returns>
         /// <remarks>
         /// In <c>DEBUG</c> mode, this resolves to the application's base directory (the build output folder),
-        /// where the required executables are copied during the build. In <c>RELEASE</c> mode, it checks the application's
-        /// base directory (supporting unit tests/portable use) before falling back to the hardened <c>ProgramData</c> vault.
+        /// where the required executables are copied during the build. In <c>RELEASE</c> mode, it resolves to the hardened
+        /// <c>ProgramData</c> vault, where installed and portable versions of Servy place the service executables;
+        /// the application's base directory is checked first only when a test sets <see cref="TestAllowBaseDirectoryProbe"/>.
         /// </remarks>
         private static string ResolveExe(string fileName)
         {
@@ -1662,14 +1962,19 @@ namespace Servy.Core.Config
             // Development
             return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, exeName);
 #else
-            // 1. Check local directory first (Critical for Unit Tests in Release mode and Portable execution)
-            string localPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, exeName);
-            if (File.Exists(localPath))
+            // 1. Check local directory first, only when a test enables it (#7528): in production a planted
+            // file next to servy-cli.exe or Servy.exe must never win over the vault copy.
+            if (TestAllowBaseDirectoryProbe)
             {
-                return localPath;
+                string localPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, exeName);
+                if (File.Exists(localPath))
+                {
+                    return localPath;
+                }
             }
 
             // 2. Fallback to the hardened vault (Production Service mode)
+            // Installed and portable versions of Servy place the service executables in the vault %ProgramData%\Servy.
             return Path.Combine(ProgramDataPath, exeName);
 #endif
         }

@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Self-contained build and publish script for Servy.Manager.
@@ -6,15 +7,17 @@
 .DESCRIPTION
     This script performs the following steps:
       1. Runs the resource publishing step via publish-res-<configuration>.ps1
-      (publish-res-debug.ps1 / publish-res-release.ps1, selected by -BuildConfiguration).
+      (publish-res-debug.ps1 / publish-res-release.ps1, selected by -BuildConfiguration),
+      which builds Servy.Host.exe, Servy.Service.exe and Servy.Restarter.exe into Resources to be embedded.
       2. Builds and publishes the Servy.Manager project as a
          self-contained, single-file executable for the specified
          target framework and runtime.
-      3. Optionally signs the resulting executable using SignPath.
+      3. Signs the published executable with SignPath when -BuildConfiguration is Release
+         and setup/signpath.ps1 is present; otherwise signing is skipped with a warning.
 
 .PARAMETER Tfm
     Target framework for the build.
-    Default: net10.0-windows.
+    Defaults to the value in build-config.ps1.
 
 .PARAMETER BuildConfiguration
     Build configuration to use.
@@ -28,20 +31,38 @@
     .\publish.ps1
     Builds Servy.Manager in Release mode with default settings.
 
+.EXAMPLE
+    .\publish.ps1 -Tfm "net10.0-windows" -BuildConfiguration "Debug" -Runtime "win-x64"
+    Builds Servy.Manager for an explicit target framework, configuration and runtime.
+
 .NOTES
     Author: Akram El Assas
 
     Requirements:
       - .NET SDK installed and accessible in PATH.
-      - SignPath.ps1 script available in ..\..\setup\ for signing.
+    Optional:
+      - setup/signpath.ps1: signs the output when -BuildConfiguration is Release;
+        when absent, signing is skipped with a warning.
 #>
+[CmdletBinding()]
 param(
-    [string]$Tfm                = "net10.0-windows",
+    [string]$Tfm                = "",
+    [ValidateSet('Debug', 'Release')]
     [string]$BuildConfiguration = "Release",
     [string]$Runtime            = "win-x64"
 )
 
 $P_PublishDir = $PSScriptRoot
+
+# Load central defaults
+$configPath = Join-Path $P_PublishDir "..\..\setup\build-config.ps1"
+if (Test-Path -LiteralPath $configPath) {
+    $buildConfig = & $configPath
+    if (-not $Tfm) { $Tfm = $buildConfig.Tfm }
+} else {
+    throw "Central build configuration not found at $configPath"
+}
+
 . (Join-Path $P_PublishDir "..\..\setup\build-common.ps1")
 
 Invoke-StandardPublish `

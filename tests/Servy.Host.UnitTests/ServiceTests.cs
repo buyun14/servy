@@ -1,0 +1,1973 @@
+using Moq;
+using Servy.Core.Config;
+using Servy.Core.Data;
+using Servy.Core.DTOs;
+using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
+using Servy.Core.Native;
+using Servy.Core.Security;
+using Servy.Core.Services;
+using Servy.Testing;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO.Pipes;
+using System.Security.Principal;
+
+namespace Servy.Host.UnitTests
+{
+    /// <summary>
+    /// Unit tests for the request handling of the Servy host service: who may ask for what, what each action reads and
+    /// writes, and how the named pipe's DACL is rebuilt from the accounts of the installed services; and for its
+    /// lifecycle callbacks (the scoped logger, the exit code and the bounded logger flush), the first pipe instance's
+    /// FILE_FLAG_FIRST_PIPE_INSTANCE fallback, and the connection handler's client pinning, request timeout and
+    /// shutdown paths.
+    /// </summary>
+    public class ServiceTests : IDisposable
+    {
+        private const string ServiceName = "MyApp";
+        private const int ServicePid = 4242;
+
+        private readonly Mock<IServyLogger> _logger = new Mock<IServyLogger>();
+        private readonly Mock<INamedPipesService> _pipes = new Mock<INamedPipesService>();
+        private readonly Mock<IServiceRepository> _repository = new Mock<IServiceRepository>();
+        private readonly Mock<IWindowsServiceApi> _api = new Mock<IWindowsServiceApi>();
+        private readonly Mock<IPipeCallerIdentifier> _identifier = new Mock<IPipeCallerIdentifier>();
+        private readonly Service _sut;
+
+        private static readonly PipeCaller TheServiceProcess = new PipeCaller(ServicePid, isAdministrator: false);
+        private static readonly PipeCaller AnotherProcess = new PipeCaller(9999, isAdministrator: false);
+        private static readonly PipeCaller Administrator = new PipeCaller(1111, isAdministrator: true);
+        private static readonly PipeCaller RemoteAdministratorWithTheServicePid = new PipeCaller(ServicePid, isAdministrator: true, isRemote: true);
+
+        public ServiceTests()
+        {
+            _api.Setup(a => a.GetServiceProcessId(ServiceName)).Returns(ServicePid);
+            _repository.Setup(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(Enumerable.Empty<ServiceDto>());
+            _sut = new Service(_logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object);
+
+            // A fake PID can be a real process on the machine running the tests: never read its token
+            _sut.ResolveProcessAccount = _ => null;
+        }
+
+        public void Dispose() => _sut.Dispose();
+
+        private static IpcRequestDto Request(string action, string? serviceName = ServiceName) => new IpcRequestDto { Action = action, ServiceName = serviceName };
+
+        /// <summary>
+        /// Tells whether the host's current pipe DACL holds a rule for <paramref name="sid"/>.
+        /// </summary>
+        /// <param name="sid">The account to look for.</param>
+        /// <returns><see langword="true"/> when a rule names the account.</returns>
+        private bool Granted(SecurityIdentifier sid)
+            => _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().Any(r => sid.Equals(r.IdentityReference));
+
+        /// <summary>
+        /// Polls the host's current pipe DACL until it grants <paramref name="sid"/>, for at most about five seconds.
+        /// </summary>
+        /// <param name="sid">The account to wait for.</param>
+        /// <returns><see langword="true"/> when the account was granted in time.</returns>
+        private async Task<bool> WaitUntilGrantedAsync(SecurityIdentifier sid)
+        {
+            for (var i = 0; i < 500; i++)
+            {
+                if (Granted(sid)) return true;
+                await Task.Delay(10, CancellationToken.None);
+            }
+
+            return false;
+        }
+
+        #region Remote clients
+
+        [Theory]
+        [InlineData(AppConfig.ServyHostGetByNameAction)]
+        [InlineData(AppConfig.ServyHostGetRestartAttemptsAction)]
+        [InlineData(AppConfig.ServyHostRefreshPipeAccessAction)]
+        public async Task ProcessRequestAsync_ClientOnAnotherComputer_IsRefusedEvenAsAnAdministratorWithTheServicePid(string action)
+        {
+            // Act: a remote PID is a process on another computer, so even a match with the SCM's PID means nothing
+            var response = await _sut.ProcessRequestAsync(Request(action), RemoteAdministratorWithTheServicePid, CancellationToken.None);
+
+            // Assert
+            Assert.False(response.Success);
+            Assert.Null(response.Data);
+            _repository.Verify(r => r.GetByNameAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            _repository.Verify(r => r.GetRestartAttemptsAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+            _repository.Verify(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        #endregion
+
+        #region Constructor
+
+        [Fact]
+        public void Constructor_NullArguments_Throw()
+        {
+            // Arrange, Act & Assert: each missing dependency is rejected by the constructor
+            Assert.Throws<ArgumentNullException>(() => new Service(null!, _pipes.Object, _repository.Object, _api.Object, _identifier.Object));
+            Assert.Throws<ArgumentNullException>(() => new Service(_logger.Object, null!, _repository.Object, _api.Object, _identifier.Object));
+            Assert.Throws<ArgumentNullException>(() => new Service(_logger.Object, _pipes.Object, (IServiceRepository)null!, _api.Object, _identifier.Object));
+            Assert.Throws<ArgumentNullException>(() => new Service(_logger.Object, _pipes.Object, _repository.Object, null!, _identifier.Object));
+            Assert.Throws<ArgumentNullException>(() => new Service(_logger.Object, _pipes.Object, _repository.Object, _api.Object, null!));
+        }
+
+        [Fact]
+        public void Constructor_RunsAsTheServyService()
+        {
+            // Assert: the host runs as the Servy service on the Servy pipe
+            Assert.Equal(AppConfig.ServyHostServiceName, _sut.ServiceName);
+            Assert.Equal("Servy", _sut.ServiceName);
+            Assert.Equal(AppConfig.ServyHostNamedPipeName, _sut.PipeName);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_NullArguments_Throw()
+        {
+            // Arrange, Act & Assert: a null request or caller is rejected
+            await Assert.ThrowsAsync<ArgumentNullException>(() => _sut.ProcessRequestAsync(null!, TheServiceProcess, CancellationToken.None));
+            await Assert.ThrowsAsync<ArgumentNullException>(() => _sut.ProcessRequestAsync(new IpcRequestDto(), null!, CancellationToken.None));
+        }
+
+        #endregion
+
+        #region Authorization
+
+        [Theory]
+        [InlineData(AppConfig.ServyHostGetByNameAction)]
+        [InlineData(AppConfig.ServyHostUpdateRuntimeStateAction)]
+        [InlineData(AppConfig.ServyHostGetRestartAttemptsAction)]
+        [InlineData(AppConfig.ServyHostUpdateRestartAttemptsAction)]
+        public async Task ProcessRequestAsync_AnotherServicesProcess_IsRefusedWithoutReadingTheDatabase(string action)
+        {
+            // Arrange: a service account asks about a service it does not run
+            var request = Request(action);
+            request.RuntimeState = new ServiceRuntimeStateDto();
+            request.RestartAttempts = 1;
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, AnotherProcess, CancellationToken.None);
+
+            // Assert
+            Assert.False(response.Success);
+            Assert.Equal("Access denied.", response.ErrorMessage);
+            Assert.Null(response.Data);
+            _repository.VerifyNoOtherCalls();
+            _logger.Verify(l => l.Warn(It.Is<string>(s => s.Contains("Refused IPC request") && s.Contains("process 9999") && s.Contains(ServiceName)), It.IsAny<Exception>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_CallerWithoutAProcessId_IsRefusedWithoutAskingTheScm()
+        {
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction), new PipeCaller(0, false), CancellationToken.None);
+
+            // Assert
+            Assert.False(response.Success);
+            _api.Verify(a => a.GetServiceProcessId(It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_ServiceNotRunning_RefusesEvenAMatchingProcessIdOfZero()
+        {
+            // Arrange: the SCM reports 0 for a stopped service, which must never match a caller
+            _api.Setup(a => a.GetServiceProcessId("Stopped")).Returns(0);
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction, "Stopped"), new PipeCaller(0, false), CancellationToken.None);
+
+            // Assert
+            Assert.False(response.Success);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_Administrator_MayAskAboutAnyService()
+        {
+            // Arrange
+            _repository.Setup(r => r.GetByNameAsync("Other", true, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = "Other" });
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction, "Other"), Administrator, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success);
+            _api.Verify(a => a.GetServiceProcessId(It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_RefreshFromAServiceAccount_IsRefused()
+        {
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostRefreshPipeAccessAction, null), TheServiceProcess, CancellationToken.None);
+
+            // Assert: only an administrator may change who can connect
+            Assert.False(response.Success);
+            Assert.Equal("Access denied.", response.ErrorMessage);
+            _repository.Verify(r => r.GetAllAsync(It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_ActionAdmittedByTheGuardWithoutACase_FailsInTheDefaultAndTouchesNothing()
+        {
+            // Arrange: an action the guard admits but the switch has no case for, as when one is added to
+            // IsKnownServiceAction and its case is forgotten
+            _sut.IsKnownServiceActionCheck = _ => true;
+            var request = new IpcRequestDto { Action = "FutureAction", ServiceName = ServiceName, RestartAttempts = 1, RuntimeState = new ServiceRuntimeStateDto() };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, Administrator, CancellationToken.None);
+
+            // Assert: refused as unknown, and no other action's handler ran
+            Assert.False(response.Success);
+            Assert.Equal("Unknown IPC action: FutureAction", response.ErrorMessage);
+            _repository.Verify(r => r.UpdateRestartAttemptsAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(It.IsAny<string>(), It.IsAny<ServiceRuntimeStateDto>(), It.IsAny<CancellationToken>()), Times.Never);
+            _repository.Verify(r => r.GetByNameAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            _repository.Verify(r => r.GetRestartAttemptsAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        public static TheoryData<string> EveryServyHostAction()
+        {
+            var data = new TheoryData<string>();
+            foreach (var field in typeof(AppConfig).GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+            {
+                if (field.IsLiteral && field.Name.StartsWith("ServyHost", StringComparison.Ordinal) && field.Name.EndsWith("Action", StringComparison.Ordinal))
+                    data.Add((string)field.GetRawConstantValue()!);
+            }
+            return data;
+        }
+
+        /// <summary>
+        /// The one repository call each declared action's case must make, keyed by action. An action declared later has
+        /// no entry until its author says what its case does.
+        /// </summary>
+        private static readonly Dictionary<string, Action<Mock<IServiceRepository>>> ExpectedRepositoryCall = new Dictionary<string, Action<Mock<IServiceRepository>>>
+        {
+            [AppConfig.ServyHostGetByNameAction] = r => r.Verify(x => x.GetByNameAsync(ServiceName, true, It.IsAny<CancellationToken>()), Times.Once),
+            [AppConfig.ServyHostUpdateRuntimeStateAction] = r => r.Verify(x => x.UpdateRuntimeStateAsync(ServiceName, It.IsAny<ServiceRuntimeStateDto>(), It.IsAny<CancellationToken>()), Times.Once),
+            [AppConfig.ServyHostGetRestartAttemptsAction] = r => r.Verify(x => x.GetRestartAttemptsAsync(ServiceName, It.IsAny<CancellationToken>()), Times.Once),
+            [AppConfig.ServyHostUpdateRestartAttemptsAction] = r => r.Verify(x => x.UpdateRestartAttemptsAsync(ServiceName, 1, It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once),
+            [AppConfig.ServyHostRefreshPipeAccessAction] = r => r.Verify(x => x.GetAllAsync(false, It.IsAny<CancellationToken>()), Times.Once),
+        };
+
+        [Theory]
+        [MemberData(nameof(EveryServyHostAction))]
+        public async Task ProcessRequestAsync_EveryDeclaredAction_IsHandledByItsOwnCase(string action)
+        {
+            // Arrange: every AppConfig.ServyHost*Action constant, with what any of them needs
+            var request = new IpcRequestDto
+            {
+                Action = action,
+                ServiceName = ServiceName,
+                RuntimeState = new ServiceRuntimeStateDto(),
+                RestartAttempts = 1,
+            };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, Administrator, CancellationToken.None);
+
+            // Assert: it succeeded, through its own handler's repository call and no other handler's. An action declared
+            // without a guard entry and a case of its own would end in "Unknown IPC action", one stacked onto another
+            // action's case would make that action's call, and a case that does nothing would make none
+            Assert.True(response.Success, $"'{action}': {response.ErrorMessage}");
+            Assert.True(ExpectedRepositoryCall.ContainsKey(action), $"'{action}' is declared but the test does not say which repository call its case makes.");
+            ExpectedRepositoryCall[action](_repository);
+            _repository.VerifyNoOtherCalls();
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("Update")]
+        [InlineData("getbyname")]
+        public async Task ProcessRequestAsync_UnknownAction_Fails(string? action)
+        {
+            // Act
+            var response = await _sut.ProcessRequestAsync(new IpcRequestDto { Action = action, ServiceName = ServiceName }, Administrator, CancellationToken.None);
+
+            // Assert: an unrecognised action fails without touching the repository
+            Assert.False(response.Success);
+            Assert.Equal($"Unknown IPC action: {action}", response.ErrorMessage);
+            _repository.VerifyNoOtherCalls();
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task ProcessRequestAsync_NoServiceName_Fails(string? serviceName)
+        {
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction, serviceName), Administrator, CancellationToken.None);
+
+            // Assert: a missing or blank service name is refused
+            Assert.False(response.Success);
+            Assert.Equal("A service name is required.", response.ErrorMessage);
+        }
+
+        #endregion
+
+        #region Actions
+
+        [Fact]
+        public async Task GetByName_TheServicesOwnProcess_GetsItsDecryptedConfigurationWithoutThePassword()
+        {
+            // Arrange
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, true, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, Parameters = "--token abc", Password = "p@ss", UserAccount = @".\svc" });
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction), TheServiceProcess, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success);
+            Assert.Equal("--token abc", response.Data!.Parameters);
+            Assert.Null(response.Data.Password);
+        }
+
+        [Fact]
+        public async Task GetByName_NoRow_SucceedsWithNoData()
+        {
+            // Arrange: the repository holds no row for the service
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, true, It.IsAny<CancellationToken>())).ReturnsAsync((ServiceDto?)null);
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction), TheServiceProcess, CancellationToken.None);
+
+            // Assert: the request succeeds and carries no data
+            Assert.True(response.Success);
+            Assert.Null(response.Data);
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_WritesOnlyTheRuntimeState()
+        {
+            // Arrange
+            var state = new ServiceRuntimeStateDto { Pid = 77, ActiveStdoutPath = "o", UpdatePreviousStopTimeout = true, PreviousStopTimeout = 5 };
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, false, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = ServiceName, StdoutPath = "o" });
+            _repository.Setup(r => r.UpdateRuntimeStateAsync(ServiceName, state, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+            var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+            request.RuntimeState = state;
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success);
+            Assert.Equal(1, response.UpdateData);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName, state, It.IsAny<CancellationToken>()), Times.Once);
+            _repository.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_NoState_Fails()
+        {
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostUpdateRuntimeStateAction), TheServiceProcess, CancellationToken.None);
+
+            // Assert: a request without a runtime state is refused
+            Assert.False(response.Success);
+            Assert.Equal("The runtime state is required.", response.ErrorMessage);
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_ActivePathNeitherConfiguredNorStored_StoresNullForItAndStillUpdatesThePid()
+        {
+            // Arrange: the row configures local logs, and the wrapper reports a share for stdout
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, StdoutPath = @"C:\Logs\out.log", StderrPath = @"C:\Logs\err.log" });
+            var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+            request.RuntimeState = new ServiceRuntimeStateDto { Pid = 77, ActiveStdoutPath = @"\\attacker\share\out.log", ActiveStderrPath = @"C:\Logs\err.log" };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert: the unknown path is written as null, the known one and the PID as reported
+            Assert.True(response.Success);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName,
+                It.Is<ServiceRuntimeStateDto>(s => s.Pid == 77 && s.ActiveStdoutPath == null && s.ActiveStderrPath == @"C:\Logs\err.log"),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_StderrPathNeitherConfiguredNorStored_StoresNullForItAndKeepsTheKnownStdoutPath()
+        {
+            // Arrange: the mirror of the stdout test - the wrapper reports a share for stderr only
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, StdoutPath = @"C:\Logs\out.log", StderrPath = @"C:\Logs\err.log" });
+            var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+            request.RuntimeState = new ServiceRuntimeStateDto { Pid = 77, ActiveStdoutPath = @"C:\Logs\out.log", ActiveStderrPath = @"\\attacker\share\err.log" };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert: the unknown stderr path is written as null with its own warning, the known stdout path as reported
+            Assert.True(response.Success);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName,
+                It.Is<ServiceRuntimeStateDto>(s => s.Pid == 77 && s.ActiveStdoutPath == @"C:\Logs\out.log" && s.ActiveStderrPath == null),
+                It.IsAny<CancellationToken>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("Ignored the active stderr path")), It.IsAny<Exception>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_NoStoredRow_RefusesBothReportedPathsAndStillUpdatesThePid()
+        {
+            // Arrange: the row is gone when the wrapper reports, so there is nothing to compare the paths with
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, false, It.IsAny<CancellationToken>())).ReturnsAsync((ServiceDto?)null);
+            var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+            request.RuntimeState = new ServiceRuntimeStateDto { Pid = 77, ActiveStdoutPath = @"C:\Logs\out.log", ActiveStderrPath = @"C:\Logs\err.log" };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert: neither path is accepted, and the request still succeeds with the PID as reported
+            Assert.True(response.Success, response.ErrorMessage);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName,
+                It.Is<ServiceRuntimeStateDto>(s => s.Pid == 77 && s.ActiveStdoutPath == null && s.ActiveStderrPath == null),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_ActivePathIsTheConfiguredPathAfterGetFullPath_IsStoredAsReported()
+        {
+            // Arrange: the same file as the configured one, spelled with another case and a ".." segment
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, StdoutPath = @"C:\Logs\out.log" });
+            var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+            request.RuntimeState = new ServiceRuntimeStateDto { Pid = 77, ActiveStdoutPath = @"c:\logs\sub\..\OUT.log" };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName,
+                It.Is<ServiceRuntimeStateDto>(s => s.Pid == 77 && s.ActiveStdoutPath == @"c:\logs\sub\..\OUT.log"),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_ActivePathIsTheStoredActivePathAfterAConfigurationEdit_IsStoredAsReported()
+        {
+            // Arrange: the configuration was edited while the service ran, so the wrapper still reports its start-time path
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, StderrPath = @"D:\New\err.log", ActiveStderrPath = @"\\fileserver\logs\err.log" });
+            var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+            request.RuntimeState = new ServiceRuntimeStateDto { Pid = 78, ActiveStderrPath = @"\\fileserver\logs\err.log" };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName,
+                It.Is<ServiceRuntimeStateDto>(s => s.Pid == 78 && s.ActiveStderrPath == @"\\fileserver\logs\err.log"),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Theory]
+        [InlineData("bad\0path.log", @"C:\Logs\out.log")]
+        [InlineData(@"C:\Logs\out.log", "bad\0configured.log")]
+        public async Task UpdateRuntimeState_PathThatCannotBeResolved_IsNeverAcceptedAndStillUpdatesThePid(string reported, string configured)
+        {
+            // Arrange: either the reported path or the configured one holds a NUL, which Path.GetFullPath refuses
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, StdoutPath = configured });
+            var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+            request.RuntimeState = new ServiceRuntimeStateDto { Pid = 77, ActiveStdoutPath = reported };
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert: the unresolvable path is written as null with a warning, the PID as reported
+            Assert.True(response.Success);
+            _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName,
+                It.Is<ServiceRuntimeStateDto>(s => s.Pid == 77 && s.ActiveStdoutPath == null),
+                It.IsAny<CancellationToken>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("Ignored the active stdout path")), It.IsAny<Exception>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task GetRestartAttempts_ReturnsTheStoredCounter()
+        {
+            // Arrange: the repository stores two attempts with a timestamp
+            var when = new DateTime(2026, 10, 2, 9, 0, 0, DateTimeKind.Utc);
+            _repository.Setup(r => r.GetRestartAttemptsAsync(ServiceName, It.IsAny<CancellationToken>())).ReturnsAsync(new RestartAttemptsDto { Attempts = 2, UpdatedAtUtc = when });
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetRestartAttemptsAction), TheServiceProcess, CancellationToken.None);
+
+            // Assert: the stored counter and timestamp are returned
+            Assert.True(response.Success);
+            Assert.Equal(2, response.RestartAttempts!.Attempts);
+            Assert.Equal(when, response.RestartAttempts.UpdatedAtUtc);
+        }
+
+        [Fact]
+        public async Task GetRestartAttempts_NoRow_ReturnsZero()
+        {
+            // Arrange: the repository holds no counter row
+            _repository.Setup(r => r.GetRestartAttemptsAsync(ServiceName, It.IsAny<CancellationToken>())).ReturnsAsync((RestartAttemptsDto?)null);
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetRestartAttemptsAction), TheServiceProcess, CancellationToken.None);
+
+            // Assert: the counter defaults to zero with no timestamp
+            Assert.True(response.Success);
+            Assert.Equal(0, response.RestartAttempts!.Attempts);
+            Assert.Null(response.RestartAttempts.UpdatedAtUtc);
+        }
+
+        [Fact]
+        public async Task UpdateRestartAttempts_StampsTheWriteWithTheHostsClock()
+        {
+            // Arrange
+            var now = new DateTime(2026, 10, 2, 10, 0, 0, DateTimeKind.Utc);
+            _sut.UtcNow = () => now;
+            _repository.Setup(r => r.UpdateRestartAttemptsAsync(ServiceName, 3, now, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+            var request = Request(AppConfig.ServyHostUpdateRestartAttemptsAction);
+            request.RestartAttempts = 3;
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success);
+            Assert.Equal(1, response.UpdateData);
+            _repository.Verify(r => r.UpdateRestartAttemptsAsync(ServiceName, 3, now, It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task UpdateRestartAttempts_ZeroCounter_IsWrittenAsTheReset()
+        {
+            // Arrange: zero is what the wrapper sends once the service is healthy again
+            var now = new DateTime(2026, 10, 2, 10, 0, 0, DateTimeKind.Utc);
+            _sut.UtcNow = () => now;
+            _repository.Setup(r => r.UpdateRestartAttemptsAsync(ServiceName, 0, now, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+            var request = Request(AppConfig.ServyHostUpdateRestartAttemptsAction);
+            request.RestartAttempts = 0;
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success, response.ErrorMessage);
+            Assert.Equal(1, response.UpdateData);
+            _repository.Verify(r => r.UpdateRestartAttemptsAsync(ServiceName, 0, now, It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData(-1)]
+        public async Task UpdateRestartAttempts_MissingOrNegativeCounter_Fails(int? attempts)
+        {
+            // Arrange: the counter is missing or negative
+            var request = Request(AppConfig.ServyHostUpdateRestartAttemptsAction);
+            request.RestartAttempts = attempts;
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(request, TheServiceProcess, CancellationToken.None);
+
+            // Assert: the request is refused and nothing is written
+            Assert.False(response.Success);
+            Assert.Equal("A non-negative restart attempts counter is required.", response.ErrorMessage);
+            _repository.Verify(r => r.UpdateRestartAttemptsAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_RepositoryThrows_FailsAndLogs()
+        {
+            // Arrange
+            var failure = new InvalidOperationException("database is locked");
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, true, It.IsAny<CancellationToken>())).ThrowsAsync(failure);
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction), TheServiceProcess, CancellationToken.None);
+
+            // Assert
+            Assert.False(response.Success);
+            Assert.Equal("The request failed: database is locked", response.ErrorMessage);
+            _logger.Verify(l => l.Error(It.Is<string>(s => s.Contains("IPC request 'GetByName' for 'MyApp' failed.")), failure), Times.Once);
+        }
+
+        [Fact]
+        public async Task ProcessRequestAsync_Cancelled_Propagates()
+        {
+            // Arrange: the repository call is cancelled
+            _repository.Setup(r => r.GetByNameAsync(ServiceName, true, It.IsAny<CancellationToken>())).ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert: the cancellation propagates instead of becoming a failed response
+            await Assert.ThrowsAsync<OperationCanceledException>(() => _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction), TheServiceProcess, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task GetByName_HandsTheTokenOfTheRequestToTheRepository()
+        {
+            // Arrange: a token of the test's own, so a call that drops it for default or None is told apart (#8089)
+            using (var cts = new CancellationTokenSource())
+            {
+                var token = cts.Token;
+                _repository.Setup(r => r.GetByNameAsync(ServiceName, true, token)).ReturnsAsync(new ServiceDto { Name = ServiceName });
+
+                // Act
+                await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetByNameAction), TheServiceProcess, token);
+
+                // Assert
+                _repository.Verify(r => r.GetByNameAsync(ServiceName, true, token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_ReadsTheStoredRowWithTheTokenOfTheRequest()
+        {
+            // Arrange: the reported path is checked against the stored row, and that read must end with the request (#8089)
+            using (var cts = new CancellationTokenSource())
+            {
+                var token = cts.Token;
+                _repository.Setup(r => r.GetByNameAsync(ServiceName, false, token)).ReturnsAsync(new ServiceDto { Name = ServiceName, StdoutPath = @"C:\Logs\out.log" });
+                var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+                request.RuntimeState = new ServiceRuntimeStateDto { Pid = 77, ActiveStdoutPath = @"C:\Logs\out.log" };
+
+                // Act
+                await _sut.ProcessRequestAsync(request, TheServiceProcess, token);
+
+                // Assert
+                _repository.Verify(r => r.GetByNameAsync(ServiceName, false, token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeState_WritesWithTheTokenOfTheRequest()
+        {
+            // Arrange: no active path is reported, so only the write itself is made (#8089)
+            using (var cts = new CancellationTokenSource())
+            {
+                var token = cts.Token;
+                var request = Request(AppConfig.ServyHostUpdateRuntimeStateAction);
+                request.RuntimeState = new ServiceRuntimeStateDto { Pid = 77 };
+
+                // Act
+                await _sut.ProcessRequestAsync(request, TheServiceProcess, token);
+
+                // Assert
+                _repository.Verify(r => r.UpdateRuntimeStateAsync(ServiceName, It.IsAny<ServiceRuntimeStateDto>(), token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task GetRestartAttempts_ReadsWithTheTokenOfTheRequest()
+        {
+            // Arrange (#8089)
+            using (var cts = new CancellationTokenSource())
+            {
+                var token = cts.Token;
+
+                // Act
+                await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostGetRestartAttemptsAction), TheServiceProcess, token);
+
+                // Assert
+                _repository.Verify(r => r.GetRestartAttemptsAsync(ServiceName, token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task UpdateRestartAttempts_WritesWithTheTokenOfTheRequest()
+        {
+            // Arrange (#8089)
+            using (var cts = new CancellationTokenSource())
+            {
+                var token = cts.Token;
+                var request = Request(AppConfig.ServyHostUpdateRestartAttemptsAction);
+                request.RestartAttempts = 1;
+
+                // Act
+                await _sut.ProcessRequestAsync(request, TheServiceProcess, token);
+
+                // Assert
+                _repository.Verify(r => r.UpdateRestartAttemptsAsync(ServiceName, 1, It.IsAny<DateTime>(), token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task RefreshPipeAccess_ReadsTheServicesWithTheTokenOfTheRequest()
+        {
+            // Arrange (#8089)
+            using (var cts = new CancellationTokenSource())
+            {
+                var token = cts.Token;
+
+                // Act
+                await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostRefreshPipeAccessAction, null), Administrator, token);
+
+                // Assert
+                _repository.Verify(r => r.GetAllAsync(false, token), Times.Once);
+            }
+        }
+
+        #endregion
+
+        #region Pipe DACL
+
+        [Fact]
+        public async Task RefreshPipeAccess_Administrator_RebuildsTheDaclFromTheServiceAccounts()
+        {
+            // Arrange
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var networkService = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>())).ReturnsAsync(new[]
+            {
+                new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = "svc-a" },
+                new ServiceDto { Name = "b", RunAsLocalSystem = false, UserAccount = "SVC-A" },
+                new ServiceDto { Name = "c", RunAsLocalSystem = true },
+                new ServiceDto { Name = "d", RunAsLocalSystem = false, UserAccount = "svc-d" },
+            });
+            _sut.ResolveAccount = a => a.Equals("svc-a", StringComparison.OrdinalIgnoreCase) ? localService : networkService;
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostRefreshPipeAccessAction, null), Administrator, CancellationToken.None);
+
+            // Assert
+            Assert.True(response.Success);
+            var rules = _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().ToList();
+            Assert.Single(rules, r => localService.Equals(r.IdentityReference));
+            Assert.Single(rules, r => networkService.Equals(r.IdentityReference));
+            _repository.Verify(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_AccountNotResolvableYet_IsRetriedUntilItResolves()
+        {
+            // Arrange: a gMSA whose domain controller is not reachable for the first two lookups, as at boot
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var lookups = 0;
+            _sut.ResolveAccount = _ => Interlocked.Increment(ref lookups) < 3 ? null : localService;
+            _sut.UnresolvedAccountRetryDelayMs = 10;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = @"CONTOSO\svc-gmsa$" } });
+
+            // Act
+            _sut.StartListening();
+            var granted = await WaitUntilGrantedAsync(localService);
+            await Task.Delay(100, CancellationToken.None);
+            _sut.StopListening();
+
+            // Assert: granted on the third lookup, and no retry once it resolved
+            Assert.True(granted);
+            Assert.Equal(3, Volatile.Read(ref lookups));
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_AccountNeverResolves_StopsRetryingAfterTheConfiguredCount()
+        {
+            // Arrange
+            var lookups = 0;
+            _sut.ResolveAccount = _ => { Interlocked.Increment(ref lookups); return null; };
+            _sut.UnresolvedAccountRetryDelayMs = 1;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = @"CONTOSO\deleted-user" } });
+
+            // Act
+            _sut.StartListening();
+            var last = -1;
+            for (var i = 0; i < 100 && last != Volatile.Read(ref lookups); i++)
+            {
+                last = Volatile.Read(ref lookups);
+                await Task.Delay(100, CancellationToken.None);
+            }
+            _sut.StopListening();
+
+            // Assert: the first build plus the configured retries, then nothing until the next refresh
+            Assert.Equal(1 + AppConfig.ServyHostUnresolvedAccountRetryCount, Volatile.Read(ref lookups));
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_ServiceStillRunningUnderItsFormerAccount_KeepsItUntilThatProcessIsGone()
+        {
+            // Arrange: reinstalled from NetworkService to LocalService while running (#7330); the old process still runs
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var networkService = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            var running = networkService;
+            var gate = new object();
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @"NT AUTHORITY\LocalService" } });
+            _sut.ResolveProcessAccount = pid => { lock (gate) return pid == ServicePid ? running : null; };
+            _sut.UnresolvedAccountRetryDelayMs = 10;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+
+            // Act 1: the old process can still report its PID when it stops
+            _sut.StartListening();
+            var bothWhileOldRuns = Granted(localService) && Granted(networkService);
+
+            // Act 2: the service restarts under LocalService
+            lock (gate) running = localService;
+            var dropped = false;
+            for (var i = 0; i < 500 && !dropped; i++)
+            {
+                dropped = !Granted(networkService);
+                if (!dropped) await Task.Delay(10, CancellationToken.None);
+            }
+            _sut.StopListening();
+
+            // Assert
+            Assert.True(bothWhileOldRuns);
+            Assert.True(dropped);
+            Assert.True(Granted(localService));
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_FormerAccountsLinger_LogsTheLingeringLineOnlyWhenTheirSetChanges()
+        {
+            // Arrange: two services reinstalled under LocalService while their old processes still run under other accounts,
+            // each rechecked every millisecond (#7362)
+            const string OtherService = "OtherApp";
+            const int OtherPid = 4343;
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var networkService = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            var formerUser = new SecurityIdentifier("S-1-5-21-1000-2000-3000-1001");
+            var running = new Dictionary<int, SecurityIdentifier> { [ServicePid] = networkService, [OtherPid] = formerUser };
+            var gate = new object();
+            var refreshes = 0;
+            var ended = 0;
+            _api.Setup(a => a.GetServiceProcessId(OtherService)).Returns(OtherPid);
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .Callback(() => Interlocked.Increment(ref refreshes))
+                .ReturnsAsync(new[]
+                {
+                    new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @"NT AUTHORITY\LocalService" },
+                    new ServiceDto { Name = OtherService, RunAsLocalSystem = false, UserAccount = @"NT AUTHORITY\LocalService" },
+                });
+            _logger.Setup(l => l.Info(It.Is<string>(m => m.Contains("No account keeps access")), It.IsAny<Exception>()))
+                .Callback(() => Interlocked.Increment(ref ended));
+            _sut.ResolveAccount = _ => localService;
+            _sut.ResolveProcessAccount = pid => { lock (gate) return running.ContainsKey(pid) ? running[pid] : null; };
+            _sut.UnresolvedAccountRetryDelayMs = 1;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+
+            // Act 1: several rechecks while both old processes run
+            _sut.StartListening();
+            for (var i = 0; i < 500 && Volatile.Read(ref refreshes) < 6; i++)
+                await Task.Delay(10, CancellationToken.None);
+            var whileBothRun = Volatile.Read(ref refreshes);
+
+            // Act 2: the other service restarts under its new account; several more rechecks while this one's old process runs
+            lock (gate) running[OtherPid] = localService;
+            for (var i = 0; i < 500 && Volatile.Read(ref refreshes) < whileBothRun + 6; i++)
+                await Task.Delay(10, CancellationToken.None);
+            var whileOneRuns = Volatile.Read(ref refreshes);
+
+            // Act 3: this service restarts too, so no account lingers any more and the rechecks end
+            lock (gate) running[ServicePid] = localService;
+            for (var i = 0; i < 500 && Volatile.Read(ref ended) == 0; i++)
+                await Task.Delay(10, CancellationToken.None);
+            _sut.StopListening();
+
+            // Assert: one line per set the rechecks saw, not one per recheck
+            Assert.True(whileBothRun >= 6);
+            Assert.True(whileOneRuns >= whileBothRun + 6);
+            _logger.Verify(l => l.Info(It.Is<string>(m => m.Contains("2 account(s) keep access")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Info(It.Is<string>(m => m.Contains("1 account(s) keep access")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Info(It.Is<string>(m => m.Contains("No account keeps access")), It.IsAny<Exception>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_AccountNeverResolvesWhileAFormerAccountLingers_LogsTheRetryWarningOnlyUpToTheBound()
+        {
+            // Arrange: an account that never resolves, and the old process still running under the service's former
+            // account, so the rechecks go on after the bounded retries for the unresolved account are spent (#7362)
+            var lookups = 0;
+            var networkService = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            _sut.ResolveAccount = _ => { Interlocked.Increment(ref lookups); return null; };
+            _sut.ResolveProcessAccount = pid => pid == ServicePid ? networkService : null;
+            _sut.UnresolvedAccountRetryDelayMs = 1;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @"CONTOSO\deleted-user" } });
+            var pastTheBound = 1 + AppConfig.ServyHostUnresolvedAccountRetryCount + 10;
+
+            // Act
+            _sut.StartListening();
+            for (var i = 0; i < 1000 && Volatile.Read(ref lookups) < pastTheBound; i++)
+                await Task.Delay(10, CancellationToken.None);
+            _sut.StopListening();
+
+            // Assert: one numbered warning per retry actually scheduled, then a single line saying no further retry is
+            // scheduled, both naming the unresolved account and never the failed read (#8090)
+            var count = AppConfig.ServyHostUnresolvedAccountRetryCount;
+            Assert.True(Volatile.Read(ref lookups) >= pastTheBound);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("1 service account(s) could not be resolved") && m.Contains("Retrying in")), It.IsAny<Exception>()), Times.Exactly(count));
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("1 service account(s) could not be resolved") && m.Contains($"(attempt 1 of {count})")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("1 service account(s) could not be resolved") && m.Contains($"(attempt {count} of {count})")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("1 service account(s) still could not be resolved") && m.Contains("No further retry")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("could not be read")), It.IsAny<Exception>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_StoppedService_GrantsNothingBeyondItsConfiguredAccount()
+        {
+            // Arrange: no process (the SCM reports PID 0)
+            var reads = 0;
+            _api.Setup(a => a.GetServiceProcessId(ServiceName)).Returns(0);
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @"NT AUTHORITY\LocalService" } });
+            _sut.ResolveProcessAccount = _ => { Interlocked.Increment(ref reads); return new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null); };
+
+            // Act
+            await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+
+            // Assert
+            var rules = _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().ToList();
+            Assert.Equal(3, rules.Count);
+            Assert.DoesNotContain(rules, r => new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null).Equals(r.IdentityReference));
+            Assert.Equal(0, reads);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_ScmFailsForOneService_StillKeepsTheLingeringAccountOfTheNext()
+        {
+            // Arrange: "gone" throws at the SCM, the next service still runs under its former account
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var networkService = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            _api.Setup(a => a.GetServiceProcessId("gone")).Throws(new InvalidOperationException("The specified service does not exist."));
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new ServiceDto { Name = "  " },
+                    new ServiceDto { Name = "gone", RunAsLocalSystem = true },
+                    new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @"NT AUTHORITY\LocalService" },
+                });
+            _sut.ResolveAccount = _ => localService;
+            _sut.ResolveProcessAccount = pid => pid == ServicePid ? networkService : null;
+
+            // Act
+            await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+
+            // Assert: the failing service is skipped and logged, the next one's former account is still granted,
+            // and the blank-named row never reaches the SCM
+            var rules = _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().ToList();
+            Assert.Contains(rules, r => networkService.Equals(r.IdentityReference));
+            _logger.Verify(l => l.Debug(It.Is<string>(m => m.Contains("'gone'")), It.IsAny<Exception>()), Times.Once);
+            _api.Verify(a => a.GetServiceProcessId(It.Is<string>(n => string.IsNullOrWhiteSpace(n))), Times.Never);
+        }
+
+        [Fact]
+        public void GetRunningServiceAccounts_NoServiceList_ReturnsNoAccountsAndAsksNobody()
+        {
+            // Arrange
+            var running = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            _sut.ResolveProcessAccount = _ => running;
+
+            // Act
+            var accounts = (List<SecurityIdentifier>)TestReflection.InvokeNonPublic(_sut, "GetRunningServiceAccounts", new object?[] { null })!;
+
+            // Assert
+            Assert.Empty(accounts);
+            _api.Verify(a => a.GetServiceProcessId(It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
+        public void GetRunningServiceAccounts_NullAndUnnamedEntries_AreSkippedAndTheNamedOneIsRead()
+        {
+            // Arrange
+            var running = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            _sut.ResolveProcessAccount = pid => pid == ServicePid ? running : null;
+            var services = new ServiceDto?[] { null, new ServiceDto { Name = null }, new ServiceDto { Name = ServiceName } };
+
+            // Act
+            var accounts = (List<SecurityIdentifier>)TestReflection.InvokeNonPublic(_sut, "GetRunningServiceAccounts", new object?[] { services })!;
+
+            // Assert: the null entry and the unnamed one never reach the SCM, the named one's account is returned
+            Assert.Equal(new[] { running }, accounts);
+            _api.Verify(a => a.GetServiceProcessId(It.IsAny<string>()), Times.Once);
+            _api.Verify(a => a.GetServiceProcessId(ServiceName), Times.Once);
+        }
+
+        [Fact]
+        public async Task ListenForPipeConnectionsAsync_NoDaclPublishedYet_CreatesTheInstanceWithTheDefaultDacl()
+        {
+            // Arrange: the listener loop is run directly, so no refresh has published a DACL
+            PipeSecurity? used = null;
+            using (var cts = new CancellationTokenSource())
+            {
+                _sut.ServerStreamFactory = (name, security) =>
+                {
+                    used = security;
+                    cts.Cancel();
+                    throw new IOException("All pipe instances are busy.");
+                };
+                // Any accept failure also ends the loop, so a regression fails the assertions below instead of looping
+                _logger.Setup(l => l.Error("Error accepting Named Pipe connection.", It.IsAny<Exception>())).Callback(() => cts.Cancel());
+                var expected = ServyHostPipeSecurity.Create((IEnumerable<SecurityIdentifier>?)null)
+                    .GetAccessRules(true, true, typeof(SecurityIdentifier)).Count;
+
+                // Act
+                await (Task)TestReflection.InvokeNonPublic(_sut, "ListenForPipeConnectionsAsync", cts.Token)!;
+
+                // Assert: the instance got a copy of the default DACL, and nothing was published
+                Assert.Null(_sut.CurrentPipeSecurity);
+                Assert.NotNull(used);
+                Assert.Equal(expected, used!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Count);
+            }
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_AccountRemoved_IsNoLongerGranted()
+        {
+            // Arrange
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            _sut.ResolveAccount = _ => localService;
+            _repository.SetupSequence(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = "svc" } })
+                .ReturnsAsync(Enumerable.Empty<ServiceDto>());
+
+            // Act
+            await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+            var before = _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().Count(r => localService.Equals(r.IdentityReference));
+            await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+            var after = _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().Count(r => localService.Equals(r.IdentityReference));
+
+            // Assert
+            Assert.Equal(1, before);
+            Assert.Equal(0, after);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_RepositoryFailsFirst_FallsBackToAdministratorsAndSystemOnly()
+        {
+            // Arrange
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>())).ThrowsAsync(new InvalidOperationException("locked"));
+
+            // Act
+            await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+
+            // Assert: never wider than the closed DACL (Local System and Administrators only)
+            var rules = _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().ToList();
+            Assert.Equal(2, rules.Count);
+            _logger.Verify(l => l.Error(It.Is<string>(s => s.Contains("Failed to read the service accounts")), It.IsAny<Exception>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_RepositoryFailsLater_KeepsThePreviousDacl()
+        {
+            // Arrange
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            _sut.ResolveAccount = _ => localService;
+            _repository.SetupSequence(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = "svc" } })
+                .ThrowsAsync(new InvalidOperationException("locked"));
+
+            // Act
+            await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+            var first = _sut.CurrentPipeSecurity;
+            await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+
+            // Assert
+            Assert.Same(first, _sut.CurrentPipeSecurity);
+        }
+
+        [Fact]
+        public async Task RefreshPipeAccess_RepositoryFails_AnswersAFailure()
+        {
+            // Arrange
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>())).ThrowsAsync(new IOException("database is locked"));
+
+            // Act
+            var response = await _sut.ProcessRequestAsync(Request(AppConfig.ServyHostRefreshPipeAccessAction, null), Administrator, CancellationToken.None);
+
+            // Assert: the DACL was not rebuilt, so the caller must not be told the new account has access (#7392)
+            Assert.False(response.Success);
+            Assert.Contains("not refreshed", response.ErrorMessage);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_RepositoryFailsAtStartup_IsRetriedUntilTheServicesAreRead()
+        {
+            // Arrange: the database is busy at boot for the first read only (#7392)
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            _sut.ResolveAccount = _ => localService;
+            _sut.UnresolvedAccountRetryDelayMs = 10;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.SetupSequence(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("database is locked"))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = @"NT AUTHORITY\LocalService" } });
+
+            // Act
+            _sut.StartListening();
+            var granted = await WaitUntilGrantedAsync(localService);
+            _sut.StopListening();
+
+            // Assert: granted once the retry read the services, with no new install or restart
+            Assert.True(granted);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_RepositoryNeverReadable_StopsRetryingAfterTheConfiguredCount()
+        {
+            // Arrange
+            var reads = 0;
+            _sut.UnresolvedAccountRetryDelayMs = 1;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .Callback(() => Interlocked.Increment(ref reads))
+                .ThrowsAsync(new IOException("database is locked"));
+
+            // Act
+            _sut.StartListening();
+            var last = -1;
+            for (var i = 0; i < 100 && last != Volatile.Read(ref reads); i++)
+            {
+                last = Volatile.Read(ref reads);
+                await Task.Delay(100, CancellationToken.None);
+            }
+            _sut.StopListening();
+
+            // Assert: the first read plus the configured retries, then nothing until the next refresh, and a single line
+            // saying no further retry is scheduled (#7563)
+            Assert.Equal(1 + AppConfig.ServyHostUnresolvedAccountRetryCount, Volatile.Read(ref reads));
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("No further retry")), It.IsAny<Exception>()), Times.Once);
+
+            // Assert: one numbered retry line per retry, then the line that says the read is given up, and never the
+            // wording of the unresolved-account case (#8090)
+            var count = AppConfig.ServyHostUnresolvedAccountRetryCount;
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("could not be read") && m.Contains("Retrying in 1 ms")), It.IsAny<Exception>()), Times.Exactly(count));
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains($"(attempt 1 of {count})")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains($"(attempt {count} of {count})")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("still could not be read") && m.Contains("No further retry")), It.IsAny<Exception>()), Times.Once);
+            _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("could not be resolved")), It.IsAny<Exception>()), Times.Never);
+        }
+
+        [Fact]
+        public void RefreshPipeSecurityAsync_RetryRebuildThrows_LogsTheError()
+        {
+            // Arrange: the first lookup cannot resolve the account, so a retry is scheduled; the retry's lookup fails
+            var lookups = 0;
+            _sut.ResolveAccount = _ =>
+            {
+                if (Interlocked.Increment(ref lookups) == 1) return null;
+                throw new InvalidOperationException("LSA unavailable");
+            };
+            _sut.UnresolvedAccountRetryDelayMs = 1;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = @"CONTOSO\svc-gmsa$" } });
+            using (var logged = new ManualResetEventSlim())
+            {
+                _logger.Setup(l => l.Error(It.Is<string>(s => s.Contains("could not be resolved")), It.IsAny<InvalidOperationException>()))
+                    .Callback(() => logged.Set());
+
+                // Act
+                _sut.StartListening();
+                var observed = logged.Wait(TimeSpan.FromSeconds(10));
+                _sut.StopListening();
+
+                // Assert: a failed retry is logged rather than left unobserved in the background task
+                Assert.True(observed);
+                Assert.Equal(2, Volatile.Read(ref lookups));
+            }
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_RetryRebuildCancelled_LogsNoRebuildFailure()
+        {
+            // Arrange: the account is unresolved, and the retry's repository read is cancelled, as when the host stops
+            var reads = 0;
+            _sut.ResolveAccount = _ => null;
+            _sut.UnresolvedAccountRetryDelayMs = 1;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .Returns<bool, CancellationToken>((decrypt, ct) =>
+                {
+                    if (Interlocked.Increment(ref reads) == 1)
+                        return Task.FromResult<IEnumerable<ServiceDto>>(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = @"CONTOSO\svc-gmsa$" } });
+                    throw new OperationCanceledException();
+                });
+
+            // Act
+            _sut.StartListening();
+            for (var i = 0; i < 500 && Volatile.Read(ref reads) < 2; i++)
+                await Task.Delay(10, CancellationToken.None);
+            await Task.Delay(100, CancellationToken.None);
+            _sut.StopListening();
+
+            // Assert: the retry ran, and its cancellation is not reported as a failed rebuild (the listener's own
+            // "Error accepting Named Pipe connection." lines are not this test's subject)
+            Assert.Equal(2, Volatile.Read(ref reads));
+            _logger.Verify(l => l.Error(It.Is<string>(s => s.Contains("could not be resolved")), It.IsAny<Exception>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_HostStoppedDuringRetryDelay_RetriesAgainAfterRestart()
+        {
+            // Arrange: an account that resolves only on its third lookup, and a retry delay longer than the test
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var lookups = 0;
+            _sut.ResolveAccount = _ => Interlocked.Increment(ref lookups) < 3 ? null : localService;
+            _sut.UnresolvedAccountRetryDelayMs = 60000;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = @"CONTOSO\svc-gmsa$" } });
+
+            // Act: stop while the first retry waits, then start again with a short delay
+            _sut.StartListening();
+            _sut.StopListening();
+            await Task.Delay(200, CancellationToken.None);
+            _sut.UnresolvedAccountRetryDelayMs = 10;
+            _sut.StartListening();
+            var granted = await WaitUntilGrantedAsync(localService);
+            _sut.StopListening();
+
+            // Assert: the cancelled wait released the pending flag, so the restarted host retried and granted the account
+            Assert.True(granted);
+            Assert.Equal(3, Volatile.Read(ref lookups));
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_OvertakenByALaterRead_DoesNotReplaceTheNewerDacl()
+        {
+            // Arrange: rebuild A reads one service and then blocks resolving its account, the way a domain lookup does
+            // while no controller answers; rebuild B reads both services and publishes first (#7365)
+            var accountX = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var accountY = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            var serviceX = new ServiceDto { Name = "x", RunAsLocalSystem = false, UserAccount = "svc-x" };
+            var serviceY = new ServiceDto { Name = "y", RunAsLocalSystem = false, UserAccount = "svc-y" };
+            _repository.SetupSequence(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { serviceX })
+                .ReturnsAsync(new[] { serviceX, serviceY });
+            using (var resolving = new ManualResetEventSlim(false))
+            using (var release = new ManualResetEventSlim(false))
+            {
+                var lookups = 0;
+                _sut.ResolveAccount = account =>
+                {
+                    if (Interlocked.Increment(ref lookups) == 1)
+                    {
+                        resolving.Set();
+                        release.Wait(TimeSpan.FromSeconds(30));
+                    }
+
+                    return account == "svc-y" ? accountY : accountX;
+                };
+
+                // Act
+                var a = Task.Run(() => _sut.RefreshPipeSecurityAsync(CancellationToken.None));
+                try
+                {
+                    Assert.True(resolving.Wait(TimeSpan.FromSeconds(10)), "Rebuild A never reached the account lookup.");
+                    await _sut.RefreshPipeSecurityAsync(CancellationToken.None);
+                    var publishedByB = Granted(accountY);
+                    release.Set();
+                    await a;
+
+                    // Assert: A finished last, but B read the services later, so B's DACL stays published
+                    Assert.True(publishedByB);
+                    Assert.True(Granted(accountY));
+                    Assert.True(Granted(accountX));
+                }
+                finally
+                {
+                    release.Set();
+                }
+            }
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_Cancelled_Propagates()
+        {
+            // Arrange: reading the services is cancelled
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>())).ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert: the cancellation propagates
+            await Assert.ThrowsAsync<OperationCanceledException>(() => _sut.RefreshPipeSecurityAsync(CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task RefreshPipeSecurityAsync_ServiceProcessRunsAsLocalSystem_IsNotALingeringAccountAndSchedulesNoRecheck()
+        {
+            // Arrange: a running service whose process runs as Local System, with a recheck delay of 1 ms so a
+            // scheduled recheck would show up as further reads
+            var localSystem = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var reads = 0;
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .Callback(() => Interlocked.Increment(ref reads))
+                .ReturnsAsync(new[] { new ServiceDto { Name = ServiceName, RunAsLocalSystem = true } });
+            _sut.ResolveProcessAccount = pid => pid == ServicePid ? localSystem : null;
+            _sut.UnresolvedAccountRetryDelayMs = 1;
+            _sut.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+
+            // Act
+            _sut.StartListening();
+            await Task.Delay(300, CancellationToken.None);
+            _sut.StopListening();
+
+            // Assert: one read (the start), no lingering line, and the closed DACL (Local System and Administrators)
+            Assert.Equal(1, Volatile.Read(ref reads));
+            _logger.Verify(l => l.Info(It.Is<string>(m => m.Contains("keep access")), It.IsAny<Exception>()), Times.Never);
+            Assert.Equal(2, _sut.CurrentPipeSecurity!.GetAccessRules(true, true, typeof(SecurityIdentifier)).Count);
+        }
+
+        #endregion
+
+        #region Service lifecycle
+
+        /// <summary>
+        /// A host <see cref="Service"/> that exposes the Service Control Manager lifecycle callbacks to the test.
+        /// </summary>
+        private sealed class LifecycleProbe : Service
+        {
+            /// <summary>
+            /// Initializes a new instance of the <see cref="LifecycleProbe"/> class.
+            /// </summary>
+            /// <param name="logger">The logger the host reports to.</param>
+            /// <param name="pipes">The named pipe framing service.</param>
+            /// <param name="repository">The repository the pipe DACL is built from.</param>
+            /// <param name="api">The Windows service API.</param>
+            /// <param name="identifier">The pipe caller identifier.</param>
+            public LifecycleProbe(IServyLogger logger, INamedPipesService pipes, IServiceRepository repository, IWindowsServiceApi api, IPipeCallerIdentifier identifier)
+                : base(logger, pipes, repository, api, identifier)
+            {
+            }
+
+            /// <summary>
+            /// Invokes the protected start callback, as the Service Control Manager would.
+            /// </summary>
+            public void RunOnStart() => OnStart(Array.Empty<string>());
+
+            /// <summary>
+            /// Invokes the protected stop callback, as the Service Control Manager would.
+            /// </summary>
+            public void RunOnStop() => OnStop();
+        }
+
+        [Fact]
+        public void OnStart_PipeCannotBeCreated_LogsTheAcceptFailureAndOnStopFlushesTheLogger()
+        {
+            // Arrange
+            var logger = new Mock<IServyLogger>();
+            logger.Setup(l => l.CreateScoped(It.IsAny<string>())).Returns(() => logger.Object);
+            using (var accepted = new ManualResetEventSlim())
+            using (var probe = new LifecycleProbe(logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object))
+            {
+                logger.Setup(l => l.Error("Error accepting Named Pipe connection.", It.IsAny<IOException>())).Callback(() => accepted.Set());
+                probe.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+
+                // Act
+                probe.RunOnStart();
+                var logged = accepted.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                probe.RunOnStop();
+
+                // Assert
+                Assert.True(logged);
+                Assert.Equal(0, probe.ExitCode);
+                logger.Verify(l => l.Dispose(), Times.Once);
+                logger.Verify(l => l.Error("Exception in OnStart.", It.IsAny<Exception>()), Times.Never);
+            }
+        }
+
+        [Fact]
+        public void OnStart_ScopesTheLoggerToTheHostServiceName()
+        {
+            // Arrange: the scoped logger is a different object from the root one, so the test can tell them apart
+            var logger = new Mock<IServyLogger>();
+            var scoped = new Mock<IServyLogger>();
+            logger.Setup(l => l.CreateScoped(It.IsAny<string>())).Returns(scoped.Object);
+            using (var accepted = new ManualResetEventSlim())
+            using (var probe = new LifecycleProbe(logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object))
+            {
+                scoped.Setup(l => l.Error("Error accepting Named Pipe connection.", It.IsAny<IOException>())).Callback(() => accepted.Set());
+                probe.ServerStreamFactory = (name, security) => throw new IOException("All pipe instances are busy.");
+
+                // Act
+                probe.RunOnStart();
+                var logged = accepted.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                probe.RunOnStop();
+
+                // Assert: the scope carries the host's name, and the lines written after OnStart go to it, not to the root logger (#8090, #8109)
+                Assert.True(logged);
+                logger.Verify(l => l.CreateScoped(AppConfig.ServyHostServiceName), Times.Once);
+                logger.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                scoped.Verify(l => l.Dispose(), Times.Once);
+            }
+        }
+
+        [Fact]
+        public void WaitIgnoringCancellation_OnlyCancelledTasks_DoesNotThrow()
+        {
+            // Arrange
+            var tasks = new[] { Task.FromCanceled(new CancellationToken(canceled: true)), Task.CompletedTask };
+
+            // Act
+            var ex = Record.Exception(() => Service.WaitIgnoringCancellation(tasks));
+
+            // Assert
+            Assert.Null(ex);
+        }
+
+        [Fact]
+        public void WaitIgnoringCancellation_AFaultedTaskBesideACancelledOne_Propagates()
+        {
+            // Arrange
+            var tasks = new[]
+            {
+                Task.FromCanceled(new CancellationToken(canceled: true)),
+                Task.FromException(new InvalidOperationException("listener failed")),
+            };
+
+            // Act
+            var ex = Assert.Throws<AggregateException>(() => Service.WaitIgnoringCancellation(tasks));
+
+            // Assert
+            Assert.Contains(ex.Flatten().InnerExceptions, e => e is InvalidOperationException);
+        }
+
+        [Fact]
+        public void OnStop_LoggerDisposeHangs_ReturnsAfterTheFlushBudget()
+        {
+            // Arrange
+            using (var release = new ManualResetEventSlim(false))
+            {
+                var logger = new Mock<IServyLogger>();
+                logger.Setup(l => l.Dispose()).Callback(() => release.Wait(TimeSpan.FromSeconds(30)));
+                var probe = new LifecycleProbe(logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object);
+
+                try
+                {
+                    // Act
+                    var stop = Task.Run(() => probe.RunOnStop());
+                    var returned = stop.Wait(TimeSpan.FromSeconds(10));
+
+                    // Assert: the flush gives up after AppConfig.LoggerFlushTimeoutMs instead of waiting for the hung Dispose
+                    Assert.True(returned);
+                    logger.Verify(l => l.Dispose(), Times.Once);
+                }
+                finally
+                {
+                    release.Set();
+                    probe.Dispose();
+                }
+            }
+        }
+
+        [Fact]
+        public void OnStop_StopListeningThrows_WarnsAndStillFlushesTheLogger()
+        {
+            // Arrange: a handler task that ended Faulted makes StopListening propagate the failure from its wait
+            var logger = new Mock<IServyLogger>();
+            using (var probe = new LifecycleProbe(logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object))
+            {
+                var handlers = TestReflection.GetField<System.Collections.Concurrent.ConcurrentDictionary<Task, bool>>(probe, "_activeHandlers");
+                handlers.TryAdd(Task.FromException(new InvalidOperationException("handler failed")), true);
+
+                // Act
+                var ex = Record.Exception(() => probe.RunOnStop());
+
+                // Assert: the failure is reported, not thrown, and the logger is still flushed
+                Assert.Null(ex);
+                logger.Verify(l => l.Warn(It.Is<string>(m => m.StartsWith("Exception stopping pipe listener:") && m.Contains("handler failed")), null), Times.Once);
+                logger.Verify(l => l.Dispose(), Times.Once);
+            }
+        }
+
+        [Fact]
+        public void OnStart_PipeDaclCannotBeBuilt_LogsAndSetsTheServiceSpecificExitCode()
+        {
+            // Arrange
+            var logger = new Mock<IServyLogger>();
+            logger.Setup(l => l.CreateScoped(It.IsAny<string>())).Returns(() => logger.Object);
+            _repository.Setup(r => r.GetAllAsync(false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { new ServiceDto { Name = "a", RunAsLocalSystem = false, UserAccount = "svc-a" } });
+            using (var probe = new LifecycleProbe(logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object))
+            {
+                probe.ResolveAccount = account => throw new InvalidOperationException("LSA unavailable");
+
+                // Act
+                // The catch ends with ServiceBase.Stop(), which runs outside the Service Control Manager. What it does
+                // there is not this test's subject, so anything it throws is recorded rather than asserted.
+                Record.Exception(() => probe.RunOnStart());
+
+                // Assert
+                logger.Verify(l => l.Error("Exception in OnStart.", It.IsAny<InvalidOperationException>()), Times.Once);
+                Assert.Equal(AppConfig.ServiceSpecificErrorCode, probe.ExitCode);
+            }
+        }
+
+        #endregion
+
+        #region First pipe instance
+
+        /// <summary>
+        /// Points <see cref="_sut"/> at a unique pipe name whose instances are created by a recording factory, which
+        /// refuses an instance that asks to be the first of its name when <paramref name="refuseFirstInstance"/> is set.
+        /// </summary>
+        /// <param name="refuseFirstInstance">Whether an instance created with <c>FILE_FLAG_FIRST_PIPE_INSTANCE</c> is refused with <c>ERROR_ACCESS_DENIED</c>.</param>
+        /// <param name="calls">Receives, in call order, whether each instance asked to be the first of its name; lock it to read it.</param>
+        /// <param name="created">Signalled once every listener has a waiting instance.</param>
+        /// <returns>The pipe name.</returns>
+        private string RecordPipeInstances(bool refuseFirstInstance, List<bool> calls, ManualResetEventSlim created)
+        {
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            var instances = 0;
+            _sut.PipeName = pipeName;
+            _sut.PipeInstanceFactory = (name, security, firstInstance) =>
+            {
+                lock (calls)
+                    calls.Add(firstInstance);
+                if (firstInstance && refuseFirstInstance)
+                    throw new Win32Exception(Errors.ERROR_ACCESS_DENIED, "Access is denied.");
+
+                var stream = new NamedPipeServerStream(name, PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances,
+                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                if (Interlocked.Increment(ref instances) == AppConfig.ServyHostListenerCount)
+                    created.Set();
+                return stream;
+            };
+            return pipeName;
+        }
+
+        [Fact]
+        public void StartListening_NameFree_OnlyTheFirstInstanceAsksToBeTheFirstOfTheName()
+        {
+            // Arrange
+            var calls = new List<bool>();
+            using (var created = new ManualResetEventSlim())
+            {
+                RecordPipeInstances(refuseFirstInstance: false, calls, created);
+
+                // Act
+                _sut.StartListening();
+                var allCreated = created.Wait(TimeSpan.FromSeconds(10));
+                _sut.StopListening();
+
+                // Assert: one instance per listener, and only the first carries FILE_FLAG_FIRST_PIPE_INSTANCE (#7537)
+                Assert.True(allCreated);
+                bool[] snapshot;
+                lock (calls)
+                    snapshot = calls.ToArray();
+                Assert.Equal(AppConfig.ServyHostListenerCount, snapshot.Length);
+                Assert.True(snapshot[0]);
+                Assert.Single(snapshot, firstInstance => firstInstance);
+                _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("FILE_FLAG_FIRST_PIPE_INSTANCE")), It.IsAny<Exception>()), Times.Never);
+            }
+        }
+
+        [Fact]
+        public void StartListening_FirstInstanceRefusedAsTheNameIsHeld_LogsAWarningAndCreatesItWithoutTheFlag()
+        {
+            // Arrange: the name is already held, so the instance asking to be the first is refused (#7537)
+            var calls = new List<bool>();
+            using (var created = new ManualResetEventSlim())
+            {
+                var pipeName = RecordPipeInstances(refuseFirstInstance: true, calls, created);
+
+                // Act
+                _sut.StartListening();
+                var allCreated = created.Wait(TimeSpan.FromSeconds(10));
+                _sut.StopListening();
+
+                // Assert: one refused attempt with the flag, then every listener's instance without it, and a warning
+                Assert.True(allCreated);
+                bool[] snapshot;
+                lock (calls)
+                    snapshot = calls.ToArray();
+                Assert.Equal(AppConfig.ServyHostListenerCount + 1, snapshot.Length);
+                Assert.True(snapshot[0]);
+                Assert.Single(snapshot, firstInstance => firstInstance);
+                _logger.Verify(l => l.Warn(
+                    It.Is<string>(m => m.Contains(pipeName) && m.Contains("FILE_FLAG_FIRST_PIPE_INSTANCE")),
+                    It.Is<Win32Exception>(e => e.NativeErrorCode == Errors.ERROR_ACCESS_DENIED)), Times.Once);
+                _logger.Verify(l => l.Error("Error accepting Named Pipe connection.", It.IsAny<Exception>()), Times.Never);
+            }
+        }
+
+        [Fact]
+        public void StartListening_FirstInstanceFailsForAnotherReason_IsReportedAndNeverCreatedWithoutTheFlag()
+        {
+            // Arrange: creating an instance fails with an error other than ERROR_ACCESS_DENIED
+            var calls = new List<bool>();
+            using (var reported = new ManualResetEventSlim())
+            {
+                _sut.PipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+                _sut.PipeInstanceFactory = (name, security, firstInstance) =>
+                {
+                    lock (calls)
+                        calls.Add(firstInstance);
+                    throw new Win32Exception(Errors.ERROR_INVALID_PARAMETER, "The parameter is incorrect.");
+                };
+                _logger.Setup(l => l.Error("Error accepting Named Pipe connection.",
+                        It.Is<Win32Exception>(e => e.NativeErrorCode == Errors.ERROR_INVALID_PARAMETER)))
+                    .Callback(() => reported.Set());
+
+                // Act
+                _sut.StartListening();
+                var observed = reported.Wait(TimeSpan.FromSeconds(10));
+                _sut.StopListening();
+
+                // Assert: the failure reached the accept loop as it is, no instance was asked for without the flag,
+                // and the "name is already held" warning was not logged
+                Assert.True(observed);
+                bool[] snapshot;
+                lock (calls)
+                    snapshot = calls.ToArray();
+                Assert.NotEmpty(snapshot);
+                Assert.All(snapshot, firstInstance => Assert.True(firstInstance));
+                _logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("FILE_FLAG_FIRST_PIPE_INSTANCE")), It.IsAny<Exception>()), Times.Never);
+            }
+        }
+
+        #endregion
+
+        #region Connection handling
+
+        /// <summary>
+        /// Starts a host on <paramref name="pipeName"/> whose server instances carry the default DACL instead of the
+        /// host's Administrators-and-System one, so a non-elevated test process can connect to it.
+        /// </summary>
+        /// <param name="logger">The logger the host reports to.</param>
+        /// <param name="pipeName">The name of the pipe to listen on.</param>
+        /// <param name="requestTimeoutMs">The per-request timeout, in milliseconds.</param>
+        /// <returns>The listening host. The caller owns it.</returns>
+        private Service ListeningHost(Mock<IServyLogger> logger, string pipeName, int requestTimeoutMs)
+        {
+            var host = new Service(logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object)
+            {
+                PipeName = pipeName,
+                RequestTimeoutMs = requestTimeoutMs,
+                ServerStreamFactory = (name, security) => new NamedPipeServerStream(name, PipeDirection.InOut,
+                    NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte, PipeOptions.Asynchronous),
+            };
+            host.StartListening();
+            return host;
+        }
+
+        [Fact]
+        public void HandleConnectionAsync_ReadThrows_LogsTheError()
+        {
+            // Arrange
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidDataException("bad frame"));
+            using (var logged = new ManualResetEventSlim())
+            {
+                logger.Setup(l => l.Error("Exception in HandleConnectionAsync.", It.IsAny<InvalidDataException>())).Callback(() => logged.Set());
+                using (var host = ListeningHost(logger, pipeName, requestTimeoutMs: 5000))
+                {
+                    // Act
+                    bool observed;
+                    using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                    {
+                        client.Connect(3000);
+                        observed = logged.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                    }
+
+                    // Assert
+                    Assert.True(observed);
+
+                    // Draining the handlers is cleanup, not this test's subject, but it is called plainly: since #7353
+                    // the listener instances are no longer scheduled with the token, so cancelling the host does not
+                    // end the ones the thread pool has not started yet as Canceled, and StopListening tolerates a
+                    // cancellation from either wait. A throw here is a regression and must fail the test.
+                    host.StopListening();
+                }
+            }
+        }
+
+        [Fact]
+        public void HandleConnectionAsync_PinsTheClientBeforeTheRead_AndReleasesItOnlyAfterTheAnswer()
+        {
+            // Arrange: every step of the connection records itself, and the pinned client's process handle records its
+            // release, so the test sees whether the client was pinned before the read and held until the answer (#7534)
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            var steps = new List<string>();
+            void Record(string step) { lock (steps) steps.Add(step); }
+            using (var released = new ManualResetEventSlim())
+            {
+                var processHandle = new Mock<IDisposable>();
+                processHandle.Setup(h => h.Dispose()).Callback(() => { Record("release"); released.Set(); });
+                var pin = new PipeClientPin(ServicePid, processHandle.Object);
+                _identifier.Setup(i => i.Pin(It.IsAny<NamedPipeServerStream>())).Callback(() => Record("pin")).Returns(pin);
+                _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                    .Callback(() => Record("read"))
+                    .ReturnsAsync(Request(AppConfig.ServyHostGetRestartAttemptsAction));
+                _identifier.Setup(i => i.Identify(It.IsAny<NamedPipeServerStream>(), pin)).Callback(() => Record("identify")).Returns(TheServiceProcess);
+                _api.Setup(a => a.GetServiceProcessId(ServiceName)).Callback(() => Record("authorize")).Returns(ServicePid);
+                _repository.Setup(r => r.GetRestartAttemptsAsync(ServiceName, It.IsAny<CancellationToken>())).ReturnsAsync(new RestartAttemptsDto());
+                _pipes.Setup(p => p.WriteAsync(It.IsAny<Stream>(), It.Is<IpcResponseDto>(r => r.Success), It.IsAny<CancellationToken>()))
+                    .Callback(() => Record("answer"))
+                    .Returns(Task.CompletedTask);
+                using (var host = ListeningHost(logger, pipeName, requestTimeoutMs: 5000))
+                {
+                    // Act
+                    bool observed;
+                    using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                    {
+                        client.Connect(3000);
+                        observed = released.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                    }
+
+                    host.StopListening();
+
+                    // Assert
+                    Assert.True(observed);
+                    string[] recorded;
+                    lock (steps) recorded = steps.ToArray();
+                    Assert.Equal(new[] { "pin", "read", "identify", "authorize", "answer", "release" }, recorded);
+                }
+            }
+        }
+
+        [Fact]
+        public void ListenForPipeConnectionsAsync_PipeCreationFails_BacksOffThenAcceptsTheNextClient()
+        {
+            // Arrange
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            var calls = 0;
+            var firstFailure = Stopwatch.StartNew();
+            long firstSuccessMs = -1;
+            _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidDataException("bad frame"));
+            using (var handled = new ManualResetEventSlim())
+            {
+                logger.Setup(l => l.Error("Exception in HandleConnectionAsync.", It.IsAny<InvalidDataException>())).Callback(() => handled.Set());
+                using (var host = new Service(logger.Object, _pipes.Object, _repository.Object, _api.Object, _identifier.Object)
+                {
+                    PipeName = pipeName,
+                    RequestTimeoutMs = 5000,
+                    // Every listener's first attempt fails (the first ServyHostListenerCount calls), so a client can only
+                    // ever be accepted by a listener that went round the loop after its back-off
+                    ServerStreamFactory = (name, security) =>
+                    {
+                        if (Interlocked.Increment(ref calls) <= AppConfig.ServyHostListenerCount)
+                            throw new IOException("All pipe instances are busy.");
+
+                        Interlocked.CompareExchange(ref firstSuccessMs, firstFailure.ElapsedMilliseconds, -1);
+                        return new NamedPipeServerStream(name, PipeDirection.InOut,
+                            NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                    },
+                })
+                {
+                    host.StartListening();
+
+                    // Act
+                    bool observed;
+                    using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                    {
+                        client.Connect(10000);
+                        observed = handled.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                    }
+
+                    // Assert: a listener that gave up after its failure would leave no instance to connect to
+                    Assert.True(observed);
+                    logger.Verify(l => l.Error("Error accepting Named Pipe connection.", It.IsAny<IOException>()), Times.AtLeastOnce());
+
+                    // The retry waited for the back-off instead of spinning straight into the next attempt
+                    Assert.True(Interlocked.Read(ref firstSuccessMs) >= AppConfig.ScmPollIntervalMs / 2,
+                        $"The first pipe instance was created {Interlocked.Read(ref firstSuccessMs)} ms after the first failure.");
+
+                    // Same drain as the sibling tests, called plainly: a throw from it fails the test
+                    host.StopListening();
+                }
+            }
+        }
+
+        [Fact]
+        public void HandleConnectionAsync_ClientNeverSendsItsRequest_WarnsAfterTheRequestTimeout()
+        {
+            // Arrange
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .Returns<Stream, CancellationToken>(async (stream, token) =>
+                {
+                    await Task.Delay(Timeout.Infinite, token);
+                    return null;
+                });
+            using (var warned = new ManualResetEventSlim())
+            {
+                // Either timeout arm may run - a pending read does not observe its token on every runtime - and both
+                // log this warning, so the test asserts the warning rather than which arm produced it.
+                logger.Setup(l => l.Warn(It.Is<string>(m => m.Contains("did not complete its request in time")), null)).Callback(() => warned.Set());
+                using (var host = ListeningHost(logger, pipeName, requestTimeoutMs: 200))
+                {
+                    // Act
+                    bool observed;
+                    using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                    {
+                        client.Connect(3000);
+                        observed = warned.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                    }
+
+                    // Assert
+                    Assert.True(observed);
+                    logger.Verify(l => l.Error("Exception in HandleConnectionAsync.", It.IsAny<Exception>()), Times.Never);
+
+                    // Same as above: the drain keeps the pending handler from setting an event this test is about to
+                    // dispose, and since #7353 it is called plainly, so a throw from it fails the test.
+                    host.StopListening();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Connects a client to a host whose request read blocks until its token ends, waits until the read is pending,
+        /// and returns the tracked handler tasks so the test can wait for them to finish.
+        /// </summary>
+        /// <param name="host">The listening host.</param>
+        /// <param name="pipeName">The pipe the host listens on.</param>
+        /// <param name="reading">The event the read sets once it is pending.</param>
+        /// <returns>The tracked handler tasks of the connection.</returns>
+        private static Task[] ConnectUntilTheReadIsPending(Service host, string pipeName, ManualResetEventSlim reading)
+        {
+            using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            {
+                client.Connect(3000);
+                Assert.True(reading.WaitHandle.WaitOne(TimeSpan.FromSeconds(10)));
+
+                // The handler is tracked right after it starts, which can be just after its read began
+                var handlers = TestReflection.GetField<System.Collections.Concurrent.ConcurrentDictionary<Task, bool>>(host, "_activeHandlers");
+                Assert.True(SpinWait.SpinUntil(() => !handlers.IsEmpty, TimeSpan.FromSeconds(10)));
+                return handlers.Keys.ToArray();
+            }
+        }
+
+        [Fact]
+        public void HandleConnectionAsync_HostStopsWhileTheReadIsPending_EndsWithoutALogEntry()
+        {
+            // Arrange
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            using (var reading = new ManualResetEventSlim())
+            {
+                _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                    .Returns<Stream, CancellationToken>(async (stream, token) =>
+                    {
+                        reading.Set();
+                        await Task.Delay(Timeout.Infinite, token);
+                        return null;
+                    });
+                using (var host = ListeningHost(logger, pipeName, requestTimeoutMs: 60000))
+                {
+                    var handlers = ConnectUntilTheReadIsPending(host, pipeName, reading);
+
+                    // Act
+                    host.StopListening();
+                    var finished = Task.WaitAll(handlers, TimeSpan.FromSeconds(10));
+
+                    // Assert: a shutdown is not a timeout and not a failure, so nothing is logged
+                    Assert.True(finished);
+                    logger.Verify(l => l.Warn(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                    logger.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                }
+            }
+        }
+
+        [Fact]
+        public void HandleConnectionAsync_PipeClosedByTheShutdown_EndsWithoutALogEntry()
+        {
+            // Arrange: the read fails with an IOException, as a read on a pipe closed under it does
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            using (var reading = new ManualResetEventSlim())
+            {
+                _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                    .Returns<Stream, CancellationToken>(async (stream, token) =>
+                    {
+                        reading.Set();
+                        try { await Task.Delay(Timeout.Infinite, token); }
+                        catch (OperationCanceledException) { throw new IOException("The pipe was closed."); }
+                        return null;
+                    });
+                using (var host = ListeningHost(logger, pipeName, requestTimeoutMs: 60000))
+                {
+                    var handlers = ConnectUntilTheReadIsPending(host, pipeName, reading);
+
+                    // Act
+                    host.StopListening();
+                    var finished = Task.WaitAll(handlers, TimeSpan.FromSeconds(10));
+
+                    // Assert: the failure was caused by the shutdown, so it is neither a timeout nor an error
+                    Assert.True(finished);
+                    logger.Verify(l => l.Warn(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                    logger.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                }
+            }
+        }
+
+        [Fact]
+        public void HandleConnectionAsync_PipeClosedByTheTimeout_WarnsOnceAndLogsNoError()
+        {
+            // Arrange: the read fails with an IOException once the request timeout ended its token
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .Returns<Stream, CancellationToken>(async (stream, token) =>
+                {
+                    try { await Task.Delay(Timeout.Infinite, token); }
+                    catch (OperationCanceledException) { throw new IOException("The pipe was closed."); }
+                    return null;
+                });
+            using (var warned = new ManualResetEventSlim())
+            {
+                logger.Setup(l => l.Warn(It.Is<string>(m => m.Contains("did not complete its request in time")), null)).Callback(() => warned.Set());
+                using (var host = ListeningHost(logger, pipeName, requestTimeoutMs: 200))
+                {
+                    // Act
+                    bool observed;
+                    using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                    {
+                        client.Connect(3000);
+                        observed = warned.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                    }
+
+                    host.StopListening();
+
+                    // Assert
+                    Assert.True(observed);
+                    logger.Verify(l => l.Warn(It.Is<string>(m => m.Contains("did not complete its request in time")), null), Times.Once);
+                    logger.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                }
+            }
+        }
+
+        [Fact]
+        public void HandleConnectionAsync_RepositoryNeverAnswers_WarnsAfterTheRequestTimeout()
+        {
+            // Arrange: the request arrives at once, and the repository call ends only when its token does (#8089)
+            var logger = new Mock<IServyLogger>();
+            var pipeName = "ServyHostUnit_" + Guid.NewGuid().ToString("N");
+            _pipes.Setup(p => p.ReadAsync<IpcRequestDto>(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Request(AppConfig.ServyHostGetRestartAttemptsAction));
+            _identifier.Setup(i => i.Identify(It.IsAny<NamedPipeServerStream>(), It.IsAny<PipeClientPin>())).Returns(Administrator);
+            _repository.Setup(r => r.GetRestartAttemptsAsync(ServiceName, It.IsAny<CancellationToken>()))
+                .Returns<string, CancellationToken>(async (name, token) =>
+                {
+                    await Task.Delay(Timeout.Infinite, token);
+                    return (RestartAttemptsDto?)null;
+                });
+            using (var warned = new ManualResetEventSlim())
+            {
+                logger.Setup(l => l.Warn(It.Is<string>(m => m.Contains("did not complete its request in time")), null)).Callback(() => warned.Set());
+                using (var host = ListeningHost(logger, pipeName, requestTimeoutMs: 200))
+                {
+                    // Act
+                    bool observed;
+                    using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                    {
+                        client.Connect(3000);
+                        observed = warned.WaitHandle.WaitOne(TimeSpan.FromSeconds(10));
+                    }
+
+                    // The drain ends a handler that is still waiting on the host's own token
+                    host.StopListening();
+
+                    // Assert: the timeout ended the repository call, not only the read
+                    Assert.True(observed);
+                    logger.Verify(l => l.Error(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+                }
+            }
+        }
+
+        #endregion
+    }
+}

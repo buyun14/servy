@@ -7,15 +7,20 @@ using System.Diagnostics;
 namespace Servy.Service.ProcessManagement
 {
     /// <summary>
-    /// Format extensions for processes.
+    /// Process helpers for the service host: a display formatter, and Toolhelp32-based enumeration of
+    /// a process's children and descendants with PID-reuse validation.
     /// </summary>
     public static class ProcessExtensions
     {
         /// <summary>
-        /// Formats the process as "ProcessName (Id)".
+        /// Formats the process as "ProcessName (Id)" for log messages.
         /// </summary>
-        /// <param name="process">Process.</param>
-        /// <returns>Process info.</returns>
+        /// <param name="process">The process to describe.</param>
+        /// <returns>
+        /// "ProcessName (Id)"; "(PID Id)" when the name cannot be read (the process has exited or access is
+        /// denied); "(Exited Process)" or "(Inaccessible Process)" when the ID cannot be read either. Never throws
+        /// for those two causes.
+        /// </returns>
         public static string Format(this Process process)
         {
             try
@@ -46,12 +51,23 @@ namespace Servy.Service.ProcessManagement
         /// <br/><strong>Note:</strong> The caller assumes ownership of these objects and
         /// must call <c>Dispose()</c> on each to prevent native handle leaks.
         /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when <paramref name="parentPid"/> is not positive.
+        /// </exception>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="parentStartTime"/> is <see cref="DateTime.MinValue"/>, so PID reuse cannot be validated.
+        /// </exception>
+        /// <exception cref="Win32Exception">
+        /// Thrown when the underlying Toolhelp32 snapshot cannot be created; see <see cref="Toolhelp32Snapshot.BuildSnapshotAndChildMap"/>.
+        /// </exception>
         public static List<Process> GetChildren(int parentPid, DateTime parentStartTime)
         {
             var children = new List<Process>();
 
-            if (parentPid <= 0 || parentStartTime == DateTime.MinValue)
-                return children;
+            if (parentPid <= 0)
+                throw new ArgumentOutOfRangeException(nameof(parentPid), parentPid, "A positive PID is required to enumerate descendants.");
+            if (parentStartTime == DateTime.MinValue)
+                throw new ArgumentException("A real parent start time is required for PID-reuse validation.", nameof(parentStartTime));
 
             // 1. ONE snapshot, build parent->children map (centralized)
             var (_, byParent) = Toolhelp32Snapshot.BuildSnapshotAndChildMap();
@@ -85,15 +101,47 @@ namespace Servy.Service.ProcessManagement
         /// <br/><strong>Note:</strong> The caller assumes full ownership of ALL returned objects and
         /// must call <c>Dispose()</c> on each to prevent native handle leaks.
         /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when <paramref name="parentPid"/> is not positive.
+        /// </exception>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="parentStartTime"/> is <see cref="DateTime.MinValue"/>, so PID reuse cannot be validated.
+        /// </exception>
+        /// <exception cref="Win32Exception">
+        /// Thrown when the underlying Toolhelp32 snapshot cannot be created; see <see cref="Toolhelp32Snapshot.BuildSnapshotAndChildMap"/>.
+        /// </exception>
         public static List<Process> GetAllDescendants(int parentPid, DateTime parentStartTime)
         {
-            var allDescendants = new List<Process>();
-
-            if (parentPid <= 0 || parentStartTime == DateTime.MinValue)
-                return allDescendants;
+            if (parentPid <= 0)
+                throw new ArgumentOutOfRangeException(nameof(parentPid), parentPid, "A positive PID is required to enumerate descendants.");
+            if (parentStartTime == DateTime.MinValue)
+                throw new ArgumentException("A real parent start time is required for PID-reuse validation.", nameof(parentStartTime));
 
             // 1. ONE snapshot, build parent->children map
             var (_, byParent) = Toolhelp32Snapshot.BuildSnapshotAndChildMap();
+
+            return GetAllDescendants(parentPid, parentStartTime, byParent, TryResolveValidChild);
+        }
+
+        /// <summary>
+        /// The BFS half of <see cref="GetAllDescendants(int, DateTime)"/>, with the snapshot map and the
+        /// per-node resolver supplied by the caller so the walk can be driven over a synthetic tree.
+        /// </summary>
+        /// <param name="parentPid">The Process ID of the parent to start the walk from.</param>
+        /// <param name="parentStartTime">The start time of the parent for PID reuse validation.</param>
+        /// <param name="byParent">The parent PID to child PIDs map to walk.</param>
+        /// <param name="resolveChild">
+        /// Resolver invoked as <c>(childPid, parentStartTime, snapshotTime)</c>; returns the validated
+        /// <see cref="Process"/> or <c>null</c> when the node cannot be resolved.
+        /// </param>
+        /// <returns>
+        /// A flattened <see cref="List{Process}"/> containing the entire descendant tree.
+        /// <br/><strong>Note:</strong> The caller assumes full ownership of ALL returned objects and
+        /// must call <c>Dispose()</c> on each to prevent native handle leaks.
+        /// </returns>
+        internal static List<Process> GetAllDescendants(int parentPid, DateTime parentStartTime, Dictionary<int, List<int>> byParent, Func<int, DateTime, DateTime, Process?> resolveChild)
+        {
+            var allDescendants = new List<Process>();
 
             // Anchor for PID-reuse detection. Any legitimate child MUST exist before this timestamp.
             var snapshotTime = DateTime.UtcNow;
@@ -118,7 +166,7 @@ namespace Servy.Service.ProcessManagement
                 {
                     if (!visited.Add(childPid)) continue; // already seen -> cycle guard
 
-                    Process? validChild = TryResolveValidChild(childPid, current.StartTime, snapshotTime);
+                    Process? validChild = resolveChild(childPid, current.StartTime, snapshotTime);
                     if (validChild != null)
                     {
                         allDescendants.Add(validChild);

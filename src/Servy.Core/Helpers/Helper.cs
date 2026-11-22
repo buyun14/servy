@@ -1,5 +1,6 @@
 using Servy.Core.Config;
 using Servy.Core.Logging;
+using Servy.Core.Native;
 using Servy.Core.Resources;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -27,11 +28,11 @@ namespace Servy.Core.Helpers
         /// </summary>
         /// <remarks>
         /// This set extends the basic Service Control Manager (SCM) restrictions to include characters
-        /// that are invalid in Windows Registry key names and the Windows file system. Because a service name
-        /// acts as a registry key under <c>HKLM\SYSTEM\CurrentControlSet\Services</c> and is often used
-        /// to generate log files or directories, prohibiting these characters prevents downstream systemic errors.
+        /// that are invalid in Windows Registry key names, the Windows file system, and SCM dependency list delimiters.
+        /// Because a service name acts as a registry key under <c>HKLM\SYSTEM\CurrentControlSet\Services</c>
+        /// and is often used to generate log files or directories, prohibiting these characters prevents downstream systemic errors.
         /// </remarks>
-        private static readonly char[] InvalidServiceChars = new[] { '\\', '/', ':', '*', '?', '"', '<', '>', '|' };
+        private static readonly char[] InvalidServiceChars = new[] { '\\', '/', ':', '*', '?', '"', '<', '>', '|', ';' };
 
         // Cache the invalid characters to avoid array allocations on high-frequency validation calls
         private static readonly char[] InvalidPathChars = Path.GetInvalidPathChars();
@@ -42,7 +43,7 @@ namespace Servy.Core.Helpers
         /// </summary>
         /// <param name="path">The path to validate.</param>
         /// <returns>True if the path is valid, otherwise false.</returns>
-        public static bool IsValidPath(string path)
+        public static bool IsValidPath(string? path)
         {
             if (string.IsNullOrWhiteSpace(path))
             {
@@ -132,49 +133,16 @@ namespace Servy.Core.Helpers
         }
 
         /// <summary>
-        /// Ensures the parent directory of the given file path exists, creating it if necessary.
-        /// </summary>
-        /// <param name="path">The full file path.</param>
-        /// <returns>True if the directory exists or was created successfully; false otherwise.</returns>
-        /// <remarks>
-        /// This method acts as a non-throwing variant of <see cref="EnsureDirectoryExists(string?)"/>, catching and
-        /// logging any filesystem access or authorization violations gracefully.
-        /// </remarks>
-        public static bool CreateParentDirectory(string? path)
-        {
-            if (string.IsNullOrWhiteSpace(path))
-            {
-                return false;
-            }
-
-            try
-            {
-                var directory = Path.GetDirectoryName(path);
-                if (string.IsNullOrWhiteSpace(directory))
-                {
-                    return false;
-                }
-                EnsureDirectoryExists(path);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Logger.Debug($"CreateParentDirectory: rejected '{path}': {ex.Message}");
-                return false;
-            }
-        }
-
-        /// <summary>
         /// Quotes and escapes a string for safe use as a Windows process argument.
         /// </summary>
         /// <param name="input">The string to quote. Can be <c>null</c> or empty.</param>
         /// <returns>
         /// A properly quoted string where:
         /// <list type="bullet">
-        ///   <item>All double quotes are escaped with a backslash.</item>
-        ///   <item>All backslashes preceding a quote or the end of the string are doubled.</item>
-        ///   <item>Trailing backslashes are doubled to avoid truncation.</item>
-        ///   <item>Any null characters (<c>\0</c>) are replaced with the literal sequence <c>\\0</c> for safety.</item>
+        ///    <item>All double quotes are escaped with a backslash.</item>
+        ///    <item>All backslashes preceding a quote or the end of the string are doubled.</item>
+        ///    <item>Trailing backslashes are doubled to avoid truncation.</item>
+        ///    <item>Any NUL characters (U+0000) are replaced with the two-character sequence <c>\0</c> (a backslash followed by the digit zero) for safety.</item>
         /// </list>
         /// For example, <c>C:\Path\"File</c> becomes <c>"C:\Path\\\"File"</c>.
         /// </returns>
@@ -201,15 +169,23 @@ namespace Servy.Core.Helpers
         /// <remarks>
         /// - Escapes all backslashes preceding a quote.
         /// - Doubles trailing backslashes before the closing quote.
-        /// - Replaces any null characters (<c>\0</c>) with the literal sequence <c>\\0</c>.
+        /// - Replaces any NUL characters (U+0000) with the two-character sequence <c>\0</c> (a backslash followed by the digit zero).
         /// </remarks>
         public static string EscapeArgs(string? input) => EscapeCore(input, escapeQuotes: true);
 
         /// <summary>
-        /// Escapes only backslashes that appear immediately before double quotes.
+        /// Escapes backslashes that appear immediately before a double quote, leaving the quotes themselves unescaped.
         /// </summary>
-        /// <param name="input">The input string to escape.</param>
-        /// <returns>The escaped string.</returns>
+        /// <param name="input">The argument string to escape. May be <see langword="null"/> or empty.</param>
+        /// <returns>
+        /// The escaped string. If <paramref name="input"/> is <see langword="null"/> or empty, returns an empty string.
+        /// </returns>
+        /// <remarks>
+        /// - Doubles all backslashes preceding a quote; the quote is emitted as-is.
+        /// - Unlike <see cref="EscapeArgs(string?)"/>, trailing backslashes are left unchanged, because the result
+        ///   is not intended to be followed by a closing quote.
+        /// - Replaces any NUL characters (U+0000) with the two-character sequence <c>\0</c> (a backslash followed by the digit zero).
+        /// </remarks>
         public static string EscapeBackslashes(string? input) => EscapeCore(input, escapeQuotes: false);
 
         /// <summary>
@@ -250,7 +226,7 @@ namespace Servy.Core.Helpers
                 }
                 else
                 {
-                    // Normal character / Write any previous backslashes as-is - just flush any backslashes
+                    // Backslashes are only special before a quote, so a run that ends at an ordinary character is literal.
                     if (backslashCount > 0)
                     {
                         sb.Append('\\', backslashCount);
@@ -260,8 +236,7 @@ namespace Servy.Core.Helpers
                 }
             }
 
-            // Escape trailing backslashes before closing quote
-            // Flush any remaining backslashes unchanged or doubled depending on mode
+            // Flush any remaining backslashes, doubled only when a closing quote will follow (EscapeArgs).
             if (backslashCount > 0)
                 sb.Append('\\', escapeQuotes ? backslashCount * 2 : backslashCount);
 
@@ -274,7 +249,7 @@ namespace Servy.Core.Helpers
         /// </summary>
         /// <param name="version">The raw version string to evaluate.</param>
         /// <returns>A valid <see cref="Version"/> object if parsing succeeds; otherwise, <see langword="null"/>.</returns>
-        public static Version? ParseVersion(string version)
+        public static Version? ParseVersion(string? version)
         {
             if (string.IsNullOrWhiteSpace(version))
                 return null;
@@ -384,6 +359,17 @@ namespace Servy.Core.Helpers
         }
 
         /// <summary>
+        /// Replaces <paramref name="destination"/> with <paramref name="source"/> in a single atomic metadata operation.
+        /// </summary>
+        /// <param name="source">The staging file to move.</param>
+        /// <param name="destination">The destination path to replace.</param>
+        /// <remarks>
+        /// This is the production move both public overloads pass as the <c>moveOverwrite</c> seam; it forwards unchanged to
+        /// <see cref="File.Move(string, string, bool)"/>.
+        /// </remarks>
+        private static void AtomicOverwriteMove(string source, string destination) => File.Move(source, destination, overwrite: true);
+
+        /// <summary>
         /// Writes content to a file atomically by writing to a temporary file first and then performing an atomic move.
         /// </summary>
         /// <param name="path">The full destination path where the file should be written.</param>
@@ -391,7 +377,7 @@ namespace Servy.Core.Helpers
         /// <param name="ct">A cancellation token to observe while waiting for the task to complete.</param>
         /// <returns>A <see cref="Task"/> representing the asynchronous write operation.</returns>
         public static Task WriteFileAtomicAsync(string path, Func<Stream, CancellationToken, Task> writeContent, CancellationToken ct = default)
-            => WriteFileAtomicCore(path, async (fs, t) => await writeContent(fs, t).ConfigureAwait(false), ct).AsTask();
+            => WriteFileAtomicCore(path, async (fs, t) => await writeContent(fs, t), AtomicOverwriteMove, ct).AsTask();
 
         /// <summary>
         /// Writes content to a file atomically by writing to a temporary file first and then performing an atomic move.
@@ -406,10 +392,32 @@ namespace Servy.Core.Helpers
         /// file is never in a partially written state.
         /// </remarks>
         public static void WriteFileAtomic(string path, Action<Stream> writeContent, CancellationToken cancellationToken = default)
+            => WriteFileAtomic(path, writeContent, AtomicOverwriteMove, cancellationToken);
+
+        /// <summary>
+        /// Seam for unit testing: the synchronous atomic write with an injectable overwrite move.
+        /// </summary>
+        /// <param name="path">The full destination path where the file should be written.</param>
+        /// <param name="writeContent">An action that receives a <see cref="Stream"/> to write the actual file content.</param>
+        /// <param name="moveOverwrite">
+        /// The move that replaces the destination with the staging file. Receives the staging path and the
+        /// destination path.
+        /// </param>
+        /// <param name="cancellationToken">Optional cancellation token.</param>
+        /// <exception cref="PathTooLongException">The calculated staging path exceeds the Windows MAX_PATH limit.</exception>
+        /// <exception cref="AggregateException">The direct move and the hardened-target fallback both failed and no retry is left.</exception>
+        /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was signalled.</exception>
+        /// <remarks>
+        /// <see cref="WriteFileAtomic(string, Action{Stream}, CancellationToken)"/> passes
+        /// <see cref="AtomicOverwriteMove"/>, so a production call behaves exactly as it did before this seam
+        /// existed. The parameter is deliberately not a mutable static: other test classes in the same assembly
+        /// reach this method through <c>ServiceExporter</c> and xUnit runs them in parallel.
+        /// </remarks>
+        internal static void WriteFileAtomic(string path, Action<Stream> writeContent, Action<string, string> moveOverwrite, CancellationToken cancellationToken = default)
         {
             // Ensure the parent directory exists before attempting to create the temp file.
             var dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir))
+            if (!string.IsNullOrWhiteSpace(dir))
             {
                 Directory.CreateDirectory(dir);
             }
@@ -423,6 +431,7 @@ namespace Servy.Core.Helpers
                 throw new PathTooLongException($"The calculated atomic staging path length ({tmp.Length}) exceeds the Windows MAX_PATH limit for target destination '{path}'. Ensure the installation path or service name fits within bounds.");
             }
 
+            bool clearedReadOnly = false;
             try
             {
                 using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
@@ -441,13 +450,60 @@ namespace Servy.Core.Helpers
                     try
                     {
                         // Remove attributes that would prevent the move operation from succeeding.
-                        PrepareDestinationForMove(path);
+                        clearedReadOnly |= PrepareDestinationForMove(path);
 
                         // On NTFS, moving within the same volume is an atomic metadata operation.
-                        File.Move(tmp, path, overwrite: true);
+                        moveOverwrite(tmp, path);
+                        clearedReadOnly = false; // destination replaced; nothing left to restore
                         break;
                     }
-                    catch (Exception ex) when (retries > 0 && (ex is IOException || ex is UnauthorizedAccessException))
+                    catch (UnauthorizedAccessException uex)
+                    {
+                        // Destination file has explicit file-level ACLs restricting direct overwrite (e.g., Read & Execute + Delete),
+                        // but grants explicit Delete permissions on the target binary.
+                        // Fall back to moving the target aside before replacing.
+                        string? backup = null;
+                        try
+                        {
+                            Logger.Debug($"WriteFileAtomic: File.Move overwrite denied on hardened target '{path}'. Fallback moving target file aside.");
+                            if (File.Exists(path))
+                            {
+                                backup = GetUniqueTempPath(path);
+                                File.Move(path, backup);
+                            }
+
+                            File.Move(tmp, path);
+                            clearedReadOnly = false;
+
+                            if (backup != null)
+                            {
+                                try { File.Delete(backup); }
+                                catch (Exception ex) { Logger.Debug($"WriteFileAtomic: could not remove backup copy '{backup}': {ex.Message}"); }
+                            }
+                            break;
+                        }
+                        catch (Exception moveEx)
+                        {
+                            if (backup != null && !File.Exists(path))
+                            {
+                                try { File.Move(backup, path); }
+                                catch (Exception restoreEx) { Logger.Warn($"WriteFileAtomic: the original of '{path}' is preserved at '{backup}' but could not be restored: {restoreEx.Message}"); }
+                            }
+
+                            if (retries <= 0)
+                            {
+                                throw new AggregateException($"Failed to replace hardened file '{path}'. Direct move failed ({uex.Message}) and fallback move failed ({moveEx.Message}).", uex, moveEx);
+                            }
+
+                            retries--;
+                            Logger.Debug($"WriteFileAtomic retrying fallback move after transient error: {moveEx.Message} (retries left: {retries})");
+                            if (cancellationToken.WaitHandle.WaitOne(AppConfig.WriteFileAtomicRetryDelayMs))
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                            }
+                        }
+                    }
+                    catch (Exception ex) when (retries > 0 && ex is IOException)
                     {
                         retries--;
                         Logger.Debug($"WriteFileAtomic retrying after transient '{ex.GetType().Name}': {ex.Message} (retries left: {retries})");
@@ -461,6 +517,11 @@ namespace Servy.Core.Helpers
             }
             finally
             {
+                if (clearedReadOnly)
+                {
+                    RestoreReadOnly(path);
+                }
+
                 // Ensure the temporary file is removed if the move failed or an exception occurred during writing.
                 CleanupTempFile(tmp);
             }
@@ -472,15 +533,25 @@ namespace Servy.Core.Helpers
         /// </summary>
         /// <param name="path">The full destination path where the file should be written.</param>
         /// <param name="writer">An asynchronous function that receives a <see cref="Stream"/> to write content.</param>
+        /// <param name="moveOverwrite">
+        /// Seam for unit testing: the move that replaces the destination with the staging file. Receives the
+        /// staging path and the destination path.
+        /// </param>
         /// <param name="cancellationToken">An optional cancellation token to abort the operation.</param>
         /// <returns>A <see cref="ValueTask"/> representing the asynchronous operation.</returns>
-        private static async ValueTask WriteFileAtomicCore(string path, Func<Stream, CancellationToken, ValueTask> writer, CancellationToken cancellationToken = default)
+        /// <exception cref="PathTooLongException">The calculated staging path exceeds the Windows MAX_PATH limit.</exception>
+        /// <exception cref="AggregateException">The direct move and the hardened-target fallback both failed and no retry is left.</exception>
+        /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was signalled.</exception>
+        /// <remarks>
+        /// <see cref="WriteFileAtomicAsync(string, Func{Stream, CancellationToken, Task}, CancellationToken)"/> passes
+        /// <see cref="AtomicOverwriteMove"/>, so a production call behaves exactly as it did before this seam existed.
+        /// </remarks>
+        internal static async ValueTask WriteFileAtomicCore(string path, Func<Stream, CancellationToken, ValueTask> writer, Action<string, string> moveOverwrite, CancellationToken cancellationToken = default)
         {
             var dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir))
+            if (!string.IsNullOrWhiteSpace(dir))
             {
-                // Directory creation is synchronous in standard .NET, but keeping context
-                // aware for potential future IO wrappers.
+                // Ensure the parent directory exists before attempting to create the file.
                 Directory.CreateDirectory(dir);
             }
 
@@ -493,13 +564,13 @@ namespace Servy.Core.Helpers
                 throw new PathTooLongException($"The calculated atomic staging path length ({tmp.Length}) exceeds the Windows MAX_PATH limit for target destination '{path}'. Ensure the installation path or service name fits within bounds.");
             }
 
+            bool clearedReadOnly = false;
             try
             {
                 using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
-                    // ConfigureAwait(false) is used here as we do not require the captured synchronization context.
-                    await writer(fs, cancellationToken).ConfigureAwait(false);
-                    await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    await writer(fs, cancellationToken);
+                    await fs.FlushAsync(cancellationToken);
                     fs.Flush(flushToDisk: true);   // forces FlushFileBuffers; cheap if already flushed
                 }
 
@@ -510,23 +581,72 @@ namespace Servy.Core.Helpers
                     try
                     {
                         // Ensure the existing file isn't Read-Only, which causes Error 5
-                        PrepareDestinationForMove(path);
+                        clearedReadOnly |= PrepareDestinationForMove(path);
 
                         // On NTFS, moving within the same volume is an atomic metadata operation.
-                        File.Move(tmp, path, overwrite: true);
+                        moveOverwrite(tmp, path);
+                        clearedReadOnly = false; // destination replaced; nothing left to restore
                         break;
                     }
-                    catch (Exception ex) when (retries > 0 && (ex is IOException || ex is UnauthorizedAccessException))
+                    catch (UnauthorizedAccessException uex)
+                    {
+                        // Destination file has explicit file-level ACLs restricting direct overwrite (e.g., Read & Execute + Delete),
+                        // but grants explicit Delete permissions on the target binary.
+                        // Fall back to moving the target aside before replacing.
+                        string? backup = null;
+                        try
+                        {
+                            Logger.Debug($"WriteFileAtomicCore: File.Move overwrite denied on hardened target '{path}'. Fallback moving target file aside.");
+                            if (File.Exists(path))
+                            {
+                                backup = GetUniqueTempPath(path);
+                                File.Move(path, backup);
+                            }
+
+                            File.Move(tmp, path);
+                            clearedReadOnly = false;
+
+                            if (backup != null)
+                            {
+                                try { File.Delete(backup); }
+                                catch (Exception deleteEx) { Logger.Debug($"WriteFileAtomicCore: could not remove backup copy '{backup}': {deleteEx.Message}"); }
+                            }
+                            break;
+                        }
+                        catch (Exception moveEx)
+                        {
+                            if (backup != null && !File.Exists(path))
+                            {
+                                try { File.Move(backup, path); }
+                                catch (Exception restoreEx) { Logger.Warn($"WriteFileAtomicCore: the original of '{path}' is preserved at '{backup}' but could not be restored: {restoreEx.Message}"); }
+                            }
+
+                            if (retries <= 0)
+                            {
+                                throw new AggregateException($"Failed to replace hardened file '{path}'. Direct move failed ({uex.Message}) and fallback move failed ({moveEx.Message}).", uex, moveEx);
+                            }
+
+                            retries--;
+                            Logger.Debug($"WriteFileAtomicCore retrying fallback move after transient error: {moveEx.Message} (retries left: {retries})");
+                            await Task.Delay(AppConfig.WriteFileAtomicRetryDelayMs, cancellationToken);
+                        }
+                    }
+                    catch (Exception ex) when (retries > 0 && ex is IOException)
                     {
                         retries--;
                         Logger.Debug($"WriteFileAtomicCore retrying after transient '{ex.GetType().Name}': {ex.Message} (retries left: {retries})");
                         // Asynchronous delay to keep the thread pool unblocked during retries.
-                        await Task.Delay(AppConfig.WriteFileAtomicRetryDelayMs, cancellationToken).ConfigureAwait(false);
+                        await Task.Delay(AppConfig.WriteFileAtomicRetryDelayMs, cancellationToken);
                     }
                 }
             }
             finally
             {
+                if (clearedReadOnly)
+                {
+                    RestoreReadOnly(path);
+                }
+
                 CleanupTempFile(tmp);
             }
         }
@@ -551,19 +671,51 @@ namespace Servy.Core.Helpers
         public static string GetUniqueTempPath(string path) => $"{path}.{Guid.NewGuid().ToString("N").Substring(0, 16)}.tmp";
 
         /// <summary>
-        /// Prepares the destination file for an overwrite operation by removing restrictive attributes.
+        /// Prepares the destination file for an overwrite operation by removing restrictive attributes such as ReadOnly.
         /// </summary>
         /// <param name="path">The path to the destination file.</param>
-        private static void PrepareDestinationForMove(string path)
+        /// <returns>
+        /// <c>true</c> if the <see cref="FileAttributes.ReadOnly"/> attribute was cleared and must be restored if the move operation fails;
+        /// otherwise, <c>false</c>.
+        /// </returns>
+        /// <remarks>
+        /// Overwriting a destination file that has the ReadOnly attribute set results in a Win32 Error 5 (Access Denied).
+        /// Clearing the attribute beforehand allows atomic replacement operations to proceed smoothly.
+        /// </remarks>
+        private static bool PrepareDestinationForMove(string path)
         {
-            // Overwriting a file with the Read-Only attribute set results in a Win32 Error 5 (Access Denied).
             if (File.Exists(path))
             {
                 var attributes = File.GetAttributes(path);
+
+                // Clear ReadOnly flag if set
                 if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
                 {
                     File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
                 }
+
+                return (attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Restores the ReadOnly attribute on the specified destination file if the move operation failed.
+        /// </summary>
+        /// <param name="path">The path to the destination file.</param>
+        private static void RestoreReadOnly(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.ReadOnly);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Best effort: never mask the original write failure.
+                Logger.Debug($"Failed to restore ReadOnly on '{path}': {ex.Message}");
             }
         }
 
@@ -596,11 +748,31 @@ namespace Servy.Core.Helpers
             if (string.IsNullOrWhiteSpace(filePath)) return;
 
             var directory = Path.GetDirectoryName(filePath);
-            if (!string.IsNullOrEmpty(directory))
+            if (!string.IsNullOrWhiteSpace(directory))
             {
                 Directory.CreateDirectory(directory);
             }
         }
+
+        /// <summary>
+        /// Evaluates whether a candidate string contains only characters valid for use in Windows Service names.
+        /// </summary>
+        /// <param name="name">The proposed service name string.</param>
+        /// <returns>
+        /// <c>true</c> if the string contains no forbidden file system, registry, or delimiter characters
+        /// and no non-printable Unicode control/format characters; otherwise, <c>false</c>.
+        /// </returns>
+        public static bool IsValidServiceNameCharset(string name) =>
+            name.IndexOfAny(InvalidServiceChars) < 0 && !name.Any(IsDisallowedNameChar);
+
+        /// <summary>
+        /// Determines whether a service name is the one Servy reserves for its host service
+        /// (<see cref="AppConfig.ServyHostServiceName"/>), compared case-insensitively as the Service Control Manager does.
+        /// </summary>
+        /// <param name="serviceName">The proposed service name.</param>
+        /// <returns><see langword="true"/> when no new service may be installed or imported under this name.</returns>
+        public static bool IsReservedForServyHost(string? serviceName)
+            => serviceName != null && string.Equals(serviceName.Trim(), AppConfig.ServyHostServiceName, StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
         /// Validates whether a proposed string can be safely used as a Windows Service name.
@@ -630,31 +802,29 @@ namespace Servy.Core.Helpers
                 return (false, string.Format(Strings.Msg_ServiceNameLengthReached, AppConfig.MaxServiceNameLength));
 
             // 4. Structural Integrity Check
-            // We reject the input if it contains:
-            //  a) Forbidden file system/registry characters (InvalidServiceChars).
-            //  b) Unicode control, format, line separator, or paragraph separator characters
-            //     (as defined in IsDisallowedNameChar) which can compromise display formatting
-            //     or cause malformed output in console/CLI parsers.
-            if (serviceName.IndexOfAny(InvalidServiceChars) >= 0 || serviceName.Any(IsDisallowedNameChar))
+            // We reject the input if it fails the shared service name character set rules.
+            if (!IsValidServiceNameCharset(serviceName))
                 return (false, Strings.Msg_InvalidServiceName);
 
-            // 5. Reserved Windows device names (case-insensitive across all segments)
+            // 5. Leading or trailing dots
             // Prevent leading or trailing dots, which cause severe filesystem/registry volatility.
             if (serviceName.StartsWith(".", StringComparison.Ordinal) || serviceName.EndsWith(".", StringComparison.Ordinal))
             {
-                return (false, Strings.Msg_InvalidServiceName);
+                return (false, Strings.Msg_ServiceNameLeadingTrailingDot);
             }
 
+            // 6. Reserved Windows device names (case-insensitive across all segments)
             // Tokenize the name by dots to scan every structural segment.
-            // This catches (.CON, .CON.txt, ..PRN, AUX.log, or service.LPT1) uniformly.
+            // This catches (CON.txt, AUX.log, or service.LPT1) uniformly. A leading-dot form (.CON, ..PRN)
+            // never reaches this loop: step 5 has already rejected it.
             string[] segments = serviceName.Split(new[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
 
             foreach (var segment in segments)
             {
                 // Ensure case-insensitive evaluation against the reserved DOS device names blocklist
-                if (ReservedNames.ReservedDeviceNames.Contains(segment))
+                if (ReservedNames.IsReservedDeviceName(segment))
                 {
-                    return (false, Strings.Msg_InvalidServiceName);
+                    return (false, string.Format(Strings.Msg_ServiceNameReservedDeviceName, serviceName));
                 }
             }
 
@@ -694,24 +864,42 @@ namespace Servy.Core.Helpers
         }
 
         /// <summary>
+        /// Determines whether a directory is an NTFS volume mount point.
+        /// </summary>
+        /// <param name="dir">The directory info instance to check.</param>
+        /// <returns><c>true</c> if the directory is a volume mount point; otherwise, <c>false</c>.</returns>
+        /// <remarks>
+        /// DirectoryInfo.LinkTarget returns the print name of a junction/reparse point, which can be
+        /// crafted freely by unprivileged creators. To ensure security, this check delegates verification
+        /// directly to the Windows Mount Manager via <see cref="NativeMethods.GetVolumeNameForVolumeMountPoint"/>.
+        /// </remarks>
+        private static bool IsVolumeMountPoint(DirectoryInfo dir)
+        {
+            var sb = new StringBuilder(50);
+            string mountPoint = dir.FullName.TrimEnd('\\') + "\\";
+            return NativeMethods.GetVolumeNameForVolumeMountPoint(mountPoint, sb, (uint)sb.Capacity);
+        }
+
+        /// <summary>
         /// Recursively walks up the directory tree to determine if the specified path resides
         /// within any directory that is an NTFS reparse point (such as a junction point or symbolic link).
         /// </summary>
         /// <param name="fullPath">The fully canonicalized absolute path to evaluate.</param>
         /// <returns>
-        /// <c>true</c> if any ancestor directory in the path hierarchy is a reparse point;
+        /// <c>true</c> if any ancestor directory in the path hierarchy is a reparse point other than
+        /// a volume mount point (see <see cref="IsVolumeMountPoint(DirectoryInfo)"/>);
         /// otherwise, <c>false</c>.
         /// </returns>
         /// <remarks>
         /// This validation serves as an infiltration and exfiltration guard across the service
         /// ecosystem. It prevents path traversal and redirection bypasses by checking both
-        /// the modern <see cref="DirectoryInfo.LinkTarget"/> property and the legacy
+        /// the modern <see cref="FileSystemInfo.LinkTarget"/> property and the legacy
         /// <see cref="FileAttributes.ReparsePoint"/> bitmask flag.
         /// </remarks>
         public static bool HasAncestorReparsePoint(string fullPath)
         {
             var parentPath = Path.GetDirectoryName(fullPath);
-            if (string.IsNullOrEmpty(parentPath))
+            if (string.IsNullOrWhiteSpace(parentPath))
                 return false; // drive root or UNC share root - no ancestors to inspect
 
             var current = new DirectoryInfo(parentPath);
@@ -721,7 +909,7 @@ namespace Servy.Core.Helpers
             // directories that are about to be created.
             while (current != null)
             {
-                if (current.Exists)
+                if (current.Exists && !IsVolumeMountPoint(current))
                 {
                     if (!string.IsNullOrEmpty(current.LinkTarget) ||
                         (current.Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint)

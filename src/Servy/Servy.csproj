@@ -2,20 +2,15 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
 
     <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>false</SelfContained>
     <PublishTrimmed>false</PublishTrimmed>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <IncludeAllContentForSelfExtract>false</IncludeAllContentForSelfExtract>
     <InvariantGlobalization>false</InvariantGlobalization>
-    <StripSymbols>true</StripSymbols>
 
     <ApplicationIcon>servy.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -25,15 +20,17 @@
 
   <PropertyGroup>
     <AssemblyTitle>Servy</AssemblyTitle>
-    <AssemblyDescription>A tool to run any app as a Windows Service</AssemblyDescription>
+    <Description>A tool to run any app as a Windows Service</Description>
     <Product>Servy</Product>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="Resources\handle64.exe" />
-    <None Remove="Resources\handle64a.exe" />
+    <None Remove="Resources\Servy.Host.exe" />
+    <None Remove="Resources\Servy.Host.pdb" />
     <None Remove="Resources\Servy.Service.exe" />
     <None Remove="Resources\Servy.Service.pdb" />
+    <None Remove="Resources\Servy.Restarter.exe" />
+    <None Remove="Resources\Servy.Restarter.pdb" />
   </ItemGroup>
 
   <ItemGroup>
@@ -44,10 +41,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="Resources\handle64.exe" />
-    <EmbeddedResource Include="Resources\handle64a.exe" />
+    <EmbeddedResource Include="Resources\Servy.Host.exe" />
+    <EmbeddedResource Include="Resources\Servy.Host.pdb" />
     <EmbeddedResource Include="Resources\Servy.Service.exe" />
     <EmbeddedResource Include="Resources\Servy.Service.pdb" />
+    <EmbeddedResource Include="Resources\Servy.Restarter.exe" />
+    <EmbeddedResource Include="Resources\Servy.Restarter.pdb" />
   </ItemGroup>
 
   <ItemGroup>

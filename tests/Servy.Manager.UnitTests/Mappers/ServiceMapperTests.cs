@@ -1,4 +1,5 @@
 using Moq;
+using Servy.Core.Config;
 using Servy.Core.Enums;
 using Servy.Core.Helpers;
 using Servy.Core.Services;
@@ -24,8 +25,6 @@ namespace Servy.Manager.UnitTests.Mappers
         [Fact]
         public async Task ToModelAsync_NullService_ReturnsNull()
         {
-            // Arrange (Vacuous setup for static method target validation)
-
             // Act
             var result = await ServiceMapper.ToModelAsync(null, true, false, _mockProcessHelper.Object, cancellationToken: TestContext.Current.CancellationToken);
 
@@ -48,15 +47,76 @@ namespace Servy.Manager.UnitTests.Mappers
         }
 
         [Fact]
+        public async Task ToModelAsync_CancelledToken_Throws()
+        {
+            // Arrange
+            var domainService = new Core.Domain.Service(_mockServiceManager.Object) { Name = "Test" };
+            using (var cts = new CancellationTokenSource())
+            {
+                cts.Cancel();
+
+                // Act & Assert
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                    () => ServiceMapper.ToModelAsync(domainService, true, false, _mockProcessHelper.Object, cts.Token));
+            }
+        }
+
+        [Fact]
+        public async Task ToModelAsync_CancelledToken_NullService_ReturnsNullWithoutThrowing()
+        {
+            // Arrange
+            using (var cts = new CancellationTokenSource())
+            {
+                cts.Cancel();
+
+                // Act
+                var result = await ServiceMapper.ToModelAsync(null, true, false, _mockProcessHelper.Object, cts.Token);
+
+                // Assert
+                Assert.Null(result);
+            }
+        }
+
+        [Fact]
+        public async Task ToModelAsync_NullOptionalStrings_CoalesceToEmptyNotNull()
+        {
+            // Arrange - every nullable source property left null
+            var domainService = new Core.Domain.Service(_mockServiceManager.Object)
+            {
+                Name = "Test",
+                Description = null,
+                StdoutPath = null,
+                StderrPath = null,
+                ActiveStdoutPath = null,
+                ActiveStderrPath = null
+            };
+
+            // Act
+            var result = await ServiceMapper.ToModelAsync(domainService, true, false,
+                _mockProcessHelper.Object, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert - ToModelAsync normalises null sources to string.Empty, the same representation ToModel gives the console paths (#2697).
+            // Assert.Equal rather than Assert.Empty: Assert.Empty throws on null, which reads as a crash
+            // instead of a clear "the coalesce was removed" failure.
+            Assert.NotNull(result);
+            Assert.Equal(string.Empty, result.Description);
+            Assert.Equal(string.Empty, result.StdoutPath);
+            Assert.Equal(string.Empty, result.StderrPath);
+            Assert.Equal(string.Empty, result.ActiveStdoutPath);
+            Assert.Equal(string.Empty, result.ActiveStderrPath);
+        }
+
+        [Fact]
         public async Task ToModelAsync_ValidService_MapsPropertiesCorrectly()
         {
-            // Arrange: Set up every single mapped property on the domain object to avoid hidden default pass-throughs
+            // Arrange
             var domainService = new Core.Domain.Service(_mockServiceManager.Object)
             {
                 Name = "Test",
                 Description = "High performance background daemon service.",
                 Pid = 1234,
                 RunAsLocalSystem = true,
+                UserAccount = @"CONTOSO\svc-account",
                 StdoutPath = @"C:\Logs\stdout.log",
                 StderrPath = @"C:\Logs\stderr.log",
                 ActiveStdoutPath = @"C:\Logs\active_stdout.log",
@@ -92,6 +152,80 @@ namespace Servy.Manager.UnitTests.Mappers
         }
 
         [Fact]
+        public async Task ToModelAsync_DisplayName_IsMappedFromTheDomainService()
+        {
+            // Arrange
+            var domainService = new Core.Domain.Service(_mockServiceManager.Object)
+            {
+                Name = "Test",
+                DisplayName = "Test Display Name"
+            };
+
+            // Act
+            var result = await ServiceMapper.ToModelAsync(domainService, true, false,
+                _mockProcessHelper.Object, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.NotNull(result);
+            Assert.Equal("Test Display Name", result.DisplayName);
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task ToModelAsync_IsDesktopAppAvailable_FlowsFromTheArgument(bool isDesktopAppAvailable)
+        {
+            // Arrange
+            var domainService = new Core.Domain.Service(_mockServiceManager.Object) { Name = "Test" };
+
+            // Act
+            var result = await ServiceMapper.ToModelAsync(domainService, isDesktopAppAvailable, false,
+                _mockProcessHelper.Object, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.NotNull(result);
+            Assert.Equal(isDesktopAppAvailable, result.IsDesktopAppAvailable);
+        }
+
+        [Fact]
+        public async Task ToModelAsync_RunAsLocalSystem_MapsLocalSystemDisplayName()
+        {
+            // Arrange
+            var domainService = new Core.Domain.Service(_mockServiceManager.Object)
+            {
+                Name = "Test",
+                RunAsLocalSystem = true,
+                UserAccount = @"CONTOSO\svc-account",
+            };
+
+            // Act
+            var result = await ServiceMapper.ToModelAsync(domainService, true, false,
+                _mockProcessHelper.Object, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(UiAppConfig.LocalSystem, result!.LogOnAs);
+        }
+
+        [Fact]
+        public async Task ToModelAsync_NamedAccount_MapsUserAccountDisplayName()
+        {
+            // Arrange
+            var domainService = new Core.Domain.Service(_mockServiceManager.Object)
+            {
+                Name = "Test",
+                RunAsLocalSystem = false,
+                UserAccount = @"CONTOSO\svc-account",
+            };
+
+            // Act
+            var result = await ServiceMapper.ToModelAsync(domainService, true, false,
+                _mockProcessHelper.Object, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(@"CONTOSO\svc-account", result!.LogOnAs);
+        }
+
+        [Fact]
         public async Task ToModelAsync_CalculatePerf_CallsHelper()
         {
             // Arrange
@@ -105,6 +239,23 @@ namespace Servy.Manager.UnitTests.Mappers
             // Assert
             Assert.Equal(10.0, result!.CpuUsage);
             Assert.Equal(500, result.RamUsage);
+            _mockProcessHelper.Verify(h => h.GetProcessTreeMetrics(1234), Times.Once);
+        }
+
+        [Fact]
+        public async Task ToModelAsync_CalculatePerf_NoPid_SkipsHelper()
+        {
+            // Arrange
+            var domainService = new Core.Domain.Service(_mockServiceManager.Object) { Name = "Test", Pid = null };
+
+            // Act
+            var result = await ServiceMapper.ToModelAsync(domainService, true, true, _mockProcessHelper.Object,
+                cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Null(result!.CpuUsage);
+            Assert.Null(result.RamUsage);
+            _mockProcessHelper.Verify(h => h.GetProcessTreeMetrics(It.IsAny<int>()), Times.Never);
         }
 
         #endregion
@@ -114,13 +265,27 @@ namespace Servy.Manager.UnitTests.Mappers
         [Fact]
         public void ToModel_NullItem_ReturnsNull()
         {
-            // Arrange (Vacuous setup for static null validation)
-
             // Act
-            var result = ServiceMapper.ToModel(null!);
+            var result = ServiceMapper.ToModel(null);
 
             // Assert
             Assert.Null(result);
+        }
+
+        [Fact]
+        public void ToModel_ConsoleServiceWithNullPaths_CoalescesToEmptyNotNull()
+        {
+            // Arrange
+            var item = new ConsoleService { Name = "C", Pid = 1234, StdoutPath = null, StderrPath = null };
+
+            // Act
+            var result = ServiceMapper.ToModel(item);
+
+            // Assert: Assert.Equal rather than Assert.Empty, which throws on null and reads as a crash
+            // instead of a clear "the coalesce was removed" failure.
+            Assert.NotNull(result);
+            Assert.Equal(string.Empty, result.StdoutPath);
+            Assert.Equal(string.Empty, result.StderrPath);
         }
 
         public static IEnumerable<object?[]> GetToModelSubtypeData()
@@ -158,16 +323,31 @@ namespace Servy.Manager.UnitTests.Mappers
 
         #region GetLogOnAsDisplayName Tests
 
+        public static IEnumerable<object[]> GetAliasData() =>
+            ServiceAccounts.LocalSystemAliases.Select(a => new object[] { a, UiAppConfig.LocalSystem })
+                .Concat(ServiceAccounts.LocalServiceAliases.Select(a => new object[] { a, UiAppConfig.LocalService }))
+                .Concat(ServiceAccounts.NetworkServiceAliases.Select(a => new object[] { a, UiAppConfig.NetworkService }));
+
+        [Theory]
+        [MemberData(nameof(GetAliasData))]
+        public void GetLogOnAsDisplayName_EveryAlias_ResolvesToItsDisplayName(string alias, string expected)
+        {
+            // Act
+            var result = ServiceMapper.GetLogOnAsDisplayName(alias);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
         [Theory]
         [InlineData(null, "LocalSystem")]
-        [InlineData("LocalSystem", "LocalSystem")]
-        [InlineData("NT AUTHORITY\\System", "LocalSystem")]
-        [InlineData("NT AUTHORITY\\LocalService", "LocalService")]
-        [InlineData("NT AUTHORITY\\NetworkService", "NetworkService")] // Issue #2565: Pin network service branch mapping alias
+        [InlineData("", "LocalSystem")]
         [InlineData("MyCustomUser", "MyCustomUser")]
+        [InlineData(@"nt authority\localservice", "LocalService")]
+        [InlineData(@"builtin\networkservice", "NetworkService")]
         public void GetLogOnAsDisplayName_ResolvesCorrectly(string? input, string expectedDisplayNameProp)
         {
-            // Arrange: Map literal token labels onto their respective static target property mappings
+            // Arrange
             string expected;
             switch (expectedDisplayNameProp)
             {

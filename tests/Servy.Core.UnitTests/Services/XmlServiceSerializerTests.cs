@@ -1,8 +1,11 @@
 using Servy.Core.Config;
 using Servy.Core.DTOs;
+using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Core.UnitTests.Helpers;
+using Servy.Core.UnitTests.Logging;
 using Servy.Testing;
+using System.Xml;
 
 namespace Servy.Core.UnitTests.Services
 {
@@ -15,7 +18,7 @@ namespace Servy.Core.UnitTests.Services
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void Deserialize_NullOrWhitespace_ReturnsNull(string? input)
         {
             // Arrange & Act
@@ -38,7 +41,7 @@ namespace Servy.Core.UnitTests.Services
             Assert.NotNull(result);
             Assert.Equal("PartialXmlService", result.Name);
 
-            // Integration check: Verify hydration via ServiceDtoHelper.ApplyDefaults
+            // Integration check: Verify hydration via ServiceDtoHelper.ApplyDefaultsAndResetIdentity
             Assert.Equal(AppConfig.DefaultStartTimeout, result.StartTimeout);
             Assert.Equal(AppConfig.DefaultStopTimeout, result.StopTimeout);
             Assert.Equal(AppConfig.DefaultRunAsLocalSystem, result.RunAsLocalSystem);
@@ -50,8 +53,9 @@ namespace Servy.Core.UnitTests.Services
             // Arrange: Create a DTO with specific values for every single field
             var expected = ServiceDtoFactory.CreateFull("Xml");
 
-            // Convert to XML string using the standard Serializer
-            var xml = ServiceDtoXml.Serialize(expected);
+            // Convert to XML string using the product serializer, so the fixture carries the
+            // same preamble and indentation a real export file has
+            var xml = _serializer.Serialize(expected);
 
             // Act
             var actual = _serializer.Deserialize(xml);
@@ -60,28 +64,46 @@ namespace Servy.Core.UnitTests.Services
             Assert.NotNull(actual);
 
             // Reflection-driven comprehensive comparison of all properties mapped across serialization boundaries
-            var excludedProperties = new[] { "Id", "Pid", "UserAccount", "Password", "RunAsLocalSystem", "PreviousStopTimeout", "ActiveStdoutPath", "ActiveStderrPath" };
-            var properties = TestReflection.GetMappedProperties<ServiceDto>(excludedProperties);
+            ServiceDtoRoundTrip.AssertPropertiesSurvived(expected, actual);
 
-            foreach (var prop in properties)
-            {
-                var expectedValue = prop.GetValue(expected);
-                var actualValue = prop.GetValue(actual);
-
-                // If the expected fixture value is null, it skips evaluation to prevent
-                // breaking on values hydrated to system defaults during deserialization.
-                if (expectedValue == null)
-                {
-                    continue;
-                }
-
-                Assert.Equal(expectedValue, actualValue);
-            }
-
-            // Check that the Password/Account (Sensitive data) handled by UntrustedDataSettings are omitted
+            // Password (sensitive data) is dropped by [XmlIgnore], the fixture's UserAccount needs a password
+            // and is never written, and RunAsLocalSystem is reset to the configured default rather than omitted.
             Assert.Null(actual.UserAccount);
             Assert.Null(actual.Password);
-            Assert.True(actual.RunAsLocalSystem);
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, actual.RunAsLocalSystem);
+        }
+
+        [Fact]
+        public void Deserialize_HostileXmlPayloadWithCredentials_IgnoresSensitiveFields()
+        {
+            // Arrange
+            string xmlPayload = "<ServiceDto>" +
+                                "<Name>MaliciousService</Name>" +
+                                "<UserAccount>TargetDomain\\Administrator</UserAccount>" +
+                                "<Password>RoguePassword123!</Password>" +
+                                "</ServiceDto>";
+
+            // Act
+            var actual = _serializer.Deserialize(xmlPayload);
+
+            // Assert
+            Assert.NotNull(actual);
+            Assert.Equal("MaliciousService", actual.Name);
+            Assert.Null(actual.UserAccount);
+            Assert.Null(actual.Password);
+        }
+
+        [Fact]
+        public void Deserialize_XsiNilRoot_ReturnsNull()
+        {
+            // Arrange: well-formed XML representing an explicit null object (XML's analogue of the JSON "null" literal)
+            string xml = "<ServiceDto xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"true\" />";
+
+            // Act
+            var result = _serializer.Deserialize(xml);
+
+            // Assert
+            Assert.Null(result);
         }
 
         [Fact]
@@ -98,7 +120,7 @@ namespace Servy.Core.UnitTests.Services
         public void Deserialize_WellFormedXmlWithUnconvertibleValue_ReturnsNull()
         {
             // Arrange: FormatException (not XmlException) path: no line info available,
-            // exercises the generic error-log branch of ServiceDtoSerializer.Deserialize.
+            // so FormatLineInfo returns string.Empty and the log entry carries no coordinates.
             string xml = "<ServiceDto><Name>S</Name><StartTimeout>abc</StartTimeout></ServiceDto>";
 
             // Assert
@@ -149,6 +171,80 @@ namespace Servy.Core.UnitTests.Services
 
         #endregion
 
+        #region FormatLineInfo Tests
+
+        [Fact]
+        public void FormatLineInfo_WrappedXmlException_ReportsLineAndPosition()
+        {
+            // Arrange
+            // XmlSerializer wraps the reader's XmlException in an InvalidOperationException, the
+            // shape a real malformed import produces, so this pins the ex.InnerException half of
+            // the ?? in FormatLineInfo. The document spans two lines so line and position differ.
+            var serializer = SecureXml.CreateStrictServiceDtoSerializer();
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+            {
+                using (var stringReader = new StringReader("<ServiceDto>\n  <Name>Unclosed"))
+                using (var xmlReader = SecureXml.CreateReader(stringReader))
+                {
+                    serializer.Deserialize(xmlReader);
+                }
+            });
+            var inner = Assert.IsType<XmlException>(ex.InnerException);
+
+            // Act
+            var info = (string?)TestReflection.InvokeNonPublic(_serializer, "FormatLineInfo", ex);
+
+            // Assert
+            Assert.Equal($" at line {inner.LineNumber}, position {inner.LinePosition}", info);
+            // Guards the assertion above against a swap of the two coordinates in the
+            // interpolation, which would otherwise render the same string.
+            Assert.NotEqual(inner.LineNumber, inner.LinePosition);
+        }
+
+        [Fact]
+        public void FormatLineInfo_BareXmlException_ReportsLineAndPosition()
+        {
+            // Arrange
+            // Pins the (ex as XmlException) half of the ??, which no deserialization test reaches:
+            // XmlSerializer always wraps the reader's exception.
+            var ex = new XmlException("boom", null, 3, 7);
+
+            // Act
+            var info = (string?)TestReflection.InvokeNonPublic(_serializer, "FormatLineInfo", ex);
+
+            // Assert
+            Assert.Equal(" at line 3, position 7", info);
+        }
+
+        [Fact]
+        public void FormatLineInfo_XmlExceptionWithoutPosition_ReturnsEmpty()
+        {
+            // Arrange
+            // A line without a position must not produce a " at line 3, position 0" suffix, which
+            // is what the && in the gate exists to prevent.
+            var ex = new XmlException("boom", null, 3, 0);
+
+            // Act
+            var info = (string?)TestReflection.InvokeNonPublic(_serializer, "FormatLineInfo", ex);
+
+            // Assert
+            Assert.Equal(string.Empty, info);
+        }
+
+        [Fact]
+        public void FormatLineInfo_ExceptionWithoutXmlException_ReturnsEmpty()
+        {
+            // Arrange & Act
+            // Pins the default branch: neither half of the ?? matches, so both coordinates stay 0.
+            var info = (string?)TestReflection.InvokeNonPublic(
+                _serializer, "FormatLineInfo", new FormatException("no position"));
+
+            // Assert
+            Assert.Equal(string.Empty, info);
+        }
+
+        #endregion
+
         #region Serialize Tests
 
         [Fact]
@@ -188,6 +284,110 @@ namespace Servy.Core.UnitTests.Services
         }
 
         [Fact]
+        public void Serialize_PopulatedDto_ExcludesSensitiveFields()
+        {
+            // Arrange
+            var dto = ServiceDtoFactory.CreateFull("Xml");
+            dto.UserAccount = "Domain\\Admin";
+            dto.Password = "SuperSecret123!";
+
+            // Act
+            var xml = _serializer.Serialize(dto);
+
+            // Assert
+            Assert.NotNull(xml);
+            Assert.DoesNotContain("UserAccount", xml);
+            Assert.DoesNotContain("Password", xml);
+            Assert.DoesNotContain("Domain\\Admin", xml);
+            Assert.DoesNotContain("SuperSecret123!", xml);
+        }
+
+        [Fact]
+        public void SerializeAndDeserialize_RoundTripSymmetry_MaintainsObjectIntegrity()
+        {
+            // Arrange
+            var original = ServiceDtoFactory.CreateFull("Xml");
+            original.UserAccount = "Domain\\Admin";
+            original.Password = "SuperSecret123!";
+
+            // Act
+            var xml = _serializer.Serialize(original);
+            var deserialized = _serializer.Deserialize(xml);
+
+            // Assert
+            Assert.NotNull(xml);
+            Assert.NotNull(deserialized);
+
+            ServiceDtoRoundTrip.AssertPropertiesSurvived(original, deserialized);
+
+            Assert.Null(deserialized.UserAccount);
+            Assert.Null(deserialized.Password);
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, deserialized.RunAsLocalSystem);
+        }
+
+        [Theory]
+        [InlineData(@"NT SERVICE\MyService")]
+        [InlineData(@"NT AUTHORITY\NetworkService")]
+        [InlineData(@"DOMAIN\svc_gmsa$")]
+        public void Deserialize_PasswordlessUserAccount_KeepsTheAccountAndNeverReadsThePassword(string account)
+        {
+            // Arrange
+            string xmlPayload = "<ServiceDto>" +
+                                "<Name>PasswordlessService</Name>" +
+                                "<UserAccount>" + account + "</UserAccount>" +
+                                "<Password>RoguePassword123!</Password>" +
+                                "<RunAsLocalSystem>true</RunAsLocalSystem>" +
+                                "</ServiceDto>";
+
+            // Act
+            var actual = _serializer.Deserialize(xmlPayload);
+
+            // Assert
+            Assert.NotNull(actual);
+            Assert.Equal(account, actual.UserAccount);
+            Assert.False(actual.RunAsLocalSystem);
+            Assert.Null(actual.Password);
+        }
+
+        [Fact]
+        public void Serialize_PasswordlessUserAccount_WritesTheAccountButNeverThePassword()
+        {
+            // Arrange
+            var dto = ServiceDtoFactory.CreateFull("Xml");
+            dto.UserAccount = @"NT SERVICE\MyService";
+            dto.Password = string.Empty;
+            dto.RunAsLocalSystem = false;
+
+            // Act
+            var xml = _serializer.Serialize(dto);
+
+            // Assert
+            Assert.NotNull(xml);
+            Assert.Contains(@"<UserAccount>NT SERVICE\MyService</UserAccount>", xml);
+            Assert.DoesNotContain("Password", xml);
+            Assert.DoesNotContain("RunAsLocalSystem", xml);
+        }
+
+        [Fact]
+        public void SerializeAndDeserialize_PasswordlessUserAccount_SurvivesTheRoundTrip()
+        {
+            // Arrange
+            var original = ServiceDtoFactory.CreateFull("Xml");
+            original.UserAccount = @"NT SERVICE\MyService";
+            original.Password = null;
+            original.RunAsLocalSystem = false;
+
+            // Act
+            var recovered = _serializer.Deserialize(_serializer.Serialize(original));
+
+            // Assert
+            Assert.NotNull(recovered);
+            Assert.Equal(@"NT SERVICE\MyService", recovered.UserAccount);
+            Assert.False(recovered.RunAsLocalSystem);
+            Assert.Null(recovered.Password);
+        }
+
+        [Fact]
         public void Serialize_InvalidDtoStateOrSerializationFailure_CatchesExceptionAndReturnsNull()
         {
             // Arrange
@@ -203,6 +403,82 @@ namespace Servy.Core.UnitTests.Services
         }
 
         #endregion
+    }
+
+    /// <summary>
+    /// Covers the two <see cref="XmlServiceSerializer.Deserialize"/> failure cases that are only observable
+    /// through the static <c>Logger</c>: the <see cref="XmlException"/> path, which appends coordinates, and the
+    /// <see cref="FormatException"/> path, which cannot and must still carry the same greppable phrase.
+    /// </summary>
+    /// <remarks>
+    /// Asserting on that writer requires <see cref="LoggerCollection"/>, because <see cref="LogCapture"/> shuts
+    /// the static <c>Logger</c> down and re-initialises it against a directory of its own - process-wide state
+    /// that two classes capturing in parallel swap under each other, leaving the loser reading an empty file.
+    /// These two cases therefore live in a class of their own rather than taking the whole of
+    /// <see cref="XmlServiceSerializerTests"/>, which has no other log assertion, out of parallel execution.
+    /// </remarks>
+    [Collection(LoggerCollection.Name)] // the failure entries are asserted through the static Logger
+    public class XmlServiceSerializerLogTests
+    {
+        /// <summary>The serializer under test.</summary>
+        private readonly XmlServiceSerializer _serializer = new XmlServiceSerializer();
+
+        /// <summary>
+        /// Malformed XML reaches the <see cref="XmlException"/> arm, where <c>FormatLineInfo</c> has coordinates
+        /// to append, so the logged entry carries the "at line" phrase.
+        /// </summary>
+        [Fact]
+        public void Deserialize_MalformedXml_LogsFailureWithLineInfo()
+        {
+            // Arrange: XmlException path, so FormatLineInfo has coordinates to append.
+            string malformedXml = "<ServiceDto><Name>UnclosedTag";
+
+            // Act
+            var (result, textLogOutput) = LogCapture.Run(() => _serializer.Deserialize(malformedXml));
+
+            // Assert
+            Assert.Null(result);
+            Assert.Contains("XML Deserialization failed at line", textLogOutput);
+        }
+
+        /// <summary>
+        /// Well-formed XML carrying an unconvertible value reaches the <see cref="FormatException"/> arm, which has
+        /// no coordinates, and must still log the same phrase so a grep finds both halves of the failures.
+        /// </summary>
+        [Fact]
+        public void Deserialize_WellFormedXmlWithUnconvertibleValue_LogsTheSameFailurePhrase()
+        {
+            // Arrange: FormatException path, so FormatLineInfo returns string.Empty; the entry must
+            // still carry the phrase the line-info branch logs, or half the import failures are
+            // invisible to a grep for it.
+            string xml = "<ServiceDto><Name>S</Name><StartTimeout>abc</StartTimeout></ServiceDto>";
+
+            // Act
+            var (result, textLogOutput) = LogCapture.Run(() => _serializer.Deserialize(xml));
+
+            // Assert
+            Assert.Null(result);
+            Assert.Contains("XML Deserialization failed.", textLogOutput);
+        }
+
+        /// <summary>
+        /// A serialization failure returns <c>null</c>, and the logged entry is the only place the format and
+        /// the name of the service that could not be exported are kept.
+        /// </summary>
+        [Fact]
+        public void Serialize_SerializationFailure_LogsTheFormatAndTheServiceName()
+        {
+            // Arrange
+            // An undeclared derived type makes XmlSerializer throw an InvalidOperationException.
+            var invalidDto = new InvalidServiceDtoMock { Name = "ExportMe" };
+
+            // Act
+            var (result, textLogOutput) = LogCapture.Run(() => _serializer.Serialize(invalidDto));
+
+            // Assert
+            Assert.Null(result);
+            Assert.Contains("XML Serialization failed for service: ExportMe", textLogOutput);
+        }
     }
 
     /// <summary>

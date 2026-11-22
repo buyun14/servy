@@ -15,10 +15,30 @@ namespace Servy.Core.Helpers
     public static class ServiceDtoHelper
     {
         /// <summary>
-        /// Populates null nullable properties with their matching system configurations sourced from <see cref="AppConfig"/>.
-        /// This ensures structural parameter completeness across business contexts without executing side-effect identity mutations.
+        /// Creates a shallow copy of a <see cref="ServiceDto"/>.
+        /// Delegates to <see cref="ICloneable.Clone"/> to perform a memberwise clone, preventing property drift when new properties are added.
         /// </summary>
-        /// <param name="dto">The service data transfer object layout to populate.</param>
+        /// <param name="dto">The service data transfer object to copy.</param>
+        /// <returns>A new <see cref="ServiceDto"/> instance with identical property values.</returns>
+        public static ServiceDto Clone(ServiceDto dto)
+        {
+            if (dto == null) throw new ArgumentNullException(nameof(dto));
+
+            return (ServiceDto)dto.Clone();
+        }
+
+        /// <summary>
+        /// Populates null nullable properties with their matching system configurations sourced from <see cref="AppConfig"/>,
+        /// normalizes string configuration fields (environment variables and dependencies), and normalizes identity fields
+        /// by trimming surrounding whitespace from <c>UserAccount</c>.
+        /// Unlike <see cref="ApplyDefaultsAndResetIdentity"/>, it never resets or clears identity values.
+        /// </summary>
+        /// <param name="dto">The service data transfer object layout to populate. The instance is modified in place.</param>
+        /// <remarks>
+        /// ServiceDtoMapper.ToDomain dereferences each property set here with '!.Value'.
+        /// Removing a line from this method, or adding a nullable ServiceDto property without one,
+        /// turns that read into a NullReferenceException on the database load path.
+        /// </remarks>
         public static void HydrateDefaults(ServiceDto? dto)
         {
             if (dto == null) return;
@@ -26,6 +46,7 @@ namespace Servy.Core.Helpers
             // Identity & Behavior
             dto.StartupType = dto.StartupType ?? (int)AppConfig.DefaultStartupType;
             dto.Priority = dto.Priority ?? (int)AppConfig.DefaultProcessPriority;
+            dto.RunAsLocalSystem = dto.RunAsLocalSystem ?? AppConfig.DefaultRunAsLocalSystem;
             dto.EnableDebugLogs = dto.EnableDebugLogs ?? AppConfig.DefaultEnableDebugLogs;
 
             // Timeouts
@@ -53,6 +74,15 @@ namespace Servy.Core.Helpers
             dto.HeartbeatUrlTimeoutSeconds = dto.HeartbeatUrlTimeoutSeconds ?? AppConfig.DefaultHeartbeatUrlTimeoutSeconds;
             dto.EnableHeartbeatUrlFlags = dto.EnableHeartbeatUrlFlags ?? AppConfig.DefaultEnableHeartbeatUrlFlags;
 
+            // Identity Normalization
+            dto.UserAccount = dto.UserAccount?.Trim();
+
+            // Environment & Dependencies Normalization
+            dto.EnvironmentVariables = StringHelper.NormalizeString(dto.EnvironmentVariables);
+            dto.AllowOverriddenRuntimeVars = dto.AllowOverriddenRuntimeVars ?? AppConfig.DefaultAllowOverriddenRuntimeVars;
+            dto.ServiceDependencies = StringHelper.NormalizeString(dto.ServiceDependencies);
+            dto.PreLaunchEnvironmentVariables = StringHelper.NormalizeString(dto.PreLaunchEnvironmentVariables);
+
             // Lifecycle Hooks (Pre-Launch)
             dto.PreLaunchTimeoutSeconds = dto.PreLaunchTimeoutSeconds ?? AppConfig.DefaultPreLaunchTimeoutSeconds;
             dto.PreLaunchRetryAttempts = dto.PreLaunchRetryAttempts ?? AppConfig.DefaultPreLaunchRetryAttempts;
@@ -67,10 +97,13 @@ namespace Servy.Core.Helpers
         /// Populates null nullable properties that have production defaults in <see cref="AppConfig"/>
         /// (startup, priority, timeouts, log rotation, health monitoring, pre-launch/pre-stop options).
         /// Optional free-form fields (paths, parameters, hooks, dependencies) without defaults remain null.
-        /// Additionally, unconditionally resets RunAsLocalSystem/UserAccount/Password to a
-        /// password-less LocalSystem baseline (Global Identity Reset on Import policy).
+        /// Additionally, applies the Global Identity Reset on Import policy: Password is always cleared,
+        /// a passwordless UserAccount (see <see cref="ServiceAccounts.IsPasswordlessAccount"/>), or a local user
+        /// account that can log on with a blank password on this machine (see
+        /// <see cref="ServiceAccounts.IsBlankPasswordLocalAccount"/>), is kept with RunAsLocalSystem set to
+        /// <c>false</c>, and any other identity is reset to the password-less LocalSystem baseline.
         /// </summary>
-        /// <param name="dto">The service DTO to hydrate. If null, the method returns immediately.</param>
+        /// <param name="dto">The service DTO to hydrate. The instance is modified in place. If null, the method returns immediately.</param>
         public static void ApplyDefaultsAndResetIdentity(ServiceDto? dto)
         {
             if (dto == null) return;
@@ -78,20 +111,48 @@ namespace Servy.Core.Helpers
             // Hydrate structural parameters via our unified local template method
             HydrateDefaults(dto);
 
-            // POLICY: Global Identity Reset on Import
-            // To maintain architectural simplicity across all interfaces (UI, CLI, PS),
-            // we do not support importing custom identities. All imported services
-            // are forced to LocalSystem to ensure a valid, password-less baseline.
-            // If you want to set a custom account you must set it manually after import.
-            dto.RunAsLocalSystem = AppConfig.DefaultRunAsLocalSystem;
-            dto.UserAccount = null;
+            // POLICY: Global Identity Reset on Import, except for passwordless accounts
+            // A password is never read from an import file, so an account that needs one cannot be
+            // applied: it is reset to the password-less LocalSystem baseline and must be set manually
+            // after import, unless the service already exists and a CLI or Manager import keeps its
+            // stored account that has a password (ServiceRepository.ApplyRuntimeState). A passwordless
+            // account (LocalService, NetworkService, NT SERVICE\..., IIS APPPOOL\..., a gMSA) carries no
+            // secret, so it is kept as the file names it. So is a local
+            // user account with a blank password, but only when this machine allows a service to log on
+            // with one (LimitBlankPasswordUse = 0) and a blank-password logon for it succeeds.
             dto.Password = null;
 
+            var account = dto.UserAccount?.Trim();
+            if (ServiceAccounts.IsPasswordlessAccount(account))
+            {
+                dto.RunAsLocalSystem = false;
+                dto.UserAccount = account;
+
+                Logger.Info($"Import: Service configuration applied for '{dto.Name}'. The passwordless account '{account}' " +
+                            "named in the imported manifest is kept.");
+                return;
+            }
+
+            if (ServiceAccounts.IsBlankPasswordLocalAccount(account))
+            {
+                dto.RunAsLocalSystem = false;
+                dto.UserAccount = account;
+
+                Logger.Info($"Import: Service configuration applied for '{dto.Name}'. The local account '{account}' named in the " +
+                            "imported manifest has a blank password and LimitBlankPasswordUse is 0 on this machine, so it is kept.");
+                return;
+            }
+
+            dto.RunAsLocalSystem = AppConfig.DefaultRunAsLocalSystem;
+            dto.UserAccount = null;
+
             // Log an informational notice to satisfy operator visibility requirements.
-            // Because serialization attributes strip identity data out of export manifests,
-            // this notice alerts administrators that the service defaults safely to LocalSystem.
-            Logger.Info($"Import: Service configuration applied for '{dto.Name}'. The Global Identity Reset policy enforces " +
-                        "the LocalSystem identity on all imported manifests. A custom account can be configured manually if required.");
+            // An account that needs a password is never exported, so this notice says what the file
+            // carries, not what the service ends up with: a CLI or Manager import over an existing
+            // service keeps a stored account that has a password (ServiceRepository.ApplyRuntimeState).
+            Logger.Info($"Import: Service configuration applied for '{dto.Name}'. The imported manifest names no passwordless account, " +
+                        "so it carries the LocalSystem identity. A CLI or Manager import over a service that already exists keeps " +
+                        "its stored account if that account has a password. A custom account can be configured manually if required.");
         }
     }
 }

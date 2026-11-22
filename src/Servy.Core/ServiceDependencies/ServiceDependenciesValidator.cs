@@ -1,6 +1,6 @@
 using Servy.Core.Config;
+using Servy.Core.Helpers;
 using Servy.Core.Resources;
-using System.Text.RegularExpressions;
 
 namespace Servy.Core.ServiceDependencies
 {
@@ -9,14 +9,12 @@ namespace Servy.Core.ServiceDependencies
     /// </summary>
     public static class ServiceDependenciesValidator
     {
-        // letters, digits, hyphen, underscore, period, spaces, and dollar sign ($)
-        private static readonly Regex ValidServiceNameRegex = new Regex(@"^[a-zA-Z0-9_.\-$ ]+$", RegexOptions.Compiled, AppConfig.InputRegexTimeout);
-
         /// <summary>
         /// Validates the input string containing service dependencies.
         /// Service names must be separated by semicolons or new lines.
-        /// Each service name must contain only letters, digits, hyphens,
-        /// underscores, periods, spaces, or dollar signs ($), and must not exceed 256 characters.
+        /// Each service name must satisfy the shared service name character set rules,
+        /// optionally preceded by '+' to reference a load-order group,
+        /// and must not exceed 256 characters.
         /// </summary>
         /// <param name="input">Raw input string with service dependencies.</param>
         /// <param name="errors">List of validation error messages.</param>
@@ -36,11 +34,15 @@ namespace Servy.Core.ServiceDependencies
             {
                 if (serviceName.Length > AppConfig.MaxServiceNameLength)
                 {
-                    errors.Add(string.Format(Strings.Msg_ServiceNameLengthReached, AppConfig.MaxServiceNameLength));
+                    errors.Add(string.Format(Strings.Msg_ServiceDependencyNameLengthReachedForName, serviceName, AppConfig.MaxServiceNameLength));
                     continue;
                 }
 
-                if (!ValidServiceNameRegex.IsMatch(serviceName))
+                string nameToValidate = serviceName.StartsWith("+", StringComparison.Ordinal)
+                    ? serviceName.Substring(1)
+                    : serviceName;
+
+                if (string.IsNullOrEmpty(nameToValidate) || !Helper.IsValidServiceNameCharset(nameToValidate))
                 {
                     errors.Add(string.Format(Strings.Msg_InvalidServiceDependencyName, serviceName));
                 }

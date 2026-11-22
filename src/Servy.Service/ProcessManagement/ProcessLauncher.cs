@@ -1,7 +1,9 @@
+using Microsoft.Win32.SafeHandles;
 using Servy.Core.Config;
 using Servy.Core.EnvironmentVariables;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.Validation;
 using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -55,6 +57,7 @@ namespace Servy.Service.ProcessManagement
         /// <param name="arguments">The raw command-line arguments to pass to the executable; can be null or empty.</param>
         /// <param name="workingDirectory">The startup working directory for the process. If null or whitespace, defaults to the executable's directory location.</param>
         /// <param name="environmentVariables">A list of <see cref="EnvironmentVariable"/> objects containing custom keys and values to inject into the execution scope.</param>
+        /// <param name="allowOverriddenRuntimeVars">If set to <c>true</c>, allows runtime environment variables to be overridden; if <c>false</c>, preserves existing runtime variables.</param>
         /// <param name="enableConsoleUI">If set to <c>true</c>, preserves standard I/O handles and shows the window; if <c>false</c>, hides the process window and redirects streams for logging capture.</param>
         /// <param name="logger">The <see cref="IServyLogger"/> instance used to emit environmental auditing and telemetry data; can be null.</param>
         /// <param name="auditContext">A descriptive keyword or method name specifying the operational scope to include in security audit trail logs.</param>
@@ -62,14 +65,20 @@ namespace Servy.Service.ProcessManagement
         public static ProcessStartInfo CreateStartInfo(
             string executablePath,
             string arguments,
-            string workingDirectory,
+            string? workingDirectory,
             List<EnvironmentVariable> environmentVariables,
+            bool allowOverriddenRuntimeVars,
             bool enableConsoleUI,
             IServyLogger? logger,
             string auditContext)
         {
             // 1. Resolve environment variables and arguments
-            var (expandedEnv, finalArgs) = Helpers.ProcessHelper.ExpandAndAudit(environmentVariables, arguments ?? string.Empty, logger, auditContext);
+            var (expandedEnv, finalArgs) = Helpers.ProcessHelper.ExpandAndAudit(
+                environmentVariables,
+                allowOverriddenRuntimeVars,
+                arguments ?? string.Empty,
+                logger,
+                auditContext);
 
             // 2. Configure ProcessStartInfo with unified defaults
             var psi = new ProcessStartInfo
@@ -114,6 +123,9 @@ namespace Servy.Service.ProcessManagement
         /// <param name="factory">The factory used to create the process wrapper.</param>
         /// <param name="logger">The logger instance for operational telemetry.</param>
         /// <returns>An initialized and started <see cref="IProcessWrapper"/>.</returns>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="options"/> is null.</exception>
+        /// <exception cref="ArgumentException">Thrown when the executable path is empty, or a synchronous launch is requested with a non-positive TimeoutMs or WaitChunkMs.</exception>
+        /// <exception cref="System.ComponentModel.Win32Exception">Thrown when the OS refuses to start the executable, most commonly because the path does not exist or is not executable. <see cref="ProcessStartInfo.UseShellExecute"/> is false, so this is the failure mode for an unstartable executable.</exception>
         /// <exception cref="TimeoutException">Thrown if a synchronous wait operation exceeds the configured timeout.</exception>
         public static IProcessWrapper Start(
             ProcessLaunchOptions options,
@@ -147,13 +159,14 @@ namespace Servy.Service.ProcessManagement
             var psi = CreateStartInfo(
                 options.ExecutablePath,
                 options.Arguments ?? string.Empty,
-                options.StartupDirectory!,
-                options.EnvironmentVariables!,
+                options.StartupDirectory,
+                options.EnvironmentVariables,
+                options.AllowOverriddenRuntimeVars,
                 options.EnableConsoleUI,
                 logger,
-                "ProcessLauncher.Start");
+                options.AuditContext);
 
-            // Overwrite redirection states explicitly since dependent side-hook tasks match tighter pipeline controls
+            // Re-derive redirection per stream: only redirect a stream whose target path is actually configured
             psi.RedirectStandardOutput = redirectOutput && !string.IsNullOrWhiteSpace(options.StdoutPath);
             psi.RedirectStandardError = redirectOutput && !string.IsNullOrWhiteSpace(options.StderrPath);
 
@@ -170,6 +183,9 @@ namespace Servy.Service.ProcessManagement
             StreamWriter? stdoutWriter = null;
             StreamWriter? stderrWriter = null;
 
+            DataReceivedEventHandler? outHandler = null;
+            DataReceivedEventHandler? errHandler = null;
+
             // Failure latches to prevent log-spam if file access is denied
             bool stdoutWriterFailed = false;
             bool stderrWriterFailed = false;
@@ -183,13 +199,31 @@ namespace Servy.Service.ProcessManagement
                 && string.Equals(normalizedOut, normalizedErr, StringComparison.OrdinalIgnoreCase);
 
             bool processStarted = false;
+
+            // Stops the async read pumps and unsubscribes the redirect handlers, so no line reaches a writer the
+            // finally block is about to dispose (#5628). Runs on the success path and first in the finally block,
+            // so every failure path (a TimeoutException included) detaches too (#7624). Idempotent.
+            void DetachOutputPumps()
+            {
+                if (outHandler != null)
+                {
+                    try { process.CancelOutputRead(); } catch { /* not reading, or already stopped */ }
+                    try { process.OutputDataReceived -= outHandler; } catch { /* wrapper already disposed */ }
+                    outHandler = null;
+                }
+                if (errHandler != null)
+                {
+                    try { process.CancelErrorRead(); } catch { /* not reading, or already stopped */ }
+                    try { process.ErrorDataReceived -= errHandler; } catch { /* wrapper already disposed */ }
+                    errHandler = null;
+                }
+            }
+
             try
             {
-                if (!process.Start())
-                {
-                    throw new InvalidOperationException(
-                        $"Process.Start returned false for '{options.ExecutablePath}' (no process resource started).");
-                }
+                // UseShellExecute is false, so Start() cannot return false (there is no process to reuse):
+                // an unstartable executable surfaces as Win32Exception.
+                process.Start();
                 processStarted = true;
 
                 // 3. Handle execution mode
@@ -213,7 +247,7 @@ namespace Servy.Service.ProcessManagement
                 // Setup StdOut Writer (Lazy Init)
                 if (psi.RedirectStandardOutput)
                 {
-                    process.OutputDataReceived += (_, e) =>
+                    outHandler = (_, e) =>
                     {
                         if (e.Data == null) return;
 
@@ -225,7 +259,6 @@ namespace Servy.Service.ProcessManagement
 
                                 if (stdoutWriter == null)
                                 {
-                                    // Outsource handwritten file generation block to helper
                                     stdoutWriter = TryOpenAppendWriter(outPath!, encoding, options.ExecutablePath, "stdout", logger);
                                     if (stdoutWriter == null)
                                     {
@@ -242,12 +275,13 @@ namespace Servy.Service.ProcessManagement
                             try { logger.Warn($"Failed to write stdout line for '{options.ExecutablePath}': {ex.Message}"); } catch { /* Fail-silent */ }
                         }
                     };
+                    process.OutputDataReceived += outHandler;
                 }
 
                 // Setup StdErr Writer (Lazy Init)
                 if (psi.RedirectStandardError)
                 {
-                    process.ErrorDataReceived += (_, e) =>
+                    errHandler = (_, e) =>
                     {
                         if (e.Data == null) return;
 
@@ -262,7 +296,6 @@ namespace Servy.Service.ProcessManagement
 
                                     if (stdoutWriter == null)
                                     {
-                                        // Utilize our unified log builder tool helper logic
                                         stdoutWriter = TryOpenAppendWriter(outPath!, encoding, options.ExecutablePath, "multiplexed stdout/stderr", logger);
                                         if (stdoutWriter == null)
                                         {
@@ -279,7 +312,6 @@ namespace Servy.Service.ProcessManagement
 
                                     if (stderrWriter == null)
                                     {
-                                        // Route calls seamlessly through shared infrastructure
                                         stderrWriter = TryOpenAppendWriter(errPath!, encoding, options.ExecutablePath, "stderr", logger);
                                         if (stderrWriter == null)
                                         {
@@ -297,6 +329,7 @@ namespace Servy.Service.ProcessManagement
                             try { logger.Warn($"Failed to write stderr line for '{options.ExecutablePath}': {ex.Message}"); } catch { /* Fail-silent */ }
                         }
                     };
+                    process.ErrorDataReceived += errHandler;
                 }
 
                 if (psi.RedirectStandardOutput) process.BeginOutputReadLine();
@@ -313,6 +346,9 @@ namespace Servy.Service.ProcessManagement
                 }
                 catch { /* fail-silent - drain is best-effort */ }
 
+                // Stop the pumps before the writers they close over are disposed in the finally block (#5628)
+                DetachOutputPumps();
+
                 returnedOwnership = true;
                 return process;
             }
@@ -322,12 +358,17 @@ namespace Servy.Service.ProcessManagement
             }
             catch (Exception ex)
             {
-                string pathValue = options.ExecutablePath ?? string.Empty;
-                logger.Error($"Failed during synchronous execution or log flushing for '{pathValue}'.", ex);
+                string pathValue = options.ExecutablePath;
+                logger.Error(processStarted
+                    ? $"Failed while monitoring or flushing the output of '{pathValue}'."
+                    : $"Failed to start '{pathValue}'.", ex);
                 throw;
             }
             finally
             {
+                // Detach before the writers are disposed and before the orphan kill, on every exit path (#7624)
+                DetachOutputPumps();
+
                 // Dispose writers safely to release file locks.
                 try { stdoutWriter?.Dispose(); }
                 catch (Exception ex) { logger.Warn($"Failed to dispose stdout writer: {ex.Message}"); }
@@ -338,7 +379,7 @@ namespace Servy.Service.ProcessManagement
                     catch (Exception ex) { logger.Warn($"Failed to dispose stderr writer: {ex.Message}"); }
                 }
 
-                if (!returnedOwnership && process != null)
+                if (!returnedOwnership)
                 {
                     // ROBUSTNESS: If we didn't successfully return ownership, the process is orphaned.
                     // We must kill the process tree before disposing the wrapper to avoid leaking child processes.
@@ -347,8 +388,8 @@ namespace Servy.Service.ProcessManagement
                         // Check if the process actually started and is still running.
                         // process.Start() is the first entry in the try block; if any subsequent logic throws,
                         // we must ensure the child does not remain active and unsupervised.
-                        if (processStarted && !process.HasExited)
-                            process.Kill(true);
+                        if (processStarted && !process.Kill(true))
+                            logger.Warn("Orphaned child after launch failure could not be terminated; it may still be running.");
                     }
                     catch (Exception killEx)
                     {
@@ -376,7 +417,8 @@ namespace Servy.Service.ProcessManagement
 
                     var errorMsg = $"{options.ExecutablePath} timed out after {options.TimeoutMs}ms. Terminating process tree.";
                     if (options.LogErrorAsWarning) logger.Warn(errorMsg); else logger.Error(errorMsg);
-                    process.Kill(true);
+                    if (!process.Kill(true))
+                        logger.Error($"{options.ExecutablePath}: the process tree could not be terminated and may still be running.");
                     throw new TimeoutException($"{options.ExecutablePath} exceeded the maximum allowed timeout of {options.TimeoutMs}ms.");
                 }
 
@@ -388,11 +430,36 @@ namespace Servy.Service.ProcessManagement
 
         /// <summary>
         /// Applies environment variables and command-line flags to ensure consistent UTF-8 I/O behavior for known runtimes.
-        /// Detection is strictly scoped to the executable filename and extension to avoid false positives from directory paths.
+        /// Detection matches the executable's filename stem (extension and directory are ignored) against anchored patterns,
+        /// so directory names containing 'python' or 'java' cannot trigger it. A shim whose stem is one of the recognised
+        /// names, such as java.cmd, is treated as the runtime itself.
         /// </summary>
         /// <param name="psi">The start info to modify.</param>
         /// <param name="logger">The logger instance for operational telemetry.</param>
         public static void ApplyLanguageFixes(ProcessStartInfo psi, IServyLogger? logger)
+            => ApplyLanguageFixes(psi, logger, PythonExeRegex.IsMatch, JavaFileEncodingRegex.IsMatch);
+
+        /// <summary>
+        /// Test seam for <see cref="ApplyLanguageFixes(ProcessStartInfo, IServyLogger?)"/>. It applies exactly the same
+        /// fixes, with the two detection matchers supplied by the caller so that their timeout fallbacks can be exercised.
+        /// </summary>
+        /// <remarks>
+        /// This overload wraps no behaviour of its own: the public overload forwards
+        /// <see cref="Regex.IsMatch(string)"/> of the two compiled detection patterns unchanged, so a production call
+        /// runs the same code with the same matchers it ran before the seam existed.
+        /// </remarks>
+        /// <param name="psi">The start info to modify.</param>
+        /// <param name="logger">The logger instance for operational telemetry.</param>
+        /// <param name="isPythonExecutable">
+        /// Returns <c>true</c> when the executable's filename stem names a Python runtime.
+        /// May throw <see cref="RegexMatchTimeoutException"/>, which is caught and treated as "not Python".
+        /// </param>
+        /// <param name="hasJavaFileEncoding">
+        /// Returns <c>true</c> when the arguments already carry a <c>-Dfile.encoding</c> flag.
+        /// May throw <see cref="RegexMatchTimeoutException"/>, which is caught and treated as "not present".
+        /// </param>
+        internal static void ApplyLanguageFixes(ProcessStartInfo psi, IServyLogger? logger,
+            Func<string, bool> isPythonExecutable, Func<string, bool> hasJavaFileEncoding)
         {
             if (psi == null || string.IsNullOrEmpty(psi.FileName))
             {
@@ -402,9 +469,9 @@ namespace Servy.Service.ProcessManagement
             string fileNameOnly = Path.GetFileNameWithoutExtension(psi.FileName);
 
             // Python Logic:
-            // Matches 'python', 'pythonw', 'python2', 'python3', or 'python3.x' patterns.
+            // Matches 'python', 'pythonw', 'python2', 'python3', 'python3.x', and the Windows launchers 'py' and 'pyw' (see PythonExeRegex).
             bool isPython;
-            try { isPython = PythonExeRegex.IsMatch(fileNameOnly); }
+            try { isPython = isPythonExecutable(fileNameOnly); }
             catch (RegexMatchTimeoutException ex)
             {
                 logger?.Warn($"ApplyLanguageFixes: Python detection regex timed out on '{fileNameOnly}' ({ex.Message}); assuming not Python.");
@@ -435,7 +502,7 @@ namespace Servy.Service.ProcessManagement
                 bool hasEncoding;
                 try
                 {
-                    hasEncoding = JavaFileEncodingRegex.IsMatch(currentArgs);
+                    hasEncoding = hasJavaFileEncoding(currentArgs);
                 }
                 catch (RegexMatchTimeoutException ex)
                 {
@@ -480,8 +547,19 @@ namespace Servy.Service.ProcessManagement
         }
 
         /// <summary>
+        /// Resolves the final, fully-qualified path of an open file handle.
+        /// </summary>
+        /// <param name="handle">The open file handle to resolve.</param>
+        /// <param name="finalPath">
+        /// When this method returns <c>true</c>, the resolved path; otherwise an empty string.
+        /// </param>
+        /// <returns><c>true</c> when the handle was resolved; otherwise, <c>false</c>.</returns>
+        internal delegate bool FinalPathResolver(SafeFileHandle handle, out string finalPath);
+
+        /// <summary>
         /// Attempts to initialize a file log writer in append mode with broad thread-sharing permissions.
         /// Ensures the target directory exists and safely disposes file streams if opening fails.
+        /// Rejects paths traversing directory junctions or symbolic links to prevent privilege escalation attacks.
         /// </summary>
         /// <param name="path">The target destination absolute disk path for log output.</param>
         /// <param name="encoding">The text encoding for the log file.</param>
@@ -489,19 +567,107 @@ namespace Servy.Service.ProcessManagement
         /// <param name="scope">A label (e.g. 'stdout' or 'stderr') used in failure log messages.</param>
         /// <param name="logger">The operational logging instance to output tracing to.</param>
         /// <returns>An active autoflushing <see cref="StreamWriter"/> instance if initialization succeeds; otherwise, <c>null</c>.</returns>
-        private static StreamWriter? TryOpenAppendWriter(string path, Encoding encoding, string exePath, string scope, IServyLogger logger)
+        internal static StreamWriter? TryOpenAppendWriter(string path, Encoding encoding, string exePath, string scope, IServyLogger logger)
+            => TryOpenAppendWriter(path, encoding, exePath, scope, logger, Helper.HasAncestorReparsePoint, PathSecurityGuard.TryGetFinalPathByHandle);
+
+        /// <summary>
+        /// Test seam for <see cref="TryOpenAppendWriter(string, Encoding, string, string, IServyLogger)"/>. It runs
+        /// exactly the same sequence of checks, with the ancestor reparse-point check and the handle-path resolver
+        /// supplied by the caller so that their refusal branches can be exercised.
+        /// </summary>
+        /// <remarks>
+        /// This overload wraps no behaviour of its own: the internal overload above forwards
+        /// <see cref="Helper.HasAncestorReparsePoint(string)"/> and
+        /// <see cref="PathSecurityGuard.TryGetFinalPathByHandle(SafeFileHandle, out string)"/> unchanged, so a
+        /// production call runs the same code with the same checks it ran before the seam existed.
+        /// </remarks>
+        /// <param name="path">The target destination absolute disk path for log output.</param>
+        /// <param name="encoding">The text encoding for the log file.</param>
+        /// <param name="exePath">The executable path, used only for log/error messages.</param>
+        /// <param name="scope">A label (e.g. 'stdout' or 'stderr') used in failure log messages.</param>
+        /// <param name="logger">The operational logging instance to output tracing to.</param>
+        /// <param name="hasAncestorReparsePoint">
+        /// Returns <c>true</c> when any ancestor directory of the given full path is a junction, symbolic link or
+        /// mount point. Called once before and once after the target directory is created.
+        /// </param>
+        /// <param name="resolveFinalPath">
+        /// Resolves an opened file handle to its final, fully-qualified path. Returning <c>false</c> makes the open
+        /// fail closed.
+        /// </param>
+        /// <param name="handleNamesPath">
+        /// Returns whether the opened handle (first argument), whose resolved final path is the second argument, names
+        /// the validated full path (third argument). <c>null</c>, the value every production call uses, selects
+        /// <see cref="PathSecurityGuard.HandleNamesValidatedPath(SafeFileHandle, string, string)"/>, the comparison
+        /// <see cref="Servy.Core.IO.RotatingStreamWriter"/> uses, so a path with an 8.3 component is accepted by both writers alike.
+        /// A test supplies its own only to stand in for a redirection that changes every name of the handle.
+        /// </param>
+        /// <returns>An active autoflushing <see cref="StreamWriter"/> instance if initialization succeeds; otherwise, <c>null</c>.</returns>
+        internal static StreamWriter? TryOpenAppendWriter(string path, Encoding encoding, string exePath, string scope, IServyLogger logger,
+            Func<string, bool> hasAncestorReparsePoint, FinalPathResolver resolveFinalPath,
+            Func<SafeFileHandle, string, string, bool>? handleNamesPath = null)
         {
             FileStream? fs = null;
             try
             {
-                Helper.EnsureDirectoryExists(path);
-                fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    logger.Error($"Disabling {scope} capture for '{exePath}': log path is empty.");
+                    return null;
+                }
+
+                string fullPath = Path.GetFullPath(path);
+
+                // 1. Check whether any parent or ancestor directory is a reparse point (junction/symlink)
+                if (hasAncestorReparsePoint(fullPath))
+                {
+                    logger.Error($"Refusing to write {scope} for '{exePath}': a directory in '{path}' is a junction, symbolic link, or mount point.");
+                    return null;
+                }
+
+                Helper.EnsureDirectoryExists(fullPath);
+
+                // Re-verify ancestor directories after EnsureDirectoryExists creates any missing paths
+                if (hasAncestorReparsePoint(fullPath))
+                {
+                    logger.Error($"Refusing to write {scope} for '{exePath}': a directory in '{path}' is a junction, symbolic link, or mount point.");
+                    return null;
+                }
+
+                // 2. Check if the target file itself is a reparse point
+                if (File.Exists(fullPath))
+                {
+                    var fileInfo = new FileInfo(fullPath);
+                    if (fileInfo.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                    {
+                        logger.Error($"Refusing to write {scope} for '{exePath}': target file '{path}' is a junction, symbolic link, or mount point.");
+                        return null;
+                    }
+                }
+
+                fs = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+
+                // 3. Verify the resolved handle path matches the intended target to defend against race conditions / symlink swaps
+                if (!resolveFinalPath(fs.SafeFileHandle, out string handleFinalPath))
+                {
+                    logger.Error($"Refusing to write {scope} for '{exePath}': could not resolve the opened handle to a path.");
+                    fs.Dispose();
+                    return null;
+                }
+
+                // The normalized final path expands 8.3 components, so the handle's opened name is compared as well
+                if (!(handleNamesPath ?? PathSecurityGuard.HandleNamesValidatedPath)(fs.SafeFileHandle, Path.GetFullPath(handleFinalPath), fullPath))
+                {
+                    logger.Error($"Refusing to write {scope} for '{exePath}': target handle path '{handleFinalPath}' does not match expected path '{fullPath}'.");
+                    fs.Dispose();
+                    return null;
+                }
+
                 return new StreamWriter(fs, encoding) { AutoFlush = true };
             }
             catch (Exception ex)
             {
                 fs?.Dispose();
-                logger.Error($"Disabling {scope} capture for '{exePath}' after open failure: {ex.Message}", ex);
+                logger.Error($"Disabling {scope} capture for '{exePath}' after open failure.", ex);
                 return null;
             }
         }

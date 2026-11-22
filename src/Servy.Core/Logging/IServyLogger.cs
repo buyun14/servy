@@ -1,7 +1,9 @@
 namespace Servy.Core.Logging
 {
     /// <summary>
-    /// Defines methods for logging informational, warning, and error messages.
+    /// Defines the Servy logging abstraction: leveled logging (Debug, Info, Warn, Error),
+    /// an optional message prefix with scoped child loggers, and runtime control over the
+    /// minimum level and the Windows Event Log sink.
     /// </summary>
     public interface IServyLogger : IDisposable
     {
@@ -42,29 +44,42 @@ namespace Servy.Core.Logging
         /// <summary>
         /// Logs a debug message and optional exception details at the DEBUG level.
         /// </summary>
-        /// <param name="message">The operational message to log.</param>
-        /// <param name="ex">An optional <see cref="Exception"/> to include in the log trace.</param>
+        /// <param name="message">The message to log.</param>
+        /// <param name="ex">An optional <see cref="Exception"/> to include in the log trace, or <see langword="null"/>.</param>
         void Debug(string message, Exception? ex = null);
 
         /// <summary>
         /// Logs an informational message.
         /// </summary>
         /// <param name="message">The message to log.</param>
-        /// <param name="ex">An optional <see cref="Exception"/> to include in the log trace.</param>
+        /// <param name="ex">An optional <see cref="Exception"/> to include in the log trace, or <see langword="null"/>.</param>
         void Info(string message, Exception? ex = null);
 
         /// <summary>
         /// Logs a warning message.
         /// </summary>
-        /// <param name="message">The warning message to log.</param>
-        /// <param name="ex">An optional <see cref="Exception"/> to include in the log trace.</param>
+        /// <param name="message">The message to log.</param>
+        /// <param name="ex">An optional <see cref="Exception"/> to include in the log trace, or <see langword="null"/>.</param>
         void Warn(string message, Exception? ex = null);
 
         /// <summary>
         /// Logs an error message and optional exception.
         /// </summary>
-        /// <param name="message">The error message to log.</param>
-        /// <param name="ex">The exception associated with the error, or <c>null</c> if none.</param>
+        /// <param name="message">The message to log.</param>
+        /// <param name="ex">An optional <see cref="Exception"/> to include in the log trace, or <see langword="null"/>.</param>
         void Error(string message, Exception? ex = null);
+
+        /// <summary>
+        /// Logs a multi-line report: the title and then every physical line of the body, so a
+        /// composed section layout survives the single-line contract the leveled methods enforce.
+        /// </summary>
+        /// <remarks>
+        /// Sinks that render newlines (the Windows Event Log) receive the block as one entry;
+        /// the file sink receives one timestamped entry per physical line.
+        /// </remarks>
+        /// <param name="level">The <see cref="LogLevel"/> of the report.</param>
+        /// <param name="title">The report heading.</param>
+        /// <param name="body">The report body; every physical line is written separately to the file sink.</param>
+        void Report(LogLevel level, string title, string body);
     }
 }

@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Signs a file using SignPath when SIGN=true is set in a .signpath configuration file.
@@ -54,7 +55,7 @@ $configCandidates = @(
     ".signpath.env"
 )
 
-$configPath = $configCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+$configPath = $configCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
 if (-not $configPath) {
     Write-Host ".signpath not found. Skipping signing."
@@ -67,16 +68,16 @@ Write-Host "Loading config from $configPath"
 # LOAD CONFIG
 # ----------------------------------------------------------
 $config = @{}
-Get-Content $configPath | ForEach-Object {
+Get-Content -LiteralPath $configPath | ForEach-Object {
     if ($_ -match "^\s*#") { return }
     if ($_ -match "^\s*$") { return }
     if ($_ -match "^\s*([^=]+)=(.*)$") {
         $key = $matches[1].Trim().ToUpperInvariant()
         $val = $matches[2]
 
-        # CONFIG PARSER: Handle inline comments and structural quotes in order of precedence.
-        # Group 1 handles a quoted value followed by an optional trailing inline comment.
-        # Group 2 handles a standard quoted value with no trailing comment.
+        # CONFIG PARSER: strip surrounding quotes and any trailing inline comment.
+        # A quoted value may contain '#' safely; only an unquoted value has its
+        # inline comment stripped, and only when the '#' is preceded by whitespace.
         if ($val -match '^"([^"]*)"(?:\s*#.*)?$') {
             $val = $matches[1]
         }
@@ -98,7 +99,7 @@ Get-Content $configPath | ForEach-Object {
 $signFlag = $config["SIGN"]
 Write-Host "signFlag=$signFlag"
 
-if ($signFlag -ine "true") {
+if ($signFlag -ne "true") {
     Write-Host "SIGN is not true in $configPath. Skipping signing."
     return
 }
@@ -113,7 +114,10 @@ $availableModule = Get-Module -ListAvailable -Name SignPath |
 
 if (-not $availableModule) {
     Write-Host "SignPath module (v$RequiredSignPathVersion) not found. Installing..."
-    Install-Module -Name SignPath -RequiredVersion $RequiredSignPathVersion -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck
+    # Explicitly pin PSGallery as repository to prevent supply-chain attacks from higher-priority internal feeds.
+    # -SkipPublisherCheck bypasses Authenticode publisher verification in CI runner environments where
+    # pre-installed or side-loaded module versions may have mismatched catalog signatures.
+    Install-Module -Name SignPath -RequiredVersion $RequiredSignPathVersion -Repository PSGallery -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck
 }
 
 # 1. Clean up the current session to prevent version "pollution"
@@ -179,7 +183,7 @@ if (!$apiToken -or !$organizationId -or !$projectSlug -or !$signingPolicySlug) {
     throw "Missing required SignPath configuration values (API Token, Organization ID, Project Slug, or Signing Policy Slug)."
 }
 
-if (-not (Test-Path $Path)) {
+if (-not (Test-Path -LiteralPath $Path)) {
     throw "File not found: $Path"
 }
 
@@ -239,9 +243,9 @@ try {
         $commonParams.ArtifactConfigurationSlug = $artifactConfigurationSlug
     }
 
-    if (Test-Path $signedPath) {
+    if (Test-Path -LiteralPath $signedPath) {
         Write-Warning "Removing stale artifact from previous run: $signedPath"
-        Remove-Item -Force $signedPath
+        Remove-Item -Force -LiteralPath $signedPath
     }
 
     $signingRequestId = Submit-SigningRequest @commonParams
@@ -255,10 +259,10 @@ catch {
 # REPLACE ORIGINAL FILE WITH SIGNED VERSION
 # ----------------------------------------------------------
 try {
-    if (-not (Test-Path $signedPath)) {
+    if (-not (Test-Path -LiteralPath $signedPath)) {
         throw "SignPath did not produce the expected output file: $signedPath"
     }
-    Move-Item -Force -Path $signedPath -Destination $Path
+    Move-Item -Force -LiteralPath $signedPath -Destination $Path
     Write-Host "Signing complete: $Path"
 }
 catch {

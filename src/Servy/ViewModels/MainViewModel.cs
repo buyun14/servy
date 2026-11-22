@@ -22,7 +22,7 @@ namespace Servy.ViewModels
     /// Implements properties, commands, and logic for configuring and managing Windows services
     /// such as install, uninstall, start, stop, and restart.
     /// </summary>
-    public partial class MainViewModel : INotifyPropertyChanged, IDisposable
+    public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         #region Private Fields
 
@@ -74,6 +74,15 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
+        /// Gets or sets a value indicating whether the manager application is available.
+        /// </summary>
+        public bool IsManagerAppAvailable
+        {
+            get => _isManagerAppAvailable;
+            set => Set(() => _isManagerAppAvailable, v => _isManagerAppAvailable = v, value);
+        }
+
+        /// <summary>
         /// Gets or sets the name of the Windows service.
         /// </summary>
         public string? ServiceName
@@ -103,7 +112,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Gets or sets the path to the executable process to be run by the service.
         /// </summary>
-        public string? ProcessPath
+        public string? ExecutablePath
         {
             get => _config.ExecutablePath;
             set => Set(() => _config.ExecutablePath, v => _config.ExecutablePath = v, value);
@@ -121,7 +130,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Gets or sets additional command line parameters for the process.
         /// </summary>
-        public string? ProcessParameters
+        public string? Parameters
         {
             get => _config.Parameters;
             set => Set(() => _config.Parameters, v => _config.Parameters = v, value);
@@ -281,10 +290,10 @@ namespace Servy.ViewModels
         /// </summary>
         public List<EnumDisplayItem<DateRotationType>> DateRotationTypes { get; } = new List<EnumDisplayItem<DateRotationType>>
         {
+            new EnumDisplayItem<DateRotationType> { Value = DateRotationType.None, DisplayName = Strings.DateRotationType_None },
             new EnumDisplayItem<DateRotationType> { Value = DateRotationType.Daily, DisplayName = Strings.DateRotationType_Daily },
             new EnumDisplayItem<DateRotationType> { Value = DateRotationType.Weekly, DisplayName = Strings.DateRotationType_Weekly },
             new EnumDisplayItem<DateRotationType> { Value = DateRotationType.Monthly, DisplayName = Strings.DateRotationType_Monthly },
-            new EnumDisplayItem<DateRotationType> { Value = DateRotationType.None, DisplayName = Strings.DateRotationType_None },
         };
 
         /// <summary>
@@ -322,7 +331,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets the heartbeat interval (seconds) as a string.
+        /// Gets or sets the health check heartbeat interval in seconds.
         /// </summary>
         public string? HeartbeatInterval
         {
@@ -331,7 +340,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets the maximum allowed failed health checks as a string.
+        /// Gets or sets the maximum number of failed health checks before taking recovery action.
         /// </summary>
         public string? MaxFailedChecks
         {
@@ -369,7 +378,7 @@ namespace Servy.ViewModels
         };
 
         /// <summary>
-        /// Gets or sets the maximum number of restart attempts as a string.
+        /// Gets or sets the maximum number of restart attempts.
         /// </summary>
         public string? MaxRestartAttempts
         {
@@ -405,16 +414,16 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets failure program path as a string.
+        /// Gets or sets the path to the program run when the service fails.
         /// </summary>
-        public string? FailureProgramPath
+        public string? FailureProgramExecutablePath
         {
             get => _config.FailureProgramPath;
             set => Set(() => _config.FailureProgramPath, v => _config.FailureProgramPath = v, value);
         }
 
         /// <summary>
-        /// Gets or sets failure program startup directory as a string.
+        /// Gets or sets the working directory of the failure program.
         /// </summary>
         public string? FailureProgramStartupDirectory
         {
@@ -423,7 +432,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets failure program parameters as a string.
+        /// Gets or sets the command line parameters passed to the failure program.
         /// </summary>
         public string? FailureProgramParameters
         {
@@ -432,7 +441,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets environment variables as a string.
+        /// Gets or sets the environment variables for the service, in KEY=VALUE form, one per line or separated by semicolons.
         /// </summary>
         public string? EnvironmentVariables
         {
@@ -441,7 +450,16 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets service dependencies as a string.
+        /// Gets or sets a value indicating whether to allow overriding of protected runtime variables (e.g., <c>JAVA_HOME</c>, <c>JAVA_OPTS</c>, <c>CATALINA_OPTS</c>) by the service's environment variables.
+        /// </summary>
+        public bool AllowOverriddenRuntimeVars
+        {
+            get => _config.AllowOverriddenRuntimeVars;
+            set => Set(() => _config.AllowOverriddenRuntimeVars, v => _config.AllowOverriddenRuntimeVars = v, value);
+        }
+
+        /// <summary>
+        /// Gets or sets the semicolon- or newline-separated list of dependent service names.
         /// </summary>
         public string? ServiceDependencies
         {
@@ -450,7 +468,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets run as local system as a bool.
+        /// Gets or sets a value indicating whether the service runs as LocalSystem.
         /// </summary>
         public bool RunAsLocalSystem
         {
@@ -459,7 +477,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets user account as a string.
+        /// Gets or sets the user account the service logs on as.
         /// </summary>
         public string? UserAccount
         {
@@ -468,7 +486,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets user password as a string.
+        /// Gets or sets the password of the user account the service logs on as.
         /// </summary>
         public string? Password
         {
@@ -477,7 +495,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets user password confirmation as a string.
+        /// Gets or sets the confirmation of the user account password.
         /// </summary>
         public string? ConfirmPassword
         {
@@ -486,7 +504,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch executable path as a string.
+        /// Gets or sets the path to the executable run before the service process starts.
         /// </summary>
         public string? PreLaunchExecutablePath
         {
@@ -495,7 +513,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch startup directory as a string.
+        /// Gets or sets the working directory of the pre-launch executable.
         /// </summary>
         public string? PreLaunchStartupDirectory
         {
@@ -504,7 +522,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch parameters as a string.
+        /// Gets or sets the command line parameters passed to the pre-launch executable.
         /// </summary>
         public string? PreLaunchParameters
         {
@@ -513,7 +531,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch environment variables as a string.
+        /// Gets or sets the environment variables for the pre-launch process, in KEY=VALUE form, one per line or separated by semicolons.
         /// </summary>
         public string? PreLaunchEnvironmentVariables
         {
@@ -522,7 +540,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch stdout log file path as a string.
+        /// Gets or sets the path for pre-launch standard output redirection.
         /// </summary>
         public string? PreLaunchStdoutPath
         {
@@ -531,7 +549,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch stderr log file path as a string.
+        /// Gets or sets the path for pre-launch standard error redirection.
         /// </summary>
         public string? PreLaunchStderrPath
         {
@@ -540,7 +558,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch timeout as a string.
+        /// Gets or sets the pre-launch timeout in seconds.
         /// </summary>
         public string? PreLaunchTimeoutSeconds
         {
@@ -549,7 +567,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch retry attempts as a string.
+        /// Gets or sets the number of retry attempts for the pre-launch process.
         /// </summary>
         public string? PreLaunchRetryAttempts
         {
@@ -558,7 +576,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-launch ignore failure as a bool.
+        /// Gets or sets a value indicating whether to ignore failures of the pre-launch process.
         /// </summary>
         public bool PreLaunchIgnoreFailure
         {
@@ -567,16 +585,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets a value indicating whether the manager application is available.
-        /// </summary>
-        public bool IsManagerAppAvailable
-        {
-            get => _isManagerAppAvailable;
-            set => Set(() => _isManagerAppAvailable, v => _isManagerAppAvailable = v, value);
-        }
-
-        /// <summary>
-        /// Gets or sets post-launch executable path as a string.
+        /// Gets or sets the path to the executable run after the service process starts.
         /// </summary>
         public string? PostLaunchExecutablePath
         {
@@ -585,7 +594,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets post-launch startup directory as a string.
+        /// Gets or sets the working directory of the post-launch executable.
         /// </summary>
         public string? PostLaunchStartupDirectory
         {
@@ -594,7 +603,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets post-launch parameters as a string.
+        /// Gets or sets the command line parameters passed to the post-launch executable.
         /// </summary>
         public string? PostLaunchParameters
         {
@@ -612,7 +621,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-stop executable path as a string.
+        /// Gets or sets the path to the executable run before the service process stops.
         /// </summary>
         public string? PreStopExecutablePath
         {
@@ -621,7 +630,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-stop startup directory as a string.
+        /// Gets or sets the working directory of the pre-stop executable.
         /// </summary>
         public string? PreStopStartupDirectory
         {
@@ -630,7 +639,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-stop parameters as a string.
+        /// Gets or sets the command line parameters passed to the pre-stop executable.
         /// </summary>
         public string? PreStopParameters
         {
@@ -639,7 +648,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-stop timeout as a string.
+        /// Gets or sets the pre-stop timeout in seconds.
         /// </summary>
         public string? PreStopTimeoutSeconds
         {
@@ -648,7 +657,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets pre-stop log as error as a bool.
+        /// Gets or sets a value indicating whether to log pre-stop failure as error.
         /// </summary>
         public bool PreStopLogAsError
         {
@@ -657,7 +666,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets post-stop executable path as a string.
+        /// Gets or sets the path to the executable run after the service process stops.
         /// </summary>
         public string? PostStopExecutablePath
         {
@@ -666,7 +675,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets post-stop startup directory as a string.
+        /// Gets or sets the working directory of the post-stop executable.
         /// </summary>
         public string? PostStopStartupDirectory
         {
@@ -675,7 +684,7 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Gets or sets post-stop parameters as a string.
+        /// Gets or sets the command line parameters passed to the post-stop executable.
         /// </summary>
         public string? PostStopParameters
         {
@@ -690,7 +699,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Command to browse and select the executable process path.
         /// </summary>
-        public ICommand BrowseProcessPathCommand { get; }
+        public ICommand BrowseExecutablePathCommand { get; }
 
         /// <summary>
         /// Command to browse and select the startup directory.
@@ -735,7 +744,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Command to browse and select the failure program path.
         /// </summary>
-        public ICommand BrowseFailureProgramPathCommand { get; }
+        public ICommand BrowseFailureProgramExecutablePathCommand { get; }
 
         /// <summary>
         /// Command to browse and select the failure program startup directory.
@@ -745,7 +754,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Command to browse and select the pre-launch executable process path.
         /// </summary>
-        public ICommand BrowsePreLaunchProcessPathCommand { get; }
+        public ICommand BrowsePreLaunchExecutablePathCommand { get; }
 
         /// <summary>
         /// Command to browse and select the pre-launch startup directory.
@@ -793,6 +802,11 @@ namespace Servy.ViewModels
         public IAsyncCommand OpenDocumentationCommand { get; }
 
         /// <summary>
+        /// Command to open the list of runtime variables wiki page.
+        /// </summary>
+        public IAsyncCommand OpenRuntimeVariablesLinkCommand { get; }
+
+        /// <summary>
         /// Command to check for updates.
         /// </summary>
         public IAsyncCommand CheckUpdatesCommand { get; }
@@ -810,7 +824,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Command to browse and select the post-launch executable process path.
         /// </summary>
-        public ICommand BrowsePostLaunchProcessPathCommand { get; }
+        public ICommand BrowsePostLaunchExecutablePathCommand { get; }
 
         /// <summary>
         /// Command to browse and select the post-launch startup directory.
@@ -820,7 +834,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Command to browse and select the pre-stop executable process path.
         /// </summary>
-        public ICommand BrowsePreStopProcessPathCommand { get; }
+        public ICommand BrowsePreStopExecutablePathCommand { get; }
 
         /// <summary>
         /// Command to browse and select the pre-stop startup directory.
@@ -830,7 +844,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Command to browse and select the post-stop executable process path.
         /// </summary>
-        public ICommand BrowsePostStopProcessPathCommand { get; }
+        public ICommand BrowsePostStopExecutablePathCommand { get; }
 
         /// <summary>
         /// Command to browse and select the post-stop startup directory.
@@ -875,7 +889,7 @@ namespace Servy.ViewModels
             ResetToDefaults();
 
             // Commands
-            BrowseProcessPathCommand = new RelayCommand<object>(_ => BrowseProcessPath());
+            BrowseExecutablePathCommand = new RelayCommand<object>(_ => BrowseExecutablePath());
             BrowseStartupDirectoryCommand = new RelayCommand<object>(_ => BrowseStartupDirectory());
             BrowseStdoutPathCommand = new RelayCommand<object>(_ => BrowseStdoutPath());
             BrowseStderrPathCommand = new RelayCommand<object>(_ => BrowseStderrPath());
@@ -893,24 +907,25 @@ namespace Servy.ViewModels
             ImportXmlCommand = new AsyncCommand(ImportXmlConfigAsync, _ => !IsBusy, name: nameof(ImportXmlCommand));
             ImportJsonCommand = new AsyncCommand(ImportJsonConfigAsync, _ => !IsBusy, name: nameof(ImportJsonCommand));
 
-            BrowseFailureProgramPathCommand = new RelayCommand<object>(_ => BrowseFailureProgramPath());
+            BrowseFailureProgramExecutablePathCommand = new RelayCommand<object>(_ => BrowseFailureProgramExecutablePath());
             BrowseFailureProgramStartupDirectoryCommand = new RelayCommand<object>(_ => BrowseFailureProgramStartupDirectory());
 
-            BrowsePreLaunchProcessPathCommand = new RelayCommand<object>(_ => BrowsePreLaunchProcessPath());
+            BrowsePreLaunchExecutablePathCommand = new RelayCommand<object>(_ => BrowsePreLaunchExecutablePath());
             BrowsePreLaunchStartupDirectoryCommand = new RelayCommand<object>(_ => BrowsePreLaunchStartupDirectory());
             BrowsePreLaunchStdoutPathCommand = new RelayCommand<object>(_ => BrowsePreLaunchStdoutPath());
             BrowsePreLaunchStderrPathCommand = new RelayCommand<object>(_ => BrowsePreLaunchStderrPath());
 
-            BrowsePostLaunchProcessPathCommand = new RelayCommand<object>(_ => BrowsePostLaunchProcessPath());
+            BrowsePostLaunchExecutablePathCommand = new RelayCommand<object>(_ => BrowsePostLaunchExecutablePath());
             BrowsePostLaunchStartupDirectoryCommand = new RelayCommand<object>(_ => BrowsePostLaunchStartupDirectory());
 
-            BrowsePreStopProcessPathCommand = new RelayCommand<object>(_ => BrowsePreStopProcessPath());
+            BrowsePreStopExecutablePathCommand = new RelayCommand<object>(_ => BrowsePreStopExecutablePath());
             BrowsePreStopStartupDirectoryCommand = new RelayCommand<object>(_ => BrowsePreStopStartupDirectory());
 
-            BrowsePostStopProcessPathCommand = new RelayCommand<object>(_ => BrowsePostStopProcessPath());
+            BrowsePostStopExecutablePathCommand = new RelayCommand<object>(_ => BrowsePostStopExecutablePath());
             BrowsePostStopStartupDirectoryCommand = new RelayCommand<object>(_ => BrowsePostStopStartupDirectory());
 
             OpenDocumentationCommand = new AsyncCommand(OpenDocumentationAsync, name: nameof(OpenDocumentationCommand));
+            OpenRuntimeVariablesLinkCommand = new AsyncCommand(OpenRuntimeVariablesLinkAsync, name: nameof(OpenRuntimeVariablesLinkCommand));
             CheckUpdatesCommand = new AsyncCommand(CheckUpdatesAsync, name: nameof(CheckUpdatesCommand));
             OpenAboutDialogCommand = new AsyncCommand(OpenAboutDialogAsync, name: nameof(OpenAboutDialogCommand));
 
@@ -960,9 +975,9 @@ namespace Servy.ViewModels
             ServiceName = string.Empty;
             ServiceDisplayName = string.Empty;
             ServiceDescription = string.Empty;
-            ProcessPath = string.Empty;
+            ExecutablePath = string.Empty;
             StartupDirectory = string.Empty;
-            ProcessParameters = string.Empty;
+            Parameters = string.Empty;
             SelectedStartupType = DefaultStartupType;
             SelectedProcessPriority = DefaultProcessPriority;
             CpuAffinity = string.Empty;
@@ -984,11 +999,12 @@ namespace Servy.ViewModels
             HeartbeatUrl = string.Empty;
             HeartbeatUrlTimeoutSeconds = DefaultHeartbeatUrlTimeoutSeconds.ToString();
             EnableHeartbeatUrlFlags = DefaultEnableHeartbeatUrlFlags;
-            FailureProgramPath = string.Empty;
+            FailureProgramExecutablePath = string.Empty;
             FailureProgramStartupDirectory = string.Empty;
             FailureProgramParameters = string.Empty;
 
             EnvironmentVariables = string.Empty;
+            AllowOverriddenRuntimeVars = DefaultAllowOverriddenRuntimeVars;
             ServiceDependencies = string.Empty;
 
             RunAsLocalSystem = DefaultRunAsLocalSystem;
@@ -1061,91 +1077,91 @@ namespace Servy.ViewModels
         /// before updating configuration properties, ensuring that user cancellation of a dialog
         /// does not overwrite existing valid paths.
         /// </remarks>
-        private void BrowseAndAssign(Func<string?, string?> dialogAction, Action<string> propertySetter)
+        private void BrowseAndAssign(Func<string?> dialogAction, Action<string> propertySetter)
         {
-            var result = dialogAction(null);
+            var result = dialogAction();
             if (!string.IsNullOrEmpty(result)) propertySetter(result);
         }
 
         /// <summary>
-        /// Opens a dialog to browse for an executable file and sets <see cref="ProcessPath"/>.
+        /// Opens a dialog to browse for an executable file and sets <see cref="ExecutablePath"/>.
         /// </summary>
-        private void BrowseProcessPath() => BrowseAndAssign(_dialogService.OpenExecutable, v => ProcessPath = v);
+        private void BrowseExecutablePath() => BrowseAndAssign(() => _dialogService.OpenExecutable(), v => ExecutablePath = v);
 
         /// <summary>
         /// Opens a dialog to browse for a folder and sets <see cref="StartupDirectory"/>.
         /// </summary>
-        private void BrowseStartupDirectory() => BrowseAndAssign(_dialogService.OpenFolder, v => StartupDirectory = v);
+        private void BrowseStartupDirectory() => BrowseAndAssign(() => _dialogService.OpenFolder(), v => StartupDirectory = v);
 
         /// <summary>
         /// Opens a dialog to select a file path for standard output redirection.
         /// </summary>
-        private void BrowseStdoutPath() => BrowseAndAssign(_ => _dialogService.SaveFile(Strings.Dialog_SelectStdoutFile), v => StdoutPath = v);
+        private void BrowseStdoutPath() => BrowseAndAssign(() => _dialogService.SaveFile(Strings.Dialog_SelectStdoutFile), v => StdoutPath = v);
 
         /// <summary>
         /// Opens a dialog to select a file path for standard error redirection.
         /// </summary>
-        private void BrowseStderrPath() => BrowseAndAssign(_ => _dialogService.SaveFile(Strings.Dialog_SelectStderrFile), v => StderrPath = v);
+        private void BrowseStderrPath() => BrowseAndAssign(() => _dialogService.SaveFile(Strings.Dialog_SelectStderrFile), v => StderrPath = v);
 
         /// <summary>
-        /// Opens a dialog to browse for a failure program file and sets <see cref="FailureProgramPath"/>.
+        /// Opens a dialog to browse for a failure program file and sets <see cref="FailureProgramExecutablePath"/>.
         /// </summary>
-        private void BrowseFailureProgramPath() => BrowseAndAssign(_dialogService.OpenExecutable, v => FailureProgramPath = v);
+        private void BrowseFailureProgramExecutablePath() => BrowseAndAssign(() => _dialogService.OpenExecutable(), v => FailureProgramExecutablePath = v);
 
         /// <summary>
         /// Opens a dialog to browse for a folder and sets <see cref="FailureProgramStartupDirectory"/>.
         /// </summary>
-        private void BrowseFailureProgramStartupDirectory() => BrowseAndAssign(_dialogService.OpenFolder, v => FailureProgramStartupDirectory = v);
+        private void BrowseFailureProgramStartupDirectory() => BrowseAndAssign(() => _dialogService.OpenFolder(), v => FailureProgramStartupDirectory = v);
 
         /// <summary>
         /// Opens a dialog to browse for a pre-launch executable file and sets <see cref="PreLaunchExecutablePath"/>.
         /// </summary>
-        private void BrowsePreLaunchProcessPath() => BrowseAndAssign(_dialogService.OpenExecutable, v => PreLaunchExecutablePath = v);
+        private void BrowsePreLaunchExecutablePath() => BrowseAndAssign(() => _dialogService.OpenExecutable(), v => PreLaunchExecutablePath = v);
 
         /// <summary>
         /// Opens a dialog to browse for a folder and sets <see cref="PreLaunchStartupDirectory"/>.
         /// </summary>
-        private void BrowsePreLaunchStartupDirectory() => BrowseAndAssign(_dialogService.OpenFolder, v => PreLaunchStartupDirectory = v);
+        private void BrowsePreLaunchStartupDirectory() => BrowseAndAssign(() => _dialogService.OpenFolder(), v => PreLaunchStartupDirectory = v);
 
         /// <summary>
         /// Opens a dialog to select a file path for pre-launch standard output redirection.
         /// </summary>
-        private void BrowsePreLaunchStdoutPath() => BrowseAndAssign(_ => _dialogService.SaveFile(Strings.Dialog_SelectStdoutFile), v => PreLaunchStdoutPath = v);
+        private void BrowsePreLaunchStdoutPath() => BrowseAndAssign(() => _dialogService.SaveFile(Strings.Dialog_SelectStdoutFile), v => PreLaunchStdoutPath = v);
 
         /// <summary>
         /// Opens a dialog to select a file path for pre-launch standard error redirection.
         /// </summary>
-        private void BrowsePreLaunchStderrPath() => BrowseAndAssign(_ => _dialogService.SaveFile(Strings.Dialog_SelectStderrFile), v => PreLaunchStderrPath = v);
+        private void BrowsePreLaunchStderrPath() => BrowseAndAssign(() => _dialogService.SaveFile(Strings.Dialog_SelectStderrFile), v => PreLaunchStderrPath = v);
 
         /// <summary>
         /// Opens a dialog to browse for a post-launch executable file and sets <see cref="PostLaunchExecutablePath"/>.
         /// </summary>
-        private void BrowsePostLaunchProcessPath() => BrowseAndAssign(_dialogService.OpenExecutable, v => PostLaunchExecutablePath = v);
+        private void BrowsePostLaunchExecutablePath() => BrowseAndAssign(() => _dialogService.OpenExecutable(), v => PostLaunchExecutablePath = v);
 
         /// <summary>
         /// Opens a dialog to browse for a folder and sets <see cref="PostLaunchStartupDirectory"/>.
         /// </summary>
-        private void BrowsePostLaunchStartupDirectory() => BrowseAndAssign(_dialogService.OpenFolder, v => PostLaunchStartupDirectory = v);
+        private void BrowsePostLaunchStartupDirectory() => BrowseAndAssign(() => _dialogService.OpenFolder(), v => PostLaunchStartupDirectory = v);
 
         /// <summary>
         /// Opens a dialog to browse for a pre-stop executable file and sets <see cref="PreStopExecutablePath"/>.
         /// </summary>
-        private void BrowsePreStopProcessPath() => BrowseAndAssign(_dialogService.OpenExecutable, v => PreStopExecutablePath = v);
+        private void BrowsePreStopExecutablePath() => BrowseAndAssign(() => _dialogService.OpenExecutable(), v => PreStopExecutablePath = v);
 
         /// <summary>
         /// Opens a dialog to browse for a pre-stop folder and sets <see cref="PreStopStartupDirectory"/>.
         /// </summary>
-        private void BrowsePreStopStartupDirectory() => BrowseAndAssign(_dialogService.OpenFolder, v => PreStopStartupDirectory = v);
+        private void BrowsePreStopStartupDirectory() => BrowseAndAssign(() => _dialogService.OpenFolder(), v => PreStopStartupDirectory = v);
 
         /// <summary>
         /// Opens a dialog to browse for a post-stop executable file and sets <see cref="PostStopExecutablePath"/>.
         /// </summary>
-        private void BrowsePostStopProcessPath() => BrowseAndAssign(_dialogService.OpenExecutable, v => PostStopExecutablePath = v);
+        private void BrowsePostStopExecutablePath() => BrowseAndAssign(() => _dialogService.OpenExecutable(), v => PostStopExecutablePath = v);
 
         /// <summary>
         /// Opens a dialog to browse for a post-stop folder and sets <see cref="PostStopStartupDirectory"/>.
         /// </summary>
-        private void BrowsePostStopStartupDirectory() => BrowseAndAssign(_dialogService.OpenFolder, v => PostStopStartupDirectory = v);
+        private void BrowsePostStopStartupDirectory() => BrowseAndAssign(() => _dialogService.OpenFolder(), v => PostStopStartupDirectory = v);
 
         #endregion
 
@@ -1160,100 +1176,60 @@ namespace Servy.ViewModels
         }
 
         /// <summary>
-        /// Calls <see cref="IServiceCommands.InstallServiceAsync"/> with the current property values.
+        /// Runs an asynchronous command body with <see cref="IsBusy"/> raised for its duration.
         /// </summary>
-        private async Task InstallServiceAsync(object? parameter)
+        /// <param name="operation">The asynchronous command body to execute.</param>
+        /// <returns>A task representing the asynchronous operation.</returns>
+        private async Task RunBusyAsync(Func<Task> operation)
         {
             try
             {
                 IsBusy = true;
-                await Task.Run(() => ServiceCommands.InstallServiceAsync(_config));
+                await operation();
             }
             finally
             {
                 ResetIsBusy();
             }
         }
+
+        /// <summary>
+        /// Snapshots the form data on the UI thread and invokes <see cref="IServiceCommands.InstallServiceAsync"/> on a background thread.
+        /// </summary>
+        private Task InstallServiceAsync(object? parameter) => RunBusyAsync(async () =>
+        {
+            var dto = ModelToServiceDto();
+            var success = await Task.Run(() => ServiceCommands.InstallServiceAsync(dto, ConfirmPassword, RunAsLocalSystem));
+            if (success)
+            {
+                ConfirmPassword = string.Empty;
+            }
+        });
 
         /// <summary>
         /// Calls <see cref="IServiceCommands.UninstallServiceAsync"/> for the current <see cref="ServiceName"/>.
         /// </summary>
-        private async Task UninstallServiceAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await Task.Run(() => ServiceCommands.UninstallServiceAsync(ServiceName));
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task UninstallServiceAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.UninstallServiceAsync(ServiceName)));
 
         /// <summary>
         /// Calls <see cref="IServiceCommands.StartServiceAsync"/> for the current <see cref="ServiceName"/>.
         /// </summary>
-        private async Task StartServiceAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await Task.Run(() => ServiceCommands.StartServiceAsync(ServiceName));
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task StartServiceAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.StartServiceAsync(ServiceName)));
 
         /// <summary>
         /// Calls <see cref="IServiceCommands.StopServiceAsync"/> for the current <see cref="ServiceName"/>.
         /// </summary>
-        private async Task StopServiceAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await Task.Run(() => ServiceCommands.StopServiceAsync(ServiceName));
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task StopServiceAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.StopServiceAsync(ServiceName)));
 
         /// <summary>
         /// Calls <see cref="IServiceCommands.RestartServiceAsync"/> for the current <see cref="ServiceName"/>.
         /// </summary>
-        private async Task RestartServiceAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await Task.Run(() => ServiceCommands.RestartServiceAsync(ServiceName));
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task RestartServiceAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.RestartServiceAsync(ServiceName)));
 
         /// <summary>
         /// Calls <see cref="IServiceCommands.OpenManagerAsync"/> to open the Servy Manager application.
         /// </summary>
-        private async Task OpenManagerAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await ServiceCommands.OpenManagerAsync();
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task OpenManagerAsync(object? parameter) => RunBusyAsync(() => ServiceCommands.OpenManagerAsync());
 
         #endregion
 
@@ -1262,7 +1238,7 @@ namespace Servy.ViewModels
         /// <summary>
         /// Clears all form fields and resets to default values.
         /// </summary>
-        private async Task ClearFormAsync(object? parameter)
+        private Task ClearFormAsync(object? parameter) => RunBusyAsync(async () =>
         {
             // Ask for confirmation before clearing everything
             bool confirm = await _messageBoxService.ShowConfirmAsync(Strings.Confirm_ClearAll, UiAppConfig.Caption);
@@ -1272,7 +1248,7 @@ namespace Servy.ViewModels
 
             // Clear all fields
             ResetToDefaults();
-        }
+        });
 
         #endregion
 
@@ -1281,34 +1257,12 @@ namespace Servy.ViewModels
         /// <summary>
         /// Exports the current service configuration to an XML file selected by the user.
         /// </summary>
-        private async Task ExportXmlConfigAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await ServiceCommands.ExportXmlConfigAsync(ConfirmPassword);
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task ExportXmlConfigAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.ExportXmlConfigAsync(ConfirmPassword)));
 
         /// <summary>
         /// Exports the current service configuration to a JSON file selected by the user.
         /// </summary>
-        private async Task ExportJsonConfigAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await ServiceCommands.ExportJsonConfigAsync(ConfirmPassword);
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task ExportJsonConfigAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.ExportJsonConfigAsync(ConfirmPassword)));
 
         /// <summary>
         /// Opens a file dialog to select an XML configuration file for a service,
@@ -1316,18 +1270,7 @@ namespace Servy.ViewModels
         /// and maps the values to the main view model.
         /// Shows an error message if the XML is invalid, deserialization fails, or any exception occurs.
         /// </summary>
-        private async Task ImportXmlConfigAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await ServiceCommands.ImportXmlConfigAsync();
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task ImportXmlConfigAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.ImportXmlConfigAsync()));
 
         /// <summary>
         /// Opens a file dialog to select a JSON configuration file for a service,
@@ -1335,18 +1278,7 @@ namespace Servy.ViewModels
         /// and maps the values to the main view model.
         /// Shows an error message if the JSON is invalid, deserialization fails, or any exception occurs.
         /// </summary>
-        private async Task ImportJsonConfigAsync(object? parameter)
-        {
-            try
-            {
-                IsBusy = true;
-                await ServiceCommands.ImportJsonConfigAsync();
-            }
-            finally
-            {
-                ResetIsBusy();
-            }
-        }
+        private Task ImportJsonConfigAsync(object? parameter) => RunBusyAsync(() => Task.Run(() => ServiceCommands.ImportJsonConfigAsync()));
 
         #endregion
 
@@ -1358,6 +1290,14 @@ namespace Servy.ViewModels
         private async Task OpenDocumentationAsync(object? parameter)
         {
             await _helpService.OpenDocumentationAsync(UiAppConfig.Caption);
+        }
+
+        /// <summary>
+        /// Opens the Servy protected runtime variables documentation page in the default browser.
+        /// </summary>
+        private async Task OpenRuntimeVariablesLinkAsync(object? parameter)
+        {
+            await ServiceCommands.OpenRuntimeVariablesLinkAsync();
         }
 
         /// <summary>
@@ -1398,15 +1338,18 @@ namespace Servy.ViewModels
         /// Load current service configuration based on windows service name.
         /// </summary>
         /// <param name="serviceName">Service Name.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
         /// <returns>A task representing the asynchronous load operation.</returns>
-        public async Task LoadServiceConfigurationAsync(string? serviceName)
+        public async Task LoadServiceConfigurationAsync(string? serviceName, CancellationToken cancellationToken = default)
         {
             try
             {
-                var dto = await _serviceRepository.GetByNameAsync(serviceName);
+                var dto = await _serviceRepository.GetByNameAsync(serviceName, decrypt: true, cancellationToken);
 
                 if (dto == null)
                 {
+                    Logger.Warn($"No stored configuration found for service '{serviceName}'");
+                    await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_ServiceNotFound, UiAppConfig.Caption);
                     return;
                 }
 
@@ -1416,7 +1359,7 @@ namespace Servy.ViewModels
             catch (Exception ex)
             {
                 Logger.Error($"Error loading configuration for service '{serviceName}'", ex);
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption);
+                await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption);
             }
         }
 
@@ -1435,70 +1378,119 @@ namespace Servy.ViewModels
         /// </remarks>
         public void BindServiceDtoToModel(ServiceDto dto)
         {
-            ServiceName = dto.Name ?? string.Empty;
-            ServiceDisplayName = dto.DisplayName ?? string.Empty;
-            ServiceDescription = dto.Description ?? string.Empty;
-            ProcessPath = dto.ExecutablePath ?? string.Empty;
-            StartupDirectory = dto.StartupDirectory ?? string.Empty;
-            ProcessParameters = dto.Parameters ?? string.Empty;
-            SelectedStartupType = dto.StartupType == null ? DefaultStartupType : (ServiceStartType)dto.StartupType;
-            SelectedProcessPriority = dto.Priority == null ? DefaultProcessPriority : (ProcessPriority)dto.Priority;
-            CpuAffinity = dto.CpuAffinity;
-            EnableConsoleUI = dto.EnableConsoleUI ?? DefaultEnableConsoleUI;
-            StdoutPath = dto.StdoutPath ?? string.Empty;
-            StderrPath = dto.StderrPath ?? string.Empty;
-            EnableSizeRotation = dto.EnableSizeRotation ?? DefaultEnableSizeRotation;
-            RotationSize = dto.RotationSize == null ? DefaultRotationSizeMB.ToString() : dto.RotationSize.Value.ToString();
-            EnableDateRotation = dto.EnableDateRotation ?? DefaultEnableDateRotation;
-            SelectedDateRotationType = dto.DateRotationType == null ? DefaultDateRotationType : (DateRotationType)dto.DateRotationType;
-            MaxRotations = dto.MaxRotations == null ? DefaultMaxRotations.ToString() : dto.MaxRotations.Value.ToString();
-            UseLocalTimeForRotation = dto.UseLocalTimeForRotation ?? DefaultUseLocalTimeForRotation;
-            EnableHealthMonitoring = dto.EnableHealthMonitoring ?? DefaultEnableHealthMonitoring;
-            HeartbeatInterval = dto.HeartbeatInterval == null ? DefaultHeartbeatInterval.ToString() : dto.HeartbeatInterval.Value.ToString();
-            MaxFailedChecks = dto.MaxFailedChecks == null ? DefaultMaxFailedChecks.ToString() : dto.MaxFailedChecks.Value.ToString();
-            SelectedRecoveryAction = dto.RecoveryAction == null ? DefaultRecoveryAction : (RecoveryAction)dto.RecoveryAction;
-            RecoveryOnCleanExit = dto.RecoveryOnCleanExit ?? DefaultRecoveryOnCleanExit;
-            MaxRestartAttempts = dto.MaxRestartAttempts == null ? DefaultMaxRestartAttempts.ToString() : dto.MaxRestartAttempts.Value.ToString();
-            HeartbeatUrl = dto.HeartbeatUrl ?? string.Empty;
-            HeartbeatUrlTimeoutSeconds = dto.HeartbeatUrlTimeoutSeconds == null ? DefaultHeartbeatUrlTimeoutSeconds.ToString() : dto.HeartbeatUrlTimeoutSeconds.Value.ToString();
-            EnableHeartbeatUrlFlags = dto.EnableHeartbeatUrlFlags ?? DefaultEnableHeartbeatUrlFlags;
-            FailureProgramPath = dto.FailureProgramPath ?? string.Empty;
-            FailureProgramStartupDirectory = dto.FailureProgramStartupDirectory ?? string.Empty;
-            FailureProgramParameters = dto.FailureProgramParameters ?? string.Empty;
-            EnvironmentVariables = StringHelper.FormatEnvironmentVariables(dto.EnvironmentVariables) ?? string.Empty;
-            ServiceDependencies = StringHelper.FormatServiceDependencies(dto.ServiceDependencies) ?? string.Empty;
-            RunAsLocalSystem = dto.RunAsLocalSystem ?? DefaultRunAsLocalSystem;
-            UserAccount = dto.UserAccount ?? string.Empty;
-            Password = dto.Password ?? string.Empty;
+            var cloned = ServiceDtoHelper.Clone(dto);
+            ServiceDtoHelper.HydrateDefaults(cloned);
+            var hydrated = cloned;
+
+            ServiceName = hydrated.Name ?? string.Empty;
+            ServiceDisplayName = hydrated.DisplayName ?? string.Empty;
+            ServiceDescription = hydrated.Description ?? string.Empty;
+            ExecutablePath = hydrated.ExecutablePath ?? string.Empty;
+            StartupDirectory = hydrated.StartupDirectory ?? string.Empty;
+            Parameters = hydrated.Parameters ?? string.Empty;
+
+            SelectedStartupType = dto.StartupType is int st && st != (int)ServiceStartType.Unknown && Enum.IsDefined(typeof(ServiceStartType), (ServiceStartType)st)
+                ? (ServiceStartType)st
+                : DefaultStartupType;
+
+            SelectedProcessPriority = dto.Priority is int prio && Enum.IsDefined(typeof(ProcessPriority), (ProcessPriority)prio)
+                ? (ProcessPriority)prio
+                : DefaultProcessPriority;
+
+            CpuAffinity = hydrated.CpuAffinity;
+            EnableConsoleUI = hydrated.EnableConsoleUI!.Value;
+            StdoutPath = hydrated.StdoutPath ?? string.Empty;
+            StderrPath = hydrated.StderrPath ?? string.Empty;
+            EnableSizeRotation = hydrated.EnableSizeRotation!.Value;
+            RotationSize = hydrated.RotationSize!.Value.ToString();
+            EnableDateRotation = hydrated.EnableDateRotation!.Value;
+
+            SelectedDateRotationType = dto.DateRotationType is int drt && Enum.IsDefined(typeof(DateRotationType), (DateRotationType)drt)
+                ? (DateRotationType)drt
+                : DefaultDateRotationType;
+
+            MaxRotations = hydrated.MaxRotations!.Value.ToString();
+            UseLocalTimeForRotation = hydrated.UseLocalTimeForRotation!.Value;
+            EnableHealthMonitoring = hydrated.EnableHealthMonitoring!.Value;
+            HeartbeatInterval = hydrated.HeartbeatInterval!.Value.ToString();
+            MaxFailedChecks = hydrated.MaxFailedChecks!.Value.ToString();
+
+            SelectedRecoveryAction = dto.RecoveryAction is int ra && Enum.IsDefined(typeof(RecoveryAction), (RecoveryAction)ra)
+                ? (RecoveryAction)ra
+                : DefaultRecoveryAction;
+
+            RecoveryOnCleanExit = hydrated.RecoveryOnCleanExit!.Value;
+            MaxRestartAttempts = hydrated.MaxRestartAttempts!.Value.ToString();
+            HeartbeatUrl = hydrated.HeartbeatUrl ?? string.Empty;
+            HeartbeatUrlTimeoutSeconds = hydrated.HeartbeatUrlTimeoutSeconds!.Value.ToString();
+            EnableHeartbeatUrlFlags = hydrated.EnableHeartbeatUrlFlags!.Value;
+            FailureProgramExecutablePath = hydrated.FailureProgramPath ?? string.Empty;
+            FailureProgramStartupDirectory = hydrated.FailureProgramStartupDirectory ?? string.Empty;
+            FailureProgramParameters = hydrated.FailureProgramParameters ?? string.Empty;
+            EnvironmentVariables = SafeFormatEnvironmentVariables(hydrated.EnvironmentVariables, nameof(hydrated.EnvironmentVariables), hydrated.Name);
+            AllowOverriddenRuntimeVars = hydrated.AllowOverriddenRuntimeVars!.Value;
+            ServiceDependencies = StringHelper.FormatServiceDependencies(hydrated.ServiceDependencies);
+            RunAsLocalSystem = hydrated.RunAsLocalSystem!.Value;
+            UserAccount = hydrated.UserAccount ?? string.Empty;
+            Password = hydrated.Password ?? string.Empty;
             ConfirmPassword = string.Empty;
-            PreLaunchExecutablePath = dto.PreLaunchExecutablePath ?? string.Empty;
-            PreLaunchStartupDirectory = dto.PreLaunchStartupDirectory ?? string.Empty;
-            PreLaunchParameters = dto.PreLaunchParameters ?? string.Empty;
-            PreLaunchEnvironmentVariables = StringHelper.FormatEnvironmentVariables(dto.PreLaunchEnvironmentVariables) ?? string.Empty;
-            PreLaunchStdoutPath = dto.PreLaunchStdoutPath ?? string.Empty;
-            PreLaunchStderrPath = dto.PreLaunchStderrPath ?? string.Empty;
-            PreLaunchTimeoutSeconds = dto.PreLaunchTimeoutSeconds == null ? DefaultPreLaunchTimeoutSeconds.ToString() : dto.PreLaunchTimeoutSeconds.Value.ToString();
-            PreLaunchRetryAttempts = dto.PreLaunchRetryAttempts == null ? DefaultPreLaunchRetryAttempts.ToString() : dto.PreLaunchRetryAttempts.Value.ToString();
-            PreLaunchIgnoreFailure = dto.PreLaunchIgnoreFailure ?? DefaultPreLaunchIgnoreFailure;
+            PreLaunchExecutablePath = hydrated.PreLaunchExecutablePath ?? string.Empty;
+            PreLaunchStartupDirectory = hydrated.PreLaunchStartupDirectory ?? string.Empty;
+            PreLaunchParameters = hydrated.PreLaunchParameters ?? string.Empty;
+            PreLaunchEnvironmentVariables = SafeFormatEnvironmentVariables(hydrated.PreLaunchEnvironmentVariables, nameof(hydrated.PreLaunchEnvironmentVariables), hydrated.Name);
+            PreLaunchStdoutPath = hydrated.PreLaunchStdoutPath ?? string.Empty;
+            PreLaunchStderrPath = hydrated.PreLaunchStderrPath ?? string.Empty;
+            PreLaunchTimeoutSeconds = hydrated.PreLaunchTimeoutSeconds!.Value.ToString();
+            PreLaunchRetryAttempts = hydrated.PreLaunchRetryAttempts!.Value.ToString();
+            PreLaunchIgnoreFailure = hydrated.PreLaunchIgnoreFailure!.Value;
 
-            PostLaunchExecutablePath = dto.PostLaunchExecutablePath ?? string.Empty;
-            PostLaunchStartupDirectory = dto.PostLaunchStartupDirectory ?? string.Empty;
-            PostLaunchParameters = dto.PostLaunchParameters ?? string.Empty;
+            PostLaunchExecutablePath = hydrated.PostLaunchExecutablePath ?? string.Empty;
+            PostLaunchStartupDirectory = hydrated.PostLaunchStartupDirectory ?? string.Empty;
+            PostLaunchParameters = hydrated.PostLaunchParameters ?? string.Empty;
 
-            EnableDebugLogs = dto.EnableDebugLogs ?? DefaultEnableDebugLogs;
+            EnableDebugLogs = hydrated.EnableDebugLogs!.Value;
 
-            StartTimeout = dto.StartTimeout == null ? DefaultStartTimeout.ToString() : dto.StartTimeout.Value.ToString();
-            StopTimeout = dto.StopTimeout == null ? DefaultStopTimeout.ToString() : dto.StopTimeout.Value.ToString();
+            StartTimeout = hydrated.StartTimeout!.Value.ToString();
+            StopTimeout = hydrated.StopTimeout!.Value.ToString();
 
-            PreStopExecutablePath = dto.PreStopExecutablePath ?? string.Empty;
-            PreStopStartupDirectory = dto.PreStopStartupDirectory ?? string.Empty;
-            PreStopParameters = dto.PreStopParameters ?? string.Empty;
-            PreStopTimeoutSeconds = dto.PreStopTimeoutSeconds == null ? DefaultPreStopTimeoutSeconds.ToString() : dto.PreStopTimeoutSeconds.Value.ToString();
-            PreStopLogAsError = dto.PreStopLogAsError ?? DefaultPreStopLogAsError;
+            PreStopExecutablePath = hydrated.PreStopExecutablePath ?? string.Empty;
+            PreStopStartupDirectory = hydrated.PreStopStartupDirectory ?? string.Empty;
+            PreStopParameters = hydrated.PreStopParameters ?? string.Empty;
+            PreStopTimeoutSeconds = hydrated.PreStopTimeoutSeconds!.Value.ToString();
+            PreStopLogAsError = hydrated.PreStopLogAsError!.Value;
 
-            PostStopExecutablePath = dto.PostStopExecutablePath ?? string.Empty;
-            PostStopStartupDirectory = dto.PostStopStartupDirectory ?? string.Empty;
-            PostStopParameters = dto.PostStopParameters ?? string.Empty;
+            PostStopExecutablePath = hydrated.PostStopExecutablePath ?? string.Empty;
+            PostStopStartupDirectory = hydrated.PostStopStartupDirectory ?? string.Empty;
+            PostStopParameters = hydrated.PostStopParameters ?? string.Empty;
+        }
+
+        /// <summary>
+        /// Safely formats environment variables for display, falling back to the raw unparsed string
+        /// if a <see cref="FormatException"/> is encountered.
+        /// </summary>
+        /// <param name="raw">The raw environment variables string retrieved from the database.</param>
+        /// <param name="field">The property or field name being bound, used for diagnostic logging.</param>
+        /// <param name="serviceName">The name of the service associated with the environment variables, used for diagnostic logging.</param>
+        /// <returns>
+        /// A newline-delimited, escaped string of environment variables if parsing succeeds;
+        /// otherwise, the raw unparsed string (or <see cref="string.Empty"/> if <paramref name="raw"/> is <see langword="null"/>).
+        /// </returns>
+        /// <remarks>
+        /// This guard ensures that legacy or malformed environment variable records written prior to parser validation
+        /// tightening do not throw an unhandled exception during DTO binding, allowing the user interface to populate
+        /// completely so an operator can inspect and correct the record.
+        /// </remarks>
+        private static string SafeFormatEnvironmentVariables(string? raw, string field, string? serviceName)
+        {
+            try
+            {
+                return StringHelper.FormatEnvironmentVariables(raw);
+            }
+            catch (FormatException ex)
+            {
+                Logger.Warn($"Stored {field} for service '{serviceName}' does not parse under the current rules; showing the raw value so it can be corrected. {ex.Message}");
+                return raw ?? string.Empty;
+            }
         }
 
         /// <summary>
@@ -1510,7 +1502,8 @@ namespace Servy.ViewModels
         /// <remarks>
         /// This method performs the inverse operation of <see cref="BindServiceDtoToModel(ServiceDto)"/>.
         /// It maps all ViewModel properties back into the DTO, utilizing <see cref="ConfigParser.ParseInt"/>
-        /// to ensure malformed numeric inputs are logged as warnings before applying defaults.
+        /// with a fallback of <c>-1</c>: a malformed numeric input is logged as a warning, and a malformed or empty
+        /// one is emitted as <c>-1</c>, which the range checks reject, so no default is applied here.
         /// </remarks>
         public ServiceDto ModelToServiceDto()
         {
@@ -1519,9 +1512,9 @@ namespace Servy.ViewModels
                 Name = ServiceName!,
                 DisplayName = ServiceDisplayName,
                 Description = ServiceDescription,
-                ExecutablePath = ProcessPath!,
+                ExecutablePath = ExecutablePath!,
                 StartupDirectory = StartupDirectory,
-                Parameters = ProcessParameters,
+                Parameters = Parameters,
                 StartupType = (int)SelectedStartupType,
                 Priority = (int)SelectedProcessPriority,
                 CpuAffinity = CpuAffinity,
@@ -1551,17 +1544,18 @@ namespace Servy.ViewModels
                 EnableHeartbeatUrlFlags = EnableHeartbeatUrlFlags,
 
                 // Failure Actions
-                FailureProgramPath = FailureProgramPath,
+                FailureProgramPath = FailureProgramExecutablePath,
                 FailureProgramStartupDirectory = FailureProgramStartupDirectory,
                 FailureProgramParameters = FailureProgramParameters,
 
                 // Normalized Strings
                 EnvironmentVariables = StringHelper.NormalizeString(EnvironmentVariables),
+                AllowOverriddenRuntimeVars = AllowOverriddenRuntimeVars,
                 ServiceDependencies = StringHelper.NormalizeString(ServiceDependencies),
 
                 // Credentials
                 RunAsLocalSystem = RunAsLocalSystem,
-                UserAccount = UserAccount,
+                UserAccount = UserAccount?.Trim(),
                 Password = Password,
 
                 // Pre-Launch Configuration

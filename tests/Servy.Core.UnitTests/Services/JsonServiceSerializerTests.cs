@@ -1,8 +1,10 @@
 using Newtonsoft.Json;
 using Servy.Core.Config;
 using Servy.Core.DTOs;
+using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Core.UnitTests.Helpers;
+using Servy.Core.UnitTests.Logging;
 using Servy.Testing;
 
 namespace Servy.Core.UnitTests.Services
@@ -14,7 +16,7 @@ namespace Servy.Core.UnitTests.Services
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void Deserialize_NullOrWhitespace_ReturnsNull(string? input)
         {
             // Act
@@ -48,7 +50,7 @@ namespace Servy.Core.UnitTests.Services
             Assert.NotNull(result);
             Assert.Equal("PartialService", result.Name);
 
-            // Verify hydration from ServiceDtoHelper.ApplyDefaults
+            // Verify hydration from ServiceDtoHelper.ApplyDefaultsAndResetIdentity
             Assert.Equal(AppConfig.DefaultStartTimeout, result.StartTimeout);
             Assert.Equal(AppConfig.DefaultStopTimeout, result.StopTimeout);
             Assert.Equal(AppConfig.DefaultRunAsLocalSystem, result.RunAsLocalSystem);
@@ -68,7 +70,7 @@ namespace Servy.Core.UnitTests.Services
             // Assert
             Assert.NotNull(result);
 
-            // Document baseline safe platform properties enforced by ServiceDtoHelper.ApplyDefaults
+            // Document baseline safe platform properties enforced by ServiceDtoHelper.ApplyDefaultsAndResetIdentity
             Assert.Equal(AppConfig.DefaultStartTimeout, result.StartTimeout);
             Assert.Equal(AppConfig.DefaultStopTimeout, result.StopTimeout);
             Assert.Equal(AppConfig.DefaultRunAsLocalSystem, result.RunAsLocalSystem);
@@ -93,29 +95,13 @@ namespace Servy.Core.UnitTests.Services
             Assert.NotNull(actual);
 
             // Reflection-driven comprehensive comparison of all properties mapped across serialization boundaries
-            var excludedProperties = new[] { "Id", "Pid", "UserAccount", "Password", "RunAsLocalSystem", "PreviousStopTimeout", "ActiveStdoutPath", "ActiveStderrPath" };
-            var properties = TestReflection.GetMappedProperties<ServiceDto>(excludedProperties);
+            ServiceDtoRoundTrip.AssertPropertiesSurvived(expected, actual);
 
-            foreach (var prop in properties)
-            {
-                var expectedValue = prop.GetValue(expected);
-                var actualValue = prop.GetValue(actual);
-
-                // If the expected fixture value is null, it skips evaluation to prevent
-                // breaking on values hydrated to system defaults during deserialization.
-                if (expectedValue == null)
-                {
-                    continue;
-                }
-
-                Assert.Equal(expectedValue, actualValue);
-            }
-
-            // Assert baseline defaults here. Due to [JsonIgnore] decorations,
-            // these properties never hit the serialized string payload loop during SerializeObject passes.
+            // Assert baseline defaults here. Password and RunAsLocalSystem carry [JsonIgnore], and the
+            // fixture's UserAccount needs a password, so none of them reaches the payload.
             Assert.Null(actual.UserAccount);
             Assert.Null(actual.Password);
-            Assert.True(actual.RunAsLocalSystem);
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, actual.RunAsLocalSystem);
         }
 
         [Fact]
@@ -137,15 +123,16 @@ namespace Servy.Core.UnitTests.Services
             var actual = _serializer.Deserialize(maliciousJson);
 
             // Assert
-            // SECURITY CONTRACT BOUNDARY: Verify that incoming credential vectors are completely ignored,
-            // preserving safe system defaults regardless of raw JSON stream content.
+            // SECURITY CONTRACT BOUNDARY: Verify that incoming credential vectors are ignored: the password
+            // is never read, and an account that needs one is reset to the safe system defaults.
             Assert.NotNull(actual);
             Assert.Equal("MaliciousService", actual.Name);
             Assert.Equal("C:\\malicious.exe", actual.ExecutablePath);
 
             Assert.Null(actual.UserAccount);
             Assert.Null(actual.Password);
-            Assert.True(actual.RunAsLocalSystem, "RunAsLocalSystem must fall back to its safe system default (true).");
+            // Identity is reset to the configured default, never taken from the payload.
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, actual.RunAsLocalSystem);
         }
 
         [Fact]
@@ -157,6 +144,58 @@ namespace Servy.Core.UnitTests.Services
             // Act & Assert
             Assert.Null(_serializer.Deserialize(invalidJson));
         }
+
+        #region FormatLineInfo Tests
+
+        [Fact]
+        public void FormatLineInfo_JsonReaderException_ReportsLineAndPosition()
+        {
+            // Arrange
+            // A reader-level failure carries real line/position metadata, the first switch case.
+            var ex = Assert.Throws<JsonReaderException>(() =>
+                JsonConvert.DeserializeObject<ServiceDto>("{\n  \"StopTimeout\": 12x\n}", JsonSecurity.UntrustedDataSettings));
+
+            // Act
+            var info = (string?)TestReflection.InvokeNonPublic(_serializer, "FormatLineInfo", ex);
+
+            // Assert
+            Assert.Equal($" at line {ex.LineNumber}, position {ex.LinePosition}", info);
+            Assert.NotEqual(string.Empty, info);
+        }
+
+        [Fact]
+        public void FormatLineInfo_JsonSerializationException_ReportsLineAndPosition()
+        {
+            // Arrange
+            // MissingMemberHandling.Error in UntrustedDataSettings turns an unknown property into a
+            // JsonSerializationException, the switch's second case. It does not derive from
+            // JsonReaderException, so the pre-#4459 IJsonLineInfo cast reported nothing for it.
+            var ex = Assert.Throws<JsonSerializationException>(() =>
+                JsonConvert.DeserializeObject<ServiceDto>(
+                    "{\n  \"NoSuchProperty\": 1\n}", JsonSecurity.UntrustedDataSettings));
+
+            // Act
+            var info = (string?)TestReflection.InvokeNonPublic(_serializer, "FormatLineInfo", ex);
+
+            // Assert
+            Assert.Equal($" at line {ex.LineNumber}, position {ex.LinePosition}", info);
+            Assert.NotEqual(string.Empty, info);
+        }
+
+        [Fact]
+        public void FormatLineInfo_ExceptionWithoutPositionMetadata_ReturnsEmpty()
+        {
+            // Arrange & Act
+            // Pins the default branch and the lineNumber/linePosition > 0 gate, so that no
+            // " at line 0, position 0" suffix can reach the log.
+            var info = (string?)TestReflection.InvokeNonPublic(
+                _serializer, "FormatLineInfo", new InvalidOperationException("no position"));
+
+            // Assert
+            Assert.Equal(string.Empty, info);
+        }
+
+        #endregion
 
         #region Serialize Tests
 
@@ -189,8 +228,9 @@ namespace Servy.Core.UnitTests.Services
             Assert.Contains("\n", json);
             Assert.Contains("  \"Name\":", json);
 
-            // SECURITY CONTRACT BOUNDARY: Verify that sensitive credentials are actively
-            // omitted from the outbound file payload via [JsonIgnore] attributes on ServiceDto.
+            // SECURITY CONTRACT BOUNDARY: Verify that sensitive credentials are actively omitted from the
+            // outbound file payload: Password carries [JsonIgnore], and an account that needs a password is
+            // never written (ServiceDto.ShouldSerializeUserAccount).
             Assert.DoesNotContain("UserAccount", json);
             Assert.DoesNotContain("Password", json);
             Assert.DoesNotContain("Domain\\Admin", json);
@@ -213,17 +253,141 @@ namespace Servy.Core.UnitTests.Services
 
             // Assert
             Assert.NotNull(recovered);
-            Assert.Equal(original.Name, recovered.Name);
-            Assert.Equal(original.ExecutablePath, recovered.ExecutablePath);
-            Assert.Equal(original.StartupType, recovered.StartupType);
-            Assert.Equal(original.RotationSize, recovered.RotationSize);
 
-            // Confirm structural integrity for unmapped fallback security fields
+            ServiceDtoRoundTrip.AssertPropertiesSurvived(original, recovered);
+
+            // Confirm structural integrity for unmapped fallback security fields (the fixture's account needs a
+            // password, so it is not written and the identity comes back as the LocalSystem baseline)
             Assert.Null(recovered.UserAccount);
             Assert.Null(recovered.Password);
-            Assert.True(recovered.RunAsLocalSystem);
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, recovered.RunAsLocalSystem);
+        }
+
+        [Theory]
+        [InlineData(@"NT SERVICE\MyService")]
+        [InlineData(@"NT AUTHORITY\NetworkService")]
+        [InlineData(@"DOMAIN\svc_gmsa$")]
+        public void Deserialize_PasswordlessUserAccount_KeepsTheAccountAndNeverReadsThePassword(string account)
+        {
+            // Arrange
+            var json = JsonConvert.SerializeObject(new
+            {
+                Name = "PasswordlessService",
+                ExecutablePath = "C:\\app.exe",
+                UserAccount = account,
+                Password = "RoguePassword123!",
+                RunAsLocalSystem = true
+            });
+
+            // Act
+            var actual = _serializer.Deserialize(json);
+
+            // Assert
+            Assert.NotNull(actual);
+            Assert.Equal(account, actual.UserAccount);
+            Assert.False(actual.RunAsLocalSystem);
+            Assert.Null(actual.Password);
+        }
+
+        [Fact]
+        public void Serialize_PasswordlessUserAccount_WritesTheAccountButNeverThePassword()
+        {
+            // Arrange
+            var dto = ServiceDtoFactory.CreateFull();
+            dto.UserAccount = @"NT SERVICE\MyService";
+            dto.Password = string.Empty;
+            dto.RunAsLocalSystem = false;
+
+            // Act
+            string? json = _serializer.Serialize(dto);
+
+            // Assert
+            Assert.NotNull(json);
+            Assert.Contains("\"UserAccount\": \"NT SERVICE\\\\MyService\"", json);
+            Assert.DoesNotContain("Password", json);
+            Assert.DoesNotContain("RunAsLocalSystem", json);
+        }
+
+        [Fact]
+        public void SerializeAndDeserialize_PasswordlessUserAccount_SurvivesTheRoundTrip()
+        {
+            // Arrange
+            var original = ServiceDtoFactory.CreateFull();
+            original.UserAccount = @"NT SERVICE\MyService";
+            original.Password = null;
+            original.RunAsLocalSystem = false;
+
+            // Act
+            var recovered = _serializer.Deserialize(_serializer.Serialize(original));
+
+            // Assert
+            Assert.NotNull(recovered);
+            Assert.Equal(@"NT SERVICE\MyService", recovered.UserAccount);
+            Assert.False(recovered.RunAsLocalSystem);
+            Assert.Null(recovered.Password);
         }
 
         #endregion
+    }
+
+    /// <summary>
+    /// Covers the failure entries of <see cref="JsonServiceSerializer"/> that are only observable through the
+    /// static <c>Logger</c>: the <c>JSON</c> format label and the <c>Serialize</c> catch arm.
+    /// </summary>
+    /// <remarks>
+    /// Lives in <see cref="LoggerCollection"/> because <see cref="LogCapture"/> swaps process-wide logger state,
+    /// which parallel capturing classes would otherwise swap under each other.
+    /// </remarks>
+    [Collection(LoggerCollection.Name)] // the failure entries are asserted through the static Logger
+    public class JsonServiceSerializerLogTests
+    {
+        /// <summary>The serializer under test.</summary>
+        private readonly JsonServiceSerializer _serializer = new JsonServiceSerializer();
+
+        /// <summary>
+        /// A <see cref="ServiceDto"/> whose extra property getter throws, which makes Json.NET fail with a
+        /// <see cref="JsonSerializationException"/> while serializing.
+        /// </summary>
+        private sealed class ThrowingServiceDto : ServiceDto
+        {
+            /// <summary>A property whose getter always throws.</summary>
+            public string Boom => throw new InvalidOperationException("boom");
+        }
+
+        /// <summary>
+        /// Malformed JSON carries line coordinates, so the logged entry must start with the <c>JSON</c> label
+        /// followed by the "at line" phrase.
+        /// </summary>
+        [Fact]
+        public void Deserialize_MalformedJson_LogsFailureWithTheJsonLabelAndLineInfo()
+        {
+            // Arrange
+            string malformedJson = "{\n  \"StopTimeout\": 12x\n}";
+
+            // Act
+            var (result, textLogOutput) = LogCapture.Run(() => _serializer.Deserialize(malformedJson));
+
+            // Assert
+            Assert.Null(result);
+            Assert.Contains("JSON Deserialization failed at line", textLogOutput);
+        }
+
+        /// <summary>
+        /// A serialization failure returns <c>null</c>, and the logged entry is the only place the format and
+        /// the name of the service that could not be exported are kept.
+        /// </summary>
+        [Fact]
+        public void Serialize_SerializationFailure_LogsTheFormatAndTheServiceName()
+        {
+            // Arrange
+            var throwingDto = new ThrowingServiceDto { Name = "ExportMe" };
+
+            // Act
+            var (result, textLogOutput) = LogCapture.Run(() => _serializer.Serialize(throwingDto));
+
+            // Assert
+            Assert.Null(result);
+            Assert.Contains("JSON Serialization failed for service: ExportMe", textLogOutput);
+        }
     }
 }

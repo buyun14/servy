@@ -1,9 +1,12 @@
-<?xml version="1.0" encoding="utf-8" ?>
+﻿<?xml version="1.0" encoding="utf-8" ?>
 <linker>
   <!-- Data Transfer Objects used by Dapper, JSON, and XML serializers via reflection -->
   <assembly fullname="Servy.Core">
     <type fullname="Servy.Core.DTOs.*" preserve="all" />
   </assembly>
+
+  <!-- Infrastructure components including custom SQLiteFunction implementations -->
+  <assembly fullname="Servy.Infrastructure" preserve="all" />
 
   <!-- Reflection-based JSON configuration and state serialization -->
   <assembly fullname="Newtonsoft.Json" preserve="all" />
@@ -22,7 +25,7 @@
   <assembly fullname="System.Security.AccessControl" preserve="all" />
   <assembly fullname="System.IO.FileSystem.AccessControl" preserve="all" />
 
-  <!-- Native file system, drive inspection, and directory watching P/Invoke dependencies -->
+  <!-- Drive inspection (PathSecurityGuard) and file-system primitives used by the trimmed projects -->
   <assembly fullname="System.IO.FileSystem" preserve="all" />
   <assembly fullname="System.IO.FileSystem.DriveInfo" preserve="all" />
   <assembly fullname="System.IO.FileSystem.Primitives" preserve="all" />

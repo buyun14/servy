@@ -1,0 +1,681 @@
+using Moq;
+using Servy.Core.Config;
+using Servy.Core.DTOs;
+using Servy.Core.NamedPipes;
+using Servy.Core.Native;
+using Servy.Core.Security;
+using Servy.Core.Services;
+using Servy.Testing;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
+
+namespace Servy.Core.IntegrationTests.NamedPipes
+{
+    /// <summary>
+    /// Runs <see cref="NamedPipesService"/> against a real named pipe served by this test process: the requests and their
+    /// answers, the timeouts, the server-identity check against pipe squatting, the peer process identifiers, the caller
+    /// identification and the pipe DACL.
+    /// </summary>
+    [Collection(CoreOsIntegrationCollection.Name)]
+    public class NamedPipesServiceIntegrationTests
+    {
+        /// <summary>A real pipe that is never connected or answered must fail the test, not hang the run.</summary>
+        private const int IntegrationTestTimeoutMs = 60000;
+
+        private readonly string _pipeName = "ServyTestPipe_" + Guid.NewGuid().ToString("N");
+        private readonly Mock<IWindowsServiceApi> _api = new Mock<IWindowsServiceApi>();
+
+        public NamedPipesServiceIntegrationTests()
+        {
+            // The test process plays the Servy host service
+            _api.Setup(a => a.GetServiceProcessId(AppConfig.ServyHostServiceName)).Returns(Environment.ProcessId);
+        }
+
+        private NamedPipesService CreateClient(int connectTimeoutMs = 2000, int requestTimeoutMs = 5000)
+            => new NamedPipesService(_pipeName, new ServyHostServerVerifier(_api.Object), connectTimeoutMs, requestTimeoutMs);
+
+        /// <summary>
+        /// Serves one connection: reads the request, records it, and answers with <paramref name="respond"/>
+        /// (or closes the pipe without answering when it returns <see langword="null"/>).
+        /// </summary>
+        private Task<IpcRequestDto?> ServeOnceAsync(Func<IpcRequestDto?, IpcResponseDto?> respond, CancellationToken ct, TimeSpan? delayBeforeAnswer = null)
+        {
+            var server = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            var framing = new NamedPipesService(_pipeName, new Mock<INamedPipeServerVerifier>().Object);
+            return Task.Run(async () =>
+            {
+                using (server)
+                {
+                    await server.WaitForConnectionAsync(ct);
+                    var request = await framing.ReadAsync<IpcRequestDto>(server, ct);
+
+                    // A client that refused the server closes without writing anything
+                    if (request == null)
+                        return null;
+
+                    if (delayBeforeAnswer.HasValue)
+                        await Task.Delay(delayBeforeAnswer.Value, ct);
+
+                    var response = respond(request);
+                    if (response != null)
+                        await framing.WriteAsync(server, response, ct);
+                    return request;
+                }
+            }, ct);
+        }
+
+        #region Requests
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetByName_HostAnswers_ReturnsTheConfigurationAndSendsTheAction()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true, Data = new ServiceDto { Name = "svc", ExecutablePath = "C:\\app.exe" } }, ct);
+
+            // Act
+            var dto = await Task.Run(() => CreateClient().GetByName("svc", ct), ct);
+
+            // Assert
+            Assert.Equal("C:\\app.exe", dto!.ExecutablePath);
+            var request = await served;
+            Assert.Equal(AppConfig.ServyHostGetByNameAction, request!.Action);
+            Assert.Equal("svc", request.ServiceName);
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetByName_ServiceHasNoRow_ReturnsNull()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true, Data = null }, ct);
+
+            // Act
+            var dto = await Task.Run(() => CreateClient().GetByName("svc", ct), ct);
+
+            // Assert
+            Assert.Null(dto);
+            await served;
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetByName_HostRefuses_ThrowsWithTheHostsReason()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = false, ErrorMessage = "Access denied." }, ct);
+
+            // Act
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Task.Run(() => CreateClient().GetByName("svc", ct), ct));
+
+            // Assert
+            Assert.Contains("Failed to retrieve configuration for service 'svc'", ex.Message);
+            Assert.Contains("Access denied.", ex.Message);
+            await served;
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetByName_HostClosesWithoutAnswering_Throws()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => null, ct);
+
+            // Act
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Task.Run(() => CreateClient().GetByName("svc", ct), ct));
+
+            // Assert
+            Assert.Contains("No additional error details received.", ex.Message);
+            await served;
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task UpdateRuntimeState_SendsOnlyTheRuntimeStateAndReturnsTheRowCount()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true, UpdateData = 1 }, ct);
+            var state = new ServiceRuntimeStateDto { Pid = 1234, ActiveStdoutPath = "out", ActiveStderrPath = "err", UpdatePreviousStopTimeout = true, PreviousStopTimeout = 20 };
+
+            // Act
+            var updated = await Task.Run(() => CreateClient().UpdateRuntimeState("svc", state, ct), ct);
+
+            // Assert
+            Assert.Equal(1, updated);
+            var request = await served;
+            Assert.Equal(AppConfig.ServyHostUpdateRuntimeStateAction, request!.Action);
+            Assert.Equal("svc", request.ServiceName);
+            Assert.Equal(1234, request.RuntimeState!.Pid);
+            Assert.Equal(20, request.RuntimeState.PreviousStopTimeout);
+            Assert.True(request.RuntimeState.UpdatePreviousStopTimeout);
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetRestartAttemptsAsync_ReturnsTheHostsCounter()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var when = new DateTime(2026, 10, 2, 7, 0, 0, DateTimeKind.Utc);
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true, RestartAttempts = new RestartAttemptsDto { Attempts = 3, UpdatedAtUtc = when } }, ct);
+
+            // Act
+            var attempts = await CreateClient().GetRestartAttemptsAsync("svc", ct);
+
+            // Assert
+            Assert.Equal(3, attempts.Attempts);
+            Assert.Equal(when, attempts.UpdatedAtUtc);
+            Assert.Equal(AppConfig.ServyHostGetRestartAttemptsAction, (await served)!.Action);
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetRestartAttemptsAsync_AnswerWithoutCounter_ReturnsZero()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true }, ct);
+
+            // Act
+            var attempts = await CreateClient().GetRestartAttemptsAsync("svc", ct);
+
+            // Assert
+            Assert.Equal(0, attempts.Attempts);
+            Assert.Null(attempts.UpdatedAtUtc);
+            await served;
+        }
+
+        [Theory(Timeout = IntegrationTestTimeoutMs)]
+        [InlineData(5)]
+        [InlineData(0)]
+        public async Task UpdateRestartAttemptsAsync_SendsTheCounter(int attempts)
+        {
+            // Arrange: five is a running count, zero is the reset the wrapper sends once the service is healthy again
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true, UpdateData = 1 }, ct);
+
+            // Act
+            var updated = await CreateClient().UpdateRestartAttemptsAsync("svc", attempts, ct);
+
+            // Assert
+            Assert.Equal(1, updated);
+            var request = await served;
+            Assert.Equal(AppConfig.ServyHostUpdateRestartAttemptsAction, request!.Action);
+            Assert.Equal(attempts, request.RestartAttempts);
+        }
+
+        [Theory(Timeout = IntegrationTestTimeoutMs)]
+        [InlineData(true, true)]
+        [InlineData(false, false)]
+        public async Task RefreshPipeAccessAsync_ReportsTheHostsAnswer(bool success, bool expected)
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = success }, ct);
+
+            // Act
+            var refreshed = await CreateClient().RefreshPipeAccessAsync(ct);
+
+            // Assert
+            Assert.Equal(expected, refreshed);
+            Assert.Equal(AppConfig.ServyHostRefreshPipeAccessAction, (await served)!.Action);
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task RefreshPipeAccessAsync_HostClosesWithoutAnswering_ReturnsFalse()
+        {
+            // Arrange: the server reads the request and closes the pipe without writing an answer
+            var ct = TestContext.Current.CancellationToken;
+            var served = ServeOnceAsync(_ => null, ct);
+
+            // Act
+            var refreshed = await CreateClient().RefreshPipeAccessAsync(ct);
+
+            // Assert: an empty answer is "not refreshed", and the request did reach the host
+            Assert.False(refreshed);
+            Assert.Equal(AppConfig.ServyHostRefreshPipeAccessAction, (await served)!.Action);
+        }
+
+        #endregion
+
+        #region Timeouts and an absent host
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetByName_NoHost_ThrowsTimeoutAfterTheConnectTimeout()
+        {
+            // Arrange
+            var stopwatch = Stopwatch.StartNew();
+
+            // Act
+            var ex = await Assert.ThrowsAsync<TimeoutException>(() => Task.Run(() => CreateClient(connectTimeoutMs: 200).GetByName("svc", TestContext.Current.CancellationToken)));
+
+            // Assert
+            Assert.Contains("timed out after 200 ms", ex.Message);
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(30));
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task RefreshPipeAccessAsync_NoHost_ReturnsFalseInsteadOfThrowing()
+        {
+            // Arrange, Act & Assert
+            Assert.False(await CreateClient(connectTimeoutMs: 200).RefreshPipeAccessAsync(TestContext.Current.CancellationToken));
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetRestartAttemptsAsync_HostNeverAnswers_ThrowsTimeoutAfterTheRequestTimeout()
+        {
+            // Arrange: the server reads the request and then sits on it
+            var ct = TestContext.Current.CancellationToken;
+            using (var stopServer = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true }, stopServer.Token, delayBeforeAnswer: TimeSpan.FromMinutes(5));
+
+                // Act
+                var ex = await Assert.ThrowsAsync<TimeoutException>(() => CreateClient(requestTimeoutMs: 300).GetRestartAttemptsAsync("svc", ct));
+
+                // Assert
+                Assert.Contains("did not answer the 'GetRestartAttempts' request within 300 ms", ex.Message);
+                stopServer.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => served);
+            }
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetRestartAttemptsAsync_CallerCancels_ThrowsOperationCanceledNotTimeout()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            using (var stopServer = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            using (var caller = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true }, stopServer.Token, delayBeforeAnswer: TimeSpan.FromMinutes(5));
+                caller.CancelAfter(300);
+
+                // Act & Assert
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => CreateClient(requestTimeoutMs: 60000).GetRestartAttemptsAsync("svc", caller.Token));
+
+                stopServer.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => served);
+            }
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task RefreshPipeAccessAsync_CallerCancels_ThrowsOperationCanceledInsteadOfReturningFalse()
+        {
+            // Arrange: the server reads the request and then sits on it
+            var ct = TestContext.Current.CancellationToken;
+            using (var stopServer = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            using (var caller = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true }, stopServer.Token, delayBeforeAnswer: TimeSpan.FromMinutes(5));
+                caller.CancelAfter(300);
+
+                // Act & Assert: a caller cancellation is never reported as "host not reachable"
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => CreateClient(requestTimeoutMs: 60000).RefreshPipeAccessAsync(caller.Token));
+
+                stopServer.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => served);
+            }
+        }
+
+        #endregion
+
+        #region Server identity (pipe squatting)
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetByName_PipeServedByAnotherProcessThanTheHost_RefusesBeforeSendingTheRequest()
+        {
+            // Arrange: the SCM reports another process as the host, so this process is a squatter
+            var ct = TestContext.Current.CancellationToken;
+            _api.Setup(a => a.GetServiceProcessId(AppConfig.ServyHostServiceName)).Returns(Environment.ProcessId + 1);
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true, Data = new ServiceDto { Name = "evil", ExecutablePath = "C:\\evil.exe" } }, ct);
+
+            // Act
+            var ex = await Assert.ThrowsAsync<UnauthorizedAccessException>(() => Task.Run(() => CreateClient().GetByName("svc", ct), ct));
+
+            // Assert: the client closed the connection without writing a request
+            Assert.Contains($"process {Environment.ProcessId}", ex.Message);
+            Assert.Null(await served);
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task RefreshPipeAccessAsync_PipeServedByAnotherProcessThanTheHost_ReturnsFalse()
+        {
+            // Arrange: the SCM reports another process as the host, so this process is a squatter
+            var ct = TestContext.Current.CancellationToken;
+            _api.Setup(a => a.GetServiceProcessId(AppConfig.ServyHostServiceName)).Returns(Environment.ProcessId + 1);
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true }, ct);
+
+            // Act
+            var refreshed = await CreateClient().RefreshPipeAccessAsync(ct);
+
+            // Assert: the verifier's UnauthorizedAccessException is reported as "not refreshed", and no request reached the squatter
+            Assert.False(refreshed);
+            IpcRequestDto? received = null;
+            try
+            {
+                received = await served;
+            }
+            catch (IOException)
+            {
+                // The client closed the pipe before the server's accept completed, so there was no request to read
+            }
+
+            Assert.Null(received);
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task GetByName_HostServiceNotRunning_Refuses()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            _api.Setup(a => a.GetServiceProcessId(AppConfig.ServyHostServiceName)).Returns(0);
+            var served = ServeOnceAsync(_ => new IpcResponseDto { Success = true }, ct);
+
+            // Act & Assert
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() => Task.Run(() => CreateClient().GetByName("svc", ct), ct));
+            Assert.Null(await served);
+        }
+
+        #endregion
+
+        #region Peer identification
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task PipePeer_BothEnds_ReportThisProcess()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            using (var server = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            using (var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
+            {
+                var waiting = server.WaitForConnectionAsync(ct);
+                await client.ConnectAsync(2000, ct);
+                await waiting;
+
+                // Act & Assert
+                Assert.True(PipePeer.TryGetClientProcessId(server, out var clientPid));
+                Assert.Equal(Environment.ProcessId, clientPid);
+                Assert.True(PipePeer.TryGetServerProcessId(client, out var serverPid));
+                Assert.Equal(Environment.ProcessId, serverPid);
+            }
+        }
+
+        [Fact]
+        public void PipePeer_NotConnected_ReturnsFalse()
+        {
+            // Arrange
+            using (var server = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            {
+                // Act & Assert
+                Assert.False(PipePeer.TryGetClientProcessId(server, out var pid));
+                Assert.Equal(0, pid);
+                Assert.False(PipePeer.TryGetServerProcessId(null!, out _));
+            }
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task PipeCallerIdentifier_IdentifiesThisProcessAndItsElevation()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            using (var server = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            using (var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
+            {
+                var waiting = server.WaitForConnectionAsync(ct);
+                await client.ConnectAsync(2000, ct);
+                await waiting;
+                var identifier = new PipeCallerIdentifier();
+
+                using (var pin = identifier.Pin(server))
+                {
+                    // Impersonation needs the server to have read something the client wrote. No Flush: flushing a pipe
+                    // waits until the other end has read, and that end is this same thread.
+                    var received = server.ReadAsync(new byte[1], 0, 1, ct);
+                    await client.WriteAsync(new byte[] { 1 }, 0, 1, ct);
+                    Assert.Equal(1, await received);
+
+                    // Act
+                    var caller = identifier.Identify(server, pin);
+
+                    // Assert
+                    Assert.Equal(Environment.ProcessId, caller.ProcessId);
+                    Assert.Equal(SecurityHelper.IsAdministrator(), caller.IsAdministrator);
+                }
+            }
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task PipeCallerIdentifier_Pin_BeforeTheRead_HoldsAHandleToTheClientProcessUntilDisposed()
+        {
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            using (var server = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            using (var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
+            {
+                var waiting = server.WaitForConnectionAsync(ct);
+                await client.ConnectAsync(2000, ct);
+                await waiting;
+
+                // Act: nothing has been read from the pipe yet
+                var pin = new PipeCallerIdentifier().Pin(server);
+                var held = TestReflection.GetField<IDisposable?>(pin, "_processHandle") as SafeWinProcessHandle;
+                var openWhilePinned = held != null && !held.IsInvalid && !held.IsClosed;
+                pin.Dispose();
+
+                // Assert: the identifier is this process's, an open handle to it kept it from being reused while pinned,
+                // and disposing the pin released that handle
+                Assert.Equal(Environment.ProcessId, pin.ProcessId);
+                Assert.True(openWhilePinned);
+                Assert.True(held!.IsClosed);
+            }
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task PipeCallerIdentifier_Identify_ReportsThePinnedProcessIdNotTheOneReadAfterTheRequest()
+        {
+            // Arrange: a pin carrying another identifier than the client's, which the pipe would report after the read
+            var ct = TestContext.Current.CancellationToken;
+            const int pinnedProcessId = 424242;
+            using (var server = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            using (var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
+            using (var pin = new PipeClientPin(pinnedProcessId, null))
+            {
+                var waiting = server.WaitForConnectionAsync(ct);
+                await client.ConnectAsync(2000, ct);
+                await waiting;
+                var received = server.ReadAsync(new byte[1], 0, 1, ct);
+                await client.WriteAsync(new byte[] { 1 }, 0, 1, ct);
+                Assert.Equal(1, await received);
+
+                // Act
+                var caller = new PipeCallerIdentifier().Identify(server, pin);
+
+                // Assert
+                Assert.Equal(pinnedProcessId, caller.ProcessId);
+                Assert.NotEqual(Environment.ProcessId, caller.ProcessId);
+            }
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task PipeCallerIdentifier_AnonymousClient_IsNeverAnAdministrator()
+        {
+            // Arrange: a client that allows no impersonation at all cannot be identified as anything
+            var ct = TestContext.Current.CancellationToken;
+            using (var server = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            using (var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Anonymous))
+            {
+                var waiting = server.WaitForConnectionAsync(ct);
+                await client.ConnectAsync(2000, ct);
+                await waiting;
+                var identifier = new PipeCallerIdentifier();
+
+                using (var pin = identifier.Pin(server))
+                {
+                    var received = server.ReadAsync(new byte[1], 0, 1, ct);
+                    await client.WriteAsync(new byte[] { 1 }, 0, 1, ct);
+                    Assert.Equal(1, await received);
+
+                    // Act
+                    var caller = identifier.Identify(server, pin);
+
+                    // Assert
+                    Assert.False(caller.IsAdministrator);
+                    Assert.Equal(Environment.ProcessId, caller.ProcessId);
+                }
+            }
+        }
+
+        #endregion
+
+        #region Pipe DACL
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task ServyHostPipeSecurity_AppliedToARealPipe_IsWhatTheServerInstanceCarries()
+        {
+            // Only Local System and Administrators may connect to a pipe carrying this DACL besides LocalService
+            Assert.SkipUnless(SecurityHelper.IsAdministrator(), "Connecting to a pipe with the host's DACL requires an elevated process.");
+
+            // Arrange
+            var ct = TestContext.Current.CancellationToken;
+            var localService = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var security = ServyHostPipeSecurity.Create(new[] { localService });
+
+            // Act
+            using (var server = NamedPipeServerStreamAcl.Create(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security))
+            using (var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
+            {
+                var waiting = server.WaitForConnectionAsync(ct);
+                await client.ConnectAsync(2000, ct);
+                await waiting;
+
+                // Assert: the instance's own descriptor, read back from the kernel
+                var applied = server.GetAccessControl();
+                Assert.True(applied.AreAccessRulesProtected);
+                var rules = applied.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().ToList();
+                var grant = Assert.Single(rules, r => localService.Equals(r.IdentityReference));
+                Assert.Equal(0, (int)(grant.PipeAccessRights & PipeAccessRights.CreateNewInstance));
+                Assert.DoesNotContain(rules, r => new SecurityIdentifier(WellKnownSidType.NetworkSid, null).Equals(r.IdentityReference));
+                Assert.DoesNotContain(rules, r => new SecurityIdentifier(WellKnownSidType.WorldSid, null).Equals(r.IdentityReference));
+            }
+        }
+
+        /// <summary>A protected DACL that grants Full Control to the given accounts only.</summary>
+        private static PipeSecurity Dacl(params SecurityIdentifier[] sids)
+        {
+            var security = new PipeSecurity();
+            security.SetAccessRuleProtection(true, false);
+            foreach (var sid in sids)
+                security.AddAccessRule(new PipeAccessRule(sid, PipeAccessRights.FullControl, AccessControlType.Allow));
+            return security;
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public async Task LocalPipeServer_Create_LocalClientExchangesDataAndTheInstanceCarriesTheGivenDacl()
+        {
+            // Arrange: a protected DACL that grants only the current user, so no elevation is needed
+            var ct = TestContext.Current.CancellationToken;
+            var me = WindowsIdentity.GetCurrent().User!;
+
+            // Act
+            using (var server = LocalPipeServer.Create(_pipeName, Dacl(me)))
+            using (var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            {
+                var waiting = server.WaitForConnectionAsync(ct);
+                await client.ConnectAsync(2000, ct);
+                await waiting;
+                var received = server.ReadAsync(new byte[1], 0, 1, ct);
+                await client.WriteAsync(new byte[] { 7 }, 0, 1, ct);
+
+                // Assert: the overlapped handle carries traffic, and the kernel's descriptor is the one passed in
+                Assert.Equal(1, await received);
+                var applied = server.GetAccessControl();
+                Assert.True(applied.AreAccessRulesProtected);
+                var rules = applied.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().ToList();
+                Assert.NotEmpty(rules);
+                Assert.All(rules, r => Assert.Equal(me, r.IdentityReference));
+            }
+        }
+
+        [Fact(Timeout = IntegrationTestTimeoutMs)]
+        public void LocalPipeServer_Create_ALaterInstanceReplacesTheSharedDacl()
+        {
+            // Arrange
+            var me = WindowsIdentity.GetCurrent().User!;
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+
+            using (var first = LocalPipeServer.Create(_pipeName, Dacl(me)))
+            {
+                // Act
+                using (LocalPipeServer.Create(_pipeName, Dacl(me, system)))
+                {
+                    // Assert: the first instance reads back the descriptor written through the second one
+                    var rules = first.GetAccessControl().GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>();
+                    Assert.Contains(rules, r => system.Equals(r.IdentityReference));
+                }
+            }
+        }
+
+        [Fact]
+        public void LocalPipeServer_Create_NameHeldByASingleInstancePipe_ThrowsWin32ExceptionNamingThePipe()
+        {
+            // Arrange: another server holds the name with a limit of one instance
+            var me = WindowsIdentity.GetCurrent().User!;
+            using (new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            {
+                // Act
+                var ex = Assert.Throws<Win32Exception>(() => LocalPipeServer.Create(_pipeName, Dacl(me)));
+
+                // Assert
+                Assert.Contains(_pipeName, ex.Message);
+            }
+        }
+
+        [Fact]
+        public void LocalPipeServer_Create_FirstInstanceWhileAnotherServerHoldsTheName_ThrowsAccessDenied()
+        {
+            // Arrange: another server holds the name and allows any number of instances, as a squatter could (#7537)
+            var me = WindowsIdentity.GetCurrent().User!;
+            using (new NamedPipeServerStream(_pipeName, PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            {
+                // Act
+                var ex = Assert.Throws<Win32Exception>(() => LocalPipeServer.Create(_pipeName, Dacl(me), firstInstance: true));
+
+                // Assert: FILE_FLAG_FIRST_PIPE_INSTANCE reports the held name, where an instance without it would join it
+                Assert.Equal(Errors.ERROR_ACCESS_DENIED, ex.NativeErrorCode);
+                Assert.Contains(_pipeName, ex.Message);
+            }
+        }
+
+        [Fact]
+        public void LocalPipeServer_Create_FirstInstanceFlag_OnlyTheFirstInstanceOfTheNameMayCarryIt()
+        {
+            // Arrange: the first instance of a free name, created with the flag
+            var me = WindowsIdentity.GetCurrent().User!;
+            using (LocalPipeServer.Create(_pipeName, Dacl(me), firstInstance: true))
+            {
+                // Act: a second instance that asks to be the first, then one that does not
+                var refused = Record.Exception(() => LocalPipeServer.Create(_pipeName, Dacl(me), firstInstance: true).Dispose());
+                var laterCreated = false;
+                using (LocalPipeServer.Create(_pipeName, Dacl(me), firstInstance: false))
+                    laterCreated = true;
+
+                // Assert: the flag is refused once the name exists, and a later instance without it is still created
+                var win32 = Assert.IsType<Win32Exception>(refused);
+                Assert.Equal(Errors.ERROR_ACCESS_DENIED, win32.NativeErrorCode);
+                Assert.True(laterCreated);
+            }
+        }
+
+        [Fact]
+        public void LocalPipeServer_Create_NullArguments_Throw()
+        {
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>(() => LocalPipeServer.Create(null!, new PipeSecurity()));
+            Assert.Throws<ArgumentNullException>(() => LocalPipeServer.Create(_pipeName, null!));
+        }
+
+        #endregion
+    }
+}

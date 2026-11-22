@@ -1,6 +1,7 @@
+using System.Collections.Concurrent;
 using Moq;
-using Servy.Core.Data;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using Servy.Service.CommandLine;
 using Servy.Service.Helpers;
 using Servy.Service.ProcessManagement;
@@ -12,17 +13,27 @@ namespace Servy.Service.UnitTests
 {
     /// <summary>
     /// Holds the mocked dependencies of <see cref="TestableService"/> and builds instances wired to them.
+    /// Manages lifetime disposal of all built services.
     /// </summary>
-    public class ServiceTestContext
+    public class ServiceTestContext : IDisposable
     {
-        public Mock<IServyLogger> Logger { get; set; } = new Mock<IServyLogger>();
-        public Mock<IServiceHelper> Helper { get; set; } = new Mock<IServiceHelper>();
-        public Mock<IStreamWriterFactory> StreamWriterFactory { get; set; } = new Mock<IStreamWriterFactory>();
-        public Mock<ITimerFactory> TimerFactory { get; set; } = new Mock<ITimerFactory>();
-        public Mock<IProcessFactory> ProcessFactory { get; set; } = new Mock<IProcessFactory>();
-        public Mock<IPathValidator> PathValidator { get; set; } = new Mock<IPathValidator>();
-        public Mock<IServiceRepository> ServiceRepository { get; set; } = new Mock<IServiceRepository>();
-        public Mock<Core.Helpers.IProcessKiller> ProcessKiller { get; set; } = new Mock<Core.Helpers.IProcessKiller>();
+        private readonly List<IDisposable> _builtServices = new List<IDisposable>();
+
+        // Get-only: Build() and BuildService() hand .Object to the SUT, which keeps that reference,
+        // so replacing a mock afterwards would leave the test verifying an instance the SUT never saw.
+        // Steer a dependency with Setup(), or pass a different instance to BuildService().
+        public Mock<IServyLogger> Logger { get; } = new Mock<IServyLogger>();
+        public Mock<IServiceHelper> Helper { get; } = new Mock<IServiceHelper>();
+        public Mock<IStreamWriterFactory> StreamWriterFactory { get; } = new Mock<IStreamWriterFactory>();
+        public Mock<ITimerFactory> TimerFactory { get; } = new Mock<ITimerFactory>();
+        public Mock<IProcessFactory> ProcessFactory { get; } = new Mock<IProcessFactory>();
+        public Mock<IPathValidator> PathValidator { get; } = new Mock<IPathValidator>();
+        public Mock<INamedPipesService> NamedPipesService { get; } = new Mock<INamedPipesService>();
+
+        /// <summary>
+        /// Every <c>Emitting heartbeat ping to:</c> line logged since <see cref="CaptureHeartbeatPings"/> was called, in logging order.
+        /// </summary>
+        public ConcurrentQueue<string> HeartbeatPingLines { get; } = new ConcurrentQueue<string>();
 
         public ServiceTestContext()
         {
@@ -35,33 +46,37 @@ namespace Servy.Service.UnitTests
         /// </summary>
         public TestableService Build()
         {
-            return new TestableService(
+            var service = new TestableService(
                 Helper.Object,
                 Logger.Object,
                 StreamWriterFactory.Object,
                 TimerFactory.Object,
                 ProcessFactory.Object,
                 PathValidator.Object,
-                ServiceRepository.Object,
-                ProcessKiller.Object
+                NamedPipesService.Object
             );
+
+            _builtServices.Add(service);
+            return service;
         }
 
         /// <summary>
         /// Creates a standard <see cref="Service"/> wired to this context's mocks.
         /// </summary>
-        public Service BuildService(IServiceRepository? serviceRepository = null, IServyLogger? logger = null)
+        public Service BuildService(INamedPipesService? namedPipesService = null, IServyLogger? logger = null)
         {
-            return new Service(
+            var service = new Service(
                 Helper.Object,
                 logger ?? Logger.Object,
                 StreamWriterFactory.Object,
                 TimerFactory.Object,
                 ProcessFactory.Object,
                 PathValidator.Object,
-                serviceRepository ?? ServiceRepository.Object,
-                ProcessKiller.Object
+                namedPipesService ?? NamedPipesService.Object
             );
+
+            _builtServices.Add(service);
+            return service;
         }
 
         /// <summary>
@@ -78,5 +93,62 @@ namespace Servy.Service.UnitTests
             HeartbeatUrlTimeoutInSeconds = 10,
             HeartbeatIntervalInSeconds = 30
         };
+
+        /// <summary>
+        /// Arranges the helper and logger mocks so that <c>OnStart</c> parses <paramref name="options"/>,
+        /// promotes the root logger to a scoped one and passes validation.
+        /// </summary>
+        /// <param name="options">The options <see cref="IServiceHelper.ParseOptions"/> returns.</param>
+        /// <returns>The scoped logger <c>OnStart</c> installs, which every later line of the service writes to.</returns>
+        public Mock<IServyLogger> ArrangeStart(StartOptions options)
+        {
+            var scopedLogger = new Mock<IServyLogger>();
+
+            Helper.Setup(h => h.GetArgs()).Returns(new[] { "servy.exe" });
+            Helper.Setup(h => h.ParseOptions(It.IsAny<INamedPipesService>(), It.IsAny<string[]>())).Returns(options);
+            Logger.Setup(l => l.CreateScoped(It.IsAny<string>())).Returns(scopedLogger.Object);
+            Helper.Setup(h => h.ValidateAndLog(options, scopedLogger.Object)).Returns(true);
+
+            return scopedLogger;
+        }
+
+        /// <summary>
+        /// Performs best-effort disposal of all SUT instances created via <see cref="Build"/> or <see cref="BuildService"/>.
+        /// </summary>
+        public void Dispose()
+        {
+            foreach (var service in _builtServices)
+            {
+                try
+                {
+                    service?.Dispose();
+                }
+                catch
+                {
+                    // Teardown is best-effort to prevent a failing SUT from blocking remaining disposals
+                }
+            }
+
+            _builtServices.Clear();
+        }
+
+        /// <summary>
+        /// Wires the <c>Debug</c> line <c>EmitHeartbeatPing</c> writes before its request, which is the only
+        /// observation point of a ping: the request itself goes out from a <c>Task.Run</c>.
+        /// </summary>
+        /// <returns>A source whose task completes with the first ping line.</returns>
+        public TaskCompletionSource<string> CaptureHeartbeatPings()
+        {
+            var logged = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Logger
+                .Setup(l => l.Debug(It.Is<string>(s => s.Contains("Emitting heartbeat ping to:")), It.IsAny<Exception>()))
+                .Callback<string, Exception>((msg, ex) =>
+                {
+                    HeartbeatPingLines.Enqueue(msg);
+                    logged.TrySetResult(msg);
+                });
+
+            return logged;
+        }
     }
 }

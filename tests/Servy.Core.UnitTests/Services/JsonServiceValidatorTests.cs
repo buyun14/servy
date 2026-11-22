@@ -4,6 +4,7 @@ using Servy.Core.Config;
 using Servy.Core.DTOs;
 using Servy.Core.Helpers;
 using Servy.Core.Resources;
+using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Core.Validation;
 
@@ -12,18 +13,44 @@ namespace Servy.Core.UnitTests.Services
     public class JsonServiceValidatorTests
     {
         private readonly JsonServiceValidator _validator;
+        private readonly TestableJsonServiceValidator _testableValidator;
         private readonly Mock<IProcessHelper> _processHelperMock;
+
+        private sealed class TestableJsonServiceValidator : JsonServiceValidator
+        {
+            public TestableJsonServiceValidator(IServiceValidationRules rules, long maxPayloadBytes)
+                : base(rules)
+            {
+                MaxPayloadBytes = maxPayloadBytes;
+            }
+
+            protected override long MaxPayloadBytes { get; }
+        }
 
         public JsonServiceValidatorTests()
         {
             _processHelperMock = new Mock<IProcessHelper>();
-            _validator = new JsonServiceValidator(new ServiceValidationRules(_processHelperMock.Object));
+            var rules = new ServiceValidationRules(_processHelperMock.Object);
+            _validator = new JsonServiceValidator(rules);
+            _testableValidator = new TestableJsonServiceValidator(rules, 32);
         }
+
+        #region Constructor Tests
+
+        [Fact]
+        public void Constructor_NullRules_ThrowsArgumentNullException()
+        {
+            // Arrange & Act & Assert
+            var ex = Assert.Throws<ArgumentNullException>(() => new JsonServiceValidator(null!));
+            Assert.Equal("serviceValidationRules", ex.ParamName);
+        }
+
+        #endregion
 
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void TryValidate_NullOrEmptyJson_ReturnsFalse(string? input)
         {
             // Arrange
@@ -43,7 +70,7 @@ namespace Servy.Core.UnitTests.Services
             // Arrange
             // Structural JSON failure
             var invalidJson = "{ 'invalid': 'json' ";
-            var expectedPrefix = string.Format(Strings.Msg_ImportInvalidStructure, "JSON", string.Empty).TrimEnd();
+            var expectedPrefix = string.Format(Strings.Msg_ImportInvalidStructure, "JSON", string.Empty).TrimEnd('.', ':', ' ');
 
             // Act
             var result = _validator.TryValidate(invalidJson, out var error);
@@ -93,7 +120,7 @@ namespace Servy.Core.UnitTests.Services
         }
 
         [Theory]
-        [InlineData(0)]                               // below min
+        [InlineData(0)]                                // below min
         [InlineData(AppConfig.MaxStopTimeout + 1)]    // above max
         public void TryValidate_InvalidStopTimeout_ReturnsFalse(int invalidTimeout)
         {
@@ -141,14 +168,17 @@ namespace Servy.Core.UnitTests.Services
         [Fact]
         public void TryValidate_JsonNotMatchingServiceDto_ReturnsFalse()
         {
+            // Arrange
             // Valid JSON, but the shape cannot bind to ServiceDto
             var json = "[1, 2, 3]";
-            var expectedPrefix = string.Format(Strings.Msg_ImportInvalidStructure, "JSON", string.Empty).TrimEnd();
+            var expectedPrefix = string.Format(Strings.Msg_ImportInvalidStructure, "JSON", string.Empty).TrimEnd('.', ':', ' ');
 
+            // Act
             var result = _validator.TryValidate(json, out var error);
 
+            // Assert
             Assert.False(result);
-            Assert.Contains(expectedPrefix, error);
+            Assert.StartsWith(expectedPrefix, error);
         }
 
         [Fact]
@@ -159,7 +189,7 @@ namespace Servy.Core.UnitTests.Services
             {
                 Name = "TestService",
                 ExecutablePath = "C:\\Windows\\System32\\calc.exe",
-                StopTimeout = 30000 // Valid: 30000 seconds (~8.3h, under the 86400 max)
+                StopTimeout = 30
             };
             var json = JsonConvert.SerializeObject(dto);
 
@@ -174,13 +204,49 @@ namespace Servy.Core.UnitTests.Services
         }
 
         [Fact]
-        public void TryValidate_PayloadExceedsMaxConfigFileSize_ReturnsFalse()
+        public void TryValidate_JsonWithUnknownMember_ReturnsFalse()
         {
             // Arrange
-            var oversized = new string('x', (int)AppConfig.MaxConfigFileSizeBytes + 1);
+            // MissingMemberHandling.Error in JsonSecurity.UntrustedDataSettings must reject a member
+            // that does not exist on ServiceDto, the way the XML twin rejects an unknown element.
+            // Everything else in this payload is valid, so the unknown member is the only reason to fail.
+            var json = "{\"Name\":\"TestService\",\"ExecutablePath\":\"C:\\\\Windows\\\\System32\\\\calc.exe\",\"StopTimeout\":30,\"NotAServiceDtoMember\":123}";
+            var expectedPrefix = string.Format(Strings.Msg_ImportInvalidStructure, "JSON", string.Empty).TrimEnd('.', ':', ' ');
+
+            _processHelperMock.Setup(ph => ph.ValidatePath("C:\\Windows\\System32\\calc.exe", It.IsAny<bool>())).Returns(true);
 
             // Act
-            var result = _validator.TryValidate(oversized, out var error);
+            var result = _validator.TryValidate(json, out var error);
+
+            // Assert
+            Assert.False(result);
+            Assert.StartsWith(expectedPrefix, error);
+            Assert.Contains("NotAServiceDtoMember", error);
+        }
+
+        [Fact]
+        public void UntrustedDataSettings_PinsDepthAndUnknownMemberHardening()
+        {
+            // Arrange & Act
+            // The MaxDepth guard cannot be reached through TryValidate: ServiceDto exposes only
+            // primitive properties, so a nested payload fails on the first structural mismatch (or on
+            // MissingMemberHandling) long before the reader descends 32 levels. Pin the settings
+            // object instead, which is what deleting either line would silently remove.
+            var settings = JsonSecurity.UntrustedDataSettings;
+
+            // Assert
+            Assert.Equal(AppConfig.UntrustedJsonMaxDepth, settings.MaxDepth);
+            Assert.Equal(MissingMemberHandling.Error, settings.MissingMemberHandling);
+        }
+
+        [Fact]
+        public void TryValidate_PayloadExceedsMaxConfigFileSize_ReturnsFalse()
+        {
+            // Arrange: 33 ASCII bytes > 32 byte limit
+            var oversized = new string('x', 33);
+
+            // Act
+            var result = _testableValidator.TryValidate(oversized, out var error);
 
             // Assert
             Assert.False(result);
@@ -190,16 +256,98 @@ namespace Servy.Core.UnitTests.Services
         [Fact]
         public void TryValidate_MultibytePayloadOverByteLimitButUnderCharLimit_ReturnsFalse()
         {
-            // Arrange
-            // 'é' is 2 bytes in UTF-8: half the char count, same byte count - must still be rejected
-            var oversized = new string('é', ((int)AppConfig.MaxConfigFileSizeBytes / 2) + 1);
+            // Arrange: 17 'é' characters = 34 UTF-8 bytes > 32 byte limit (under 32 char limit)
+            var oversized = new string('é', 17);
 
             // Act
-            var result = _validator.TryValidate(oversized, out var error);
+            var result = _testableValidator.TryValidate(oversized, out var error);
 
             // Assert
             Assert.False(result);
             Assert.Equal(string.Format(Strings.Msg_ImportPayloadTooLarge, "JSON", AppConfig.MaxConfigFileSizeMB), error);
         }
+
+        #region TryValidate overload that hands the parsed definition back
+
+        [Fact]
+        public void TryValidate_ValidJson_HandsBackHydratedDtoWithIdentityReset()
+        {
+            // Arrange
+            // RunAsLocalSystem/Password are [JsonIgnore] and a null UserAccount is not written, so the raw parse leaves them null;
+            // HeartbeatInterval is absent from the manifest and must come from AppConfig.
+            var dto = new ServiceDto { Name = "TestService", ExecutablePath = "C:\\path\\to\\exe" };
+            var json = JsonConvert.SerializeObject(dto);
+            _processHelperMock.Setup(ph => ph.ValidatePath(dto.ExecutablePath, It.IsAny<bool>())).Returns(true);
+
+            // Act
+            var result = _validator.TryValidate(json, out var error, out var parsed);
+
+            // Assert
+            Assert.True(result);
+            Assert.Null(error);
+            Assert.NotNull(parsed);
+            Assert.Equal("TestService", parsed.Name);
+            Assert.Equal(AppConfig.DefaultHeartbeatInterval, parsed.HeartbeatInterval);
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, parsed.RunAsLocalSystem);
+            Assert.Null(parsed.UserAccount);
+            Assert.Null(parsed.Password);
+        }
+
+        [Fact]
+        public void TryValidate_ValidJsonWithPasswordlessAccount_HandsBackTheAccount()
+        {
+            // Arrange
+            var dto = new ServiceDto { Name = "TestService", ExecutablePath = "C:\\path\\to\\exe", RunAsLocalSystem = false, UserAccount = @"NT SERVICE\TestService" };
+            var json = JsonConvert.SerializeObject(dto);
+            _processHelperMock.Setup(ph => ph.ValidatePath(dto.ExecutablePath, It.IsAny<bool>())).Returns(true);
+
+            // Act
+            var result = _validator.TryValidate(json, out var error, out var parsed);
+
+            // Assert
+            Assert.True(result);
+            Assert.Null(error);
+            Assert.NotNull(parsed);
+            Assert.False(parsed.RunAsLocalSystem);
+            Assert.Equal(@"NT SERVICE\TestService", parsed.UserAccount);
+            Assert.Null(parsed.Password);
+        }
+
+        [Fact]
+        public void TryValidate_ValidJsonWithAccountThatNeedsAPassword_HandsBackTheLocalSystemBaseline()
+        {
+            // Arrange: the account is written by hand, because an export never carries one that needs a password
+            var dto = new ServiceDto { Name = "TestService", ExecutablePath = "C:\\path\\to\\exe", RunAsLocalSystem = false, UserAccount = @"NT SERVICE\TestService" };
+            var json = JsonConvert.SerializeObject(dto).Replace(@"NT SERVICE\\", @"DOMAIN\\");
+            _processHelperMock.Setup(ph => ph.ValidatePath(dto.ExecutablePath, It.IsAny<bool>())).Returns(true);
+
+            // Act
+            var result = _validator.TryValidate(json, out var error, out var parsed);
+
+            // Assert
+            Assert.True(result);
+            Assert.Null(error);
+            Assert.NotNull(parsed);
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, parsed.RunAsLocalSystem);
+            Assert.Null(parsed.UserAccount);
+            Assert.Null(parsed.Password);
+        }
+
+        [Fact]
+        public void TryValidate_InvalidJson_HandsBackNoDto()
+        {
+            // Arrange
+            var invalidJson = "{ \"Name\": ";
+
+            // Act
+            var result = _validator.TryValidate(invalidJson, out var error, out var parsed);
+
+            // Assert
+            Assert.False(result);
+            Assert.NotNull(error);
+            Assert.Null(parsed);
+        }
+
+        #endregion
     }
 }

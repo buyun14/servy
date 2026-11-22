@@ -6,31 +6,39 @@ namespace Servy.Service.UnitTests.StreamWriters
 {
     public class StreamWriterFactoryTests
     {
-        [Fact]
-        public void Create_ReturnsInstanceOfRotatingStreamWriterAdapter()
+        [Theory]
+        // One flag on per row. Two complementary rows can never detect every transposition:
+        // "same in row 1" implies "same in row 2", which is how enableSizeRotation and
+        // useLocalTime stayed swappable after #5386. Here every pair differs in some row, and
+        // each flag takes both values across the set, so hardcoding one to a constant fails too.
+        [InlineData(true, false, false)]
+        [InlineData(false, true, false)]
+        [InlineData(false, false, true)]
+        public void Create_ForwardsAllParametersToInnerWriter(
+            bool enableSizeRotation,
+            bool enableDateRotation,
+            bool useLocalTime)
         {
             // Arrange
             var factory = new StreamWriterFactory();
             string path = Path.Combine(Path.GetTempPath(), $"ServyTest_{Guid.NewGuid():N}.log");
-            bool enableSizeRotation = true;
             long rotationSizeInBytes = 1024;
-            bool enableDateRotation = false;
             DateRotationType dateRotationType = DateRotationType.Daily;
             int maxRotations = 3;
-            bool useLocalTime = true;
 
             try
             {
-                // Act & Assert
+                // Act
                 using (var result = factory.Create(
-                    path,
-                    enableSizeRotation,
-                    rotationSizeInBytes,
-                    enableDateRotation,
-                    dateRotationType,
-                    maxRotations,
-                    useLocalTime))
+                    path: path,
+                    enableSizeRotation: enableSizeRotation,
+                    rotationSizeInBytes: rotationSizeInBytes,
+                    enableDateRotation: enableDateRotation,
+                    dateRotationType: dateRotationType,
+                    maxRotations: maxRotations,
+                    useLocalTimeForRotation: useLocalTime))
                 {
+                    // Assert
                     var adapter = Assert.IsType<RotatingStreamWriterAdapter>(result);
                     var inner = TestReflection.GetField<Core.IO.RotatingStreamWriter>(adapter, "_inner");
                     Assert.Equal(path, TestReflection.GetField<FileInfo>(inner, "_file").FullName);

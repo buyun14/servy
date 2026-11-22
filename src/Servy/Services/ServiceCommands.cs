@@ -6,24 +6,19 @@ using Servy.Core.Helpers;
 using Servy.Core.Logging;
 using Servy.Core.Services;
 using Servy.Core.Validation;
-using Servy.Models;
 using Servy.Resources;
 using Servy.UI.Services;
-using Servy.Validation;
 using System.Diagnostics;
 using System.IO;
+using Servy.UI.Validation;
 using static Servy.Config.UiAppConfig;
 using AppConfig = Servy.Core.Config.AppConfig;
 
 namespace Servy.Services
 {
     /// <summary>
-    ///  Concrete implementation of <see cref="IServiceCommands"/> that provides service management commands such as install, uninstall, start, stop, and restart.
+    /// Concrete implementation of <see cref="IServiceCommands"/> that provides service management commands such as install, uninstall, start, stop, and restart.
     /// </summary>
-    /// <remarks>
-    /// Initializes a new instance of the <see cref="ServiceCommands"/> class.
-    /// </remarks>
-    /// <exception cref="ArgumentNullException">Thrown if any argument is null.</exception>
     public class ServiceCommands : IServiceCommands
     {
         #region Constants
@@ -44,8 +39,6 @@ namespace Servy.Services
         private readonly IJsonServiceValidator _jsonServiceValidator;
         private readonly IAppConfiguration _appConfig;
         private readonly ICursorService _cursorService;
-        private readonly IXmlServiceSerializer _xmlServiceSerializer;
-        private readonly IJsonServiceSerializer _jsonServiceSerializer;
         private readonly IProcessHelper _processHelper;
 
         #endregion
@@ -56,7 +49,7 @@ namespace Servy.Services
         /// Initializes a new instance of the <see cref="ServiceCommands"/> class.
         /// </summary>
         /// <param name="modelToServiceDto">MainViewModel to ServiceDto mapper.</param>
-        /// <param name="bindServiceDtoToModel">Binds a service dto MainViewModel.</param>
+        /// <param name="bindServiceDtoToModel">Binds a service dto to MainViewModel.</param>
         /// <param name="serviceManager">The service manager responsible for performing service operations.</param>
         /// <param name="messageBoxService">The message box service used to display messages to the user.</param>
         /// <param name="dialogService">File Dialog service.</param>
@@ -65,8 +58,6 @@ namespace Servy.Services
         /// <param name="jsonServiceValidator">JSON service validator.</param>
         /// <param name="appConfig">Application configuration.</param>
         /// <param name="cursorService">Cursor service for managing cursor state during operations.</param>
-        /// <param name="xmlServiceSerializer">XML service serializer.</param>
-        /// <param name="jsonServiceSerializer">JSON service serializer.</param>
         /// <param name="processHelper">The process helper used to start processes.</param>
         /// <exception cref="ArgumentNullException">Thrown when any required dependency is <c>null</c>.</exception>
         public ServiceCommands(
@@ -80,8 +71,6 @@ namespace Servy.Services
             IJsonServiceValidator jsonServiceValidator,
             IAppConfiguration appConfig,
             ICursorService cursorService,
-            IXmlServiceSerializer xmlServiceSerializer,
-            IJsonServiceSerializer jsonServiceSerializer,
             IProcessHelper processHelper
             )
         {
@@ -95,8 +84,6 @@ namespace Servy.Services
             _jsonServiceValidator = jsonServiceValidator ?? throw new ArgumentNullException(nameof(jsonServiceValidator));
             _appConfig = appConfig ?? throw new ArgumentNullException(nameof(appConfig));
             _cursorService = cursorService ?? throw new ArgumentNullException(nameof(cursorService));
-            _xmlServiceSerializer = xmlServiceSerializer ?? throw new ArgumentNullException(nameof(xmlServiceSerializer));
-            _jsonServiceSerializer = jsonServiceSerializer ?? throw new ArgumentNullException(nameof(jsonServiceSerializer));
             _processHelper = processHelper ?? throw new ArgumentNullException(nameof(processHelper));
         }
 
@@ -105,39 +92,40 @@ namespace Servy.Services
         #region IServiceCommands Implementation
 
         /// <inheritdoc />
-        public async Task<bool> InstallServiceAsync(ServiceConfiguration config, CancellationToken cancellationToken = default)
+        public async Task<bool> InstallServiceAsync(
+            ServiceDto dto,
+            string? confirmPassword = null,
+            bool runAsLocalSystem = true,
+            CancellationToken cancellationToken = default)
         {
+            if (dto == null)
+            {
+                await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_ValidationError, Caption);
+                return false;
+            }
+
             var wrapperExePath = AppConfig.GetServyUIServicePath();
 
             if (!File.Exists(wrapperExePath))
             {
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_InvalidWrapperExePath, Caption);
+                await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_InvalidWrapperExePath, Caption);
                 return false;
             }
 
-            // 1. Obtain the canonical DTO from the ViewModel
-            // This removes the sentinel-vs-default divergence (e.g., -1 vs DefaultRotationSize)
-            var dto = _modelToServiceDto();
-
-            if (dto == null)
-            {
-                return false;
-            }
-
-            // 2. Apply install-specific overrides and masking
+            // 1. Apply install-specific overrides and masking
             // Ensure Description is not null for OS service registration
             dto.Description = dto.Description ?? string.Empty;
 
             // Mask credentials if running as LocalSystem
-            if (config.RunAsLocalSystem)
+            if (runAsLocalSystem)
             {
                 dto.UserAccount = null;
                 dto.Password = null;
             }
 
-            // 3. Validate the DTO
-            // We pass config.ConfirmPassword directly to the validator as it is a UI-only field
-            if (!await _serviceConfigurationValidator.ValidateAsync(dto, wrapperExePath: wrapperExePath, confirmPassword: config.ConfirmPassword, cancellationToken: cancellationToken))
+            // 2. Validate the DTO
+            // We pass confirmPassword directly to the validator as it is a UI-only field
+            if (!await _serviceConfigurationValidator.ValidateAsync(dto, wrapperExePath: wrapperExePath, confirmPassword: confirmPassword, cancellationToken: cancellationToken))
             {
                 return false;
             }
@@ -146,7 +134,7 @@ namespace Servy.Services
             {
                 if (_serviceManager.IsServiceInstalled(dto.Name, cancellationToken))
                 {
-                    var confirmExists = await _messageBoxService.ShowConfirmAsync(Strings.Msg_ServiceAlreadyExists, Caption);
+                    var confirmExists = await _messageBoxService.ShowConfirmAsync(string.Format(Strings.Msg_ServiceAlreadyExists, dto.Name), Caption);
                     if (!confirmExists)
                     {
                         return false;
@@ -155,7 +143,7 @@ namespace Servy.Services
 
                 _cursorService.SetWaitCursor();
 
-                // 4. Map Install Options strictly from the validated DTO
+                // 3. Map Install Options strictly from the validated DTO
                 // Conversion logic (like MB to Bytes) is handled here just before the service call
                 var effectiveSize = dto.RotationSize ?? AppConfig.DefaultRotationSizeMB;
                 var rotationSizeValue = effectiveSize > 0 ? AppConfig.ToBytes(effectiveSize) : 0;
@@ -196,6 +184,7 @@ namespace Servy.Services
                     EnableHeartbeatUrlFlags = dto.EnableHeartbeatUrlFlags ?? AppConfig.DefaultEnableHeartbeatUrlFlags,
 
                     EnvironmentVariables = dto.EnvironmentVariables,
+                    AllowOverriddenRuntimeVars = dto.AllowOverriddenRuntimeVars ?? AppConfig.DefaultAllowOverriddenRuntimeVars,
                     ServiceDependencies = dto.ServiceDependencies,
 
                     PreLaunchExePath = dto.PreLaunchExecutablePath,
@@ -210,7 +199,7 @@ namespace Servy.Services
 
                     FailureProgramPath = dto.FailureProgramPath,
                     FailureProgramStartupDirectory = dto.FailureProgramStartupDirectory,
-                    FailureProgramArgs = dto.FailureProgramParameters,
+                    FailureProgramExecutableArgs = dto.FailureProgramParameters,
 
                     PostLaunchExePath = dto.PostLaunchExecutablePath,
                     PostLaunchStartupDirectory = dto.PostLaunchStartupDirectory,
@@ -230,20 +219,20 @@ namespace Servy.Services
                     PostStopArgs = dto.PostStopParameters,
 
                     // Maintain the EnableDebugLogs override from the incoming config
-                    EnableDebugLogs = config.EnableDebugLogs
+                    EnableDebugLogs = dto.EnableDebugLogs ?? AppConfig.DefaultEnableDebugLogs
                 };
 
                 var res = await _serviceManager.InstallServiceAsync(options, cancellationToken);
 
                 if (!res.IsSuccess)
                 {
-                    var msg = !string.IsNullOrWhiteSpace(res.ErrorMessage) ? res.ErrorMessage : Strings.Msg_UnexpectedError;
+                    var msg = !string.IsNullOrWhiteSpace(res.ErrorMessage) ? res.ErrorMessage : Core.Resources.Strings.Msg_UnexpectedError;
                     Logger.Warn($"InstallService failed: {msg}");
                     await _messageBoxService.ShowErrorAsync(msg, Caption);
                     return false;
                 }
 
-                await _messageBoxService.ShowInfoAsync(Strings.Msg_ServiceInstalled, Caption);
+                await _messageBoxService.ShowInfoAsync(string.Format(Core.Resources.Strings.Msg_ServiceInstalled, options.ServiceName), Caption);
                 return true;
             }
             catch (OperationCanceledException)
@@ -258,7 +247,7 @@ namespace Servy.Services
             catch (Exception ex)
             {
                 Logger.Error(UnexpectedError, ex);
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_UnexpectedError, Caption);
+                await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, Caption);
                 return false;
             }
             finally
@@ -268,63 +257,20 @@ namespace Servy.Services
         }
 
         /// <inheritdoc />
-        public async Task<bool> UninstallServiceAsync(string? serviceName, CancellationToken cancellationToken = default)
-        {
-            if (!await IsServiceNameValidAsync(serviceName))
-            {
-                return false;
-            }
-
-            try
-            {
-                var exists = _serviceManager.IsServiceInstalled(serviceName, cancellationToken);
-                if (!exists)
-                {
-                    await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_ServiceNotFound, Caption);
-                    return false;
-                }
-
-                _cursorService.SetWaitCursor();
-                var res = await _serviceManager.UninstallServiceAsync(serviceName, cancellationToken);
-
-                if (!res.IsSuccess)
-                {
-                    var msg = !string.IsNullOrWhiteSpace(res.ErrorMessage) ? res.ErrorMessage : Strings.Msg_UnexpectedError;
-                    Logger.Warn($"UninstallService failed: {msg}");
-                    await _messageBoxService.ShowErrorAsync(msg, Caption);
-                    return false;
-                }
-
-                await _messageBoxService.ShowInfoAsync(Strings.Msg_ServiceRemoved, Caption);
-                return true;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_AdminRightsRequired, Caption);
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Logger.Error(UnexpectedError, ex);
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_UnexpectedError, Caption);
-                return false;
-            }
-            finally
-            {
-                _cursorService.ResetCursor();
-            }
-        }
+        public Task<bool> UninstallServiceAsync(string? serviceName, CancellationToken cancellationToken = default) =>
+            ExecuteServiceCommandAsync(
+                serviceName,
+                (name) => _serviceManager.UninstallServiceAsync(name, cancellationToken),
+                string.Format(Strings.Msg_ServiceRemoved, serviceName),
+                checkDisabled: false,
+                cancellationToken: cancellationToken);
 
         /// <inheritdoc />
         public Task<bool> StartServiceAsync(string? serviceName, CancellationToken cancellationToken = default) =>
             ExecuteServiceCommandAsync(
                 serviceName,
                 (name) => _serviceManager.StartServiceAsync(name, logSuccessfulStart: true, cancellationToken: cancellationToken),
-                Strings.Msg_ServiceStarted,
+                string.Format(Core.Resources.Strings.Msg_ServiceStarted, serviceName),
                 checkDisabled: true,
                 cancellationToken: cancellationToken);
 
@@ -333,7 +279,7 @@ namespace Servy.Services
             ExecuteServiceCommandAsync(
                 serviceName,
                 (name) => _serviceManager.StopServiceAsync(name, logSuccessfulStop: true, cancellationToken: cancellationToken),
-                Strings.Msg_ServiceStopped,
+                string.Format(Core.Resources.Strings.Msg_ServiceStopped, serviceName),
                 checkDisabled: false,
                 cancellationToken: cancellationToken);
 
@@ -342,7 +288,7 @@ namespace Servy.Services
             ExecuteServiceCommandAsync(
                 serviceName,
                 (name) => _serviceManager.RestartServiceAsync(name, logSuccessfulRestart: true, cancellationToken: cancellationToken),
-                Strings.Msg_ServiceRestarted,
+                string.Format(Core.Resources.Strings.Msg_ServiceRestarted, serviceName),
                 checkDisabled: true,
                 cancellationToken: cancellationToken);
 
@@ -370,8 +316,7 @@ namespace Servy.Services
         public Task ImportXmlConfigAsync(CancellationToken cancellationToken = default) =>
             ImportConfigAsync(
                 _dialogService.OpenXml,
-                (content) => { var isValid = _xmlServiceValidator.TryValidate(content, out var err); return (isValid, err); },
-                (content) => _xmlServiceSerializer.Deserialize(content),
+                (content) => { var isValid = _xmlServiceValidator.TryValidate(content, out var err, out var dto); return (isValid, err, dto); },
                 "XML",
                 Strings.Msg_FailedToLoadXml,
                 cancellationToken);
@@ -380,8 +325,7 @@ namespace Servy.Services
         public Task ImportJsonConfigAsync(CancellationToken cancellationToken = default) =>
             ImportConfigAsync(
                 _dialogService.OpenJson,
-                (content) => { var isValid = _jsonServiceValidator.TryValidate(content, out var err); return (isValid, err); },
-                (content) => _jsonServiceSerializer.Deserialize(content),
+                (content) => { var isValid = _jsonServiceValidator.TryValidate(content, out var err, out var dto); return (isValid, err, dto); },
                 "JSON",
                 Strings.Msg_FailedToLoadJson,
                 cancellationToken);
@@ -389,30 +333,51 @@ namespace Servy.Services
         /// <inheritdoc />
         public async Task OpenManagerAsync(CancellationToken cancellationToken = default)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            string? managerPath = _appConfig.ManagerAppPublishPath;
+            string baseDir = AppFoldersHelper.GetAppDirectory();
 
-            if (string.IsNullOrWhiteSpace(_appConfig.ManagerAppPublishPath) || !File.Exists(_appConfig.ManagerAppPublishPath))
+            if (string.IsNullOrWhiteSpace(managerPath) || !File.Exists(managerPath))
             {
                 await _messageBoxService.ShowErrorAsync(Strings.Msg_ManagerAppNotFound, Caption);
                 return;
             }
 
+#if !DEBUG
+            // Security invariant check: re-verify target path is safely contained within application directory
+            // (the config-time check in App.xaml.cs runs once at startup and can go stale afterwards).
+            // Compiled out in Debug deliberately: App.xaml.cs points a Debug build at
+            // AppConfig.ManagerAppPublishReleasePath, the repository's bin/Release publish folder, which is a
+            // sibling of the running app directory and would therefore be refused on every launch. This
+            // assumes Debug builds are never distributed and the repository checkout is a trusted location.
+            if (!PathSecurityGuard.IsSafelyContainedWithinAppDirectory(managerPath, baseDir))
+            {
+                Logger.Error($"Refusing to launch Manager application: Target path '{managerPath}' is not contained within application directory '{baseDir}'.");
+                await _messageBoxService.ShowErrorAsync(Strings.Msg_ManagerAppLaunchFailed, Caption);
+                return;
+            }
+#endif
+
             var forceFlag = _appConfig.ForceSoftwareRendering ? $" {AppConfig.ForceSoftwareRenderingArg}" : string.Empty;
 
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 var psi = new ProcessStartInfo
                 {
-                    FileName = _appConfig.ManagerAppPublishPath,
+                    FileName = managerPath,
                     UseShellExecute = true,
-                    Arguments = $"\"{AppConfig.SkipSplashArgument}\"{forceFlag}", // Pass false to skip splash screen
+                    Arguments = $"\"{AppConfig.SkipSplashArgument}\"{forceFlag}", // Pass argument to skip splash screen
+                    WorkingDirectory = baseDir
                 };
 
                 using (var process = _processHelper.Start(psi))
                 {
                     if (process == null)
                     {
-                        Logger.Warn($"Failed to start external process {_appConfig.ManagerAppPublishPath}.");
+                        Logger.Warn($"Failed to start external process {managerPath}.");
+                        await _messageBoxService.ShowErrorAsync(Strings.Msg_ManagerAppLaunchFailed, Caption);
+                        return;
                     }
                 }
             }
@@ -420,11 +385,42 @@ namespace Servy.Services
             {
                 throw;
             }
+            catch (UnauthorizedAccessException)
+            {
+                await _messageBoxService.ShowErrorAsync(Strings.Msg_AdminRightsRequired, Caption);
+            }
             catch (Exception ex)
             {
-                Logger.Error($"Failed to start Manager app at {_appConfig.ManagerAppPublishPath}.", ex);
+                Logger.Error($"Failed to start Manager app at {managerPath}.", ex);
                 await _messageBoxService.ShowErrorAsync(Strings.Msg_ManagerAppLaunchFailed, Caption);
             }
+        }
+
+        /// <inheritdoc />
+        public Task OpenRuntimeVariablesLinkAsync(CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = AppConfig.RuntimeVariablesUrl,
+                    UseShellExecute = true
+                };
+
+                _processHelper.Start(psi)?.Dispose();
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Failed to open runtime variables link at '{AppConfig.RuntimeVariablesUrl}'.", ex);
+            }
+
+            return Task.CompletedTask;
         }
 
         #endregion
@@ -485,7 +481,7 @@ namespace Servy.Services
                 }
                 else
                 {
-                    var errorMessage = !string.IsNullOrWhiteSpace(res.ErrorMessage) ? res.ErrorMessage : Strings.Msg_UnexpectedError;
+                    var errorMessage = !string.IsNullOrWhiteSpace(res.ErrorMessage) ? res.ErrorMessage : Core.Resources.Strings.Msg_UnexpectedError;
                     Logger.Warn($"Failed to execute operation on {serviceName}: {errorMessage}");
                     await _messageBoxService.ShowErrorAsync(errorMessage, Caption);
                     return false;
@@ -503,7 +499,7 @@ namespace Servy.Services
             catch (Exception ex)
             {
                 Logger.Error(UnexpectedError, ex);
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_UnexpectedError, Caption);
+                await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, Caption);
                 return false;
             }
             finally
@@ -513,17 +509,17 @@ namespace Servy.Services
         }
 
         /// <summary>
-        /// Validates the service name.
+        /// Validates the service name and displays a warning dialog if it is invalid.
         /// </summary>
         /// <param name="serviceName">Service name.</param>
         /// <returns>Returns true if valid; otherwise, false.</returns>
         private async Task<bool> IsServiceNameValidAsync(string? serviceName)
         {
-            var (isValid, errorMsg) = Core.Helpers.Helper.IsServiceNameValid(serviceName);
+            var (isValid, errorMsg) = Helper.IsServiceNameValid(serviceName);
 
             if (!isValid)
             {
-                await _messageBoxService.ShowWarningAsync(errorMsg, Caption);
+                await _messageBoxService.ShowErrorAsync(errorMsg, Caption);
                 return false;
             }
 
@@ -534,7 +530,7 @@ namespace Servy.Services
         /// Standardizes the configuration export pipeline, handling path resolution, security validation,
         /// and formatted logging for both XML and JSON outputs.
         /// </summary>
-        /// <param name="confirmPassword">The password provided by the user to authorize the export of sensitive configuration data.</param>
+        /// <param name="confirmPassword">The service account password confirmation, forwarded to the configuration validator and checked against the configured password; it does not authorize or unlock the export.</param>
         /// <param name="getFilePath">A delegate that triggers a file save dialog and returns the selected destination path.</param>
         /// <param name="exportAction">A delegate that performs the actual serialization and file writing for the specific format.</param>
         /// <param name="formatName">A display-friendly name of the format (e.g., "XML", "JSON") used for logging and error reporting.</param>
@@ -576,10 +572,14 @@ namespace Servy.Services
             {
                 throw;
             }
+            catch (UnauthorizedAccessException)
+            {
+                await _messageBoxService.ShowErrorAsync(Strings.Msg_AdminRightsRequired, Caption);
+            }
             catch (Exception ex)
             {
                 Logger.Error($"Failed to export service configuration to {formatName}.", ex);
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_UnexpectedError, Caption);
+                await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, Caption);
             }
             finally
             {
@@ -593,23 +593,21 @@ namespace Servy.Services
         /// </summary>
         /// <param name="getFilePath">A delegate that triggers a file open dialog and returns the selected source path.</param>
         /// <param name="validateContent">A delegate that performs raw content validation (e.g., schema or syntax checks)
-        /// and returns a tuple indicating success and any associated error message.</param>
-        /// <param name="deserialize">A delegate that converts the raw file content into a <see cref="ServiceDto"/>.</param>
+        /// and returns a tuple indicating success, any associated error message, and the materialized DTO.</param>
         /// <param name="formatName">A display-friendly name of the format (e.g., "XML", "JSON") used for logging.</param>
         /// <param name="loadErrorMessage">The localized message to display if the file content cannot be mapped to the DTO.</param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
         /// <returns>A task representing the asynchronous import operation.</returns>
         /// <remarks>
         /// The import process follows a multi-stage security gate:
-        /// 1. Security & Size Check: Prevents large file attacks, UNC bypasses, and path traversal (via <see cref="ImportGuard"/>).
-        /// 2. Raw content/syntax validation.
+        /// 1. Security &amp; Size Check: Prevents large file attacks, UNC bypasses, and path traversal (via <see cref="ImportGuard"/>).
+        /// 2. Raw content/syntax validation, which also materializes the DTO.
         /// 3. Logical domain validation (via <see cref="IServiceConfigurationValidator"/>).
         /// Only after passing all gates is the UI model updated.
         /// </remarks>
         private async Task ImportConfigAsync(
             Func<string?, string?> getFilePath,
-            Func<string, (bool IsValid, string? ErrorMsg)> validateContent,
-            Func<string, ServiceDto?> deserialize,
+            Func<string, (bool IsValid, string? ErrorMsg, ServiceDto? Dto)> validateContent,
             string formatName,
             string loadErrorMessage,
             CancellationToken cancellationToken = default)
@@ -631,6 +629,7 @@ namespace Servy.Services
                     return;
                 }
 
+                // The validator performs the single parse of the payload and hands the definition back.
                 var validation = validateContent(content);
                 if (!validation.IsValid)
                 {
@@ -638,7 +637,7 @@ namespace Servy.Services
                     return;
                 }
 
-                var dto = deserialize(content);
+                var dto = validation.Dto;
                 if (dto == null)
                 {
                     await _messageBoxService.ShowErrorAsync(loadErrorMessage, Caption);
@@ -647,7 +646,7 @@ namespace Servy.Services
 
                 if (!await _serviceConfigurationValidator.ValidateAsync(dto, importMode: true, cancellationToken: cancellationToken))
                 {
-                    Logger.Info($"{formatName} File '{path}' not valid.");
+                    Logger.Warn($"{formatName} file '{path}' is not valid.");
                     return;
                 }
 
@@ -658,10 +657,14 @@ namespace Servy.Services
             {
                 throw;
             }
+            catch (UnauthorizedAccessException)
+            {
+                await _messageBoxService.ShowErrorAsync(Strings.Msg_AdminRightsRequired, Caption);
+            }
             catch (Exception ex)
             {
                 Logger.Error($"Failed to import service configuration from {formatName}.", ex);
-                await _messageBoxService.ShowErrorAsync(Strings.Msg_UnexpectedError, Caption);
+                await _messageBoxService.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, Caption);
             }
             finally
             {

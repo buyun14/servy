@@ -1,8 +1,10 @@
+using Servy.Core.Config;
 using Servy.Core.Data;
 using Servy.Core.DTOs;
 using Servy.Core.Enums;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Manager.Config;
 using Servy.Manager.Design;
@@ -25,7 +27,7 @@ namespace Servy.Manager.ViewModels
     /// ViewModel for the main window of Servy Manager.
     /// Holds the list of services and exposes commands for managing them.
     /// </summary>
-    public class MainViewModel : SearchableViewModelBase, IDisposable
+    public class MainViewModel : SearchableViewModelBase
     {
         #region Private Fields
 
@@ -49,7 +51,12 @@ namespace Servy.Manager.ViewModels
         private readonly IAppConfiguration _appConfig;
         private readonly IProcessHelper _processHelper;
 
-        private bool _isDisposed;
+        /// <summary>
+        /// Gets the effective degree of parallelism for bulk and refresh work: 2x logical CPU cores,
+        /// capped by <see cref="IAppConfiguration.MaxBulkOperationParallelism"/>, never below 1.
+        /// </summary>
+        private int EffectiveParallelism =>
+            Math.Max(1, Math.Min(Environment.ProcessorCount * 2, _appConfig.MaxBulkOperationParallelism));
 
         #endregion
 
@@ -81,14 +88,7 @@ namespace Servy.Manager.ViewModels
         public string? SearchText
         {
             get => _searchText;
-            set
-            {
-                if (_searchText != value)
-                {
-                    _searchText = value;
-                    OnPropertyChanged();
-                }
-            }
+            set => Set(ref _searchText, value);
         }
 
         /// <summary>
@@ -99,20 +99,11 @@ namespace Servy.Manager.ViewModels
             get => _serviceCommands;
             set
             {
-                _serviceCommands = value;
-
-                if (PerformanceVM != null)
-                {
-                    PerformanceVM.ServiceCommands = value;
-                }
-                if (ConsoleVM != null)
-                {
-                    ConsoleVM.ServiceCommands = value;
-                }
-                if (DependenciesVM != null)
-                {
-                    DependenciesVM.ServiceCommands = value;
-                }
+                _serviceCommands = value ?? throw new ArgumentNullException(nameof(value));
+                PerformanceVM.ServiceCommands = value;
+                ConsoleVM.ServiceCommands = value;
+                DependenciesVM.ServiceCommands = value;
+                OnPropertyChanged();
             }
         }
 
@@ -129,6 +120,16 @@ namespace Servy.Manager.ViewModels
         /// <summary>
         /// Gets or sets the tri-state "Select All" value for the services.
         /// </summary>
+        /// <remarks>
+        /// Setting this property does two things to every row: it applies the new check state
+        /// (<see cref="ServiceRowViewModel.IsChecked"/>) and it clears the row highlight
+        /// (<see cref="ServiceRowViewModel.IsSelected"/>), so a single highlighted row is not shown
+        /// alongside a bulk selection. Checking a row by hand does not clear the highlight, so the
+        /// two paths are deliberately asymmetric.
+        /// The <c>_isUpdatingSelectAll</c> guard skips the loop while the header state is being
+        /// recomputed from the rows by <see cref="UpdateSelectAllState"/>, which is what stops a
+        /// background refresh from clearing the highlight.
+        /// </remarks>
         public bool? SelectAll
         {
             get => _selectAll;
@@ -147,7 +148,8 @@ namespace Servy.Manager.ViewModels
                     {
                         bool targetState = value == true;
 
-                        // Apply the target check-state to every row in a single pass.
+                        // Apply the target check-state to every row in a single pass, and clear the
+                        // row highlight as well so a highlighted row is not left next to a bulk selection.
                         foreach (var service in _services)
                         {
                             service.IsChecked = targetState;
@@ -172,14 +174,7 @@ namespace Servy.Manager.ViewModels
         public bool IsConfiguratorEnabled
         {
             get => _isConfiguratorEnabled;
-            set
-            {
-                if (_isConfiguratorEnabled != value)
-                {
-                    _isConfiguratorEnabled = value;
-                    OnPropertyChanged();
-                }
-            }
+            set => Set(ref _isConfiguratorEnabled, value);
         }
 
         #endregion
@@ -401,6 +396,7 @@ namespace Servy.Manager.ViewModels
         {
             if (Interlocked.CompareExchange(ref _isRefreshingFlag, 1, 0) == 1)
             {
+                Logger.Debug("Timer tick skipped; a service refresh is already in flight.");
                 return;
             }
 
@@ -413,14 +409,6 @@ namespace Servy.Manager.ViewModels
                 var token = cts.Token;
 
                 await RefreshAllServicesAsync(token);
-            }
-            catch (OperationCanceledException)
-            {
-                // Clean exit
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"Failed background refresh.", ex);
             }
             finally
             {
@@ -440,23 +428,39 @@ namespace Servy.Manager.ViewModels
             await ExecuteSearchPipelineAsync(
                 async (token) =>
                 {
-                    // Step 3: fetch data off UI thread
-                    var sw = Stopwatch.StartNew();
-                    var results = await Task.Run(() => ServiceCommands.SearchServicesAsync(SearchText, true, token), token);
-                    sw.Stop();
-                    Logger.Debug($"Created {results.Count} SearchServicesAsync in {sw.ElapsedMilliseconds} ms");
+                    // fetchAndApplyAsync 1 of 4 (runs inside the pipeline's step 5 & 6):
+                    // fetch data off UI thread
+                    var stopwatch = Stopwatch.StartNew();
+                    var results = await Task.Run(() => ServiceCommands.SearchServicesAsync(SearchText, calculatePerf: true, token), token);
+                    stopwatch.Stop();
+                    Logger.Debug($"Fetched {results.Count} services in {stopwatch.ElapsedMilliseconds} ms");
 
-                    // Step 4: fetch data & build VMs off UI thread
-                    sw = Stopwatch.StartNew();
+                    // fetchAndApplyAsync 2 of 4: build the row view models off UI thread
+                    stopwatch = Stopwatch.StartNew();
                     var vms = await Task.Run(() =>
                         results.Select(s => new ServiceRowViewModel(s, ServiceCommands, _cursorService)).ToList()
                     , token);
-                    sw.Stop();
-                    Logger.Debug($"Created {vms.Count} ServiceRowViewModels in {sw.ElapsedMilliseconds} ms");
+                    stopwatch.Stop();
+                    Logger.Debug($"Created {vms.Count} ServiceRowViewModels in {stopwatch.ElapsedMilliseconds} ms");
 
-                    // Step 5: update collection on UI thread
+                    // Superseded while the rows were being built (#1796): do not replace the newer search's grid.
+                    if (token.IsCancellationRequested)
+                    {
+                        foreach (var vm in vms) vm.Dispose();
+                        return 0;
+                    }
+
+                    // fetchAndApplyAsync 3 of 4: update collection on UI thread
                     await _dispatcher.InvokeAsync(() =>
                     {
+                        // Re-checked on the UI thread: the callback is queued at Background priority, so a newer
+                        // search can cancel this one between the check above and this point.
+                        if (token.IsCancellationRequested)
+                        {
+                            foreach (var vm in vms) vm.Dispose();
+                            return;
+                        }
+
                         // Mutual exclusion: prevents the background refresh thread from
                         // accessing the collection while we are rebuilding it.
                         lock (_servicesLock)
@@ -488,26 +492,35 @@ namespace Servy.Manager.ViewModels
                         OnPropertyChanged(nameof(HasSelectedServices));
                     }, DispatcherPriority.Background);
 
-                    // Step 6: refresh all service statuses and details in the background
+                    // Superseded while the apply callback was queued: the callback disposed the rows, so start no refresh.
+                    if (token.IsCancellationRequested) return 0;
+
+                    // fetchAndApplyAsync 4 of 4: refresh all service statuses and details in the background.
+                    // Cancel any in-flight timer refresh targeting old row ViewModels and assign a fresh token source.
+                    var oldCts = Interlocked.Exchange(ref _cts, new CancellationTokenSource());
+                    Helpers.Helper.CancelAndDisposeSafely(oldCts);
+
+                    var freshCts = _cts;
+                    var refreshToken = freshCts?.Token ?? token;
+
                     _ = Task.Run(async () =>
                     {
-                        if (Interlocked.CompareExchange(ref _isRefreshingFlag, 1, 0) == 1)
-                            return;
+                        // Wait out any canceling tick that is currently releasing _isRefreshingFlag
+                        while (Interlocked.CompareExchange(ref _isRefreshingFlag, 1, 0) == 1)
+                        {
+                            if (refreshToken.IsCancellationRequested) return;
+                            await Task.Delay(10, refreshToken).ConfigureAwait(false);
+                        }
 
                         try
                         {
-                            await RefreshAllServicesAsync(token);
+                            await RefreshAllServicesAsync(refreshToken);
                         }
-                        catch (OperationCanceledException)
+                        finally
                         {
-                            // expected when cancelled
+                            Interlocked.Exchange(ref _isRefreshingFlag, 0);
                         }
-                        catch (Exception ex)
-                        {
-                            Logger.Error($"RefreshAllServicesAsync failed.", ex);
-                        }
-                        finally { Interlocked.Exchange(ref _isRefreshingFlag, 0); }
-                    }, token);
+                    }, refreshToken);
 
                     return vms.Count;
                 },
@@ -516,17 +529,18 @@ namespace Servy.Manager.ViewModels
                 manyFormat: Strings.Footer_Service_Many,
                 onPreFetchYieldAsync: async () =>
                 {
-                    // Step 2: allow WPF to repaint the button and show progress bar
+                    // onPreFetchYieldAsync hook (runs inside the pipeline's step 3 & 4):
+                    // allow WPF to repaint the button and show progress bar
                     await _dispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
                 });
         }
 
         /// <summary>
-        /// When overridden in a derived class, provides a hook to display modal alert feedback if the underlying fetch sequence encounters an error.
+        /// Surfaces a search-pipeline failure to the user as a modal warning dialog.
         /// </summary>
         protected override async Task HandleSearchExceptionAsync(Exception ex)
         {
-            await _messageBoxService.ShowWarningAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption);
+            await _messageBoxService.ShowWarningAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption);
         }
 
         /// <summary>
@@ -563,7 +577,7 @@ namespace Servy.Manager.ViewModels
                     return ServiceCommands.StartServiceAsync(s, showMessageBox: false, cancellationToken: token);
                 },
                 Strings.Confirm_StartSelectedServices,
-                "启动所选服务失败",
+                "Failed to start selected services",
                 _cts?.Token ?? CancellationToken.None);
 
         /// <summary>
@@ -576,7 +590,7 @@ namespace Servy.Manager.ViewModels
                     return ServiceCommands.StopServiceAsync(s, showMessageBox: false, cancellationToken: token);
                 },
                 Strings.Confirm_StopSelectedServices,
-                "停止所选服务失败",
+                "Failed to stop selected services",
                 _cts?.Token ?? CancellationToken.None);
 
         /// <summary>
@@ -589,7 +603,7 @@ namespace Servy.Manager.ViewModels
                     return ServiceCommands.RestartServiceAsync(s, showMessageBox: false, cancellationToken: token);
                 },
                 Strings.Confirm_RestartSelectedServices,
-                "重启所选服务失败",
+                "Failed to restart selected services",
                 _cts?.Token ?? CancellationToken.None);
 
         #endregion
@@ -619,7 +633,7 @@ namespace Servy.Manager.ViewModels
         {
             await _helpService.OpenAboutDialogAsync(
                string.Format(Strings.Text_About,
-               Core.Config.AppConfig.Version,
+               AppConfig.Version,
                Helper.GetBuiltWithFramework(),
                DateTime.Now.Year),
                UiAppConfig.Caption);
@@ -635,14 +649,9 @@ namespace Servy.Manager.ViewModels
         /// </summary>
         public void StopRefreshTimer()
         {
-            _appConfig.PropertyChanged -= AppConfig_PropertyChanged;
-
             // Thread-safe disposal pattern
             var oldCts = Interlocked.Exchange(ref _cts, null);
-            if (oldCts != null)
-            {
-                Helpers.Helper.CancelAndDisposeSafely(oldCts);
-            }
+            Helpers.Helper.CancelAndDisposeSafely(oldCts);
 
             if (_refreshTimer != null)
             {
@@ -658,9 +667,20 @@ namespace Servy.Manager.ViewModels
         /// </summary>
         public void CreateAndStartTimer()
         {
-            if (_isDisposed) return;
+            if (Volatile.Read(ref _isDisposed) != 0) return;
 
-            Interlocked.CompareExchange(ref _cts, new CancellationTokenSource(), null);
+            // Resync state in case AppConfig changed while the Main tab was deactivated
+            IsConfiguratorEnabled = _appConfig.IsDesktopAppAvailable;
+
+            if (Volatile.Read(ref _cts) == null)
+            {
+                var candidate = new CancellationTokenSource();
+                if (Interlocked.CompareExchange(ref _cts, candidate, null) != null)
+                {
+                    // Lost the race - another thread installed a CTS first.
+                    candidate.Dispose();
+                }
+            }
 
             if (_refreshTimer == null)
             {
@@ -718,8 +738,8 @@ namespace Servy.Manager.ViewModels
                 await SetBusyStateAsync(true);
                 busyEntered = true;
 
-                // 3. Dispatch all operations concurrently: Scale parallelism up to 2x logical CPU cores, capped by application configuration.
-                int maxDegreeOfParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount * 2, _appConfig.MaxBulkOperationParallelism));
+                // 3. Dispatch all operations concurrently, at the shared hardware-aware ceiling.
+                int maxDegreeOfParallelism = EffectiveParallelism;
 
                 using (var throttler = new SemaphoreSlim(maxDegreeOfParallelism))
                 {
@@ -790,10 +810,15 @@ namespace Servy.Manager.ViewModels
                 token.ThrowIfCancellationRequested();
 
                 // 1. Take snapshot of services safely
-                var snapshot = new List<Service>();
+                List<Service> snapshot;
                 lock (_servicesLock)
                 {
                     snapshot = _services.Select(r => r.Service).ToList();
+                }
+
+                if (snapshot.Count == 0)
+                {
+                    return; // nothing to refresh: skip the SCM enumeration and the DB read
                 }
 
                 // 2. Fetch OS Info in bulk (Off UI thread)
@@ -803,30 +828,40 @@ namespace Servy.Manager.ViewModels
                 var allServicesList = await Task.Run(() => _serviceManager.GetAllServices(token), token);
 #if DEBUG
                 stopwatch.Stop();
-                Logger.Debug($"GetAllServices finished in {stopwatch.ElapsedMilliseconds}ms");
+                Logger.Debug($"GetAllServices finished in {stopwatch.ElapsedMilliseconds} ms");
 #endif
                 var allServicesDict = BuildUniqueNameDictionary(allServicesList, s => s.Name);
 
-                // 3. Fetch all Repository DTOs in bulk
-                var allDtosList = await _serviceRepository.GetAllAsync(decrypt: true, token);
+                // 3. Fetch all Repository DTOs in bulk. The tick reads only Pid, StartupType, Description, DisplayName,
+                // RunAsLocalSystem and UserAccount, none of them encrypted, so it does not decrypt: a record whose sensitive fields cannot be decrypted is then returned
+                // as stored rather than degraded, and no password is decrypted for nothing (#7328, #6486).
+                var allDtosList = await _serviceRepository.GetAllAsync(decrypt: false, token);
                 var allDtosDict = BuildUniqueNameDictionary(allDtosList, d => d.Name);
 
                 // 4. Process data collection in parallel
                 // We collect the updates in thread-safe bags instead of applying them immediately
                 var changedDtos = new System.Collections.Concurrent.ConcurrentBag<ServiceDto>();
                 var uiUpdates = new System.Collections.Concurrent.ConcurrentBag<ServiceUpdateInfo>();
-                // Scale parallelism up to 2x logical CPU cores, capped by application configuration.
-                int maxRefreshDegreeOfParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount * 2, _appConfig.MaxBulkOperationParallelism));
+                int maxRefreshDegreeOfParallelism = EffectiveParallelism;
 
-                using (var semaphore = new SemaphoreSlim(maxRefreshDegreeOfParallelism))
+                await Task.Run(() =>
                 {
-                    var tasks = snapshot.Select(async service =>
-                    {
-                        await semaphore.WaitAsync(token);
-                        try
+                    Parallel.ForEach(
+                        snapshot,
+                        new ParallelOptions
+                        {
+                            MaxDegreeOfParallelism = maxRefreshDegreeOfParallelism,
+                            CancellationToken = token
+                        },
+                        service =>
                         {
                             if (service == null || string.IsNullOrWhiteSpace(service.Name)) return;
                             allDtosDict.TryGetValue(service.Name, out var dto);
+
+                            // Read the stored description BEFORE GetServiceUpdateInfo runs: it mutates the DTO it is
+                            // given and returns that same reference, so by the time the write-back guard below is
+                            // reached dto.Description already holds the service control manager's text (#7377)
+                            var marked = DecryptionFailureMarker.IsPresent(dto?.Description);
 
                             // Collect updates without touching the UI model yet
                             var result = GetServiceUpdateInfo(service, allServicesDict, dto, token);
@@ -834,17 +869,15 @@ namespace Servy.Manager.ViewModels
                             if (result.UpdateInfo != null)
                                 uiUpdates.Add(result.UpdateInfo);
 
-                            if (result.UpdatedDto != null)
+                            // Never write back a service whose STORED description carries a decryption failure marker:
+                            // the drift the tick sees for such a row is the marker prefix itself rather than a metadata
+                            // change, so the refresh tick is not what should rewrite it - the next real save strips the
+                            // marker through DecryptionFailureMarker.Strip (#7334, #7377; the read no longer decrypts,
+                            // see step 3, so the stored text is all there is to recognize such a row by)
+                            if (result.UpdatedDto != null && !marked)
                                 changedDtos.Add(result.UpdatedDto);
-                        }
-                        finally
-                        {
-                            semaphore.Release();
-                        }
-                    }).ToList();
-
-                    await Task.WhenAll(tasks);
-                }
+                        });
+                }, token);
 
                 // 5. Batch-Apply all UI updates to the UI thread in one go
                 // This prevents the "Collection modified" crash by ensuring
@@ -863,10 +896,12 @@ namespace Servy.Manager.ViewModels
                     }, DispatcherPriority.Background, cancellationToken: token);
                 }
 
-                // 6. Execute a single atomic database batch write for all drifted services
-                if (changedDtos.Any())
+                // 6. Write back the drifted metadata. The tick syncs only Description and StartupType, so it
+                // writes only those two columns instead of upserting the whole DTO: a row read for display can
+                // then never overwrite its own stored secrets, whatever state the in-memory copy is in (#7328).
+                foreach (var dto in changedDtos)
                 {
-                    await _serviceRepository.UpsertBatchAsync(changedDtos, token);
+                    await _serviceRepository.UpdateDescriptionAndStartupTypeAsync(dto.Name, dto.Description, dto.StartupType, token);
                 }
             }
             catch (OperationCanceledException)
@@ -875,7 +910,7 @@ namespace Servy.Manager.ViewModels
             }
             catch (Exception ex)
             {
-                Logger.Error($"Failed to refresh all services.", ex);
+                Logger.Error("Failed to refresh all services.", ex);
             }
         }
 
@@ -891,7 +926,7 @@ namespace Servy.Manager.ViewModels
         /// blank names are skipped and case-insensitive duplicates keep the first occurrence (a warning is logged for the rest).
         /// </returns>
         private static Dictionary<string, T> BuildUniqueNameDictionary<T>(
-            IEnumerable<T> sourceList,
+            IEnumerable<T>? sourceList,
             Func<T, string?> nameExtractor) where T : class
         {
             var dictionary = new Dictionary<string, T>(StringComparer.OrdinalIgnoreCase);
@@ -922,11 +957,14 @@ namespace Servy.Manager.ViewModels
         }
 
         /// <summary>
-        /// Pure logic method to calculate what needs to change without touching UI models.
+        /// Calculates what needs to change for one service without touching the UI models. When the stored description or
+        /// startup type has drifted from the service control manager's, it writes the current values into
+        /// <paramref name="serviceDto"/> in place and returns that same instance as the DTO to write back, unless the
+        /// native details could not be read (<see cref="ServiceInfo.DetailsUnavailable"/>), in which case nothing is written back.
         /// </summary>
         private (ServiceUpdateInfo? UpdateInfo, ServiceDto? UpdatedDto) GetServiceUpdateInfo(
             Service service,
-            Dictionary<string, ServiceInfo>? allServices,
+            Dictionary<string, ServiceInfo> allServices,
             ServiceDto? serviceDto,
             CancellationToken token)
         {
@@ -935,15 +973,21 @@ namespace Servy.Manager.ViewModels
                 token.ThrowIfCancellationRequested();
 
                 var update = new ServiceUpdateInfo(service);
+                bool scmDetailsUnavailable = false;
 
                 // 1. Evaluate OS Status First
-                if (allServices != null && !string.IsNullOrWhiteSpace(service.Name) && allServices.TryGetValue(service.Name, out var info) && info != null)
+                if (!string.IsNullOrWhiteSpace(service.Name) && allServices.TryGetValue(service.Name, out var info) && info != null)
                 {
                     update.IsInstalled = true;
                     update.Status = info.Status;
                     update.StartupType = info.StartupType;
-                    update.LogOnAs = ServiceMapper.GetLogOnAsDisplayName(info.LogOnAs ?? UiAppConfig.LocalSystem);
+                    // An account the SCM query never returned is unknown, not Local System: keep the row's current value.
+                    update.LogOnAs = info.DetailsUnavailable && string.IsNullOrEmpty(info.LogOnAs)
+                        ? null
+                        : ServiceMapper.GetLogOnAsDisplayName(info.LogOnAs ?? UiAppConfig.LocalSystem);
                     update.Description = info.Description;
+                    update.DisplayName = info.DisplayName;
+                    scmDetailsUnavailable = info.DetailsUnavailable;
                 }
                 else
                 {
@@ -973,7 +1017,19 @@ namespace Servy.Manager.ViewModels
 
                 if (update.StartupType == null && serviceDto != null && serviceDto.StartupType.HasValue)
                 {
-                    update.StartupType = (ServiceStartType)serviceDto.StartupType.Value;
+                    update.StartupType = ConfigParser.ParseEnum(serviceDto.StartupType, AppConfig.DefaultStartupType);
+                }
+
+                // The SCM does not know this service, so the stored description is the only authority:
+                // never let the row's in-memory copy overwrite it. The same goes for the display name and the
+                // log on account, shown the way the load maps them (ServiceDtoMapper.ToDomain, ServiceMapper.ToModelAsync).
+                if (!update.IsInstalled && serviceDto != null)
+                {
+                    update.Description = serviceDto.Description ?? string.Empty;
+                    update.DisplayName = serviceDto.DisplayName ?? string.Empty;
+                    update.LogOnAs = (serviceDto.RunAsLocalSystem ?? AppConfig.DefaultRunAsLocalSystem)
+                        ? Strings.Account_LocalSystem
+                        : ServiceMapper.GetLogOnAsDisplayName(serviceDto.UserAccount);
                 }
 
                 ServiceDto? resultDto = null;
@@ -997,7 +1053,9 @@ namespace Servy.Manager.ViewModels
                     bool descDrifted = !string.Equals(dbDesc, currDesc, StringComparison.Ordinal);
                     bool startupDrifted = currentStartupType.HasValue && serviceDto.StartupType != (int)currentStartupType.Value;
 
-                    if (descDrifted || startupDrifted)
+                    // A placeholder description and an unrefined start type are not the SCM's values:
+                    // show them on the row, but never store them.
+                    if (!scmDetailsUnavailable && (descDrifted || startupDrifted))
                     {
                         serviceDto.Description = currentDescription;
                         if (currentStartupType.HasValue)
@@ -1039,7 +1097,6 @@ namespace Servy.Manager.ViewModels
             if (info.RequiresPidUpdate)
             {
                 service.Pid = info.NewPid;
-                service.IsPidEnabled = service.Pid != null;
             }
 
             service.CpuUsage = info.CpuUsage;
@@ -1057,6 +1114,9 @@ namespace Servy.Manager.ViewModels
 
             if (info.Description != null && service.Description != info.Description)
                 service.Description = info.Description;
+
+            if (info.DisplayName != null && service.DisplayName != info.DisplayName)
+                service.DisplayName = info.DisplayName;
         }
 
         /// <summary>
@@ -1075,6 +1135,7 @@ namespace Servy.Manager.ViewModels
             public ServiceStartType? StartupType { get; set; }
             public string? LogOnAs { get; set; }
             public string? Description { get; set; }
+            public string? DisplayName { get; set; }
 
             public ServiceUpdateInfo(Service target)
             {
@@ -1105,6 +1166,11 @@ namespace Servy.Manager.ViewModels
         /// Removes a service from the services collection, unsubscribes from its events,
         /// and refreshes the view. This method is thread-safe and dispatches to the UI thread.
         /// </summary>
+        /// <remarks>
+        /// Also cancels any in-flight search via <see cref="SearchableViewModelBase.ClearActiveSearchContext"/>: its results
+        /// would describe a list this removal has already changed. The search is abandoned silently -
+        /// the footer keeps the previous search's row count until the next search runs.
+        /// </remarks>
         public void RemoveService(string serviceName)
         {
             if (string.IsNullOrWhiteSpace(serviceName)) return;
@@ -1116,8 +1182,13 @@ namespace Servy.Manager.ViewModels
 
                 lock (_servicesLock)
                 {
-                    itemToRemove = _services.FirstOrDefault(s => s.Service?.Name == serviceName);
-                    if (itemToRemove == null) return;
+                    itemToRemove = _services.FirstOrDefault(s =>
+                        string.Equals(s.Service?.Name, serviceName, StringComparison.OrdinalIgnoreCase));
+                    if (itemToRemove == null)
+                    {
+                        Logger.Warn($"RemoveService({serviceName}) called, but no matching service found in the collection.");
+                        return;
+                    }
 
                     itemToRemove.PropertyChanged -= Service_PropertyChanged;
                     _services.Remove(itemToRemove);
@@ -1130,6 +1201,7 @@ namespace Servy.Manager.ViewModels
                 Logger.Debug($"RemoveService({serviceName}) finished in {stopwatch.ElapsedMilliseconds} ms");
                 ClearActiveSearchContext();
                 UpdateSelectAllState();
+                OnPropertyChanged(nameof(HasSelectedServices));
             };
 
             if (_dispatcher.CheckAccess())
@@ -1155,33 +1227,23 @@ namespace Servy.Manager.ViewModels
         #region IDisposable implementation
 
         /// <summary>
-        /// Public dispose method that clients call.
-        /// </summary>
-        public void Dispose()
-        {
-            Dispose(disposing: true);
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
         /// Protected virtual dispose method following the standard pattern.
         /// </summary>
-        protected virtual void Dispose(bool disposing)
+        protected override void Dispose(bool disposing)
         {
-            if (_isDisposed) return;
-
             if (disposing)
             {
+                _appConfig.PropertyChanged -= AppConfig_PropertyChanged;
+
                 // Stop the main timer first so no more ticks reach ServiceCommands.
                 StopRefreshTimer();
-                ClearActiveSearchContext();
 
                 // Dispose child VMs so their timers/CTS/tailers stop before we tear down
                 // the shared ServiceCommands instance they still reference.
-                (PerformanceVM as IDisposable)?.Dispose();
-                (ConsoleVM as IDisposable)?.Dispose();
-                (DependenciesVM as IDisposable)?.Dispose();
-                (LogsVM as IDisposable)?.Dispose();
+                PerformanceVM.Dispose();
+                ConsoleVM.Dispose();
+                DependenciesVM.Dispose();
+                LogsVM.Dispose();
 
                 // Drain the row VM list - unhook MainViewModel's handler and
                 // dispose each row so its own Service.PropertyChanged unsubscription runs.
@@ -1196,10 +1258,10 @@ namespace Servy.Manager.ViewModels
                 }
 
                 // Now safe to dispose the shared command engine.
-                ServiceCommands?.Dispose();
+                ServiceCommands.Dispose();
             }
 
-            _isDisposed = true;
+            base.Dispose(disposing);
         }
 
         #endregion

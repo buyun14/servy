@@ -21,16 +21,35 @@ namespace Servy.Manager.UnitTests.Converters
         [Fact]
         public void Convert_NonStringValue_ReturnsFirstLineOfToString()
         {
-            // Arrange - an object whose ToString() is multi-line, as an Exception's is.
-            var value = new InvalidOperationException("Boom");
-            var expected = value.ToString().Split('\n')[0].TrimEnd('\r');
+            // Arrange - an exception renders multi-line only once it has been thrown and its
+            // StackTrace populated; an unthrown one is a single "Type: Message" line.
+            InvalidOperationException value;
+            try { throw new InvalidOperationException("Boom"); }
+            catch (InvalidOperationException ex) { value = ex; }
+
+            // Guard the arrange: if the premise stops holding the test must fail here rather
+            // than degrade to comparing a single line with itself.
+            Assert.Contains('\n', value.ToString());
 
             // Act
             var result = _converter.Convert(value, typeof(string), null!, CultureInfo.InvariantCulture);
 
             // Assert
-            Assert.Equal(expected, result);
+            Assert.Equal("System.InvalidOperationException: Boom", result);
             Assert.DoesNotContain('\n', (string)result);
+        }
+
+        [Fact]
+        public void Convert_ObjectWhoseToStringReturnsNull_ReturnsEmptyString()
+        {
+            // Arrange
+            var value = new NullToStringObject();
+
+            // Act
+            var result = _converter.Convert(value, typeof(string), null!, CultureInfo.InvariantCulture);
+
+            // Assert
+            Assert.Equal(string.Empty, result);
         }
 
         [Theory]
@@ -38,6 +57,8 @@ namespace Servy.Manager.UnitTests.Converters
         [InlineData("First line\nSecond line", "First line")]
         [InlineData("First line\r\nSecond line", "First line")]
         [InlineData("First line\rSecond line", "First line")]
+        [InlineData("First line\nSecond line\nThird line", "First line")]
+        [InlineData("First line\r\nSecond\rThird\nFourth", "First line")]
         [InlineData("", "")]
         public void Convert_ValidString_ReturnsFirstLine(string input, string expected)
         {
@@ -48,14 +69,25 @@ namespace Servy.Manager.UnitTests.Converters
             Assert.Equal(expected, result);
         }
 
-        [Fact]
-        public void ConvertBack_ReturnsDoNothing()
+        [Theory]
+        [InlineData(null)]
+        [InlineData("Any UI value")]
+        public void ConvertBack_ReturnsDoNothing(object? value)
         {
             // Act
-            var result = _converter.ConvertBack("test", typeof(string), null!, CultureInfo.InvariantCulture);
+            var result = _converter.ConvertBack(value!, typeof(string), null!, CultureInfo.InvariantCulture);
 
             // Assert
             Assert.Equal(Binding.DoNothing, result);
+        }
+
+        /// <summary>
+        /// A bound object whose <see cref="object.ToString"/> returns null, which is the only
+        /// input that reaches the converter's null-coalescing arms.
+        /// </summary>
+        private sealed class NullToStringObject
+        {
+            public override string? ToString() => null;
         }
     }
 }

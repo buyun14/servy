@@ -1,12 +1,14 @@
 using Servy.CLI.Helpers;
+using Servy.CLI.Resources;
 using Servy.Testing;
 
 namespace Servy.CLI.UnitTests.Helpers
 {
-    [Collection("SequentialConsoleTests")]
+    [Collection(ConsoleTestCollection.Name)]
     public class ConsoleHelperTests
     {
         private const string RedirectedOverrideFieldName = "_isOutputRedirectedOverride";
+        private const string WindowWidthOverrideFieldName = "_windowWidthOverride";
 
         [Fact]
         public async Task RunWithLoadingAnimation_NullAction()
@@ -55,14 +57,14 @@ namespace Servy.CLI.UnitTests.Helpers
                     // Assert
                     Assert.True(actionExecuted);
 
-                    // If the implementation is correct, only the action's output should be here.
-                    // If the action is silent, it will be empty.
-                    // If the action DOES produce output, the helper shouldn't append animation frames.
-                    var output = sw.ToString();
-                    Assert.DoesNotContain("Testing Redirected...", output); // Ensure animation text is missing
-
-                    // Soft fallback: Do NOT use Assert.Empty(output) here because parallel tests
-                    // writing to the global Console.Out will bleed into this StringWriter instance.
+                    // The redirected path writes nothing at all: the spinner task returns before its
+                    // first frame (ConsoleHelper.cs:47) and the clearing block is skipped
+                    // (ConsoleHelper.cs:80), while the action above is silent by construction.
+                    // SequentialConsoleTests is declared with DisableParallelization = true, so no
+                    // other console-mutating test runs alongside this one and can bleed into the
+                    // writer. Assert the whole capture is empty rather than only that the animation
+                    // text is absent: any other output on this path is the regression to catch.
+                    Assert.Empty(sw.ToString());
                 }
             }
             finally
@@ -106,11 +108,76 @@ namespace Servy.CLI.UnitTests.Helpers
         }
 
         /// <summary>
-        /// Covers the non-redirected branch where the animation runs.
-        /// Because we cannot reliably toggle Console.IsOutputRedirected back to false if the test runner
-        /// environment is already redirected (e.g., CI/CD builds or Test Explorer instances), this test uses
-        /// a custom TextWriter wrapper that simulates an IOException on property access to force coverage
-        /// of the deepest nested catch block.
+        /// Covers the non-redirected branch where reading Console.WindowWidth throws and the clearing
+        /// catch writes the fallback newline. The premise is environmental and the test cannot force it:
+        /// ConsoleHelper reads Console.WindowWidth, which talks to the real console handle and is not
+        /// redirected by Console.SetOut, while the window-width override seam is an int? that cannot throw.
+        /// The premise is therefore probed in the arrange step instead of being assumed.
+        /// </summary>
+        [Fact]
+        public async Task RunWithLoadingAnimation_WhenWindowWidthThrowsIOException_ExecutesFallbackNewline()
+        {
+            // Arrange
+            // Probe the premise with the same exception filter the production clearing catch uses, so a
+            // host that does have a console is handled explicitly rather than running an assertion whose
+            // premise never held.
+            bool windowWidthThrows = false;
+            try
+            {
+                _ = Console.WindowWidth;
+            }
+            catch (Exception ex) when (ex is IOException || ex is ArgumentException || ex is InvalidOperationException)
+            {
+                windowWidthThrows = true;
+            }
+
+            Assert.SkipUnless(
+                windowWidthThrows,
+                "Console.WindowWidth does not throw in this host, so the fallback newline path cannot be "
+                + "reached without a production seam.");
+
+            Func<Task> dummyAction = () => Task.Delay(50);
+
+            // Force output redirection to false to ensure the clear-line code path runs
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            // Leave the window-width override cleared so the production property reads the real console handle
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+
+            try
+            {
+                using (var sw = new StringWriter())
+                {
+                    var originalOut = Console.Out;
+                    Console.SetOut(sw);
+
+                    try
+                    {
+                        // Act
+                        await ConsoleHelper.RunWithLoadingAnimation(dummyAction, "Testing Width Fault...");
+                    }
+                    finally
+                    {
+                        Console.SetOut(originalOut);
+                    }
+
+                    // Assert
+                    // Neither the spinner frames nor the clearing write carries a newline, so a trailing
+                    // newline can only come from the fallback Console.WriteLine() in the clearing catch.
+                    // EndsWith reports the captured output when the newline is missing.
+                    Assert.EndsWith(Environment.NewLine, sw.ToString());
+                }
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// Covers the non-redirected branch where the animation runs and line clearing write fails with an IOException.
+        /// Uses a custom TextWriter wrapper that throws an IOException on the line-clearing Write only, and sets
+        /// the window-width test seam to force execution into the clearing Console.Write branch.
         /// </summary>
         [Fact]
         public async Task RunWithLoadingAnimation_WhenLineClearingHitsIOException_ExecutesFallbackNewline()
@@ -118,13 +185,14 @@ namespace Servy.CLI.UnitTests.Helpers
             // Arrange
             Func<Task> dummyAction = () => Task.Delay(50); // Small delay to let the loop spin if it can
 
-            // Force output redirection to false to ensure the clear-line code path runs
+            // Force output redirection to false and window width to a positive value to ensure clearing Write path is reached
             TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, 80);
 
             try
             {
-                // Instantiating a TextWriter that forces an IOException upon attempting to check Console settings
-                // or write operations, simulating terminal detachment during cleanup execution.
+                // A TextWriter that throws an IOException on the line-clearing write (and on no other write),
+                // simulating terminal detachment during cleanup execution.
                 using (var faultingWriter = new FaultingStringWriter())
                 {
                     var originalOut = Console.Out;
@@ -141,7 +209,7 @@ namespace Servy.CLI.UnitTests.Helpers
                     }
 
                     // Assert
-                    // If Console.IsOutputRedirected is false in the runtime context but WindowWidth access drops an IOException,
+                    // With the redirection seam forced to false and the width seam at 80, the clearing Write throws an IOException;
                     // the catch block handles it by calling Console.WriteLine(), appending the Environment.NewLine sequence.
                     Assert.True(faultingWriter.IsFallbackWriteLineCalled);
                 }
@@ -149,6 +217,400 @@ namespace Servy.CLI.UnitTests.Helpers
             finally
             {
                 TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// The fallback catch filter in the finally block also handles ArgumentException and InvalidOperationException
+        /// (ObjectDisposedException derives from the latter, as when Console.Out was replaced by a disposed writer).
+        /// Each row makes the clearing write throw that type; none may escape the finally block, and the fallback
+        /// newline must still be written. Dropping either term from the filter fails its rows.
+        /// </summary>
+        [Theory]
+        [InlineData(typeof(ArgumentException))]
+        [InlineData(typeof(InvalidOperationException))]
+        [InlineData(typeof(ObjectDisposedException))]
+        public async Task RunWithLoadingAnimation_WhenLineClearingHitsAnotherHandledException_ExecutesFallbackNewline(Type exceptionType)
+        {
+            // Arrange
+            Func<Task> dummyAction = () => Task.Delay(50);
+            Exception fault = exceptionType == typeof(ObjectDisposedException)
+                ? new ObjectDisposedException("Console.Out")
+                : (Exception)Activator.CreateInstance(exceptionType, "Simulated failure on the clearing write.");
+
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, 80);
+
+            try
+            {
+                using (var faultingWriter = new FaultingStringWriter(fault))
+                {
+                    var originalOut = Console.Out;
+                    Console.SetOut(faultingWriter);
+
+                    try
+                    {
+                        // Act
+                        await ConsoleHelper.RunWithLoadingAnimation(dummyAction, "Testing Fallback...");
+                    }
+                    finally
+                    {
+                        Console.SetOut(originalOut);
+                    }
+
+                    // Assert
+                    // The exception did not escape the finally block, and the fallback newline was written.
+                    Assert.True(faultingWriter.IsFallbackWriteLineCalled);
+                }
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// A zero window width has no line to clear. The width guard must skip the clearing write, because
+        /// "new string(' ', width - 1)" throws for a width of 0 and the catch would then print a stray fallback newline.
+        /// </summary>
+        [Fact]
+        public async Task RunWithLoadingAnimation_WhenWindowWidthIsZero_SkipsTheClearingWriteWithoutTheFallbackNewline()
+        {
+            // Arrange
+            Func<Task> dummyAction = () => Task.Delay(50);
+
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, 0);
+
+            try
+            {
+                using (var writer = new ClearingRecordingStringWriter())
+                {
+                    var originalOut = Console.Out;
+                    Console.SetOut(writer);
+
+                    try
+                    {
+                        // Act
+                        await ConsoleHelper.RunWithLoadingAnimation(dummyAction, "Testing Zero Width...");
+                    }
+                    finally
+                    {
+                        Console.SetOut(originalOut);
+                    }
+
+                    // Assert
+                    Assert.False(writer.ClearingWriteSeen, "A zero-width window has no line to clear.");
+                    Assert.False(writer.FallbackWriteLineCalled, "The width guard must keep a zero width out of the fallback path.");
+                }
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// The clearing write blanks the line with one space fewer than the window is wide, so the cursor
+        /// never reaches the last column and the console does not wrap to the next line.
+        /// </summary>
+        [Fact]
+        public async Task RunWithLoadingAnimation_WhenWindowIsTenWide_ClearsWithNineSpaces()
+        {
+            // Arrange
+            Func<Task> dummyAction = () => Task.Delay(50);
+
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, 10);
+
+            try
+            {
+                using (var writer = new ClearingRecordingStringWriter())
+                {
+                    var originalOut = Console.Out;
+                    Console.SetOut(writer);
+
+                    try
+                    {
+                        // Act
+                        await ConsoleHelper.RunWithLoadingAnimation(dummyAction, "Working");
+                    }
+                    finally
+                    {
+                        Console.SetOut(originalOut);
+                    }
+
+                    // Assert
+                    Assert.Equal("\r" + new string(' ', 9) + "\r", writer.ClearingWrite);
+                    Assert.False(writer.FallbackWriteLineCalled);
+                }
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// A write failure on the spinner frame faults the background spinner task, and the catch around
+        /// "await spinnerTask" in RunWithLoadingAnimation's finally is the only thing that keeps that fault
+        /// from replacing the result of the caller's action. Without this case the catch can be deleted, or
+        /// narrowed to OperationCanceledException, with every test green - and a command whose work
+        /// succeeded would then report an IOException raised by a cosmetic spinner frame.
+        /// </summary>
+        [Fact]
+        public async Task RunWithLoadingAnimation_WhenSpinnerFrameWriteThrows_SwallowsFaultAndStillClearsLine()
+        {
+            // Arrange
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, 80);
+
+            try
+            {
+                using (var writer = new SpinnerFaultingStringWriter())
+                {
+                    var actionExecuted = false;
+                    Func<Task> action = () => Task.Run(() =>
+                    {
+                        // Hold the action open until the spinner has attempted (and failed) its first frame,
+                        // so the case cannot pass because the spinner never started.
+                        Assert.True(
+                            writer.SpinnerFrameAttempted.Task.Wait(TimeSpan.FromSeconds(5)),
+                            "The spinner never wrote a frame.");
+                        actionExecuted = true;
+                    });
+
+                    var originalOut = Console.Out;
+                    Console.SetOut(writer);
+                    Exception? exception;
+                    try
+                    {
+                        // Act
+                        exception = await Record.ExceptionAsync(
+                            () => ConsoleHelper.RunWithLoadingAnimation(action, "Spinner fault..."));
+                    }
+                    finally
+                    {
+                        Console.SetOut(originalOut);
+                    }
+
+                    // Assert
+                    Assert.Null(exception);
+                    Assert.True(actionExecuted, "The caller's action must still run to completion.");
+                    Assert.True(
+                        writer.ClearingWriteSeen,
+                        "The clearing write must still run after the spinner task faulted.");
+                }
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// The CLI's only caller passes no message, so the default text is what every real run shows.
+        /// Pins that the default is Strings.Msg_PreparingEnvironment, not an empty label.
+        /// </summary>
+        [Fact]
+        public async Task RunWithLoadingAnimation_WhenNoMessageIsGiven_ShowsTheDefaultPreparingMessage()
+        {
+            // Arrange
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, 80);
+
+            try
+            {
+                using (var writer = new SpinnerFrameCapturingStringWriter())
+                {
+                    // Hold the action open until the spinner has written its first frame.
+                    Func<Task> action = () => Task.Run(() =>
+                    {
+                        Assert.True(
+                            writer.SpinnerFrameWritten.Task.Wait(TimeSpan.FromSeconds(5)),
+                            "The spinner never wrote a frame.");
+                    });
+
+                    var originalOut = Console.Out;
+                    Console.SetOut(writer);
+                    try
+                    {
+                        // Act
+                        await ConsoleHelper.RunWithLoadingAnimation(action);
+                    }
+                    finally
+                    {
+                        Console.SetOut(originalOut);
+                    }
+
+                    // Assert
+                    Assert.NotNull(writer.FirstSpinnerFrame);
+                    Assert.Contains(Strings.Msg_PreparingEnvironment, writer.FirstSpinnerFrame);
+                }
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// Pins that the spinner turns: an action that outlasts one frame gets a second frame, and the
+        /// second frame shows the next spinner character.
+        /// </summary>
+        [Fact]
+        public async Task RunWithLoadingAnimation_WhenActionOutlastsOneFrame_WritesTheNextSpinnerCharacter()
+        {
+            // Arrange
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, false);
+            TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, 80);
+
+            try
+            {
+                using (var writer = new SpinnerFrameSequenceStringWriter())
+                {
+                    // Hold the action open until the spinner has written its second frame.
+                    Func<Task> action = () => Task.Run(() =>
+                    {
+                        Assert.True(
+                            writer.SecondFrameWritten.Task.Wait(TimeSpan.FromSeconds(5)),
+                            "The spinner never wrote a second frame.");
+                    });
+
+                    var originalOut = Console.Out;
+                    Console.SetOut(writer);
+                    try
+                    {
+                        // Act
+                        await ConsoleHelper.RunWithLoadingAnimation(action, "Working");
+                    }
+                    finally
+                    {
+                        Console.SetOut(originalOut);
+                    }
+
+                    // Assert
+                    Assert.True(writer.Frames.Count >= 2);
+                    Assert.Equal("\rWorking |", writer.Frames[0]);
+                    Assert.Equal("\rWorking /", writer.Frames[1]);
+                }
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), RedirectedOverrideFieldName, null);
+                TestReflection.SetFieldStatic(typeof(ConsoleHelper), WindowWidthOverrideFieldName, null);
+            }
+        }
+
+        /// <summary>
+        /// Records every spinner frame in order and signals when the second one arrives.
+        /// </summary>
+        private sealed class SpinnerFrameSequenceStringWriter : StringWriter
+        {
+            private readonly object _gate = new object();
+
+            /// <summary>
+            /// Completes once the spinner has written its second frame.
+            /// </summary>
+            public TaskCompletionSource<bool> SecondFrameWritten { get; } = new TaskCompletionSource<bool>();
+
+            /// <summary>
+            /// The spinner frames in the order they were written.
+            /// </summary>
+            public List<string> Frames { get; } = new List<string>();
+
+            /// <summary>
+            /// Records spinner frames (they start with a carriage return and do not end with one), then forwards every write.
+            /// </summary>
+            /// <param name="value">The text being written to the console.</param>
+            public override void Write(string? value)
+            {
+                if (value != null && value.StartsWith("\r") && !value.EndsWith("\r"))
+                {
+                    lock (_gate)
+                    {
+                        Frames.Add(value);
+                        if (Frames.Count == 2) SecondFrameWritten.TrySetResult(true);
+                    }
+                }
+
+                base.Write(value);
+            }
+        }
+
+        /// <summary>
+        /// Throws on the spinner frame (which starts with "\r" but does not end with it) and records the
+        /// clearing write (which starts and ends with "\r"), so the background-fault catch is the only thing
+        /// between the spinner's IOException and the caller. The inverse of
+        /// <see cref="FaultingStringWriter"/>, which faults the clearing write and leaves the spinner alone.
+        /// </summary>
+        private sealed class SpinnerFaultingStringWriter : StringWriter
+        {
+            /// <summary>
+            /// Completes as soon as the spinner has attempted its first frame.
+            /// </summary>
+            public TaskCompletionSource<bool> SpinnerFrameAttempted { get; } = new TaskCompletionSource<bool>();
+
+            /// <summary>
+            /// Whether the clearing write ran, which it can only do after the faulted spinner task was awaited.
+            /// </summary>
+            public bool ClearingWriteSeen { get; private set; }
+
+            /// <summary>
+            /// Records the clearing write and faults the spinner frame.
+            /// </summary>
+            /// <param name="value">The text being written to the console.</param>
+            /// <exception cref="IOException">Thrown on a spinner frame, simulating a detached console.</exception>
+            public override void Write(string? value)
+            {
+                if (value != null && value.StartsWith("\r") && value.EndsWith("\r"))
+                {
+                    ClearingWriteSeen = true;
+                }
+                else if (value != null && value.StartsWith("\r"))
+                {
+                    SpinnerFrameAttempted.TrySetResult(true);
+                    throw new IOException("Simulated console detach on the spinner frame.");
+                }
+
+                base.Write(value);
+            }
+        }
+
+        /// <summary>
+        /// Records the first spinner frame: it starts with "\r" and, unlike the clearing write, does not end with it.
+        /// </summary>
+        private sealed class SpinnerFrameCapturingStringWriter : StringWriter
+        {
+            /// <summary>
+            /// Completes once the spinner has written its first frame.
+            /// </summary>
+            public TaskCompletionSource<bool> SpinnerFrameWritten { get; } = new TaskCompletionSource<bool>();
+
+            /// <summary>
+            /// The text of the first spinner frame, or null if none was written.
+            /// </summary>
+            public string? FirstSpinnerFrame { get; private set; }
+
+            /// <summary>
+            /// Captures the first spinner frame, then forwards every write.
+            /// </summary>
+            /// <param name="value">The text being written to the console.</param>
+            public override void Write(string? value)
+            {
+                if (FirstSpinnerFrame == null && value != null && value.StartsWith("\r") && !value.EndsWith("\r"))
+                {
+                    FirstSpinnerFrame = value;
+                    SpinnerFrameWritten.TrySetResult(true);
+                }
+
+                base.Write(value);
             }
         }
 
@@ -157,14 +619,26 @@ namespace Servy.CLI.UnitTests.Helpers
         /// </summary>
         private class FaultingStringWriter : StringWriter
         {
+            private readonly Exception _fault;
+
+            public FaultingStringWriter(Exception? fault = null)
+            {
+                _fault = fault ?? new IOException("The handle is invalid or screen buffer configuration lost.");
+            }
+
             public bool IsFallbackWriteLineCalled { get; private set; }
 
             public override void Write(string? value)
             {
-                // Simulate an unexpected programmatic TTY drop precisely when the clearing buffer generates a blank line
-                if (value != null && value.StartsWith("\r") && value.Contains(" "))
+                // Simulate an unexpected programmatic TTY drop on the clearing write only.
+                // That write is the one whose IOException reaches the catch at ConsoleHelper.cs:90
+                // and produces the fallback newline; the spinner frame at ConsoleHelper.cs:51 also
+                // begins with "\r" and contains spaces, but its exception is swallowed at :74 and
+                // proves nothing. The clearing write is the only one of the two that also ends
+                // with "\r", so match on that and leave the spinner alone.
+                if (value != null && value.StartsWith("\r") && value.EndsWith("\r") && value.Contains(" "))
                 {
-                    throw new IOException("The handle is invalid or screen buffer configuration lost.");
+                    throw _fault;
                 }
                 base.Write(value);
             }
@@ -172,6 +646,38 @@ namespace Servy.CLI.UnitTests.Helpers
             public override void WriteLine()
             {
                 IsFallbackWriteLineCalled = true;
+                base.WriteLine();
+            }
+        }
+
+        /// <summary>
+        /// Records the clearing write (starts and ends with "\r") and the fallback WriteLine().
+        /// </summary>
+        private sealed class ClearingRecordingStringWriter : StringWriter
+        {
+            public bool ClearingWriteSeen { get; private set; }
+
+            /// <summary>
+            /// The text of the clearing write, or null when none ran.
+            /// </summary>
+            public string? ClearingWrite { get; private set; }
+
+            public bool FallbackWriteLineCalled { get; private set; }
+
+            public override void Write(string? value)
+            {
+                if (value != null && value.StartsWith("\r") && value.EndsWith("\r") && value.Contains(" "))
+                {
+                    ClearingWriteSeen = true;
+                    ClearingWrite = value;
+                }
+
+                base.Write(value);
+            }
+
+            public override void WriteLine()
+            {
+                FallbackWriteLineCalled = true;
                 base.WriteLine();
             }
         }

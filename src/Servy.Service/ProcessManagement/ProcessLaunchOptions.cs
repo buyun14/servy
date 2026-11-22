@@ -10,6 +10,11 @@ namespace Servy.Service.ProcessManagement
     public class ProcessLaunchOptions
     {
         /// <summary>
+        /// Gets or sets the label used to prefix expansion-audit log lines (e.g. "Pre-Launch", "Post-Stop").
+        /// </summary>
+        public string AuditContext { get; set; } = "ProcessLauncher.Start";
+
+        /// <summary>
         /// Gets or sets the absolute filesystem path to the executable to be launched.
         /// </summary>
         public string ExecutablePath { get; set; } = string.Empty;
@@ -22,7 +27,7 @@ namespace Servy.Service.ProcessManagement
 
         /// <summary>
         /// Gets or sets the directory in which the process will be started.
-        /// If null, the directory containing the executable is used by default.
+        /// If null, empty or whitespace, the directory containing the executable is used.
         /// </summary>
         public string? StartupDirectory { get; set; }
 
@@ -30,6 +35,11 @@ namespace Servy.Service.ProcessManagement
         /// Gets or sets the list of environment variables to be injected into the process's environment block.
         /// </summary>
         public List<EnvironmentVariable> EnvironmentVariables { get; set; } = new List<EnvironmentVariable>();
+
+        /// <summary>
+        /// Gets or sets a value indicating whether to allow overriding of protected runtime variables (e.g., <c>JAVA_HOME</c>, <c>JAVA_OPTS</c>, <c>CATALINA_OPTS</c>) by the service's environment variables.
+        /// </summary>
+        public bool AllowOverriddenRuntimeVars { get; set; }
 
         #region Behavioral Flags
 
@@ -77,8 +87,11 @@ namespace Servy.Service.ProcessManagement
         #region Redirection
 
         /// <summary>
-        /// Gets or sets a value indicating whether standard output and error should be redirected
-        /// to the service's internal rotating log writers.
+        /// Gets or sets a value indicating whether standard output and error should be appended
+        /// to the files named by <see cref="StdoutPath"/>/<see cref="StderrPath"/>.
+        /// Honoured only for a synchronous launch without a console window: it is ignored when
+        /// <see cref="FireAndForget"/> or <see cref="EnableConsoleUI"/> is true, and a stream whose path is not set is not captured.
+        /// Unlike the main monitored process, these writers do not rotate.
         /// </summary>
         public bool RedirectToWriters { get; set; } = false;
 

@@ -10,7 +10,7 @@ namespace Servy.Manager.ViewModels
     /// <summary>
     /// Base class providing a unified, thread-safe seven-step search pipeline infrastructure with integrated cancellation and footer telemetry tracking.
     /// </summary>
-    public abstract class SearchableViewModelBase : ViewModelBase
+    public abstract class SearchableViewModelBase : ViewModelBase, IDisposable
     {
         #region Fields
 
@@ -24,9 +24,21 @@ namespace Servy.Manager.ViewModels
         /// </summary>
         protected readonly ICursorService _cursorService;
 
+        /// <summary>
+        /// Atomic flag representing whether the current instance has been disposed (0 = false, 1 = true).
+        /// </summary>
+        protected int _isDisposed = 0;
+
         #endregion
 
         #region Properties
+
+        /// <summary>
+        /// Whether a search has completed at least once for this view model, regardless of
+        /// how many results it returned. Used to decide whether a newly loaded view needs
+        /// its initial population.
+        /// </summary>
+        public bool HasSearched { get; protected set; }
 
         /// <summary>
         /// Indicates whether a background operation is running.
@@ -76,33 +88,56 @@ namespace Servy.Manager.ViewModels
         /// Runs the centralized seven-step search pipeline engine thread-safely.
         /// </summary>
         /// <param name="fetchAndApplyAsync">Asynchronous delegate to execute the data query and process collection changes.</param>
-        /// <param name="noneFormat">String format constraint applied when zero matches return.</param>
-        /// <param name="oneFormat">String format constraint applied when exactly one match returns.</param>
-        /// <param name="manyFormat">String format constraint applied when multiple matches return.</param>
+        /// <param name="noneFormat">Footer format string used when the search returns no matches.</param>
+        /// <param name="oneFormat">Footer format string used when the search returns exactly one match.</param>
+        /// <param name="manyFormat">Footer format string used when the search returns multiple matches.</param>
         /// <param name="onPreFetchYieldAsync">Optional hook parameter allowing views to trigger intermediary UI thread dispatcher yielding.</param>
-        /// <returns>A tracking execution task container handle.</returns>
+        /// <returns>A task that represents the asynchronous search operation.</returns>
         protected async Task ExecuteSearchPipelineAsync(
             Func<CancellationToken, Task<int>> fetchAndApplyAsync,
-            string noneFormat,
-            string oneFormat,
-            string manyFormat,
+            string? noneFormat = null,
+            string? oneFormat = null,
+            string? manyFormat = null,
             Func<Task>? onPreFetchYieldAsync = null)
         {
+            // LIFECYCLE GATE: Bail immediately if the ViewModel has already initiated teardown
+            if (Volatile.Read(ref _isDisposed) != 0)
+            {
+                return;
+            }
+
             // Step 1 & 2: Stopwatch initialization and atomic thread-safe CTS swap
             var stopwatch = Stopwatch.StartNew();
             var newCts = new CancellationTokenSource();
-            var token = newCts.Token;
             var oldCts = Interlocked.Exchange(ref _searchCts, newCts);
+            Helpers.Helper.CancelAndDisposeSafely(oldCts);
 
-            if (oldCts != null)
+            OnSearchCtsSwapped();
+
+            CancellationToken token;
+            try
             {
-                Helpers.Helper.CancelAndDisposeSafely(oldCts);
+                // RACING DISPOSE CHECK: Capture token safely. If a racing Dispose pulled this
+                // instance out from under us and processed it, this will throw an ObjectDisposedException.
+                token = newCts.Token;
+
+                // Re-verify global disposal state immediately after the swap to handle tight race windows
+                if (Volatile.Read(ref _isDisposed) != 0)
+                {
+                    Helpers.Helper.CancelAndDisposeSafely(newCts);
+                    return;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // Captured CTS was cancelled and disposed mid-swap by a racing Dispose thread. Exit cleanly.
+                return;
             }
 
             try
             {
                 // Step 3 & 4: Clear footer text and present wait state boundaries immediately
-                FooterText = string.Empty; // Clear footer text before search
+                FooterText = string.Empty;
                 _cursorService.SetWaitCursor();
                 SearchButtonText = Strings.Button_Searching;
                 IsBusy = true;
@@ -115,15 +150,24 @@ namespace Servy.Manager.ViewModels
                 // Step 5 & 6: Execute site-specific query actions and update underlying collection records
                 int matchCount = await fetchAndApplyAsync(token);
 
-                token.ThrowIfCancellationRequested();
+                if (token.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                HasSearched = true;
+
                 stopwatch.Stop();
 
-                FooterText = UiHelper.GetRowsInfo(
-                    count: matchCount,
-                    duration: stopwatch.Elapsed,
-                    noneFormat: noneFormat,
-                    oneFormat: oneFormat,
-                    manyFormat: manyFormat);
+                if (!string.IsNullOrEmpty(noneFormat) || !string.IsNullOrEmpty(oneFormat) || !string.IsNullOrEmpty(manyFormat))
+                {
+                    FooterText = UiHelper.GetRowsInfo(
+                        count: matchCount,
+                        duration: stopwatch.Elapsed,
+                        noneFormat: noneFormat ?? string.Empty,
+                        oneFormat: oneFormat ?? string.Empty,
+                        manyFormat: manyFormat ?? string.Empty);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -131,7 +175,7 @@ namespace Servy.Manager.ViewModels
             }
             catch (Exception ex)
             {
-                Logger.Error($"Search pipeline executed with a critical anomaly in {GetType().Name}.", ex);
+                Logger.Error($"Search pipeline failed in {GetType().Name}.", ex);
                 await HandleSearchExceptionAsync(ex);
             }
             finally
@@ -139,17 +183,45 @@ namespace Servy.Manager.ViewModels
                 // Step 7: Stale-search recovery gate check. Restore original context states safely.
                 if (ReferenceEquals(Volatile.Read(ref _searchCts), newCts))
                 {
-                    _cursorService.ResetCursor();
-                    SearchButtonText = Strings.Button_Search;
-                    IsBusy = false;
+                    RestoreIdleSearchState();
                 }
             }
+        }
+
+        /// <summary>
+        /// Restores the idle search UI state: default cursor, default button caption, not busy.
+        /// </summary>
+        /// <remarks>
+        /// This is the single undo of the wait state the search pipeline sets up before it runs, and it is
+        /// reached from both exits - the pipeline's own Step 7 gate, and <see cref="ClearActiveSearchContext"/>
+        /// when no successor search will run that gate. Keeping one copy is what stops a future addition to
+        /// the wait state from being restored on only one of the two paths, which is the shape of #4375.
+        /// </remarks>
+        private void RestoreIdleSearchState()
+        {
+            _cursorService.ResetCursor();
+            SearchButtonText = Strings.Button_Search;
+            IsBusy = false;
         }
 
         /// <summary>
         /// When overridden in a derived class, provides a hook to display modal alert feedback if the underlying fetch sequence encounters an error.
         /// </summary>
         protected virtual Task HandleSearchExceptionAsync(Exception ex) => Task.CompletedTask;
+
+        /// <summary>
+        /// When overridden in a derived class, provides a synchronization point between the atomic
+        /// search token swap and the disposal recheck that immediately follows it.
+        /// </summary>
+        /// <remarks>
+        /// The base implementation does nothing and costs a virtual call per search. It exists so a
+        /// test double can hold the search thread inside that otherwise purely synchronous window and
+        /// release a concurrent <see cref="Dispose()"/> into it deterministically, which is the only
+        /// way to reach the recheck and its <see cref="ObjectDisposedException"/> handler on demand.
+        /// </remarks>
+        protected virtual void OnSearchCtsSwapped()
+        {
+        }
 
         /// <summary>
         /// Cancels the active search token and restores UI state (cursor, button text, busy flag).
@@ -162,10 +234,40 @@ namespace Servy.Manager.ViewModels
                 Helpers.Helper.CancelAndDisposeSafely(oldCts);
 
                 // No successor search will run the Step 7 restore - do it here.
-                _cursorService.ResetCursor();
-                SearchButtonText = Strings.Button_Search;
-                IsBusy = false;
+                RestoreIdleSearchState();
             }
+        }
+
+        #endregion
+
+        #region IDisposable Implementation
+
+        /// <summary>
+        /// Disposes the ViewModel, safely cancelling and releasing the search token.
+        /// </summary>
+        /// <param name="disposing">
+        /// <see langword="true"/> when called from <see cref="IDisposable.Dispose()"/>. This type has no finalizer,
+        /// so it is never <see langword="false"/>; the parameter exists for derived types to override.
+        /// </param>
+        protected virtual void Dispose(bool disposing)
+        {
+            // Trip the flag FIRST, before cleaning tokens, so racing search threads self-terminate immediately.
+            if (Interlocked.Exchange(ref _isDisposed, 1) != 0)
+            {
+                return;
+            }
+
+            if (disposing)
+            {
+                ClearActiveSearchContext();
+            }
+        }
+
+        /// <inheritdoc />
+        public void Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
         }
 
         #endregion

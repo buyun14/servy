@@ -2,6 +2,7 @@ using Servy.Core.Config;
 using Servy.Core.Native;
 using System.ComponentModel;
 using System.Security;
+using System.Security.Principal;
 
 namespace Servy.Core.UnitTests.Native
 {
@@ -35,18 +36,33 @@ namespace Servy.Core.UnitTests.Native
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void ValidateCredentials_EmptyUsername_ThrowsArgumentException(string? invalidUsername)
         {
-            Assert.Throws<ArgumentException>(() => NativeMethodsHelpers.ValidateCredentials(invalidUsername!, null));
+            // Arrange, Act & Assert
+            var ex = Assert.Throws<ArgumentException>("username",
+                () => NativeMethodsHelpers.ValidateCredentials(invalidUsername!, null));
+
+            Assert.Contains("cannot be empty or whitespace", ex.Message);
         }
 
         [Theory]
         [InlineData("Everyone")]
         [InlineData("Anonymous Logon")]
         [InlineData("NT AUTHORITY\\Interactive")]
+        // Account names are case-insensitive on Windows
+        [InlineData("everyone")]
+        [InlineData("nt authority\\INTERACTIVE")]
+        // Padding is trimmed before the lookup
+        [InlineData("  Everyone  ")]
+        // BUILTIN groups, qualified and bare (#6122)
+        [InlineData("BUILTIN\\Administrators")]
+        [InlineData("builtin\\users")]
+        [InlineData("Guests")]
+        [InlineData("BUILTIN\\Backup Operators")]
         public void ValidateCredentials_ForbiddenGroup_ThrowsArgumentException(string forbiddenGroup)
         {
+            // Arrange, Act & Assert
             var ex = Assert.Throws<ArgumentException>(() => NativeMethodsHelpers.ValidateCredentials(forbiddenGroup, null));
             Assert.Contains("group or logon context", ex.Message);
         }
@@ -59,6 +75,7 @@ namespace Servy.Core.UnitTests.Native
         [InlineData("IIS APPPOOL\\DefaultAppPool")]
         public void ValidateCredentials_BuiltInAccount_WithPassword_ThrowsArgumentException(string builtInAccount)
         {
+            // Arrange, Act & Assert
             var ex = Assert.Throws<ArgumentException>(() => NativeMethodsHelpers.ValidateCredentials(builtInAccount, "SomePassword"));
             Assert.Contains("password cannot be provided", ex.Message);
         }
@@ -80,8 +97,13 @@ namespace Servy.Core.UnitTests.Native
         [InlineData("JustAUser")]
         [InlineData("DOMAIN\\")]
         [InlineData(".\\")]
+        // The two rows below pass the format regex and are rejected by the later
+        // whitespace-after-trim guard: the account half is blank once the trailing '$' is stripped.
+        [InlineData("DOMAIN\\ $")]
+        [InlineData(".\\   $")]
         public void ValidateCredentials_InvalidFormat_ThrowsArgumentException(string badFormat)
         {
+            // Arrange, Act & Assert
             var ex = Assert.Throws<ArgumentException>(() => NativeMethodsHelpers.ValidateCredentials(badFormat, null));
             Assert.Contains("Username format is invalid", ex.Message);
         }
@@ -101,26 +123,34 @@ namespace Servy.Core.UnitTests.Native
         public void ValidateCredentials_ValidLocalAccount_BadPassword_ThrowsException()
         {
             // Arrange
-            // ENVIRONMENT DEPENDENCY NOTE: Environment.UserName maps to the current executing identity.
-            // If the host is domain-joined or running under a built-in system service account, resolving this
-            // as a local machine account via '.\' can trigger translation or password-guard failures before
-            // LogonUser is reached. We capture any downstream structural failure context below.
             string currentUser = $".\\{Environment.UserName}";
+
+            // The bad-password path is only reachable when the name resolves as a local account.
+            // On domain-joined hosts or under a service identity, ValidateCredentials fails earlier
+            // (SecurityException at translation, ArgumentException at built-in/group guards) and
+            // LogonUser is never reached.
+            bool resolvable;
+            try
+            {
+                var ntAccount = new NTAccount(Environment.MachineName, Environment.UserName);
+                _ = ntAccount.Translate(typeof(SecurityIdentifier));
+                resolvable = true;
+            }
+            catch (IdentityNotMappedException)
+            {
+                resolvable = false;
+            }
+
+            Assert.SkipUnless(resolvable, "Current identity does not resolve as a local account; LogonUser is unreachable here.");
+
             string badPassword = Guid.NewGuid().ToString(); // Guaranteed to be wrong
 
             // Act & Assert
-            // Depending on host configuration (Workstation vs. Domain vs. SYSTEM), this call path will fail with
-            // UnauthorizedAccessException/Win32Exception (bad password), SecurityException (unmapped local name),
-            // or ArgumentException (system identity rule violation).
             var exception = Assert.ThrowsAny<Exception>(() => NativeMethodsHelpers.ValidateCredentials(currentUser, badPassword));
 
-            // ENVIRONMENT-RESILIENT RANGE CHECK: Broaden the accepted exception boundaries to prevent environmental false-positives
             Assert.True(
-                exception is Win32Exception ||
-                exception is UnauthorizedAccessException ||
-                exception is SecurityException ||
-                exception is ArgumentException,
-                $"Unexpected identity translation exception caught for current environment profile: {exception.GetType().Name}");
+                exception is UnauthorizedAccessException || exception is Win32Exception,
+                $"Expected a logon failure exception from LogonUser, but received {exception.GetType().Name}: {exception.Message}");
         }
 
         #endregion
@@ -130,18 +160,20 @@ namespace Servy.Core.UnitTests.Native
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void AtomicSecureMove_NullOrEmptySource_ThrowsArgumentException(string? source)
         {
+            // Arrange, Act & Assert
             Assert.Throws<ArgumentException>("source", () => NativeMethodsHelpers.AtomicSecureMove(source!, "dest.txt"));
         }
 
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void AtomicSecureMove_NullOrEmptyDestination_ThrowsArgumentException(string? destination)
         {
+            // Arrange, Act & Assert
             Assert.Throws<ArgumentException>("destination", () => NativeMethodsHelpers.AtomicSecureMove("src.txt", destination!));
         }
 
@@ -177,13 +209,16 @@ namespace Servy.Core.UnitTests.Native
         [Fact]
         public void AtomicSecureMove_DestinationExists_ReplacesAtomically()
         {
+            // Arrange
             string src = Path.Combine(_testDir, "src.txt");
             string dest = Path.Combine(_testDir, "dest.txt");
             File.WriteAllText(src, "New Content");
             File.WriteAllText(dest, "Old Content");   // destination already exists
 
+            // Act
             NativeMethodsHelpers.AtomicSecureMove(src, dest);
 
+            // Assert
             Assert.False(File.Exists(src));
             Assert.True(File.Exists(dest));
             Assert.Equal("New Content", File.ReadAllText(dest));
@@ -265,7 +300,7 @@ namespace Servy.Core.UnitTests.Native
                 fs.Write(extraPadding, 0, extraPadding.Length);
             }
 
-            string digest1, digest2;
+            string? digest1, digest2;
 
             // Act
             using (var fs1 = new FileStream(file1Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
@@ -288,7 +323,65 @@ namespace Servy.Core.UnitTests.Native
         }
 
         [Fact]
-        public void GetFileIdentity_ClosedStream_HandlesGracefully()
+        public void GetFileIdentity_SameLengthDifferentContent_ProducesDifferentDigests()
+        {
+            // Arrange
+            string firstPath = Path.Combine(_testDir, "same-length-1.log");
+            string secondPath = Path.Combine(_testDir, "same-length-2.log");
+            File.WriteAllText(firstPath, "2026-01-01 service started");
+            File.WriteAllText(secondPath, "2026-01-02 service stopped");
+            Assert.Equal(new FileInfo(firstPath).Length, new FileInfo(secondPath).Length);
+
+            // Act
+            string? first, second;
+            using (var fs = new FileStream(firstPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                first = NativeMethodsHelpers.GetFileIdentity(fs).PrefixDigest;
+            }
+            using (var fs = new FileStream(secondPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                second = NativeMethodsHelpers.GetFileIdentity(fs).PrefixDigest;
+            }
+
+            // Assert
+            Assert.False(string.IsNullOrEmpty(first));
+            Assert.NotEqual(first, second);
+        }
+
+        [Fact]
+        public void GetFileIdentity_SameContentInTwoFiles_ProducesTheSameDigest()
+        {
+            // Arrange
+            string firstPath = Path.Combine(_testDir, "twin-1.log");
+            string secondPath = Path.Combine(_testDir, "twin-2.log");
+            File.WriteAllText(firstPath, "identical content");
+            File.WriteAllText(secondPath, "identical content");
+
+            // Act
+            string? first, second;
+            using (var fs = new FileStream(firstPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                first = NativeMethodsHelpers.GetFileIdentity(fs).PrefixDigest;
+            }
+            using (var fs = new FileStream(secondPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                second = NativeMethodsHelpers.GetFileIdentity(fs).PrefixDigest;
+            }
+
+            // Assert
+            Assert.False(string.IsNullOrEmpty(first));
+            Assert.Equal(first, second);
+        }
+
+        [Fact]
+        public void GetFileIdentity_NullStream_ThrowsArgumentNullException()
+        {
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>("fs", () => NativeMethodsHelpers.GetFileIdentity(null!));
+        }
+
+        [Fact]
+        public void GetFileIdentity_ClosedStream_HandlesGracefullyAndLeavesPrefixDigestNull()
         {
             // Arrange
             string filePath = Path.Combine(_testDir, "closed.log");
@@ -302,12 +395,83 @@ namespace Servy.Core.UnitTests.Native
 
             // Act
             // Passing a closed stream will force SafeFileHandle to throw ObjectDisposedException
-            // and fs.CanSeek to return false. The method should catch these safely.
+            // and fs.CanSeek to return false. The method should catch these safely and leave PrefixDigest null.
             var identity = NativeMethodsHelpers.GetFileIdentity(closedStream);
 
             // Assert
             Assert.False(identity.IsValidHandleInfo); // Kernel32 probe failed
-            Assert.Empty(identity.PrefixDigest); // Prefix probe skipped (CanSeek was false)
+            Assert.Null(identity.PrefixDigest); // Prefix probe skipped/failed (returns null, not string.Empty)
+        }
+
+        [Fact]
+        public void GetFileIdentity_StreamPositionedMidFile_RestoresCallerPosition()
+        {
+            // Arrange
+            string filePath = Path.Combine(_testDir, "position.log");
+            File.WriteAllText(filePath, "0123456789ABCDEFGHIJ");
+
+            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                // A non-zero start, so a probe that leaves the stream at 0 or at the end of its read is visible.
+                fs.Seek(7, SeekOrigin.Begin);
+
+                // Act
+                var identity = NativeMethodsHelpers.GetFileIdentity(fs);
+
+                // Assert
+                // The content probe did run and moved the stream, so the restore in the finally block
+                // is what puts it back. This is the contract established by issue 1479.
+                Assert.False(string.IsNullOrEmpty(identity.PrefixDigest));
+                Assert.Equal(7, fs.Position);
+                Assert.Equal((int)'7', fs.ReadByte());
+            }
+        }
+
+        [Fact]
+        public void GetFileIdentity_ReadFails_LeavesPrefixDigestNullAndRestoresPosition()
+        {
+            // Arrange
+            string filePath = Path.Combine(_testDir, "writeonly.log");
+            File.WriteAllText(filePath, "0123456789ABCDEFGHIJ");
+
+            // A write-only stream can seek but not read, so the probe's first Read throws
+            // NotSupportedException after Seek(0) has already moved the stream. The sibling
+            // ClosedStream test goes through CanSeek == false and never reaches the catch.
+            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+            {
+                fs.Seek(7, SeekOrigin.Begin);
+
+                // Act
+                var identity = NativeMethodsHelpers.GetFileIdentity(fs);
+
+                // Assert
+                // A failed content probe is "undeterminable" (null), never an empty-file digest,
+                // which IsDifferentFrom would read as "proven same" (#5160).
+                Assert.Null(identity.PrefixDigest);
+
+                // The finally block restores the caller's position on the exception path too (#1479);
+                // moving the restore to the end of the inner try keeps every other test green.
+                Assert.Equal(7, fs.Position);
+            }
+        }
+
+        #endregion
+
+        #region Access Right Constants Tests
+
+        [Fact]
+        public void TokenQuery_MatchesWin32TokenQueryAccessRight()
+        {
+            // Arrange
+            // winnt.h defines TOKEN_QUERY as 0x0008; ProcessAccount.TryGetUser passes it to
+            // OpenProcessToken to read the token's user (#7364).
+            const uint expected = 0x0008;
+
+            // Act
+            uint actual = NativeMethods.TOKEN_QUERY;
+
+            // Assert
+            Assert.Equal(expected, actual);
         }
 
         #endregion

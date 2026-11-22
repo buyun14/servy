@@ -1,39 +1,55 @@
-#pragma warning disable SA1310 // Field names should not contain underscore
-
 namespace Servy.Core.Native
 {
     /// <summary>
-    /// Defines common Windows error codes used by service control operations.
+    /// Defines the Win32 error codes Servy's native interop checks: service control, file moves, process snapshots,
+    /// console pipes, named-pipe client location, logon validation and Restart Manager lookups.
     /// </summary>
     public static class Errors
     {
-        /// <summary>
-        /// The handle is invalid or no longer valid for the requested operation.
-        /// </summary>
+        /// <summary>Access is denied.</summary>
+        public const int ERROR_ACCESS_DENIED = 5;
+
+        /// <summary>The handle is invalid or no longer valid for the requested operation.</summary>
         public const int ERROR_INVALID_HANDLE = 6;
 
-        /// <summary>
-        /// One or more parameters are invalid.
-        /// </summary>
+        /// <summary>An attempt was made to move a file to a different device (ERROR_NOT_SAME_DEVICE).</summary>
+        public const int ERROR_NOT_SAME_DEVICE = 0x11; // 17
+
+        /// <summary>Represents the Win32 error code indicating that a data block or process table length changed between internal allocation queries (commonly thrown transiently by Toolhelp32 APIs).</summary>
+        public const int ERROR_BAD_LENGTH = 24;
+
+        /// <summary>A general device or pipe failure.</summary>
+        public const int ERROR_GEN_FAILURE = 31;
+
+        /// <summary>One or more parameters are invalid.</summary>
         public const int ERROR_INVALID_PARAMETER = 87;
 
-        /// <summary>
-        /// The Windows API native error code indicating that an attempt was made to move a file or directory
-        /// across different storage volumes or device boundaries.
-        /// </summary>
-        /// <remarks>
-        /// This constant maps to the standard system error <c>ERROR_NOT_SAME_DEVICE</c> (decimal 17). It typically occurs
-        /// when invoking native filesystem functions like <c>MoveFileEx</c> or <c>ReplaceFile</c> without specifying
-        /// a cross-volume copy-and-delete fallback flag (such as <c>MOVEFILE_COPY_ALLOWED</c>) when processing paths
-        /// that cross logical drive boundaries (e.g., from <c>C:</c> to <c>D:</c>).
-        /// </remarks>
-        public const int ERROR_NOT_SAME_DEVICE = 0x11; // 17
+        /// <summary>Represents the Win32 error code indicating the provided buffer is too small to contain the data.</summary>
+        public const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+        /// <summary>The pipe client is on this computer (GetNamedPipeClientComputerName failure).</summary>
+        public const int ERROR_PIPE_LOCAL = 229;
 
         /// <summary>The pipe is not connected (no console attached to the target process).</summary>
         public const int ERROR_PIPE_NOT_CONNECTED = 233;
 
-        /// <summary>A general device or pipe failure.</summary>
-        public const int ERROR_GEN_FAILURE = 31;
+        /// <summary>More data is available: the buffer passed to RmGetList is too small for the list of processes.</summary>
+        public const int ERROR_MORE_DATA = 234;
+
+        /// <summary>An instance of the service is already running.</summary>
+        public const int ERROR_SERVICE_ALREADY_RUNNING = 1056;
+
+        /// <summary>The specified service does not exist as an installed service.</summary>
+        public const int ERROR_SERVICE_DOES_NOT_EXIST = 1060;
+
+        /// <summary>The service cannot accept control messages at this time (e.g., while in a pending transition state).</summary>
+        public const int ERROR_SERVICE_CANNOT_ACCEPT_CTRL = 1061;
+
+        /// <summary>The specified service has not been started.</summary>
+        public const int ERROR_SERVICE_NOT_ACTIVE = 1062;
+
+        /// <summary>The specified service has been marked for deletion.</summary>
+        public const int ERROR_SERVICE_MARKED_FOR_DELETE = 1072;
 
         /// <summary>The user name or password is incorrect (LogonUserW failure).</summary>
         public const int ERROR_LOGON_FAILURE = 1326;

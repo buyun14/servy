@@ -2,7 +2,8 @@ using Servy.Core.Config;
 using Servy.Core.DTOs;
 using Servy.Core.Enums;
 using Servy.Core.Logging;
-using System.Diagnostics.Eventing.Reader;
+using Servy.Core.Resources;
+using System.Diagnostics.Eventing.Reader;   // EventLogException
 using System.Security;
 using System.Text.RegularExpressions;
 
@@ -31,6 +32,7 @@ namespace Servy.Core.Services
         /// the service defaults to the value defined in <see cref="AppConfig.EventSource"/>.
         /// Pass an empty string to disable the provider filter and enable wildcard querying.
         /// </param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="reader"/> is null.</exception>
         public EventLogService(IEventLogReader reader, string? sourceName = null)
         {
             _reader = reader ?? throw new ArgumentNullException(nameof(reader));
@@ -104,13 +106,13 @@ namespace Servy.Core.Services
 
                 try
                 {
-                    var eventQuery = new EventLogQuery(AppConfig.EventLogName, PathType.LogName, query)
-                    {
-                        ReverseDirection = true   // newest events first, so the MaxResults cap keeps the most recent
-                    };
-
                     // Request the lazy iterator over the underlying EventLogReader.
-                    var records = _reader.ReadEvents(eventQuery, AppConfig.EventLogMaxResults * AppConfig.EventLogPrefetchCushion); // Generous cushion
+                    // newestFirst: true so the MaxResults cap keeps the most recent events.
+                    var records = _reader.ReadEvents(
+                        AppConfig.EventLogName,
+                        query,
+                        newestFirst: true,
+                        AppConfig.EventLogMaxResults * AppConfig.EventLogPrefetchCushion); // Generous cushion
 
                     // ROBUSTNESS: The foreach enumeration loop must run within the try block.
                     // Since ReadEvents is a lazy iterator, this is where the service handle is actually requested,
@@ -150,13 +152,13 @@ namespace Servy.Core.Services
                 {
                     // InvalidOperationException is appropriate when a required system service (Event Log)
                     // is not in the correct state to perform the operation.
-                    throw new InvalidOperationException("Cannot access Windows Event Log. Ensure the 'Windows Event Log' service is running and the query is valid.", ex);
+                    throw new InvalidOperationException(Strings.Msg_EventLogUnavailable, ex);
                 }
                 catch (UnauthorizedAccessException ex)
                 {
                     // SecurityException is the standard .NET way to signal that a call failed
                     // due to insufficient permissions/privileges.
-                    throw new SecurityException("Access denied to Windows Event Log. Please ensure the application is running with sufficient privileges (Administrator).", ex);
+                    throw new SecurityException(Strings.Msg_EventLogAccessDenied, ex);
                 }
 
                 return results

@@ -1,21 +1,24 @@
 using Servy.Core.DTOs;
-using Servy.Models;
+using Servy.Core.Services;
+using Servy.UI.Validation;
 
 namespace Servy.Services
 {
     /// <summary>
     /// Defines commands for managing Windows services - install, uninstall, start, stop and restart -
-    /// plus importing/exporting service configuration (XML/JSON) and launching Servy Manager.
+    /// plus importing/exporting service configuration (XML/JSON), launching Servy Manager, and opening the runtime variables wiki page.
     /// </summary>
     public interface IServiceCommands
     {
         /// <summary>
-        /// Orchestrates the installation of a new Windows service using the provided configuration.
+        /// Orchestrates the installation of a new Windows service using the provided configuration DTO.
         /// </summary>
-        /// <param name="config">
-        /// The <see cref="ServiceConfiguration"/> containing all process paths,
+        /// <param name="dto">
+        /// The <see cref="ServiceDto"/> snapshot containing all process paths,
         /// startup parameters, and lifecycle hook settings.
         /// </param>
+        /// <param name="confirmPassword">Optional password confirmation string for user credential validation.</param>
+        /// <param name="runAsLocalSystem">Indicates whether the service runs under the LocalSystem account.</param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
         /// <returns>
         /// A task representing the asynchronous installation operation, returning <c>true</c> if the service was installed successfully;
@@ -27,7 +30,6 @@ namespace Servy.Services
         /// It performs several critical steps:
         /// <list type="bullet">
         /// <item><description>Locates and validates the Servy UI service wrapper executable.</description></item>
-        /// <item><description>Maps the high-level <see cref="ServiceConfiguration"/> to a data-transfer object (<see cref="ServiceDto"/>).</description></item>
         /// <item><description>Triggers comprehensive validation via the <see cref="IServiceConfigurationValidator"/>.</description></item>
         /// <item><description>Checks for existing service name collisions in the Windows SCM.</description></item>
         /// <item><description>Invokes the <see cref="IServiceManager"/> to perform the actual OS-level installation.</description></item>
@@ -35,11 +37,15 @@ namespace Servy.Services
         /// </para>
         /// <para>
         /// <b>Security:</b> User credentials (account and password) are handled according to the
-        /// <see cref="ServiceConfiguration.RunAsLocalSystem"/> flag. Credentials are encrypted
+        /// <paramref name="runAsLocalSystem"/> flag. Credentials are encrypted
         /// before being stored in the repository.
         /// </para>
         /// </remarks>
-        Task<bool> InstallServiceAsync(ServiceConfiguration config, CancellationToken cancellationToken = default);
+        Task<bool> InstallServiceAsync(
+            ServiceDto dto,
+            string? confirmPassword = null,
+            bool runAsLocalSystem = true,
+            CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Uninstalls the specified Windows service.
@@ -74,17 +80,27 @@ namespace Servy.Services
         Task<bool> RestartServiceAsync(string? serviceName, CancellationToken cancellationToken = default);
 
         /// <summary>
-        /// Exports the service configuration to an XML file selected by the user.
+        /// Prompts for an XML file, validates the current configuration
+        /// (including the password confirmation), and writes the file only if validation succeeds.
+        /// If validation fails, the first error is shown and nothing is written.
         /// </summary>
-        /// <param name="confirmPassword">The confirmation of the service account password.</param>
+        /// <param name="confirmPassword">
+        /// The confirmation of the service account password, checked against the configured password
+        /// as part of the validation pass.
+        /// </param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
         /// <returns>A task that represents the asynchronous operation.</returns>
         Task ExportXmlConfigAsync(string? confirmPassword, CancellationToken cancellationToken = default);
 
         /// <summary>
-        /// Exports the service configuration to a JSON file selected by the user.
+        /// Prompts for a JSON file, validates the current configuration
+        /// (including the password confirmation), and writes the file only if validation succeeds.
+        /// If validation fails, the first error is shown and nothing is written.
         /// </summary>
-        /// <param name="confirmPassword">The confirmation of the service account password.</param>
+        /// <param name="confirmPassword">
+        /// The confirmation of the service account password, checked against the configured password
+        /// as part of the validation pass.
+        /// </param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
         /// <returns>A task that represents the asynchronous operation.</returns>
         Task ExportJsonConfigAsync(string? confirmPassword, CancellationToken cancellationToken = default);
@@ -115,5 +131,12 @@ namespace Servy.Services
         /// <param name="cancellationToken">Optional cancellation token.</param>
         /// <returns>A task that represents the asynchronous operation.</returns>
         Task OpenManagerAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Opens the list of runtime variables wiki page in the default web browser.
+        /// </summary>
+        /// <param name="cancellationToken">Optional cancellation token.</param>
+        /// <returns>A task that represents the asynchronous operation.</returns>
+        Task OpenRuntimeVariablesLinkAsync(CancellationToken cancellationToken = default);
     }
 }

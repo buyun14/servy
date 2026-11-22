@@ -2,119 +2,90 @@ using Moq;
 using Servy.Core.Enums;
 using Servy.Core.Logging;
 using Servy.Service.CommandLine;
+using Servy.Service.ProcessManagement;
 using Servy.Testing;
+using System.Diagnostics;
 using System.Timers;
 using ITimer = Servy.Service.Timers.ITimer;
 
 namespace Servy.Service.UnitTests
 {
-    public class TestableServiceTests
+    public class TestableServiceTests : IDisposable
     {
+        private readonly ServiceTestContext _ctx = new ServiceTestContext();
+
         [Fact]
         public void OnStart_Workflow_ParsesPromotesAndValidates()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
             var fullArgs = new[] { "servy.exe" };
             var expectedOptions = new StartOptions { ServiceName = "TestService" };
 
             var mockScopedLogger = new Mock<IServyLogger>();
 
             // 1. Setup the ServiceHelper sequence
-            ctx.Helper.Setup(h => h.GetArgs()).Returns(fullArgs);
-            ctx.Helper.Setup(h => h.ParseOptions(ctx.ServiceRepository.Object, fullArgs))
-                      .Returns(expectedOptions);
+            _ctx.Helper.Setup(h => h.GetArgs()).Returns(fullArgs);
+            _ctx.Helper.Setup(h => h.ParseOptions(_ctx.NamedPipesService.Object, fullArgs))
+                       .Returns(expectedOptions);
 
             // 2. Setup Logger Promotion (Root -> Scoped)
-            ctx.Logger.Setup(l => l.CreateScoped(expectedOptions.ServiceName))
+            _ctx.Logger.Setup(l => l.CreateScoped(expectedOptions.ServiceName))
                        .Returns(mockScopedLogger.Object);
 
             // 3. Setup Validation and Working Directory check (using the SCOPED logger)
-            ctx.Helper.Setup(h => h.ValidateAndLog(expectedOptions, mockScopedLogger.Object))
-                      .Returns(true);
-            ctx.Helper.Setup(h => h.EnsureValidStartupDirectory(expectedOptions, mockScopedLogger.Object));
+            _ctx.Helper.Setup(h => h.ValidateAndLog(expectedOptions, mockScopedLogger.Object))
+                       .Returns(true);
+            _ctx.Helper.Setup(h => h.EnsureValidStartupDirectory(expectedOptions, mockScopedLogger.Object));
 
-            using (var service = ctx.Build())
-            {
-                // Act
-                service.StartForTest();
+            var service = _ctx.Build();
 
-                // Assert
-                // Verify the sequence of orchestration
-                ctx.Helper.Verify(h => h.GetArgs(), Times.Once);
-                ctx.Helper.Verify(h => h.ParseOptions(ctx.ServiceRepository.Object, fullArgs), Times.Once);
+            // Act
+            service.StartForTest();
 
-                // Verify logger promotion
-                ctx.Logger.Verify(l => l.CreateScoped(expectedOptions.ServiceName), Times.Once);
+            // Assert
+            // Verify the sequence of orchestration
+            _ctx.Helper.Verify(h => h.GetArgs(), Times.Once);
+            _ctx.Helper.Verify(h => h.ParseOptions(_ctx.NamedPipesService.Object, fullArgs), Times.Once);
 
-                // The root logger must NOT be disposed because the scoped logger
-                // delegates its underlying EventLog/File operations to it.
-                ctx.Logger.Verify(l => l.Dispose(), Times.Never);
+            // Verify logger promotion
+            _ctx.Logger.Verify(l => l.CreateScoped(expectedOptions.ServiceName), Times.Once);
 
-                // Verify validation and working directory check used the NEW scoped logger
-                ctx.Helper.Verify(h => h.ValidateAndLog(expectedOptions, mockScopedLogger.Object), Times.Once);
-                ctx.Helper.Verify(h => h.EnsureValidStartupDirectory(expectedOptions, mockScopedLogger.Object), Times.Once);
-            }
+            // The root logger must NOT be disposed because the scoped logger
+            // delegates its underlying EventLog/File operations to it.
+            _ctx.Logger.Verify(l => l.Dispose(), Times.Never);
+
+            // Verify validation and working directory check used the NEW scoped logger
+            _ctx.Helper.Verify(h => h.ValidateAndLog(expectedOptions, mockScopedLogger.Object), Times.Once);
+            _ctx.Helper.Verify(h => h.EnsureValidStartupDirectory(expectedOptions, mockScopedLogger.Object), Times.Once);
         }
 
         [Fact]
         public void OnStart_WhenParseOptionsReturnsNull_DoesNotCallEnsureValidStartupDirectory()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
             var fullArgs = new[] { "servy.exe" };
 
             // 1. Mock GetArgs to return a valid array
-            ctx.Helper.Setup(h => h.GetArgs()).Returns(fullArgs);
+            _ctx.Helper.Setup(h => h.GetArgs()).Returns(fullArgs);
 
             // 2. Mock ParseOptions to return null
-            ctx.Helper
-                .Setup(h => h.ParseOptions(ctx.ServiceRepository.Object, fullArgs))
+            _ctx.Helper
+                .Setup(h => h.ParseOptions(_ctx.NamedPipesService.Object, fullArgs))
                 .Returns((StartOptions?)null);
 
-            using (var service = ctx.Build())
-            {
-                // Act
-                service.TestOnStart(fullArgs);
+            var service = _ctx.Build();
 
-                // Assert
-                // Verify we attempted to parse but stopped there
-                ctx.Helper.Verify(h => h.ParseOptions(ctx.ServiceRepository.Object, fullArgs), Times.Once);
+            // Act
+            service.StartForTest();
 
-                // Verify that subsequent steps (Promotion/Validation/WorkingDir) were NEVER reached
-                ctx.Logger.Verify(l => l.CreateScoped(It.IsAny<string>()), Times.Never);
-                ctx.Helper.Verify(h => h.ValidateAndLog(It.IsAny<StartOptions>(), It.IsAny<IServyLogger>()), Times.Never);
-                ctx.Helper.Verify(h => h.EnsureValidStartupDirectory(It.IsAny<StartOptions>(), It.IsAny<IServyLogger>()), Times.Never);
-            }
-        }
+            // Assert
+            // Verify we attempted to parse but stopped there
+            _ctx.Helper.Verify(h => h.ParseOptions(_ctx.NamedPipesService.Object, fullArgs), Times.Once);
 
-        [Fact]
-        public void OnStart_WhenExceptionThrown_LogsError()
-        {
-            // Arrange
-            var ctx = new ServiceTestContext();
-            var exception = new InvalidOperationException("Test exception");
-
-            // Simulate the exception at the first entry point of OnStart
-            ctx.Helper
-                .Setup(h => h.GetArgs())
-                .Throws(exception);
-
-            using (var service = ctx.Build())
-            {
-                // Act
-                service.TestOnStart(new string[] { });
-
-                // Assert
-                // Since the crash happens before promotion, mockLogger is still the active logger
-                ctx.Logger.Verify(l => l.Error(
-                    It.Is<string>(s => s.Contains("Exception in OnStart")),
-                    exception
-                    ), Times.Once);
-
-                // Verify that promotion was never attempted due to the early failure
-                ctx.Logger.Verify(l => l.CreateScoped(It.IsAny<string>()), Times.Never);
-            }
+            // Verify that subsequent steps (Promotion/Validation/WorkingDir) were NEVER reached
+            _ctx.Logger.Verify(l => l.CreateScoped(It.IsAny<string>()), Times.Never);
+            _ctx.Helper.Verify(h => h.ValidateAndLog(It.IsAny<StartOptions>(), It.IsAny<IServyLogger>()), Times.Never);
+            _ctx.Helper.Verify(h => h.EnsureValidStartupDirectory(It.IsAny<StartOptions>(), It.IsAny<IServyLogger>()), Times.Never);
         }
 
         [Theory]
@@ -122,14 +93,11 @@ namespace Servy.Service.UnitTests
         [InlineData(true, 0, 3, RecoveryAction.RestartService, false)]
         [InlineData(true, 5, 0, RecoveryAction.RestartService, false)]
         [InlineData(true, 5, 3, RecoveryAction.None, false)]
-        [InlineData(true, 0, 0, RecoveryAction.None, false)]
         [InlineData(true, 5, 3, RecoveryAction.RestartService, true)]
         public void OnStart_ComputesRecoveryActionEnabledFromOptions(
-            bool enableHealthMonitoring,  int heartbeat, int maxFailedChecks, RecoveryAction recovery, bool expected)
+            bool enableHealthMonitoring, int heartbeat, int maxFailedChecks, RecoveryAction recovery, bool expected)
         {
             // Arrange
-            var ctx = new ServiceTestContext();
-            var fullArgs = new[] { "TestService" };
             var options = new StartOptions
             {
                 ServiceName = "TestService",
@@ -139,86 +107,143 @@ namespace Servy.Service.UnitTests
                 RecoveryAction = recovery
             };
 
-            var mockScopedLogger = new Mock<IServyLogger>();
+            ArrangeStart(options);
 
-            ctx.Helper.Setup(h => h.GetArgs()).Returns(fullArgs);
-            ctx.Helper.Setup(h => h.ParseOptions(ctx.ServiceRepository.Object, It.IsAny<string[]>())).Returns(options);
-            ctx.Logger.Setup(l => l.CreateScoped(It.IsAny<string>())).Returns(mockScopedLogger.Object);
-            ctx.Helper.Setup(h => h.ValidateAndLog(It.IsAny<StartOptions>(), It.IsAny<IServyLogger>())).Returns(true);
-            ctx.Helper.Setup(h => h.EnsureValidStartupDirectory(It.IsAny<StartOptions>(), It.IsAny<IServyLogger>()));
+            var service = _ctx.Build();
 
-            using (var service = ctx.Build())
+            // Act
+            service.StartForTest();
+
+            // Assert
+            Assert.Equal(expected, TestReflection.GetField<bool>(service, "_recoveryActionEnabled"));
+        }
+
+        [Theory]
+        [InlineData(null, false)]
+        [InlineData("", false)]
+        [InlineData("   ", false)]
+        [InlineData(@"C:\hooks\prelaunch.exe", true)]
+        public void OnStart_ComputesPreLaunchEnabledFromThePreLaunchPath(string? preLaunchExecutablePath, bool expected)
+        {
+            // Arrange
+            var options = new StartOptions
             {
-                // Act
-                service.TestOnStart(fullArgs);
+                ServiceName = "TestService",
+                PreLaunchExecutablePath = preLaunchExecutablePath,
+                PreLaunchTimeoutInSeconds = 0 // fire-and-forget, so the start is not held up by the hook
+            };
 
-                // Assert
-                Assert.Equal(expected, TestReflection.GetField<bool>(service, "_recoveryActionEnabled"));
-            }
+            ArrangeStart(options);
+
+            var preLaunch = new Mock<IProcessWrapper>();
+            preLaunch.Setup(p => p.Start()).Returns(true);
+            _ctx.ProcessFactory
+                .Setup(f => f.Create(It.IsAny<ProcessStartInfo>(), It.IsAny<IServyLogger>()))
+                .Returns(preLaunch.Object);
+
+            var service = _ctx.Build();
+
+            // Act
+            service.StartForTest();
+
+            // Assert
+            Assert.Equal(expected, TestReflection.GetField<bool>(service, "_preLaunchEnabled"));
+        }
+
+        [Fact]
+        public void OnStart_CopiesTheRecoverySettingsFromOptions()
+        {
+            // Arrange
+            var options = new StartOptions
+            {
+                ServiceName = "TestService",
+                EnableHealthMonitoring = true,
+                HeartbeatIntervalInSeconds = 5,
+                MaxFailedChecks = 7,                              // not AppConfig.DefaultMaxFailedChecks
+                MaxRestartAttempts = 11,                          // not AppConfig.DefaultMaxRestartAttempts
+                RecoveryAction = RecoveryAction.RestartProcess    // not the field's default
+            };
+
+            ArrangeStart(options);
+
+            var service = _ctx.Build();
+
+            // Act
+            service.StartForTest();
+
+            // Assert
+            Assert.Equal(11, TestReflection.GetField<int>(service, "_maxRestartAttempts"));
+            Assert.Equal(7, TestReflection.GetField<int>(service, "_maxFailedChecks"));
+            Assert.Equal(RecoveryAction.RestartProcess, TestReflection.GetField<RecoveryAction>(service, "_recoveryAction"));
         }
 
         [Fact]
         public void SetupHealthMonitoring_ValidParameters_CreatesAndStartsTimer_AndLogs()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
             var mockTimer = new Mock<ITimer>();
 
-            ctx.TimerFactory
+            _ctx.TimerFactory
                 .Setup(f => f.Create(It.IsAny<double>()))
                 .Returns(mockTimer.Object);
 
-            using (var service = ctx.Build())
+            var service = _ctx.Build();
+
+            service.SetRecoveryActionEnabled(true);
+
+            var options = new StartOptions
             {
-                service.SetRecoveryActionEnabled(true);
+                HeartbeatIntervalInSeconds = 5,
+                MaxFailedChecks = 3,
+                RecoveryAction = RecoveryAction.RestartService,
+                EnableHealthMonitoring = true,
+            };
 
-                var options = new StartOptions
-                {
-                    HeartbeatIntervalInSeconds = 5,
-                    MaxFailedChecks = 3,
-                    RecoveryAction = RecoveryAction.RestartService,
-                    EnableHealthMonitoring = true,
-                };
+            // Act
+            service.InvokeSetupHealthMonitoring(options);
 
-                // Act
-                service.InvokeSetupHealthMonitoring(options);
+            // Assert
+            // HeartbeatIntervalInSeconds = 5 => 5 s expressed in milliseconds
+            _ctx.TimerFactory.Verify(f => f.Create(5_000.0), Times.Once);
 
-                // Assert
-                ctx.TimerFactory.Verify(f => f.Create(options.HeartbeatIntervalInSeconds * 1000.0), Times.Once);
+            mockTimer.VerifyAdd(t => t.Elapsed += It.IsAny<ElapsedEventHandler>(), Times.Once);
+            mockTimer.VerifySet(t => t.AutoReset = true, Times.Once);
+            mockTimer.Verify(t => t.Start(), Times.Once);
 
-                mockTimer.VerifyAdd(t => t.Elapsed += It.IsAny<ElapsedEventHandler>(), Times.Once);
-                mockTimer.VerifySet(t => t.AutoReset = true, Times.Once);
-                mockTimer.Verify(t => t.Start(), Times.Once);
-
-                ctx.Logger.Verify(l => l.Info(It.Is<string>(s => s.Contains("Health monitoring started")), It.IsAny<Exception>()), Times.Once);
-            }
+            _ctx.Logger.Verify(l => l.Info(It.Is<string>(s => s.Contains("Health monitoring started")), It.IsAny<Exception>()), Times.Once);
         }
 
         [Fact]
         public void SetupHealthMonitoring_WhenRecoveryDisabled_DoesNotCreateTimer()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
+            var service = _ctx.Build();
 
-            using (var service = ctx.Build())
+            service.SetRecoveryActionEnabled(false);
+
+            var options = new StartOptions
             {
-                service.SetRecoveryActionEnabled(false);
+                EnableHealthMonitoring = true,
+                HeartbeatIntervalInSeconds = 5,
+                MaxFailedChecks = 3,
+                RecoveryAction = RecoveryAction.RestartService
+            };
 
-                var options = new StartOptions
-                {
-                    EnableHealthMonitoring = true,
-                    HeartbeatIntervalInSeconds = 5,
-                    MaxFailedChecks = 3,
-                    RecoveryAction = RecoveryAction.RestartService
-                };
+            // Act
+            service.InvokeSetupHealthMonitoring(options);
 
-                // Act
-                service.InvokeSetupHealthMonitoring(options);
-
-                // Assert
-                ctx.TimerFactory.Verify(f => f.Create(It.IsAny<double>()), Times.Never);
-                ctx.Logger.Verify(l => l.Info(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
-            }
+            // Assert
+            _ctx.TimerFactory.Verify(f => f.Create(It.IsAny<double>()), Times.Never);
+            _ctx.Logger.Verify(l => l.Info(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
         }
+
+        /// <summary>
+        /// Arranges the helper and logger mocks so that <c>OnStart</c> parses <paramref name="options"/>,
+        /// promotes the logger and passes validation.
+        /// </summary>
+        /// <param name="options">The options <c>ParseOptions</c> returns.</param>
+        private void ArrangeStart(StartOptions options) => _ctx.ArrangeStart(options);
+
+        public void Dispose() => _ctx.Dispose();
     }
 }

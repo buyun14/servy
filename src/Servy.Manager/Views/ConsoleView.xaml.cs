@@ -1,10 +1,10 @@
+using Servy.Core.Config;
 using Servy.Core.Logging;
 using Servy.Manager.Models;
 using Servy.Manager.ViewModels;
 using Servy.UI.Helpers;
 using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
-using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -29,13 +29,11 @@ namespace Servy.Manager.Views
         /// </summary>
         private bool _isFirstLoad = true;
 
-        /// <summary>
-        /// Define a small tolerance for floating point comparisons
-        /// </summary>
+        /// <summary>Defines the tolerance below which a vertical scroll change is treated as zero.</summary>
         private const double ScrollTolerance = 0.001;
 
         /// <summary>Defines the pixel threshold from the bottom that forces an immediate resumption of tailing.</summary>
-        private const double ResumeAtBottomThresholdPx = 10;
+        private const double ResumeAtBottomThresholdPx = 3;
 
         /// <summary>Defines the pixel window from the bottom where auto-scrolling remains active.</summary>
         private const double AutoFollowBandPx = 50;
@@ -54,7 +52,19 @@ namespace Servy.Manager.Views
             {
                 if (DataContext is ConsoleViewModel vm)
                 {
-                    vm.SetPaused(LogList.SelectedItems.Count > 0);
+                    if (LogList.SelectedItems.Count > 0)
+                    {
+                        vm.SetPaused(true);
+                    }
+                    else
+                    {
+                        var sv = Helper.GetVisualChild<ScrollViewer>(LogList);
+                        bool isAtBottom = sv != null && sv.VerticalOffset >= (sv.ScrollableHeight - ResumeAtBottomThresholdPx);
+                        if (isAtBottom)
+                        {
+                            vm.SetPaused(false);
+                        }
+                    }
                 }
             };
         }
@@ -91,11 +101,11 @@ namespace Servy.Manager.Views
         {
             if (e?.PropertyName == nameof(ConsoleViewModel.IsPaused) && sender is ConsoleViewModel vm && !vm.IsPaused)
             {
-                // Clear UI selection
                 LogList.SelectedItems.Clear();
 
-                // Snap to the bottom of the fresh history loaded by LoadLogsAsync
-                // We use a slight delay to ensure the ListView has rendered the new items
+                // Snap to the bottom. The history SwitchServiceAsync reloads on resume arrives later, and the
+                // view model requests its own scroll to the end once those lines are added.
+                // Queued at Render priority rather than run inline, so the ListBox renders before the scroll.
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
                     OnRequestScroll(true);
@@ -110,7 +120,6 @@ namespace Servy.Manager.Views
         /// </summary>
         private void LogList_ScrollChanged(object sender, ScrollChangedEventArgs e)
         {
-            // Check if the change is effectively zero using the tolerance range
             if (Math.Abs(e.VerticalChange) < ScrollTolerance)
                 return;
 
@@ -119,25 +128,12 @@ namespace Servy.Manager.Views
                 var sv = e.OriginalSource as ScrollViewer;
                 if (sv == null) return;
 
-                // Check if we are at the bottom
                 bool isAtBottom = sv.VerticalOffset >= (sv.ScrollableHeight - ResumeAtBottomThresholdPx);
 
                 // UI/UX Logic: Resume only if at the bottom AND nothing is selected.
                 // Otherwise, stay in "Paused" mode to protect the user's focus.
-                if (isAtBottom && LogList.SelectedItems.Count == 0)
-                {
-                    if (vm.IsPaused)
-                    {
-                        vm.SetPaused(false);
-                    }
-                }
-                else
-                {
-                    if (!vm.IsPaused)
-                    {
-                        vm.SetPaused(true);
-                    }
-                }
+                // SetPaused is a no-op when the state already matches.
+                vm.SetPaused(!(isAtBottom && LogList.SelectedItems.Count == 0));
             }
         }
 
@@ -154,20 +150,33 @@ namespace Servy.Manager.Views
 
                 if (_isFirstLoad || scrollToEnd)
                 {
-                    sv.ScrollToEnd();
+                    ScrollToEnd();
                     _isFirstLoad = false;
                 }
                 else if (DataContext is ConsoleViewModel vm && sv.VerticalOffset >= (sv.ScrollableHeight - AutoFollowBandPx) && !vm.IsPaused)
                 {
                     // Only auto-scroll if the user hasn't paused (by selecting or scrolling up)
-                    sv.ScrollToEnd();
+                    ScrollToEnd();
                 }
             }), DispatcherPriority.DataBind);
         }
 
         /// <summary>
+        /// Scrolls the log list to the last item and snaps the scroll viewer to the bottom.
+        /// </summary>
+        private void ScrollToEnd()
+        {
+            if (LogList.Items.Count > 0)
+            {
+                LogList.ScrollIntoView(LogList.Items[LogList.Items.Count - 1]);
+                var sv = Helper.GetVisualChild<ScrollViewer>(LogList);
+                sv?.ScrollToEnd();
+            }
+        }
+
+        /// <summary>
         /// Performs the asynchronous copy operation of currently selected log lines in the ListBox to the system clipboard.
-        /// Retries on transient clipboard COM locks.
+        /// Retries on transient clipboard COM locks and notifies the user upon failure after exhausted retries.
         /// </summary>
         /// <returns>A <see cref="Task"/> representing the asynchronous copy operation.</returns>
         private async Task CopySelectedLinesAsync()
@@ -186,28 +195,19 @@ namespace Servy.Manager.Views
                 return;
             }
 
-            for (int i = 0; i < Core.Config.AppConfig.ClipboardComMaxRetries; i++)
+            // Since this async execution targets the UI thread context, no dispatcher is passed:
+            // the shared helper then writes directly, on the STA context this handler already runs on.
+            if (await ClipboardHelper.TrySetTextAsync(text))
             {
-                try
-                {
-                    // Since this async execution targets the UI thread context,
-                    // this direct execution safely targets the required STA clipboard context.
-                    Clipboard.SetText(text);
-                    return;
-                }
-                catch (COMException) { /* clipboard locked */ }
-                catch (ExternalException) { /* generic Win32 failure */ }
-                catch (ArgumentException) { /* text is null or empty */ }
-
-                if (i < Core.Config.AppConfig.ClipboardComMaxRetries - 1)
-                {
-                    // Yield control back to the WPF dispatcher queue thread pump.
-                    // This allows UI paint commands and input requests to flow normally while waiting to retry.
-                    await Task.Delay(Core.Config.AppConfig.ClipboardComRetryDelayMs);
-                }
+                return;
             }
 
-            Logger.Warn($"Failed to copy {selected.Count} log line(s) to clipboard after {Core.Config.AppConfig.ClipboardComMaxRetries} attempts.");
+            Logger.Warn($"Failed to copy {selected.Count} log line(s) to clipboard after {AppConfig.ClipboardComMaxRetries} attempts.");
+
+            if (DataContext is ConsoleViewModel vm)
+            {
+                await vm.ShowClipboardErrorAsync();
+            }
         }
 
         /// <summary>

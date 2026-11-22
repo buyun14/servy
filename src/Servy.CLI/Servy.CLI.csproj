@@ -2,26 +2,25 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
 
     <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>false</SelfContained>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <IncludeAllContentForSelfExtract>false</IncludeAllContentForSelfExtract>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <StripSymbols>true</StripSymbols>
 
     <IsTrimmable>true</IsTrimmable>
     <PublishTrimmed>true</PublishTrimmed>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <TrimMode>partial</TrimMode>
-    <DebuggerSupport>false</DebuggerSupport>
     <PublishReadyToRun>false</PublishReadyToRun>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+
+    <DebuggerSupport>true</DebuggerSupport>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>portable</DebugType>
+    <CopyOutputSymbolsToPublishDirectory>true</CopyOutputSymbolsToPublishDirectory>
   </PropertyGroup>
 
   <ItemGroup>
@@ -30,23 +29,27 @@
 
   <PropertyGroup>
     <AssemblyTitle>Servy.CLI</AssemblyTitle>
-    <AssemblyDescription>Servy Command Line Interface</AssemblyDescription>
+    <Description>Servy Command Line Interface</Description>
     <Product>Servy.CLI</Product>
     <ApplicationIcon>servy.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="Resources\handle64.exe" />
-    <None Remove="Resources\handle64a.exe" />
+    <None Remove="Resources\Servy.Host.exe" />
+    <None Remove="Resources\Servy.Host.pdb" />
     <None Remove="Resources\Servy.Service.CLI.exe" />
     <None Remove="Resources\Servy.Service.CLI.pdb" />
+    <None Remove="Resources\Servy.Restarter.exe" />
+    <None Remove="Resources\Servy.Restarter.pdb" />
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="Resources\handle64.exe" />
-    <EmbeddedResource Include="Resources\handle64a.exe" />
+    <EmbeddedResource Include="Resources\Servy.Host.exe" />
+    <EmbeddedResource Include="Resources\Servy.Host.pdb" />
     <EmbeddedResource Include="Resources\Servy.Service.CLI.exe" />
     <EmbeddedResource Include="Resources\Servy.Service.CLI.pdb" />
+    <EmbeddedResource Include="Resources\Servy.Restarter.exe" />
+    <EmbeddedResource Include="Resources\Servy.Restarter.pdb" />
   </ItemGroup>
 
   <ItemGroup>

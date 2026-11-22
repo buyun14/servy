@@ -10,7 +10,7 @@ namespace Servy.Core.Native
     /// for Windows Service management, process lifecycle control, and security rights.
     /// </summary>
     [ExcludeFromCodeCoverage]
-    public static partial class NativeMethods
+    public static class NativeMethods
     {
         #region Constants
 
@@ -23,13 +23,11 @@ namespace Servy.Core.Native
         /// <summary>Information level for QueryServiceConfig2/ChangeServiceConfig2: Service description.</summary>
         public const int SERVICE_CONFIG_DESCRIPTION = 1;
 
-        /// <summary>Logon type: Interactive. Designed for users who will be using the computer interactively.</summary>
-        public const int LOGON32_LOGON_INTERACTIVE = 2;
         /// <summary>Logon type: Network. Intended for high-performance servers to authenticate clear-text passwords.</summary>
         public const int LOGON32_LOGON_NETWORK = 3;
         /// <summary>Uses the standard logon provider for the system.</summary>
         public const int LOGON32_PROVIDER_DEFAULT = 0;
-        ///<summary>Logon type: Service. Intended for service accounts that run in the background without user interaction.</summary>
+        /// <summary>Logon type: Service. Intended for service accounts that run in the background without user interaction.</summary>
         public const int LOGON32_LOGON_SERVICE = 5;
 
         /// <summary>Snapshot flag: Includes all processes in the system in the snapshot.</summary>
@@ -57,16 +55,6 @@ namespace Servy.Core.Native
         /// <summary>The service runs in its own process.</summary>
         public const int SERVICE_WIN32_OWN_PROCESS = 0x00000010;
 
-        /// <summary>Share mode: Enables subsequent open operations on a file/device to request read access.</summary>
-        public const uint FILE_SHARE_READ = 0x00000001;
-        /// <summary>Share mode: Enables subsequent open operations on a file/device to request write access.</summary>
-        public const uint FILE_SHARE_WRITE = 0x00000002;
-        /// <summary>Share mode: Enables subsequent open operations on a file/device to request delete access.</summary>
-        public const uint FILE_SHARE_DELETE = 0x00000004;
-        /// <summary>Creation disposition: Opens a file/device only if it exists.</summary>
-        public const uint OPEN_EXISTING = 3;
-        /// <summary>Flag: Opens a directory for backup/restore or identity tracking.</summary>
-        public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
         /// <summary>Path flag: Return the path with a drive letter.</summary>
         public const uint VOLUME_NAME_DOS = 0x0;
 
@@ -74,15 +62,6 @@ namespace Servy.Core.Native
         public const uint MOVEFILE_REPLACE_EXISTING = 0x01;
         /// <summary>Ensures the move operation is flushed to disk before returning.</summary>
         public const uint MOVEFILE_WRITE_THROUGH = 0x08;
-
-        /// <summary>Represents the Win32 error code indicating the provided buffer is too small to contain the data.</summary>
-        public const int ERROR_INSUFFICIENT_BUFFER = 122;
-
-        /// <summary>
-        /// Represents the Win32 error code indicating that a data block or process table length changed
-        /// between internal allocation queries (commonly thrown transiently by Toolhelp32 APIs).
-        /// </summary>
-        public const int ERROR_BAD_LENGTH = 24;
 
         #endregion
 
@@ -96,12 +75,6 @@ namespace Servy.Core.Native
 
         /// <summary>Access right to create a service object and add it to the database.</summary>
         public const uint SC_MANAGER_CREATE_SERVICE = 0x0002;
-
-        /// <summary>Required to query the status of a service.</summary>
-        public const int SERVICE_QUERY_STATUS = 0x0004;
-
-        /// <summary>Access right to query the configuration parameters of a service.</summary>
-        public const uint SERVICE_QUERY_CONFIG = 0x0001;
 
         #endregion
 
@@ -119,12 +92,51 @@ namespace Servy.Core.Native
         /// <summary>Access right to delete the service.</summary>
         public const uint SERVICE_DELETE = 0x00010000;
 
+        /// <summary>Required to query the status of a service.</summary>
+        public const int SERVICE_QUERY_STATUS = 0x0004;
+
+        /// <summary>Access right to query the configuration parameters of a service.</summary>
+        public const uint SERVICE_QUERY_CONFIG = 0x0001;
+
+        /// <summary>Access right to read the information in the security descriptor of the object.</summary>
+        public const uint SERVICE_READ_CONTROL = 0x00020000;
+
+        /// <summary>Access right to modify the discretionary access control list (DACL) in the security descriptor.</summary>
+        public const uint SERVICE_WRITE_DAC = 0x00040000;
+
+        /// <summary>Access right to enumerate the services that depend on this service.</summary>
+        public const uint SERVICE_ENUMERATE_DEPENDENTS = 0x0008;
+
+        /// <summary>Access right to pause or continue the service.</summary>
+        public const uint SERVICE_PAUSE_CONTINUE = 0x0040;
+
+        /// <summary>Access right to send an interrogate control code to the service.</summary>
+        public const uint SERVICE_INTERROGATE = 0x0080;
+
+        /// <summary>
+        /// Full rights required for ServiceController.Stop() and Start() to succeed without Access Denied.
+        /// </summary>
+        public const uint SERVICE_CONTROL_AND_STATUS_ACCESS = SERVICE_QUERY_CONFIG
+                                                            | (uint)SERVICE_QUERY_STATUS
+                                                            | SERVICE_ENUMERATE_DEPENDENTS
+                                                            | SERVICE_START
+                                                            | SERVICE_STOP
+                                                            | SERVICE_PAUSE_CONTINUE
+                                                            | SERVICE_INTERROGATE
+                                                            | SERVICE_READ_CONTROL;
+
         #endregion
 
         #region Service Configuration & Type Flags
 
+        /// <summary>Service start type: started automatically by the service control manager during system startup.</summary>
+        public const int SERVICE_AUTO_START = 0x00000002;
+
         /// <summary>Service start type: started by the service control manager when a process calls StartService.</summary>
         public const int SERVICE_DEMAND_START = 0x00000003;
+
+        /// <summary>Service start type: disabled and cannot be started.</summary>
+        public const int SERVICE_DISABLED = 0x00000004;
 
         /// <summary>Logs the error and continues the startup operation if the service fails to start.</summary>
         public const uint SERVICE_ERROR_NORMAL = 0x00000001;
@@ -162,7 +174,7 @@ namespace Servy.Core.Native
         }
 
         /// <summary>Contains configuration information for an installed service.</summary>
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct QUERY_SERVICE_CONFIG
         {
             /// <summary>The type of service.</summary>
@@ -189,42 +201,47 @@ namespace Servy.Core.Native
         [StructLayout(LayoutKind.Sequential)]
         public struct SERVICE_STATUS
         {
+            /// <summary>The type of service (SERVICE_WIN32_OWN_PROCESS, SERVICE_WIN32_SHARE_PROCESS, and flags).</summary>
             public int dwServiceType;
+            /// <summary>The current state of the service (SERVICE_STOPPED, SERVICE_RUNNING, and the pending states).</summary>
             public int dwCurrentState;
+            /// <summary>Bit mask of the control codes the service accepts and processes in its handler.</summary>
             public int dwControlsAccepted;
+            /// <summary>Win32 error code the service reports on start or stop; ERROR_SERVICE_SPECIFIC_ERROR means <see cref="dwServiceSpecificExitCode"/> holds the reason.</summary>
             public int dwWin32ExitCode;
+            /// <summary>Service-specific exit code, meaningful only when <see cref="dwWin32ExitCode"/> is ERROR_SERVICE_SPECIFIC_ERROR.</summary>
             public int dwServiceSpecificExitCode;
+            /// <summary>Check-point value the service increments periodically during a lengthy pending operation.</summary>
             public int dwCheckPoint;
+            /// <summary>Estimated time, in milliseconds, for a pending start, stop, pause or continue operation.</summary>
             public int dwWaitHint;
         }
 
         /// <summary>Describes a process entry in a system snapshot.</summary>
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct PROCESSENTRY32
         {
+            /// <summary>Size of the structure, in bytes. Must be set to <c>sizeof(PROCESSENTRY32)</c> before calling Process32First.</summary>
             public uint dwSize;
+            /// <summary>No longer used; always zero.</summary>
             public uint cntUsage;
+            /// <summary>Process identifier.</summary>
             public uint th32ProcessID;
+            /// <summary>No longer used; always zero.</summary>
             public IntPtr th32DefaultHeapID;
+            /// <summary>No longer used; always zero.</summary>
             public uint th32ModuleID;
+            /// <summary>Number of execution threads started by the process.</summary>
             public uint cntThreads;
+            /// <summary>Identifier of the process that created this process. The process-tree walker keys on this member.</summary>
             public uint th32ParentProcessID;
+            /// <summary>Base priority of any threads created by this process.</summary>
             public int pcPriClassBase;
+            /// <summary>No longer used; always zero.</summary>
             public uint dwFlags;
+            /// <summary>Name of the executable file for the process (MAX_PATH characters).</summary>
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
             public string szExeFile;
-        }
-
-        /// <summary>Contains basic information about a process for internal NT queries.</summary>
-        [StructLayout(LayoutKind.Sequential)]
-        public struct PROCESS_BASIC_INFORMATION
-        {
-            public IntPtr Reserved1;       // ExitStatus
-            public IntPtr PebBaseAddress;
-            public IntPtr Reserved2_0;     // AffinityMask
-            public IntPtr Reserved2_1;     // BasePriority
-            public IntPtr UniqueProcessId;
-            public IntPtr InheritedFromUniqueProcessId; // Reserved3
         }
 
         /// <summary>Defines common process access rights.</summary>
@@ -237,30 +254,35 @@ namespace Servy.Core.Native
             QueryLimitedInformation = 0x1000,
         }
 
-        /// <summary>Information classes for NtQueryInformationProcess.</summary>
-        public enum ProcessInfoClass
-        {
-            ProcessBasicInformation = 0,
-        }
-
         /// <summary>Represents console control signal types.</summary>
         public enum CtrlEvents : uint
         {
+            /// <summary>Generates a CTRL+C signal.</summary>
             CTRL_C_EVENT = 0,
+            /// <summary>Generates a CTRL+BREAK signal.</summary>
             CTRL_BREAK_EVENT = 1,
-            CTRL_CLOSE_EVENT = 2,
-            CTRL_LOGOFF_EVENT = 5,
-            CTRL_SHUTDOWN_EVENT = 6,
         }
 
         /// <summary>Represents the number of 100-nanosecond intervals since January 1, 1601 (UTC).</summary>
         [StructLayout(LayoutKind.Sequential)]
         public struct FILETIME
         {
-            /// <summary>Specifies the low-order 32 bits of the file time. </summary>
+            /// <summary>Specifies the low-order 32 bits of the file time.</summary>
             public uint dwLowDateTime;
             /// <summary>Specifies the high-order 32 bits of the file time.</summary>
             public uint dwHighDateTime;
+        }
+
+        /// <summary>
+        /// Contains the deletion disposition passed to <c>SetFileInformationByHandle</c> with <see cref="FileDispositionInfoClass"/>.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct FILE_DISPOSITION_INFO
+        {
+            /// <summary>
+            /// Nonzero to mark the file for deletion when its last handle closes; zero to clear the mark.
+            /// </summary>
+            public byte DeleteFile;
         }
 
         /// <summary>
@@ -321,63 +343,6 @@ namespace Servy.Core.Native
             public uint FileIndexLow;
         }
 
-        /// <summary>Provides a unique identifier for a file on a specific volume.</summary>
-        public struct FILE_IDENTITY
-        {
-            /// <summary>The unique file index.</summary>
-            public ulong FileIndex;
-
-            /// <summary>The volume serial number.</summary>
-            public uint VolumeSerialNumber;
-
-            /// <summary>A digest of the start of the file for secondary identification.</summary>
-            public string PrefixDigest;
-
-            /// <summary>Indicates if handle-based information was successfully retrieved.</summary>
-            public bool IsValidHandleInfo;
-
-            /// <summary>
-            /// Compares the current file identity against another to determine if the underlying
-            /// file object on disk has been replaced (rotated) or truncated.
-            /// </summary>
-            /// <param name="other">The previously known file identity to compare against.</param>
-            /// <returns>
-            /// <c>true</c> if the files are proven different or if identity is undeterminable;
-            /// <c>false</c> only if they are proven to be the same file object.
-            /// </returns>
-            public bool IsDifferentFrom(FILE_IDENTITY other)
-            {
-                // If one probe succeeded and the other failed, they are fundamentally different states.
-                if (IsValidHandleInfo != other.IsValidHandleInfo) return true;
-
-                // 1. Primary Probe: Win32 File Index and Volume Serial Number (Most reliable)
-                if (IsValidHandleInfo)   // other.IsValidHandleInfo is guaranteed equal here
-                {
-                    if (FileIndex != other.FileIndex || VolumeSerialNumber != other.VolumeSerialNumber)
-                        return true;
-                    return false;
-                }
-
-                // 2. Secondary Probe: Content Prefix Digest (Used when handle info is unavailable, e.g., FAT32)
-                if (PrefixDigest != null && other.PrefixDigest != null)
-                {
-                    // If content digests differ, the file has definitely changed.
-                    // If both are empty strings (empty files), we treat them as same content-wise.
-                    return PrefixDigest != other.PrefixDigest;
-                }
-
-                // 3. Fallback: Identity Undeterminable
-                // If we reach this point, both robust probes failed or yielded null data (e.g., due to
-                // exclusive file locks, antivirus interference, or I/O errors).
-                //
-                // SAFE DEFAULT: We return 'true' to signal a potential difference. This forces the
-                // caller (like LogTailer) to break its inner loop and perform a "soft refresh" via
-                // metadata-guarded re-opening. This prevents masking rotations on hostile file
-                // systems where tunneling hides metadata changes.
-                return true;
-            }
-        }
-
         #endregion
 
         #region SCM & Service Functions
@@ -389,19 +354,19 @@ namespace Servy.Core.Native
         /// <summary>Creates a service object and adds it to the specified SCM database.</summary>
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern SafeServiceHandle CreateService(
-          SafeScmHandle hSCManager,
-          string lpServiceName,
-          string lpDisplayName,
-          uint dwDesiredAccess,
-          uint dwServiceType,
-          uint dwStartType,
-          uint dwErrorControl,
-          string lpBinaryPathName,
-          string? lpLoadOrderGroup,
-          IntPtr lpdwTagId,
-          string? lpDependencies,
-          string? lpServiceStartName,
-          string? lpPassword);
+            SafeScmHandle hSCManager,
+            string lpServiceName,
+            string lpDisplayName,
+            uint dwDesiredAccess,
+            uint dwServiceType,
+            uint dwStartType,
+            uint dwErrorControl,
+            string lpBinaryPathName,
+            string? lpLoadOrderGroup,
+            IntPtr lpdwTagId,
+            string? lpDependencies,
+            string? lpServiceStartName,
+            string? lpPassword);
 
         /// <summary>Opens an existing service.</summary>
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -420,7 +385,7 @@ namespace Servy.Core.Native
         public static extern bool ControlService(SafeServiceHandle hService, uint dwControl, ref SERVICE_STATUS lpServiceStatus);
 
         /// <summary>Retrieves the configuration parameters of the specified service.</summary>
-        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool QueryServiceConfig(
             SafeServiceHandle hService,
             IntPtr lpServiceConfig,
@@ -437,7 +402,7 @@ namespace Servy.Core.Native
             out int pcbBytesNeeded);
 
         /// <summary>Retrieves optional configuration parameters using a raw buffer pointer.</summary>
-        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool QueryServiceConfig2(
             SafeServiceHandle hService,
             uint dwInfoLevel,
@@ -463,23 +428,23 @@ namespace Servy.Core.Native
         /// <summary>Changes optional service configuration (Description).</summary>
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool ChangeServiceConfig2(
-              SafeServiceHandle hService,
-             uint dwInfoLevel,
-              ref SERVICE_DESCRIPTION lpInfo);
+            SafeServiceHandle hService,
+            uint dwInfoLevel,
+            ref SERVICE_DESCRIPTION lpInfo);
 
         /// <summary>Changes optional service configuration (Delayed Auto Start).</summary>
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool ChangeServiceConfig2(
-              SafeServiceHandle hService,
-             uint dwInfoLevel,
-              ref SERVICE_DELAYED_AUTO_START_INFO lpInfo);
+            SafeServiceHandle hService,
+            uint dwInfoLevel,
+            ref SERVICE_DELAYED_AUTO_START_INFO lpInfo);
 
         /// <summary>Changes optional service configuration using a raw buffer pointer.</summary>
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool ChangeServiceConfig2(
-              SafeServiceHandle hService,
-             uint dwInfoLevel,
-              IntPtr lpInfo);
+            SafeServiceHandle hService,
+            uint dwInfoLevel,
+            IntPtr lpInfo);
 
         /// <summary>Updates the SCM's status information for the calling service.</summary>
         [DllImport("advapi32.dll", SetLastError = true)]
@@ -505,23 +470,15 @@ namespace Servy.Core.Native
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern SafeWinProcessHandle OpenProcess(ProcessAccess desiredAccess, bool inheritHandle, int processId);
 
-        /// <summary>Low-level NT function to retrieve process information.</summary>
-        [DllImport("ntdll.dll")]
-        public static extern int NtQueryInformationProcess(
-            IntPtr processHandle,
-            ProcessInfoClass processInformationClass,
-            ref PROCESS_BASIC_INFORMATION processInformation,
-            uint processInformationLength,
-            out uint returnLength);
+        /// <summary>Opens the access token of a process.</summary>
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool OpenProcessToken(SafeWinProcessHandle processHandle, uint desiredAccess, out SafeAccessTokenHandle tokenHandle);
 
-        /// <summary>Internal overload for NtQueryInformationProcess.</summary>
-        [DllImport("ntdll.dll")]
-        public static extern int NtQueryInformationProcess(
-            IntPtr processHandle,
-            ProcessInfoClass processInformationClass,
-            out PROCESS_BASIC_INFORMATION processInformation,
-            uint processInformationLength,
-            IntPtr returnLength = default);
+        /// <summary>
+        /// Access right required to query an access token (Win32 <c>TOKEN_QUERY</c>). Pass it as the
+        /// <c>desiredAccess</c> argument of <see cref="OpenProcessToken"/> to read the token's user.
+        /// </summary>
+        public const uint TOKEN_QUERY = 0x0008;
 
         /// <summary>
         /// Parses a Unicode command-line string and returns an array of pointers to the command-line arguments,
@@ -539,8 +496,9 @@ namespace Servy.Core.Native
         /// using the pointer returned by this function.
         /// </para>
         /// <para>
-        /// This method is essential for correctly resolving unquoted service paths that contain spaces
-        /// (e.g., "C:\Program Files\Servy\Servy.Service.exe"), as it mirrors the OS's own argument parsing logic.
+        /// This method resolves a quoted service path that contains spaces
+        /// (e.g., <c>"C:\Program Files\Servy\Servy.Service.exe" MyService</c>) to its executable. An unquoted path is split
+        /// at its first space, unlike the Service Control Manager, which tries each space-delimited prefix in turn.
         /// </para>
         /// </remarks>
         [DllImport("shell32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -556,9 +514,6 @@ namespace Servy.Core.Native
 
         #region Console Functions
 
-        /// <summary>Delegate for processing console control signals.</summary>
-        public delegate bool ConsoleCtrlHandlerRoutine(CtrlEvents ctrlType);
-
         /// <summary>Attaches the calling process to the console of a specified process.</summary>
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool AttachConsole(int processId);
@@ -573,7 +528,7 @@ namespace Servy.Core.Native
 
         /// <summary>Adds or removes an application-defined console signal handler.</summary>
         [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandlerRoutine? handlerRoutine, bool add);
+        public static extern bool SetConsoleCtrlHandler(IntPtr handlerRoutine, bool add);
 
         /// <summary>Sends a specified signal to a console process group.</summary>
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -588,16 +543,16 @@ namespace Servy.Core.Native
         #region File & Security Functions
 
         /// <summary>Closes an open object handle.</summary>
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr handle);
 
         /// <summary>Retrieves the final path for the specified file handle.</summary>
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern uint GetFinalPathNameByHandle(
-           SafeFileHandle hFile,
-           [Out] StringBuilder lpszFilePath,
-           uint cchFilePath,
-           uint dwFlags);
+            SafeFileHandle hFile,
+            [Out] StringBuilder lpszFilePath,
+            uint cchFilePath,
+            uint dwFlags);
 
         /// <summary>Attempts to log a user on to the local computer.</summary>
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -617,6 +572,66 @@ namespace Servy.Core.Native
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
 
+        /// <summary><c>FileDispositionInfo</c>: the <c>FILE_INFO_BY_HANDLE_CLASS</c> value that marks a file for deletion through <see cref="SetFileInformationByHandle"/>.</summary>
+        public const int FileDispositionInfoClass = 4;
+
+        /// <summary>Sets the deletion disposition of the file behind an open handle; the file is removed when the last handle closes.</summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int fileInformationClass, ref FILE_DISPOSITION_INFO lpFileInformation, uint dwBufferSize);
+
+        /// <summary>
+        /// Requests all entries of <c>NetLocalGroupGetMembers</c> in one buffer.
+        /// </summary>
+        public const int MAX_PREFERRED_LENGTH = -1;
+
+        /// <summary>
+        /// One member of a local group, as returned by <c>NetLocalGroupGetMembers</c> at information level 1.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct LOCALGROUP_MEMBERS_INFO_1
+        {
+            /// <summary>Pointer to the member's security identifier.</summary>
+            public IntPtr lgrmi1_sid;
+
+            /// <summary>The account type of the member (a <c>SID_NAME_USE</c> value).</summary>
+            public int lgrmi1_sidusage;
+
+            /// <summary>Pointer to the member's account name.</summary>
+            public IntPtr lgrmi1_name;
+        }
+
+        /// <summary><c>SID_NAME_USE</c>: a group account.</summary>
+        public const int SidTypeGroup = 2;
+
+        /// <summary><c>SID_NAME_USE</c>: an alias (local group) account.</summary>
+        public const int SidTypeAlias = 4;
+
+        /// <summary><c>SID_NAME_USE</c>: a well-known group account.</summary>
+        public const int SidTypeWellKnownGroup = 5;
+
+        /// <summary>Retrieves the members of a local group.</summary>
+        [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
+        public static extern int NetLocalGroupGetMembers(
+            string? servername,
+            string localgroupname,
+            int level,
+            out IntPtr bufptr,
+            int prefmaxlen,
+            out int entriesread,
+            out int totalentries,
+            IntPtr resumehandle);
+
+        /// <summary>Frees a buffer allocated by a <c>Net*</c> function.</summary>
+        [DllImport("netapi32.dll")]
+        public static extern int NetApiBufferFree(IntPtr buffer);
+
+        /// <summary>Retrieves a Volume GUID path for a volume mount point.</summary>
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool GetVolumeNameForVolumeMountPoint(
+            string lpszVolumeMountPoint,
+            [Out] StringBuilder lpszVolumeName,
+            uint cchBufferLength);
+
         #endregion
 
         #region LogonAsServiceGrant Interop
@@ -625,8 +640,11 @@ namespace Servy.Core.Native
         [StructLayout(LayoutKind.Sequential)]
         public struct LSA_UNICODE_STRING
         {
+            /// <summary>Length, in bytes, of the string in <see cref="Buffer"/>, not counting a terminating null.</summary>
             public ushort Length;
+            /// <summary>Total size, in bytes, of <see cref="Buffer"/>; at least <see cref="Length"/>, plus two bytes when a terminating null is stored.</summary>
             public ushort MaximumLength;
+            /// <summary>Pointer to the wide-character string; need not be null-terminated.</summary>
             public IntPtr Buffer;
         }
 
@@ -634,20 +652,27 @@ namespace Servy.Core.Native
         [StructLayout(LayoutKind.Sequential)]
         public struct LSA_OBJECT_ATTRIBUTES
         {
+            /// <summary>Size of this structure, in bytes.</summary>
             public int Length;
+            /// <summary>Root directory handle for the object name. Must be <see cref="IntPtr.Zero"/> for LSA policy objects.</summary>
             public IntPtr RootDir;
+            /// <summary>Pointer to an object name (LSA_UNICODE_STRING). Not used by LsaOpenPolicy; set to <see cref="IntPtr.Zero"/>.</summary>
             public IntPtr ObjectName;
+            /// <summary>Object attribute flags. Not used by LsaOpenPolicy; set to zero.</summary>
             public uint Attributes;
+            /// <summary>Pointer to a security descriptor. Not used by LsaOpenPolicy; set to <see cref="IntPtr.Zero"/>.</summary>
             public IntPtr SecurityDesc;
+            /// <summary>Pointer to a SECURITY_QUALITY_OF_SERVICE structure. Not used by LsaOpenPolicy; set to <see cref="IntPtr.Zero"/>.</summary>
             public IntPtr SecurityQos;
         }
 
         /// <summary>LSA Policy database access rights.</summary>
         public static class POLICY_ACCESS
         {
+            /// <summary>Access right to translate names to SIDs and the reverse; required to enumerate or add account rights.</summary>
             public const uint POLICY_LOOKUP_NAMES = 0x00000800;
+            /// <summary>Access right to create an LSA account object; required to add rights to an account that has none yet.</summary>
             public const uint POLICY_CREATE_ACCOUNT = 0x00000010;
-            public const uint POLICY_ASSIGN_PRIVILEGE = 0x00000400;
         }
 
         /// <summary>Frees memory allocated by LSA functions.</summary>
@@ -685,6 +710,194 @@ namespace Servy.Core.Native
         /// <summary>Closes an LSA Policy handle.</summary>
         [DllImport("advapi32.dll")]
         public static extern int LsaClose(IntPtr policyHandle);
+
+        #endregion
+
+        #region Service Security Descriptor Functions
+
+        /// <summary>Security information flag indicating that the discretionary access control list (DACL) is being queried or set.</summary>
+        public const uint DACL_SECURITY_INFORMATION = 0x00000004;
+
+        /// <summary>Retrieves a copy of the security descriptor associated with a service object.</summary>
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern bool QueryServiceObjectSecurity(
+            SafeHandle hService,
+            uint dwSecurityInformation,
+            byte[]? lpSecurityDescriptor,
+            uint cbBufSize,
+            out uint pcbBytesNeeded);
+
+        /// <summary>Sets components of the security descriptor of a service object.</summary>
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern bool SetServiceObjectSecurity(
+            SafeHandle hService,
+            uint dwSecurityInformation,
+            byte[] lpSecurityDescriptor);
+
+        #endregion
+
+        #region Service Status and Named Pipe Peer Functions
+
+        /// <summary>The <c>InfoLevel</c> of <see cref="QueryServiceStatusEx"/> that returns a <see cref="SERVICE_STATUS_PROCESS"/>.</summary>
+        public const int SC_STATUS_PROCESS_INFO = 0;
+
+        /// <summary>Process status information for a service, as returned by <see cref="QueryServiceStatusEx"/>.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SERVICE_STATUS_PROCESS
+        {
+            /// <summary>The type of service.</summary>
+            public int dwServiceType;
+            /// <summary>The current state of the service.</summary>
+            public int dwCurrentState;
+            /// <summary>Bit mask of the control codes the service accepts.</summary>
+            public int dwControlsAccepted;
+            /// <summary>Win32 error code the service reports on start or stop.</summary>
+            public int dwWin32ExitCode;
+            /// <summary>Service-specific exit code.</summary>
+            public int dwServiceSpecificExitCode;
+            /// <summary>Check-point value of a pending operation.</summary>
+            public int dwCheckPoint;
+            /// <summary>Estimated time, in milliseconds, of a pending operation.</summary>
+            public int dwWaitHint;
+            /// <summary>The process identifier of the service, or 0 when the service is not running.</summary>
+            public int dwProcessId;
+            /// <summary>Flags; SERVICE_RUNS_IN_SYSTEM_PROCESS for a service in a system process.</summary>
+            public int dwServiceFlags;
+        }
+
+        /// <summary>Retrieves the current status of the specified service, including its process identifier.</summary>
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool QueryServiceStatusEx(
+            SafeServiceHandle hService,
+            int infoLevel,
+            out SERVICE_STATUS_PROCESS lpBuffer,
+            int cbBufSize,
+            out int pcbBytesNeeded);
+
+        /// <summary>
+        /// Creates an instance of a named pipe. Used instead of <see cref="System.IO.Pipes.NamedPipeServerStream"/>'s
+        /// constructors because they cannot pass <c>PIPE_REJECT_REMOTE_CLIENTS</c>.
+        /// </summary>
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateNamedPipeW")]
+        public static extern SafePipeHandle CreateNamedPipe(
+            string name,
+            uint openMode,
+            uint pipeMode,
+            uint maxInstances,
+            uint outBufferSize,
+            uint inBufferSize,
+            uint defaultTimeout,
+            ref PipeSecurityAttributes securityAttributes);
+
+        /// <summary>The <c>SECURITY_ATTRIBUTES</c> structure passed to <see cref="CreateNamedPipe"/>.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PipeSecurityAttributes
+        {
+            /// <summary>The size of the structure, in bytes.</summary>
+            public int Length;
+
+            /// <summary>A pointer to a self-relative security descriptor.</summary>
+            public IntPtr SecurityDescriptor;
+
+            /// <summary>Whether the handle is inherited by child processes.</summary>
+            public int InheritHandle;
+        }
+
+        /// <summary>Retrieves the process identifier of the client connected to the server end of a named pipe.</summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetNamedPipeClientProcessId(SafeHandle pipe, out uint clientProcessId);
+
+        /// <summary>
+        /// Retrieves the computer name of the client connected to the server end of a named pipe. Fails with
+        /// ERROR_PIPE_LOCAL when the client is on this computer.
+        /// </summary>
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "GetNamedPipeClientComputerNameW")]
+        public static extern bool GetNamedPipeClientComputerName(SafeHandle pipe, StringBuilder clientComputerName, uint clientComputerNameLength);
+
+        /// <summary>Retrieves the process identifier of the server that owns the server end of a named pipe.</summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetNamedPipeServerProcessId(SafeHandle pipe, out uint serverProcessId);
+
+        #endregion
+
+        #region Restart Manager Functions
+
+        /// <summary>The number of characters of a Restart Manager session key, without the terminating null (<c>CCH_RM_SESSION_KEY</c>).</summary>
+        public const int CCH_RM_SESSION_KEY = 32;
+
+        /// <summary>The maximum number of characters of an application name in <see cref="RM_PROCESS_INFO"/> (<c>CCH_RM_MAX_APP_NAME</c>).</summary>
+        public const int CCH_RM_MAX_APP_NAME = 255;
+
+        /// <summary>The maximum number of characters of a service short name in <see cref="RM_PROCESS_INFO"/> (<c>CCH_RM_MAX_SVC_NAME</c>).</summary>
+        public const int CCH_RM_MAX_SVC_NAME = 63;
+
+        /// <summary>
+        /// Identifies a process to the Restart Manager: its identifier and its creation time, which together tell a
+        /// process apart from a later one that reuses the identifier (<c>RM_UNIQUE_PROCESS</c>).
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RM_UNIQUE_PROCESS
+        {
+            /// <summary>The process identifier.</summary>
+            public int dwProcessId;
+            /// <summary>The creation time of the process.</summary>
+            public FILETIME ProcessStartTime;
+        }
+
+        /// <summary>Describes an application that uses a resource registered with a Restart Manager session (<c>RM_PROCESS_INFO</c>).</summary>
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct RM_PROCESS_INFO
+        {
+            /// <summary>The process that uses the resource.</summary>
+            public RM_UNIQUE_PROCESS Process;
+            /// <summary>The display name of the application.</summary>
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)]
+            public string strAppName;
+            /// <summary>The short name of the service, when the application is a service.</summary>
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)]
+            public string strServiceShortName;
+            /// <summary>The type of application (<c>RM_APP_TYPE</c>).</summary>
+            public int ApplicationType;
+            /// <summary>The status of the application (<c>RM_APP_STATUS</c> flags).</summary>
+            public uint AppStatus;
+            /// <summary>The Terminal Services session the process runs in.</summary>
+            public uint TSSessionId;
+            /// <summary>Whether the Restart Manager can restart the application.</summary>
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bRestartable;
+        }
+
+        /// <summary>Starts a new Restart Manager session. Returns a Win32 error code; 0 on success.</summary>
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        public static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, StringBuilder strSessionKey);
+
+        /// <summary>Ends a Restart Manager session. Returns a Win32 error code; 0 on success.</summary>
+        [DllImport("rstrtmgr.dll")]
+        public static extern int RmEndSession(uint pSessionHandle);
+
+        /// <summary>Registers files, processes or services with a Restart Manager session. Returns a Win32 error code; 0 on success.</summary>
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        public static extern int RmRegisterResources(
+            uint pSessionHandle,
+            uint nFiles,
+            string[] rgsFilenames,
+            uint nApplications,
+            [In] RM_UNIQUE_PROCESS[]? rgApplications,
+            uint nServices,
+            string[]? rgsServiceNames);
+
+        /// <summary>
+        /// Lists the processes that use the resources registered with a Restart Manager session. Returns a Win32 error
+        /// code: 0 on success, or <see cref="Errors.ERROR_MORE_DATA"/> when <paramref name="rgAffectedApps"/> is too
+        /// small, with the size it needs in <paramref name="pnProcInfoNeeded"/>.
+        /// </summary>
+        [DllImport("rstrtmgr.dll")]
+        public static extern int RmGetList(
+            uint dwSessionHandle,
+            out uint pnProcInfoNeeded,
+            ref uint pnProcInfo,
+            [In, Out] RM_PROCESS_INFO[]? rgAffectedApps,
+            ref uint lpdwRebootReasons);
 
         #endregion
     }

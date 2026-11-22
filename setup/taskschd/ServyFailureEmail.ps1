@@ -1,4 +1,5 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Monitors Servy error events in the Windows Application log and sends notification emails.
@@ -7,10 +8,13 @@
     This script performs a targeted audit of the Windows Application event log to identify
     failures within services managed by Servy. It provides an automated alerting mechanism
     for administrators by:
-      1. Filtering the Application log specifically for 'Servy' error sources.
+      1. Filtering the Application log specifically for 'Servy' error sources, keeping only
+         the Servy error event IDs (3000-3199).
       2. Tracking the last processed event via a local timestamp file to prevent duplicate alerts.
       3. Parsing event messages to identify the specific service name and error context.
-      4. Dispatching HTML-formatted notification emails using a robust .NET SMTP implementation.
+      4. Dispatching HTML-formatted notification emails using a robust .NET SMTP implementation,
+         at most 10 per run: when more errors arrived, the newest 10 are sent and the older ones
+         are skipped and recorded in ServyWatermarkErrors.log.
       5. Providing fallback logging to the Event Log or local disk if email delivery fails.
 
 .NOTES
@@ -49,7 +53,7 @@ $DefaultPlaceholderDomain = "example.com"
 
 # Event ID Taxonomy (Refer to src/Servy.Core/Logging/EventIds.cs for updates)
 # 3000-3099: Core Errors | 3100-3199: Script Errors
-$EVENT_ID_DEPENDENCY_ERROR = 3104
+$EVENT_ID_DEPENDENCY_ERROR = 3104 # mirrors EventIds.ScheduledTaskScriptDependencyError
 
 # -------------------------------
 # 2. Imports
@@ -75,14 +79,14 @@ function ConvertTo-HtmlSafe {
 # 3. Load Configuration
 # -------------------------------
 $configPath = Join-Path $scriptDir "smtp-config.xml"
-if (-not (Test-Path $configPath)) {
+if (-not (Test-Path -LiteralPath $configPath)) {
     $errorMsg = "ServyFailureEmail: Configuration file not found at '$configPath'. Stopping script."
     Write-FallbackError -Message $errorMsg -ScriptDir $scriptDir -FallbackFileName $fallbackLogFile
     exit 1
 }
 
 try {
-    [xml]$SmtpConfig = Get-Content $configPath -ErrorAction Stop
+    [xml]$SmtpConfig = Get-Content -LiteralPath $configPath -ErrorAction Stop
 } catch {
     $errorMsg = "ServyFailureEmail: Failed to parse XML configuration. Error: $($_.Exception.Message)"
     Write-FallbackError -Message $errorMsg -ScriptDir $scriptDir -FallbackFileName $fallbackLogFile
@@ -130,9 +134,9 @@ function Send-NotificationEmail {
         [string]$PlaceholderDomain = "example.com"
     )
 
-    # Masking is now performed by the caller before HTML encoding.
-    # This ensures the regex tail (?:"[^"]*"|'[^']*'|\S+) matches full quoted strings
-    # before quotes are converted to &quot; or &#39;.
+    # Body and Subject arrive already masked. Masking must run before HTML encoding so the
+    # masker's quoted-value branches ("..." and '...', see Protect-SensitiveString in ServySecurity.ps1)
+    # still see the raw quotes they anchor on rather than &quot; or &#39;.
 
     # --- HARDENED CONFIGURATION ACCESS ---
 
@@ -143,9 +147,9 @@ function Send-NotificationEmail {
         return 'PermanentFailure'
     }
 
-    $smtpServer = $configRoot.Server
-    $from        = $configRoot.From
-    $to          = $configRoot.To
+    $smtpServer = ([string]$configRoot.Server).Trim()
+    $from       = ([string]$configRoot.From).Trim()
+    $to         = ([string]$configRoot.To).Trim()
 
     $rawPort    = ([string]$configRoot.Port).Trim()
     $rawUseSsl  = ([string]$configRoot.UseSsl).Trim()
@@ -155,10 +159,8 @@ function Send-NotificationEmail {
     $portRef = 0
     $smtpPort = if ([int]::TryParse($rawPort, [ref]$portRef)) { $portRef } else { 0 }
 
-    # 3. Safe SSL Preference Resolution (Case-insensitive, defaults to true)
-    # Casts to string and trims whitespace to prevent parsing errors.
-    # Uses case-insensitive regex '(?i)' to match "false", "FALSE", "False", or "0".
-    $useSsl = if ($rawUseSsl -match '^(?i)(false|0)$') { $false } else { $true }
+    # 3. UseSsl defaults to true; only an explicit false/0 (any case, -match is case-insensitive) disables it.
+    $useSsl = if ($rawUseSsl -match '^(false|0)$') { $false } else { $true }
 
     # 4. Safe Timeout Resolution (Defaults to 30000ms / 30s)
     $timeoutRef = 0
@@ -178,6 +180,12 @@ function Send-NotificationEmail {
     # Check for invalid port
     if ($smtpPort -le 0 -or $smtpPort -gt 65535) {
         Write-FallbackError -Message "ServyFailureEmail: Invalid or missing Port ($smtpPort) in smtp-config.xml." -ScriptDir $ScriptDir -FallbackFileName $FallbackLogFile
+        return 'PermanentFailure'
+    }
+
+    # Check for invalid timeout (ms). Upper bound mirrors the task's PT5M ExecutionTimeLimit.
+    if ($timeout -le 0 -or $timeout -gt 300000) {
+        Write-FallbackError -Message "ServyFailureEmail: Invalid TimeoutMs ($timeout) in smtp-config.xml. Expected 1-300000 milliseconds." -ScriptDir $ScriptDir -FallbackFileName $FallbackLogFile
         return 'PermanentFailure'
     }
 
@@ -214,7 +222,7 @@ function Send-NotificationEmail {
         return 'PermanentFailure'
     }
 
-    if (-not (Test-Path $credPath)) {
+    if (-not (Test-Path -LiteralPath $credPath)) {
         Write-FallbackError -Message "ServyFailureEmail: Credential file not found at '$credPath'. Skipping email." -ScriptDir $ScriptDir -FallbackFileName $FallbackLogFile
         return 'PermanentFailure'
     }
@@ -234,7 +242,7 @@ function Send-NotificationEmail {
 
     # --- EXECUTION ---
     try {
-        $cred = Import-Clixml $credPath
+        $cred = Import-Clixml -LiteralPath $credPath
 
         $smtp = New-Object System.Net.Mail.SmtpClient($smtpServer, $smtpPort)
         $smtp.EnableSsl = $useSsl
@@ -260,13 +268,24 @@ function Send-NotificationEmail {
         return 'PermanentFailure'
     } catch [System.Net.Mail.SmtpException] {
         # SMTP-level errors: Apply granular classification based on RFC 5321 codes.
-        # 4xx (e.g., 421, 450) are treated as Transient; 5xx (e.g., 550, 554) are Permanent.
+        # 4xx (e.g., 421, 450) are treated as Transient; 5xx (e.g., 550, 553) are Permanent,
+        # except 554, which is retried (see below).
         $status = $_.Exception.StatusCode
+        $inner  = $_.Exception.InnerException
+
+        # GeneralFailure (-1) is reported both for permanent auth/config errors (#2318) and for
+        # every transport-level failure. The inner exception is what separates them.
+        $isTransport = $status -eq [System.Net.Mail.SmtpStatusCode]::GeneralFailure -and (
+               $inner -is [System.Net.Sockets.SocketException] `
+            -or $inner -is [System.Net.WebException] `
+            -or $inner -is [System.IO.IOException] `
+            -or $inner -is [System.TimeoutException])
 
         # 4xx replies are transient per RFC 5321; TransactionFailed (554) is also
         # retried because some servers use it for greylisting-style rejections.
         $isTransient = ($status -ge 400 -and $status -lt 500) `
-            -or $status -eq [System.Net.Mail.SmtpStatusCode]::TransactionFailed
+            -or $status -eq [System.Net.Mail.SmtpStatusCode]::TransactionFailed `
+            -or $isTransport
 
         $errorMsg = "ServyFailureEmail: SMTP $status sending to $to. Error: $($_.Exception.Message)"
 
@@ -283,7 +302,7 @@ function Send-NotificationEmail {
         Write-FallbackError -Message "ServyFailureEmail: Permanent format failure: $($_.Exception.Message)" -ScriptDir $ScriptDir -FallbackFileName $FallbackLogFile
         return 'PermanentFailure'
     } catch [System.IO.IOException], [System.Net.WebException], [System.Net.Sockets.SocketException], [System.TimeoutException] {
-        # ROBUSTNESS: Explicitly isolate known transient/retryable physical infrastructure and network faults.
+        # ROBUSTNESS: Explicitly isolate known transient/retryable physical infrastructure and network faults during pre-send stages (e.g. credential import).
         $errorMsg = "ServyFailureEmail: Transient network I/O failure to $to. Error: $($_.Exception.Message)"
         Write-FallbackError -Message $errorMsg -ScriptDir $ScriptDir -FallbackFileName $FallbackLogFile
         return 'TransientFailure'

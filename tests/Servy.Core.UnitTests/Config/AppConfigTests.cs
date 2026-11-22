@@ -1,5 +1,5 @@
 using Servy.Core.Config;
-using System.Runtime.InteropServices;
+using Servy.Testing;
 
 namespace Servy.Core.UnitTests.Config
 {
@@ -8,18 +8,37 @@ namespace Servy.Core.UnitTests.Config
         [Fact]
         public void UpdateCheckTimeouts_AreConsistent()
         {
-            // Arrange (Static property validation context)
-
             // Act & Assert
-            Assert.True(AppConfig.UpdateCheckTimeoutSeconds <= AppConfig.UpdateCheckHttpTimeoutSeconds,
-                "Cooperative cancellation timeout must not exceed the HTTP client timeout.");
+            // Strictly less, not <=: at equal values the cooperative CancellationTokenSource and the
+            // HttpClient transport timeout fire at the same instant and which one wins is
+            // scheduler-dependent, which is the generic connection error the remarks on
+            // UpdateCheckTimeoutSeconds say this invariant exists to prevent.
+            Assert.True(AppConfig.UpdateCheckTimeoutSeconds < AppConfig.UpdateCheckHttpTimeoutSeconds,
+                "Cooperative cancellation must fire strictly before the HTTP client timeout.");
+        }
+
+        [Fact]
+        public void SkipSplashArgument_IsAValueBoolTryParseReadsAsFalse()
+        {
+            // Act & Assert
+            // The consumer (AppBootstrapper.OnStartup) parses the positional argument with
+            // bool.TryParse and never reads this constant, so producer and consumer are bound by
+            // string value only and nothing but this assertion notices a change to "0" or "no".
+            Assert.True(bool.TryParse(AppConfig.SkipSplashArgument, out var skipSplash) && !skipSplash,
+                $"SkipSplashArgument must be a string bool.TryParse accepts as false; got '{AppConfig.SkipSplashArgument}'.");
+        }
+
+        [Fact]
+        public void ChildSleepSeconds_OutlastsChildTimeoutSeconds()
+        {
+            // Act & Assert
+            Assert.True(TestTimeouts.ChildSleepSeconds >= TestTimeouts.ChildTimeoutSeconds,
+                "The spawned leaf process must still be alive when the enumeration budget expires.");
         }
 
         [Fact]
         public void Version_ShouldNotBeNullOrEmpty()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var version = AppConfig.Version;
 
@@ -28,22 +47,8 @@ namespace Servy.Core.UnitTests.Config
         }
 
         [Fact]
-        public void ServyCoreDllName_ShouldBeCorrect()
-        {
-            // Arrange (Static property validation context)
-
-            // Act
-            var dllName = AppConfig.ServyCoreDllName;
-
-            // Assert
-            Assert.Equal("Servy.Core", dllName);
-        }
-
-        [Fact]
         public void ServyServiceUIExe_ShouldBeCorrect()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var exeName = AppConfig.ServyServiceUIExe;
 
@@ -54,8 +59,6 @@ namespace Servy.Core.UnitTests.Config
         [Fact]
         public void ServyServiceCLIExe_ShouldBeCorrect()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var exeName = AppConfig.ServyServiceCLIExe;
 
@@ -66,8 +69,6 @@ namespace Servy.Core.UnitTests.Config
         [Fact]
         public void DefaultConnectionString_ShouldContainDbFolderPath()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var connectionString = AppConfig.DefaultConnectionString;
 
@@ -79,8 +80,6 @@ namespace Servy.Core.UnitTests.Config
         [Fact]
         public void DefaultAESKeyPath_ShouldEndWithAesKeyDat()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var keyPath = AppConfig.DefaultAESKeyPath;
 
@@ -91,8 +90,6 @@ namespace Servy.Core.UnitTests.Config
         [Fact]
         public void DefaultAESIVPath_ShouldEndWithAesIvDat()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var ivPath = AppConfig.DefaultAESIVPath;
 
@@ -101,36 +98,16 @@ namespace Servy.Core.UnitTests.Config
         }
 
         [Fact]
-        public void GetHandleExePath_ShouldReturnFullPath()
+        public void LegacyHandleExeFileNames_NameBothSysinternalsHandleBuilds()
         {
-            // Arrange
-            // Host architecture is resolved dynamically via native environment reflection
-
-            // Act
-            var path = AppConfig.GetHandleExePath();
-
-            // Assert
-            Assert.False(string.IsNullOrWhiteSpace(path));
-            Assert.True(Path.IsPathRooted(path), $"Expected an absolute path but got: {path}");
-
-            // Use literal expected values instead of re-evaluating production constants.
-            // This breaks the lockstep behavior and guarantees that inverted architectural mappings
-            // or swapped internal filenames are successfully caught by the test runner.
-            if (RuntimeInformation.OSArchitecture == Architecture.Arm64)
-            {
-                Assert.EndsWith("handle64a.exe", path, StringComparison.OrdinalIgnoreCase);
-            }
-            else
-            {
-                Assert.EndsWith("handle64.exe", path, StringComparison.OrdinalIgnoreCase);
-            }
+            // Literal values rather than production constants: these are the names earlier versions extracted to
+            // the vault, so a renamed entry would leave that copy behind forever.
+            Assert.Equal(new[] { "handle64.exe", "handle64a.exe" }, AppConfig.LegacyHandleExeFileNames);
         }
 
         [Fact]
         public void GetServyCLIServicePath_ShouldReturnFullPath()
         {
-            // Arrange (Static execution context)
-
             // Act
             var path = AppConfig.GetServyCLIServicePath();
 
@@ -143,8 +120,6 @@ namespace Servy.Core.UnitTests.Config
         [Fact]
         public void GetServyUIServicePath_ShouldReturnFullPath()
         {
-            // Arrange (Static execution context)
-
             // Act
             var path = AppConfig.GetServyUIServicePath();
 
@@ -155,10 +130,78 @@ namespace Servy.Core.UnitTests.Config
         }
 
         [Fact]
+        public void GetServyRestarterPath_ShouldReturnFullPath()
+        {
+            // Act
+            var path = AppConfig.GetServyRestarterPath();
+
+            // Assert
+            Assert.False(string.IsNullOrWhiteSpace(path));
+            Assert.True(Path.IsPathRooted(path), $"Expected an absolute path but got: {path}");
+            Assert.EndsWith("Servy.Restarter.exe", path, StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Fact]
+        public void GetServyCLIServicePath_PlantedFileNextToExe_SwitchOff_ResolvesToVaultInRelease()
+        {
+            // Arrange
+            // A Servy.Service.CLI.exe next to the running executable is what a planted file looks like (#7528).
+            var localPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Servy.Service.CLI.exe");
+            var created = !File.Exists(localPath);
+            if (created) File.WriteAllText(localPath, "planted");
+            var savedSwitch = AppConfig.TestAllowBaseDirectoryProbe;
+            AppConfig.TestAllowBaseDirectoryProbe = false;
+
+            try
+            {
+                // Act
+                var path = AppConfig.GetServyCLIServicePath();
+
+                // Assert
+#if DEBUG
+                // DEBUG builds always resolve to the build output folder.
+                Assert.Equal(localPath, path);
+#else
+                // RELEASE builds must ignore the planted file and resolve to the hardened vault.
+                Assert.Equal(Path.Combine(AppConfig.ProgramDataPath, "Servy.Service.CLI.exe"), path);
+#endif
+            }
+            finally
+            {
+                AppConfig.TestAllowBaseDirectoryProbe = savedSwitch;
+                if (created) File.Delete(localPath);
+            }
+        }
+
+        [Fact]
+        public void GetServyCLIServicePath_PlantedFileNextToExe_SwitchOn_ResolvesToBaseDirectory()
+        {
+            // Arrange
+            var localPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Servy.Service.CLI.exe");
+            var created = !File.Exists(localPath);
+            if (created) File.WriteAllText(localPath, "planted");
+            var savedSwitch = AppConfig.TestAllowBaseDirectoryProbe;
+            AppConfig.TestAllowBaseDirectoryProbe = true;
+
+            try
+            {
+                // Act
+                var path = AppConfig.GetServyCLIServicePath();
+
+                // Assert
+                // The test-only switch re-enables the base-directory probe in RELEASE; DEBUG always uses it.
+                Assert.Equal(localPath, path);
+            }
+            finally
+            {
+                AppConfig.TestAllowBaseDirectoryProbe = savedSwitch;
+                if (created) File.Delete(localPath);
+            }
+        }
+
+        [Fact]
         public void ProgramDataPath_ShouldBeUnderCommonApplicationData()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var path = AppConfig.ProgramDataPath;
 
@@ -170,14 +213,49 @@ namespace Servy.Core.UnitTests.Config
         [Fact]
         public void SecurityFolderPath_ShouldBeTheSecuritySubfolder()
         {
-            // Arrange (Static property validation context)
-
             // Act
             var path = AppConfig.SecurityFolderPath;
 
             // Assert
             var expected = Path.Combine(AppConfig.ProgramDataPath, "security");
             Assert.Equal(expected, path);
+        }
+
+        [Fact]
+        public void FindRepoRoot_NoSlnInAncestry_ThrowsInvalidOperationException()
+        {
+            // Arrange: an isolated directory under the OS temp root, whose ancestry cannot contain
+            // Servy.sln - the solution lives under the checkout, which is never an ancestor of the
+            // temp root on the CI runners or on a developer machine.
+            var isolatedDir = Path.Combine(Path.GetTempPath(), "ServyFindRepoRootTest_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(isolatedDir);
+
+            try
+            {
+                // Act & Assert: the walk reaches the drive root without a hit, so dir is null and the
+                // null-coalescing throw is the only way out of the method.
+                var ex = Assert.Throws<InvalidOperationException>(() => AppConfig.FindRepoRoot(isolatedDir));
+                Assert.Contains("Servy.sln", ex.Message);
+            }
+            finally
+            {
+                Directory.Delete(isolatedDir, recursive: true);
+            }
+        }
+
+        [Fact]
+        public void KeyProviderMigrationFailureEscalationThreshold_LeavesTheTransientWarningBranchReachable()
+        {
+            // Act
+            var threshold = AppConfig.KeyProviderMigrationFailureEscalationThreshold;
+
+            // Assert
+            // ProtectedKeyProvider.GetOrGenerate escalates to Error at failCount >= threshold and
+            // logs a Warning below it. failCount starts at 1, so at a threshold of 1 the Warning
+            // branch can never run and the first transient migration failure is already reported as a
+            // persistent security degradation.
+            Assert.True(threshold > 1,
+                $"The escalation threshold must leave room for at least one transient Warning; got {threshold}.");
         }
     }
 }

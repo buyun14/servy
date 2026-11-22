@@ -16,12 +16,23 @@
   #define Arch "x64"
 #endif
 
+#ifndef BuildConfiguration
+  #define BuildConfiguration "Release"
+#endif
+
+#ifndef Tfm
+  #define Tfm "net10.0-windows"
+#endif
+
+#define AppIdGuidX64   "8343B121-BE1C-463F-AA5B-FD237DD2F8D0"
+#define AppIdGuidArm64 "8343B121-BE1C-463F-AA5B-FD237DD2F8D1"
+
 #if Arch == "arm64"
-  #define AppIdGuid    "8343B121-BE1C-463F-AA5B-FD237DD2F8D1"
+  #define AppIdGuid    AppIdGuidArm64
   #define ArchAllowed  "arm64"
   #define Runtime      "win-arm64"
 #else
-  #define AppIdGuid    "8343B121-BE1C-463F-AA5B-FD237DD2F8D0"
+  #define AppIdGuid    AppIdGuidX64
   #define ArchAllowed  "x64compatible"
   #define Runtime      "win-x64"
 #endif
@@ -31,7 +42,7 @@ PrivilegesRequired=admin
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
 ; (To generate a new GUID, click Tools | Generate GUID inside the IDE.)
 AppId={{{#AppIdGuid}}
-SetupMutex=SetupMutex{#SetupSetting("AppId")}
+SetupMutex=ServySetupMutex
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 ;AppVerName={#MyAppName} {#MyAppVersion}
@@ -48,21 +59,23 @@ OutputDir=.
 OutputBaseFilename=servy-{#MyAppVersion}-{#Arch}-installer
 SetupIconFile=..\src\Servy\servy.ico
 
-Compression=lzma2
+Compression=lzma
 LZMAAlgorithm=1
 ; LZMADictionarySize=65536
 ; LZMADictionarySize=98304
-;LZMADictionarySize=131072
+; LZMADictionarySize=131072
 LZMADictionarySize=196608
 LZMANumFastBytes=273
 LZMAUseSeparateProcess=yes
 SolidCompression=yes
 
-ArchitecturesAllowed={#ArchAllowed}
+; Allow setup to start on all 64-bit platforms so InitializeSetup can show an explicit error instead of Inno's generic Windows version message (#7481)
+ArchitecturesAllowed=x64compatible arm64
 ArchitecturesInstallIn64BitMode={#ArchAllowed}
 WizardStyle=modern dynamic
 
 UsePreviousTasks=no
+UsePreviousSetupType=no
 AlwaysRestart=no
 
 [Messages]
@@ -86,24 +99,26 @@ Name: "addpath"; Description: "Add Servy to PATH"; GroupDescription: "Additional
 
 [Files]
 ; Main app EXE
-Source: "..\src\Servy\bin\Release\net10.0-windows\{#Runtime}\publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: install_main_app
+Source: "..\src\Servy\bin\{#BuildConfiguration}\{#Tfm}\{#Runtime}\publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: install_main_app
 
 ; appsettings.desktop.json (only copy if not present, and never uninstall)
 ; Source: "..\src\Servy\appsettings.desktop.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall; Components: install_main_app
 
 ; CLI
-Source: "..\src\Servy.CLI\bin\Release\net10.0-windows\{#Runtime}\publish\Servy.CLI.exe"; DestDir: "{app}"; DestName: "{#CliExeName}"; Flags: ignoreversion; Components: install_cli
+Source: "..\src\Servy.CLI\bin\{#BuildConfiguration}\{#Tfm}\{#Runtime}\publish\Servy.CLI.exe"; DestDir: "{app}"; DestName: "{#CliExeName}"; Flags: ignoreversion; Components: install_cli
 
 ; appsettings.cli.json (only copy if not present, and never uninstall)
 ; Source: "..\src\Servy.CLI\appsettings.cli.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall; Components: install_cli
 
-; PowerShell Module
+; PowerShell Module and Dump/Restore Scripts
 Source: "..\src\Servy.CLI\Servy.psm1"; DestDir: "{app}"; Flags: ignoreversion; Components: install_cli
 Source: "..\src\Servy.CLI\Servy.psd1"; DestDir: "{app}"; Flags: ignoreversion; Components: install_cli
 Source: "..\src\Servy.CLI\servy-module-examples.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: install_cli
+Source: "..\src\Servy.CLI\Servy-Dump.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: install_cli
+Source: "..\src\Servy.CLI\Servy-Restore.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: install_cli
 
 ; Manager
-Source: "..\src\Servy.Manager\bin\Release\net10.0-windows\{#Runtime}\publish\{#ManagerAppExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: install_manager
+Source: "..\src\Servy.Manager\bin\{#BuildConfiguration}\{#Tfm}\{#Runtime}\publish\{#ManagerAppExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: install_manager
 
 ; appsettings.manager.json (only copy if not present, and never uninstall)
 ; Source: "..\src\Servy.Manager\appsettings.manager.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall; Components: install_manager
@@ -138,98 +153,10 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 ; Filename: "{app}\{#ManagerAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(ManagerAppName, '&', '&&')}}"; Flags: postinstall shellexec skipifsilent unchecked; Components: install_manager
 Filename: "{#DocsURL}"; Description: "Open Documentation"; Flags: postinstall shellexec skipifsilent unchecked
 
-; 1. Reset inheritance, grant Admins/System, and PURGE broad groups
-; *S-1-5-32-544: Administrators
-; *S-1-5-18:     Local System
-; *S-1-5-32-545: Users (Purge)
-; *S-1-5-11:     Authenticated Users (Purge)
-; *S-1-1-0:      Everyone (Purge)
-Filename: "icacls.exe"; \
-    Parameters: """{commonappdata}\Servy"" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F /remove:g *S-1-5-32-545 /remove:g *S-1-5-11 /remove:g *S-1-1-0"; \
-    Flags: runhidden; StatusMsg: "Securing service data directory..."
-
-; 2. Grant the Current User (The "Manual Key")
-; Replicates C# logic: Add current user only if they aren't SYSTEM
-Filename: "icacls.exe"; \
-    Parameters: """{commonappdata}\Servy"" /grant ""{username}"":(OI)(CI)F"; \
-    Flags: runhidden; \
-    Check: ShouldAddCurrentUser; \
-    StatusMsg: "Assigning user permissions..."
-
-[Code]
-function ConvertStringSidToSid(
-  StringSid: String;
-  var Sid: UINT_PTR
-): Boolean;
-  external 'ConvertStringSidToSidW@advapi32.dll stdcall';
-
-function LookupAccountSid(
-  SystemName: String;
-  Sid: UINT_PTR;
-  Name: String;
-  var NameSize: DWORD;
-  ReferencedDomainName: String;
-  var ReferencedDomainNameSize: DWORD;
-  var Use: DWORD
-): Boolean;
-  external 'LookupAccountSidW@advapi32.dll stdcall';
-
-function LocalFree(hMem: UINT_PTR): UINT_PTR;
-  external 'LocalFree@kernel32.dll stdcall';
-
-function GetLocalizedSystemAccountName(): String;
-var
-  pSid: UINT_PTR;
-  Name, Domain: String;
-  NameSize, DomainSize, Use: DWORD;
-  NullPos: Integer;
-begin
-  Result := 'SYSTEM'; // Fallback
-  pSid := 0;
-  if ConvertStringSidToSid('S-1-5-18', pSid) then
-  begin
-    try
-      NameSize := 0;
-      DomainSize := 0;
-      LookupAccountSid('', pSid, Name, NameSize, Domain, DomainSize, Use);
-      if NameSize > 0 then
-      begin
-        SetLength(Name, NameSize);
-        SetLength(Domain, DomainSize);
-        if LookupAccountSid('', pSid, Name, NameSize, Domain, DomainSize, Use) then
-        begin
-          // Strip null terminator returned by Win32 API
-          NullPos := Pos(#0, Name);
-          if NullPos > 0 then
-            SetLength(Name, NullPos - 1);
-          Result := Trim(Name);
-        end;
-      end;
-    finally
-      if pSid <> 0 then
-        LocalFree(pSid);
-    end;
-  end;
-end;
-
-function ShouldAddCurrentUser(): Boolean;
-var
-  CurrentUserName, SystemAccountName: String;
-begin
-  CurrentUserName := GetUserNameString();
-  SystemAccountName := GetLocalizedSystemAccountName();
-
-  // Replicate C# logic: currentUserSid != systemSid
-  // We don't check for 'adminSid' here because a User SID is never equal
-  // to the Administrators Group SID.
-  Result := (CompareText(CurrentUserName, SystemAccountName) <> 0) and
-            (CurrentUserName <> '');
-end;
-
 [UninstallRun]
-Filename: "taskkill"; Parameters: "/im ""{#MyAppExeName}"" /t /f"; Flags: runhidden waituntilterminated; RunOnceId: StopMainApp
-Filename: "taskkill"; Parameters: "/im ""{#ManagerAppExeName}"" /t /f"; Flags: runhidden waituntilterminated; RunOnceId: StopManagerApp
-Filename: "taskkill"; Parameters: "/im ""{#CliExeName}"" /t /f"; Flags: runhidden waituntilterminated; RunOnceId: StopCliApp
+Filename: "{sys}\taskkill.exe"; Parameters: "/im ""{#MyAppExeName}"" /t /f"; Flags: runhidden waituntilterminated; RunOnceId: StopMainApp
+Filename: "{sys}\taskkill.exe"; Parameters: "/im ""{#ManagerAppExeName}"" /t /f"; Flags: runhidden waituntilterminated; RunOnceId: StopManagerApp
+Filename: "{sys}\taskkill.exe"; Parameters: "/im ""{#CliExeName}"" /t /f"; Flags: runhidden waituntilterminated; RunOnceId: StopCliApp
 
 [UninstallDelete]
 ; Type: filesandordirs; Name: "{app}\taskschd"
@@ -275,40 +202,47 @@ begin
   // 1. Check 64-bit HKLM
   if not RegQueryStringValue(HKLM64, sUnInstPath, ValueName, sValue) then
   begin
-    // 2. Check HKCU
-    if not RegQueryStringValue(HKCU, sUnInstPath, ValueName, sValue) then
-    begin
-      // 3. Check 32-bit HKLM (HKLM32 automatically redirects SOFTWARE to WOW6432Node)
-      RegQueryStringValue(HKLM32, sUnInstPath, ValueName, sValue);
-    end;
+    // 2. Check 32-bit HKLM (HKLM32 automatically redirects SOFTWARE to WOW6432Node).
+    // HKCU is deliberately omitted: this setup runs elevated, so it writes to HKLM.
+    // Probing HKCU could allow non-elevated user processes to spoof an uninstall path (#7484).
+    RegQueryStringValue(HKLM32, sUnInstPath, ValueName, sValue);
   end;
 
   Result := sValue;
 end;
 
-function GetUninstallString(): String;
+function QueryUninstallValueAnyArch(const ValueName: String): String;
 var
   AppIdGuids: array[0..1] of String;
   i: Integer;
   sResult: String;
 begin
-  AppIdGuids[0] := ExpandConstant('{#AppIdGuid}');
-  if AppIdGuids[0] = '8343B121-BE1C-463F-AA5B-FD237DD2F8D1' then
-    AppIdGuids[1] := '8343B121-BE1C-463F-AA5B-FD237DD2F8D0'
+  Result := '';
+  AppIdGuids[0] := '{#AppIdGuid}';
+  if AppIdGuids[0] = '{#AppIdGuidArm64}' then
+    AppIdGuids[1] := '{#AppIdGuidX64}'
   else
-    AppIdGuids[1] := '8343B121-BE1C-463F-AA5B-FD237DD2F8D1';
+    AppIdGuids[1] := '{#AppIdGuidArm64}';
 
   for i := 0 to High(AppIdGuids) do
   begin
-    sResult := QueryUninstallRegistry(AppIdGuids[i], 'UninstallString');
+    sResult := QueryUninstallRegistry(AppIdGuids[i], ValueName);
     if sResult <> '' then
     begin
       Result := sResult;
       Exit;
     end;
   end;
+end;
 
-  Result := '';
+function GetUninstallString(): String;
+begin
+  Result := QueryUninstallValueAnyArch('UninstallString');
+end;
+
+function GetInstalledVersion(): String;
+begin
+  Result := QueryUninstallValueAnyArch('DisplayVersion');
 end;
 
 function IsUpgrade(): Boolean;
@@ -330,7 +264,7 @@ end;
 
 function UnInstallOldVersion(): Integer;
 var
-  sUnInstallString: String;
+  sUnInstallString, sExePath: String;
   iResultCode: Integer;
 begin
   Result := 0;
@@ -339,42 +273,24 @@ begin
 
   if sUnInstallString <> '' then
   begin
-    sUnInstallString := RemoveQuotes(sUnInstallString);
-    if Exec(sUnInstallString, '/SILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_HIDE, ewWaitUntilTerminated, iResultCode) and (iResultCode = 0) then
-      Result := 3
+    sExePath := RemoveQuotes(sUnInstallString);
+    if FileExists(sExePath) then
+    begin
+      if Exec(sExePath, '/SILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_HIDE, ewWaitUntilTerminated, iResultCode) and (iResultCode = 0) then
+        Result := 3
+      else
+        Result := 2;
+    end
     else
+    begin
+      Log('Uninstall string executable does not exist: ' + sExePath);
       Result := 2;
+    end;
   end
   else
     Result := 1;
 
   Log('UnInstallOldVersion.Result = ' + IntToStr(Result));
-end;
-
-function GetInstalledVersion(): String;
-var
-  AppIdGuids: array[0..1] of String;
-  i: Integer;
-  sResult: String;
-begin
-  Result := '';
-  AppIdGuids[0] := ExpandConstant('{#AppIdGuid}');
-  if AppIdGuids[0] = '8343B121-BE1C-463F-AA5B-FD237DD2F8D1' then
-    AppIdGuids[1] := '8343B121-BE1C-463F-AA5B-FD237DD2F8D0'
-  else
-    AppIdGuids[1] := '8343B121-BE1C-463F-AA5B-FD237DD2F8D1';
-
-  for i := 0 to High(AppIdGuids) do
-  begin
-    sResult := QueryUninstallRegistry(AppIdGuids[i], 'DisplayVersion');
-    if sResult <> '' then
-    begin
-      Result := sResult;
-      Exit;
-    end;
-  end;
-
-  Result := '';
 end;
 
 function NumericVersion(const Version: string): Int64;
@@ -407,12 +323,33 @@ var
   sInstalledVersion, message: String;
   installedVersion, myAppVersion: Int64;
   v: Integer;
-  UninstKey: String;
-  Hives: array[0..2] of Integer;
-  Values: array[0..4] of String;
-  i, j: Integer;
 begin
   Result := True;
+
+  // Check for architecture mismatch to provide a clear error message (#7481)
+  #if Arch == "arm64"
+    if not IsArm64 then
+    begin
+      MsgBox('This installer is built for ARM64 systems. Please download and run the x64 installer (servy-' + ExpandConstant('{#MyAppVersion}') + '-x64-installer.exe).', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+  #else
+    if IsArm64 then
+    begin
+      // Soft warning for running x64 installer under ARM64 emulation
+      if WizardSilent then
+      begin
+        Log('Running the x64 installer on an ARM64 system; continuing because setup is silent.')
+      end
+      else if MsgBox('You are running the x64 installer on an ARM64 system. An ARM64-native version (servy-' + ExpandConstant('{#MyAppVersion}') + '-arm64-installer.exe) is available for optimal performance.' + #13#10#13#10 + 'Do you want to continue with the x64 installation anyway?', mbConfirmation, MB_YESNO) = IDNO then
+      begin
+        Result := False;
+        Exit;
+      end;
+    end;
+  #endif
+
   sInstalledVersion := GetInstalledVersion();
 
   if IsUpgrade() and (sInstalledVersion <> '') then
@@ -451,25 +388,77 @@ begin
       Result := False;
     end;
   end;
+end;
 
-  // Uninstall key path
-  UninstKey := ExpandConstant('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1');
+function GetFileAttributes(lpFileName: String): Cardinal;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
 
-  // Define the hives and value names to delete
-  Hives[0] := HKLM64;
-  Hives[1] := HKLM32;
-  Hives[2] := HKCU;
-  Values[0] := 'Inno Setup: Selected Tasks';
-  Values[1] := 'Inno Setup: Deselected Tasks';
-  Values[2] := 'Inno Setup: Selected Components';
-  Values[3] := 'Inno Setup: Deselected Components';
-  Values[4] := 'Inno Setup: Setup Type';
+// FILE_ATTRIBUTE_REPARSE_POINT is predefined by Inno Setup
+const
+  INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
 
-  // Loop over hives and values to delete
-  for i := 0 to High(Hives) do
-    for j := 0 to High(Values) do
-      if RegValueExists(Hives[i], UninstKey, Values[j]) then
-        RegDeleteValue(Hives[i], UninstKey, Values[j]);
+// Runs icacls.exe on the service data directory and reports whether it succeeded
+function RunIcacls(const Params: string): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Log('Securing service data directory: icacls.exe ' + Params);
+  Result := Exec(ExpandConstant('{sys}\icacls.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+  if not Result then
+    Log(Format('ERROR: icacls.exe failed with exit code %d.', [ResultCode]));
+end;
+
+// Secures the service data directory before anything is installed (#7526). Returns an empty string on success,
+// otherwise the reason setup must stop: setup fails closed rather than install into a vault it could not secure.
+function SecureDataDirectory(): String;
+var
+  DataDir, Params: string;
+  Attributes: Cardinal;
+begin
+  Result := '';
+  DataDir := ExpandConstant('{commonappdata}\Servy');
+
+  if not DirExists(DataDir) and not ForceDirectories(DataDir) then
+  begin
+    Result := Format('Failed to create the service data directory "%s".', [DataDir]);
+    Log('ERROR: ' + Result);
+    Exit;
+  end;
+
+  // A linked directory would have its owner and ACL written on a directory outside it: refuse it with a warning
+  Attributes := GetFileAttributes(DataDir);
+  if (Attributes <> INVALID_FILE_ATTRIBUTES) and ((Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    Log(Format('WARNING: the service data directory "%s" is a reparse point (symlink/junction); its owner and permissions were left unchanged.', [DataDir]));
+    if not WizardSilent then
+      MsgBox(Format('The service data directory "%s" is a symbolic link or junction, so setup did not secure it. Replace it with a real directory.', [DataDir]), mbInformation, MB_OK);
+    Exit;
+  end;
+
+  // 1. Hand the directory to Administrators: a standard user who created it before Servy did stays its owner
+  //    otherwise, and an owner can always rewrite the DACL
+  Params := Format('"%s" /setowner *S-1-5-32-544', [DataDir]);
+  if not RunIcacls(Params) then
+  begin
+    Result := Format('Failed to give the ownership of the service data directory "%s" to Administrators.', [DataDir]);
+    Exit;
+  end;
+
+  // 2. Reset inheritance, grant Admins/System, and PURGE broad groups
+  // *S-1-5-32-544: Administrators
+  // *S-1-5-18:     Local System
+  // *S-1-5-32-545: Users (Purge)
+  // *S-1-5-11:     Authenticated Users (Purge)
+  // *S-1-1-0:      Everyone (Purge)
+  //
+  // NOTE: No personal user ACE is granted here because an elevated installer's user is always covered by the
+  // BUILTIN\Administrators grant. Every other explicit entry, on this directory and on everything in it, is purged by
+  // SecurityHelper.CreateSecureDirectory and ServyExePermissionsHardener.SecureVaultAsync on the first elevated start
+  // of Servy, Servy Manager or the CLI, which grant the custom service accounts their access back right after; setup
+  // cannot read their accounts, so it leaves the entries below this directory to them.
+  Params := Format('"%s" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F /remove:g *S-1-5-32-545 /remove:g *S-1-5-11 /remove:g *S-1-1-0 /remove:g "%s"', [DataDir, ExpandConstant('{username}')]);
+  if not RunIcacls(Params) then
+    Result := Format('Failed to secure the permissions of the service data directory "%s".', [DataDir]);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -478,6 +467,16 @@ var
 begin
   sNeedsRestart := BoolToStr(NeedsRestart);
   Log('PrepareToInstall(' + sNeedsRestart + ') called');
+
+  // Secure the service data directory before anything changes, so a failure leaves the machine as it was
+  Result := SecureDataDirectory();
+  if Result <> '' then
+  begin
+    if not WizardSilent then
+      MsgBox(Result, mbError, MB_OK);
+    Exit;
+  end;
+
   if IsUpgrade() then
   begin
     if UnInstallOldVersion() <> 3 then
@@ -494,8 +493,9 @@ end;
 
 // -----------------------------------------------------
 // Post-Install actions:
-//  - Add Servy to PATH if related task selected
 //  - Refresh icon cache after install
+//  - Clean up the remembered setup state (selected tasks, components, setup type)
+//  - Add Servy to PATH if related task selected
 //  - Replace XML Placeholders for Task Scheduler paths
 // -----------------------------------------------------
 // Declare Windows API function for refreshing icon cache
@@ -538,35 +538,112 @@ begin
     SetLength(Result, Length(Result) - 1);
 end;
 
+procedure SplitPath(const Value: string; Parts: TStringList);
+begin
+  Parts.StrictDelimiter := True;
+  Parts.Delimiter := ';';
+  Parts.DelimitedText := Value;
+end;
+
+function IsSameFolder(const Entry, NormalizedFolder: string): Boolean;
+begin
+  Result := CompareText(NormalizeFolder(Trim(Entry)), NormalizedFolder) = 0;
+end;
+
+function PathContainsFolder(const OldPath, NormalizedFolder: string): Boolean;
+var
+  Parts: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  Parts := TStringList.Create;
+  try
+    SplitPath(OldPath, Parts);
+    for i := 0 to Parts.Count - 1 do
+      if IsSameFolder(Parts[i], NormalizedFolder) then
+      begin
+        Result := True;
+        Exit;
+      end;
+  finally
+    Parts.Free;
+  end;
+end;
+
 procedure AddToPath(const Folder: string);
 var
   OldPath, NewPath, NormalizedFolder: string;
+  Parts: TStringList;
+  i: Integer;
 begin
   // Read the current system PATH
   if not RegQueryStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment', 'Path', OldPath) then
     OldPath := '';
 
-  // Only add if it's not already there
   NormalizedFolder := NormalizeFolder(Folder);
 
-  // Append semicolons to both sides for reliable checking against other entries (e.g., 'C:\A' vs 'C:\A B')
-  if Pos(';' + LowerCase(NormalizedFolder) + ';', ';' + LowerCase(OldPath) + ';') = 0 then
-  begin
-    if OldPath <> '' then
-        NewPath := OldPath + ';' + NormalizedFolder
-    else
-        NewPath := NormalizedFolder;
+  Parts := TStringList.Create;
+  try
+    SplitPath(OldPath, Parts);
 
-    // Write the new system PATH preserving REG_EXPAND_SZ type
-    if not RegWriteExpandStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment', 'Path', NewPath) then
+    // Drop empty elements the existing value may already carry
+    for i := Parts.Count - 1 downto 0 do
+      if Trim(Parts[i]) = '' then
+        Parts.Delete(i);
+
+    if not PathContainsFolder(OldPath, NormalizedFolder) then
     begin
-      MsgBox('Failed to update system PATH environment variable.', mbError, MB_OK);
-      Exit;
-    end;
+      Parts.Add(NormalizedFolder);
+      NewPath := Parts.DelimitedText;
 
-    // Notify the system about the environment change
-    RefreshEnvironment();
+      // Write the new system PATH preserving REG_EXPAND_SZ type
+      if not RegWriteExpandStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment', 'Path', NewPath) then
+      begin
+        Log('Failed to update system PATH environment variable.');
+        if not WizardSilent then
+          MsgBox('Failed to update system PATH environment variable.', mbError, MB_OK);
+        Exit;
+      end;
+
+      // Notify the system about the environment change
+      RefreshEnvironment();
+    end;
+  finally
+    Parts.Free;
   end;
+end;
+
+function XmlEscape(const S: string): string;
+begin
+  Result := S;
+  StringChangeEx(Result, '&', '&amp;', True);   // must run first
+  StringChangeEx(Result, '<', '&lt;', True);
+  StringChangeEx(Result, '>', '&gt;', True);
+end;
+
+procedure CleanupOldSetupRegistryState();
+var
+  UninstKey: String;
+  Hives: array[0..2] of Integer;
+  Values: array[0..4] of String;
+  i, j: Integer;
+begin
+  UninstKey := ExpandConstant('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1');
+
+  Hives[0] := HKLM64;
+  Hives[1] := HKLM32;
+  Hives[2] := HKCU;
+
+  Values[0] := 'Inno Setup: Selected Tasks';
+  Values[1] := 'Inno Setup: Deselected Tasks';
+  Values[2] := 'Inno Setup: Selected Components';
+  Values[3] := 'Inno Setup: Deselected Components';
+  Values[4] := 'Inno Setup: Setup Type';
+
+  for i := 0 to High(Hives) do
+    for j := 0 to High(Values) do
+      if RegValueExists(Hives[i], UninstKey, Values[j]) then
+        RegDeleteValue(Hives[i], UninstKey, Values[j]);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -575,27 +652,33 @@ var
   FileLines: TArrayOfString;
   FilesToFix: array[0..1] of String;
   I, J: Integer;
-  InstallPath: String;
+  InstallPath, XmlInstallPath: String;
 begin
   if CurStep = ssPostInstall then
   begin
     // 1. Refresh icon cache
     RefreshIconCache();
 
-    // 2. Add to PATH logic (if selected)
+    // 2. Clean up legacy remembered setup state post-install
+    //    (the service data directory is secured before the installation, in PrepareToInstall)
+    CleanupOldSetupRegistryState();
+
+    // 3. Add to PATH logic (if selected)
     if WizardIsTaskSelected('addpath') and WizardIsComponentSelected('install_cli') then
     begin
       InstallDir := NormalizeFolder(ExpandConstant('{app}'));
       AddToPath(InstallDir);
-      RegWriteDWordValue(HKLM64, 'Software\Servy', 'AddedToPath', 1);
+      if not RegWriteDWordValue(HKLM64, 'Software\Servy', 'AddedToPath', 1) then
+        Log('WARNING: Failed to write AddedToPath registry marker.');
     end;
 
-    // 3. Resolve Hardcoded Paths in Task Scheduler XMLs
+    // 4. Resolve Hardcoded Paths in Task Scheduler XMLs
     InstallPath := ExpandConstant('{app}');
+    XmlInstallPath := XmlEscape(InstallPath);
     FilesToFix[0] := InstallPath + '\taskschd\ServyFailureNotification.xml';
     FilesToFix[1] := InstallPath + '\taskschd\ServyFailureEmail.xml';
 
-    for I := 0 to 1 do
+    for I := 0 to High(FilesToFix) do
     begin
       if FileExists(FilesToFix[I]) then
       begin
@@ -603,14 +686,15 @@ begin
         begin
           for J := 0 to GetArrayLength(FileLines) - 1 do
           begin
-            // Perform the replacement on the decoded Unicode string
-            StringChangeEx(FileLines[J], '{SERVY_INSTALL_PATH}', InstallPath, True);
+            StringChangeEx(FileLines[J], '{SERVY_INSTALL_PATH}', XmlInstallPath, True);
           end;
 
-          // SaveStringsToUTF8File writes a standard UTF-8 file.
-          // Because we updated the header to UTF-8, Task Scheduler will read it perfectly.
-          SaveStringsToUTF8File(FilesToFix[I], FileLines, False);
-        end;
+          // Written as UTF-8 with a BOM, which Task Scheduler accepts for task XML.
+          if not SaveStringsToUTF8File(FilesToFix[I], FileLines, False) then
+            Log('Failed to save updated Task Scheduler XML: ' + FilesToFix[I]);
+        end
+        else
+          Log('Failed to load Task Scheduler XML for substitution: ' + FilesToFix[I]);
       end;
     end;
   end;
@@ -625,43 +709,199 @@ procedure RemoveFromPath(const Folder: string);
 var
   OldPath, NewPath: string;
   Parts: TStringList;
-  i: Integer;
+  i, InitialCount: Integer;
   NormalizedFolder: string;
 begin
   NormalizedFolder := NormalizeFolder(Folder);
 
   if RegQueryStringValue(
-       HKLM64,
-       'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
-       'Path',
-       OldPath) then
-  begin
-    Parts := TStringList.Create;
-    try
-      Parts.StrictDelimiter := True;
-      Parts.Delimiter := ';';
-      Parts.DelimitedText := OldPath;
-
-      for i := Parts.Count - 1 downto 0 do
-        if CompareText(NormalizeFolder(Trim(Parts[i])), NormalizedFolder) = 0 then
-          Parts.Delete(i);
-
-      NewPath := Parts.DelimitedText;
-
-      RegWriteExpandStringValue(
         HKLM64,
         'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
         'Path',
-        NewPath
-      );
+        OldPath) then
+  begin
+    Parts := TStringList.Create;
+    try
+      SplitPath(OldPath, Parts);
+      InitialCount := Parts.Count;
 
-      RegWriteDWordValue(HKLM64, 'Software\Servy', 'AddedToPath', 0);
+      for i := Parts.Count - 1 downto 0 do
+        if IsSameFolder(Parts[i], NormalizedFolder) then
+          Parts.Delete(i);
 
-      RefreshEnvironment();
+      if Parts.Count <> InitialCount then
+      begin
+        NewPath := Parts.DelimitedText;
+
+        if not RegWriteExpandStringValue(
+          HKLM64,
+          'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+          'Path',
+          NewPath
+        ) then
+          Log('WARNING: Failed to write updated PATH environment variable during uninstall.');
+
+        RegWriteDWordValue(HKLM64, 'Software\Servy', 'AddedToPath', 0);
+
+        RefreshEnvironment();
+      end;
     finally
       Parts.Free;
     end;
   end;
+end;
+
+// -----------------------------------------------------
+// The Servy host service ("Servy", Servy.Host.exe / Servy.Host.Net48.exe) is installed at run time by the
+// Desktop App, Servy Manager and servy-cli, and every Servy service depends on it. It, and the binaries the
+// apps extracted into the data folder, are removed only when no Servy-managed service remains: the services
+// the user did not uninstall keep running after Servy is uninstalled, as before (#7293).
+// -----------------------------------------------------
+
+// Lower-case file name of the executable a service command line runs: the quoted part, or the first token
+function CommandLineExeName(const CommandLine: String): String;
+var
+  S: String;
+  P: Integer;
+begin
+  Result := '';
+  S := Trim(CommandLine);
+  if (Length(S) > 0) and (S[1] = '"') then
+  begin
+    Delete(S, 1, 1);
+    P := Pos('"', S);
+    if P = 0 then
+      Exit;
+    S := Copy(S, 1, P - 1);
+  end
+  else
+  begin
+    P := Pos(' ', S);
+    if P > 0 then
+      S := Copy(S, 1, P - 1);
+  end;
+  Result := Lowercase(ExtractFileName(S));
+end;
+
+// The service wrappers of the .NET 10 and the .NET Framework 4.8 build
+function IsServyWrapperExe(const ExeName: String): Boolean;
+begin
+  Result := (ExeName = 'servy.service.exe') or (ExeName = 'servy.service.cli.exe')
+    or (ExeName = 'servy.service.net48.exe') or (ExeName = 'servy.service.cli.net48.exe');
+end;
+
+function IsServyHostExe(const ExeName: String): Boolean;
+begin
+  Result := (ExeName = 'servy.host.exe') or (ExeName = 'servy.host.net48.exe');
+end;
+
+function DependsOnServyHost(const ServiceKey: String): Boolean;
+var
+  Dependencies: String;
+begin
+  Result := False;
+  if RegQueryMultiStringValue(HKLM64, ServiceKey, 'DependOnService', Dependencies) then
+    Result := Pos(#0 + 'servy' + #0, #0 + Lowercase(Dependencies) + #0) > 0;
+end;
+
+// True when a service runs a Servy wrapper or depends on the Servy host service. When the services
+// cannot be listed, it answers True, so nothing is removed.
+function ServyManagedServiceRemains(): Boolean;
+var
+  Names: TArrayOfString;
+  I: Integer;
+  ServiceKey, ImagePath: String;
+begin
+  Result := True;
+  if not RegGetSubkeyNames(HKLM64, 'SYSTEM\CurrentControlSet\Services', Names) then
+  begin
+    Log('Could not list the installed services; the Servy service and the extracted binaries are kept.');
+    Exit;
+  end;
+
+  for I := 0 to GetArrayLength(Names) - 1 do
+  begin
+    if CompareText(Names[I], 'Servy') <> 0 then
+    begin
+      ServiceKey := 'SYSTEM\CurrentControlSet\Services\' + Names[I];
+      if RegQueryStringValue(HKLM64, ServiceKey, 'ImagePath', ImagePath) and IsServyWrapperExe(CommandLineExeName(ImagePath)) then
+      begin
+        Log('Servy-managed service remains: ' + Names[I]);
+        Exit;
+      end;
+
+      if DependsOnServyHost(ServiceKey) then
+      begin
+        Log('Service depending on the Servy service remains: ' + Names[I]);
+        Exit;
+      end;
+    end;
+  end;
+
+  Result := False;
+end;
+
+// Deletes the files of one pattern directly in Folder (not in its subfolders)
+procedure DeleteFilesMatching(const Folder, Pattern: String);
+var
+  FindRec: TFindRec;
+begin
+  if FindFirst(Folder + '\' + Pattern, FindRec) then
+  begin
+    try
+      repeat
+        if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY = 0 then
+        begin
+          if DeleteFile(Folder + '\' + FindRec.Name) then
+            Log('Deleted ' + Folder + '\' + FindRec.Name)
+          else
+            Log('Could not delete ' + Folder + '\' + FindRec.Name);
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+procedure RemoveServyHostWhenUnused();
+var
+  ImagePath, DataDir: String;
+  Attributes: Cardinal;
+  ResultCode: Integer;
+begin
+  if ServyManagedServiceRemains() then
+  begin
+    Log('Servy-managed services remain; the Servy service and the binaries in the data folder are kept.');
+    Exit;
+  end;
+
+  if RegQueryStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Services\Servy', 'ImagePath', ImagePath) then
+  begin
+    // Never remove a service that only borrows the name (#7294)
+    if IsServyHostExe(CommandLineExeName(ImagePath)) then
+    begin
+      // net stop waits for the service to stop, so its executable can be deleted afterwards
+      Exec(ExpandConstant('{sys}\net.exe'), 'stop Servy', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      if Exec(ExpandConstant('{sys}\sc.exe'), 'delete Servy', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+        Log('Removed the Servy service.')
+      else
+        Log('Could not remove the Servy service. sc.exe exit code: ' + IntToStr(ResultCode));
+    end
+    else
+      Log('The service named Servy runs ' + ImagePath + ', not the Servy host; it is left untouched.');
+  end;
+
+  // Executables and DLLs only: db\, security\, logs\ and the .json / .config files are kept
+  DataDir := ExpandConstant('{commonappdata}\Servy');
+  Attributes := GetFileAttributes(DataDir);
+  if (Attributes = INVALID_FILE_ATTRIBUTES) or ((Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    Log('The service data directory "' + DataDir + '" is missing or a reparse point; its executables and DLLs are left untouched.');
+    Exit;
+  end;
+  DeleteFilesMatching(DataDir, '*.exe');
+  DeleteFilesMatching(DataDir, '*.dll');
 end;
 
 // PATH removal and registry cleanup on uninstall
@@ -683,6 +923,8 @@ begin
 
   if Step = usPostUninstall then
   begin
+    // After [UninstallRun] closed the apps
+    RemoveServyHostWhenUnused();
     RegDeleteKeyIncludingSubkeys(HKLM64, 'Software\Servy');
   end;
 end;

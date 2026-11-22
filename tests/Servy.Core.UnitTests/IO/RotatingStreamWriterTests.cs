@@ -1,21 +1,20 @@
+using Microsoft.Win32.SafeHandles;
 using Servy.Core.Config;
 using Servy.Core.Enums;
 using Servy.Core.IO;
+using Servy.Core.UnitTests.Logging;
 using Servy.Testing;
 using System.Globalization;
 
 namespace Servy.Core.UnitTests.IO
 {
-    public class RotatingStreamWriterTests : IDisposable
+    public class RotatingStreamWriterTests : TempDirectoryTestBase
     {
-        private readonly string _testDir;
         private readonly string _logFilePath;
 
         public RotatingStreamWriterTests()
         {
-            _testDir = Path.Combine(Path.GetTempPath(), "RotatingStreamWriterTests", Guid.NewGuid().ToString());
-            Directory.CreateDirectory(_testDir);
-            _logFilePath = Path.Combine(_testDir, "test.log");
+            _logFilePath = Path.Combine(TempDirectory, "test.log");
         }
 
         // Helper to construct per the constructor signature
@@ -53,7 +52,7 @@ namespace Servy.Core.UnitTests.IO
         public void Constructor_CreatesDirectoryIfNotExists()
         {
             // Arrange
-            var newDir = Path.Combine(_testDir, "newfolder");
+            var newDir = Path.Combine(TempDirectory, "newfolder");
             var newFile = Path.Combine(newDir, "file.log");
 
             Assert.False(Directory.Exists(newDir));
@@ -90,7 +89,7 @@ namespace Servy.Core.UnitTests.IO
         public void LazyInitialization_Write_DoesNotCreateFileUntilCalled()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "lazy_write.txt");
+            var filePath = Path.Combine(TempDirectory, "lazy_write.txt");
 
             // Act & Assert
             using (var writer = CreateWriter(filePath, true, 10))
@@ -109,7 +108,7 @@ namespace Servy.Core.UnitTests.IO
         public void LazyInitialization_WriteLine_DoesNotCreateFileUntilCalled()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "lazy_writeline.txt");
+            var filePath = Path.Combine(TempDirectory, "lazy_writeline.txt");
 
             // Act & Assert
             using (var writer = CreateWriter(filePath, true, 10))
@@ -126,14 +125,14 @@ namespace Servy.Core.UnitTests.IO
         public void LazyInitialization_RecreatesWriterAfterRotation()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "lazy_rotate.txt");
+            var filePath = Path.Combine(TempDirectory, "lazy_rotate.txt");
 
             // Act
             using (var writer = CreateWriter(filePath, true, 5, false, DateRotationType.Daily, 0))
             {
                 writer.Write("123456"); // Triggers rotation, file is moved
 
-                // This assertion passes because Rotate() moved the file and CloseWriter() was called inside it
+                // The first write crossed the 5-byte limit, so the rotation closed the writer and renamed the file
                 Assert.False(File.Exists(filePath), "Original file should have been moved");
 
                 writer.Write("789"); // Triggers lazy init; a NEW file handle is opened here
@@ -176,7 +175,7 @@ namespace Servy.Core.UnitTests.IO
         public void GenerateUniqueFileName_FileDoesNotExist_ReturnsOriginalPath()
         {
             // Arrange
-            var path = Path.Combine(_testDir, "log.txt");
+            var path = Path.Combine(TempDirectory, "log.txt");
 
             // Act
             var result = InvokeGenerateUniqueFileName(path);
@@ -189,7 +188,7 @@ namespace Servy.Core.UnitTests.IO
         public void GenerateUniqueFileName_FileExists_AppendsNumber()
         {
             // Arrange
-            var path = Path.Combine(_testDir, "log.txt");
+            var path = Path.Combine(TempDirectory, "log.txt");
             File.WriteAllText(path, "dummy"); // create first file
 
             var first = InvokeGenerateUniqueFileName(path);
@@ -199,7 +198,7 @@ namespace Servy.Core.UnitTests.IO
             var second = InvokeGenerateUniqueFileName(path);
 
             // Assert
-            Assert.Equal(Path.Combine(_testDir, "log.(2).txt"), second);
+            Assert.Equal(Path.Combine(TempDirectory, "log.(2).txt"), second);
         }
 
         [Fact]
@@ -208,7 +207,7 @@ namespace Servy.Core.UnitTests.IO
         {
             // Arrange
             string fileName = "testlog.txt";
-            string basePath = Path.Combine(_testDir, fileName);
+            string basePath = Path.Combine(TempDirectory, fileName);
             string namePart = Path.GetFileNameWithoutExtension(fileName);
             string extension = Path.GetExtension(fileName);
 
@@ -220,7 +219,7 @@ namespace Servy.Core.UnitTests.IO
             int max = AppConfig.RotatingStreamWriterMaxUniqueFilenameRetries;
             for (int i = 1; i <= max; i++)
             {
-                string collisionPath = Path.Combine(_testDir, $"{namePart}.({i}){extension}");
+                string collisionPath = Path.Combine(TempDirectory, $"{namePart}.({i}){extension}");
                 File.WriteAllText(collisionPath, string.Empty);
             }
 
@@ -241,8 +240,8 @@ namespace Servy.Core.UnitTests.IO
         public void HandlesCollisions_BasedOnExtensionType(string fileName, string expectedName)
         {
             // Arrange
-            var basePath = Path.Combine(_testDir, fileName);
-            var expectedPath = Path.Combine(_testDir, expectedName);
+            var basePath = Path.Combine(TempDirectory, fileName);
+            var expectedPath = Path.Combine(TempDirectory, expectedName);
             File.WriteAllText(basePath, "dummy"); // Create the collision
 
             // Act
@@ -257,12 +256,12 @@ namespace Servy.Core.UnitTests.IO
         {
             // Arrange
             var fileName = "App.20260325_001611.log";
-            var basePath = Path.Combine(_testDir, fileName);
+            var basePath = Path.Combine(TempDirectory, fileName);
 
             File.WriteAllText(basePath, "orig");
-            File.WriteAllText(Path.Combine(_testDir, "App.20260325_001611.(1).log"), "coll1");
+            File.WriteAllText(Path.Combine(TempDirectory, "App.20260325_001611.(1).log"), "coll1");
 
-            var expectedPath = Path.Combine(_testDir, "App.20260325_001611.(2).log");
+            var expectedPath = Path.Combine(TempDirectory, "App.20260325_001611.(2).log");
 
             // Act
             var result = InvokeGenerateUniqueFileName(basePath);
@@ -275,26 +274,26 @@ namespace Servy.Core.UnitTests.IO
         public void Rotate_CreatesRotatedFileAndNewWriter()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "rotate.txt");
+            var filePath = Path.Combine(TempDirectory, "rotate.txt");
             var fixedTime = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
 
             // Act
             using (var writer = CreateWriter(filePath, true, 5, false, DateRotationType.Daily, 0, false, () => fixedTime))
             {
-                writer.WriteLine("123"); // small write
-                writer.Write("456");    // triggers rotation
+                writer.WriteLine("123"); // 3 characters plus CRLF reach the 5-byte limit: this write rotates
+                writer.Write("456");    // recreates the base file through lazy initialization
 
                 // Assert
                 Assert.True(File.Exists(filePath)); // new file recreated
 
-                var rotatedFiles = Directory.GetFiles(_testDir, "rotate.*.txt").Where(f => !f.EndsWith("rotate.txt")).ToList();
+                var rotatedFiles = Directory.GetFiles(TempDirectory, "rotate.*.txt").Where(f => !f.EndsWith("rotate.txt")).ToList();
                 Assert.NotEmpty(rotatedFiles);
 
                 // Assert precisely against the frozen time
                 Assert.Contains(fixedTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture), rotatedFiles[0]);
             }
 
-            var latestRotatedFile = Directory.GetFiles(_testDir, "rotate.*.txt")
+            var latestRotatedFile = Directory.GetFiles(TempDirectory, "rotate.*.txt")
                     .Select(f => new FileInfo(f))
                     .Where(f => !f.Name.Equals("rotate.txt"))
                     .OrderByDescending(f => f.LastWriteTimeUtc)
@@ -309,7 +308,7 @@ namespace Servy.Core.UnitTests.IO
         public void Flush_WhenWriterIsNotNull_CallsUnderlyingFlush()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "test.txt");
+            var filePath = Path.Combine(TempDirectory, "test.txt");
 
             // Act & Assert
             using (var writer = CreateWriter(filePath, true, 10))
@@ -336,7 +335,8 @@ namespace Servy.Core.UnitTests.IO
         public void Flush_WhenWriterIsNull_DoesNothing()
         {
             // Arrange
-            using (var writer = CreateWriter(Path.Combine(_testDir, "test.txt"), true, 10))
+            var path = Path.Combine(TempDirectory, "test.txt");
+            using (var writer = CreateWriter(path, true, 10))
             {
                 // Act
                 // Calling Flush should not throw
@@ -344,24 +344,8 @@ namespace Servy.Core.UnitTests.IO
 
                 // Assert
                 Assert.Null(exception);
+                Assert.False(File.Exists(path), "Flush must not lazily initialize the writer, so the file stays uncreated.");
             }
-        }
-
-        [Fact]
-        public void Flush_EmptyWrite_CoversBaseStreamLengthZero()
-        {
-            // Arrange
-            var filePath = Path.Combine(_testDir, "flush_empty.txt");
-
-            // Act
-            using (var writer = CreateWriter(filePath, true, 10))
-            {
-                writer.Write(""); // Forces lazy initialization, _baseStream is created
-                writer.Flush();   // Length could be 0, covers the extra boundary
-            }
-
-            // Assert
-            Assert.True(File.Exists(filePath));
         }
 
         private string InvokeGenerateUniqueFileName(string path)
@@ -388,6 +372,7 @@ namespace Servy.Core.UnitTests.IO
 
             // Assert
             Assert.Null(ex2);
+            Assert.DoesNotContain("Line after disposal", File.ReadAllText(_logFilePath));
         }
 
         [Fact]
@@ -396,16 +381,16 @@ namespace Servy.Core.UnitTests.IO
             // Arrange
             using (var writer = CreateWriter(_logFilePath, true, 1000))
             {
-                var basePath = Path.Combine(_testDir, "file.log");
+                var basePath = Path.Combine(TempDirectory, "file.log");
                 File.WriteAllText(basePath, "test");
-                File.WriteAllText(Path.Combine(_testDir, "file.(1).log"), "test");
-                File.WriteAllText(Path.Combine(_testDir, "file.(2).log"), "test");
+                File.WriteAllText(Path.Combine(TempDirectory, "file.(1).log"), "test");
+                File.WriteAllText(Path.Combine(TempDirectory, "file.(2).log"), "test");
 
                 // Act
                 var uniqueName = (string)TestReflection.InvokeNonPublicStatic(typeof(RotatingStreamWriter), "GenerateUniqueFileName", new object[] { basePath })!;
 
                 // Assert
-                Assert.Equal(Path.Combine(_testDir, "file.(3).log"), uniqueName);
+                Assert.Equal(Path.Combine(TempDirectory, "file.(3).log"), uniqueName);
             }
         }
 
@@ -413,7 +398,7 @@ namespace Servy.Core.UnitTests.IO
         public void WriteLine_DoesNotRotate_WhenRotationSizeZero()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "zero.txt");
+            var filePath = Path.Combine(TempDirectory, "zero.txt");
 
             // Act
             using (var writer = CreateWriter(filePath, true, 0))
@@ -423,7 +408,7 @@ namespace Servy.Core.UnitTests.IO
 
             // Assert
             Assert.True(File.Exists(filePath));
-            var rotatedFiles = Directory.GetFiles(_testDir, "zero.*.txt").Where(f => !f.EndsWith("zero.txt"));
+            var rotatedFiles = Directory.GetFiles(TempDirectory, "zero.*.txt").Where(f => !f.EndsWith("zero.txt"));
             Assert.Empty(rotatedFiles);
         }
 
@@ -431,7 +416,7 @@ namespace Servy.Core.UnitTests.IO
         public void WriteLine_DoesNotRotate_WhenFileSmallerThanRotationSize()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "small.txt");
+            var filePath = Path.Combine(TempDirectory, "small.txt");
 
             // Act
             using (var writer = CreateWriter(filePath, true, 1024))
@@ -441,7 +426,7 @@ namespace Servy.Core.UnitTests.IO
 
             // Assert
             Assert.True(File.Exists(filePath));
-            var rotatedFiles = Directory.GetFiles(_testDir, "small.*.txt").Where(f => !f.EndsWith("small.txt"));
+            var rotatedFiles = Directory.GetFiles(TempDirectory, "small.*.txt").Where(f => !f.EndsWith("small.txt"));
             Assert.Empty(rotatedFiles);
         }
 
@@ -449,12 +434,12 @@ namespace Servy.Core.UnitTests.IO
         public void WriteLine_Rotates_WhenFileExceedsRotationSize()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "rotate2.txt");
+            var filePath = Path.Combine(TempDirectory, "rotate2.txt");
 
             // Act
             using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 5))
             {
-                writer.WriteLine("12345"); // exactly 5 bytes -> triggers rotation threshold
+                writer.WriteLine("12345"); // 5 characters plus the line terminator: over the 5-byte limit, so this write rotates
                 writer.Flush();
                 writer.WriteLine("12");    // write to newly initialized stream file
                 writer.Flush();
@@ -466,7 +451,7 @@ namespace Servy.Core.UnitTests.IO
 
             // 2. Firm Validation: Target the middle-timestamp layout and explicitly filter out
             // the base tracking path to verify a genuine archival stream rotation took place.
-            var rotatedFiles = Directory.GetFiles(_testDir, "rotate2.*.txt")
+            var rotatedFiles = Directory.GetFiles(TempDirectory, "rotate2.*.txt")
                                         .Where(f => !f.EndsWith("rotate2.txt", StringComparison.OrdinalIgnoreCase))
                                         .ToList();
 
@@ -481,7 +466,8 @@ namespace Servy.Core.UnitTests.IO
         public void Write_WhenWriterIsNull_DoesNothingAfterDisposal()
         {
             // Arrange
-            var writer = CreateWriter(Path.Combine(_testDir, "test.txt"), true, 10);
+            var path = Path.Combine(TempDirectory, "test.txt");
+            var writer = CreateWriter(path, true, 10);
             writer.Dispose();
 
             // Act
@@ -489,108 +475,238 @@ namespace Servy.Core.UnitTests.IO
 
             // Assert
             Assert.Null(exception);
+            Assert.False(File.Exists(path), "A disposed writer must not lazily create the file.");
         }
 
         [Fact]
         public void EnforceMaxRotations_CoversAllBranches()
         {
             // Arrange
-            string baseLog = Path.Combine(_testDir, "service.log");
+            string baseLog = Path.Combine(TempDirectory, "service.log");
             File.WriteAllText(baseLog, "base");
 
-            var writer = CreateWriter(baseLog, true, 1000);
-            writer.Write(""); // force file creation
-
-            // ---- BRANCH 1: _maxRotations <= 0 ----
-            TestReflection.SetField(writer, "_maxRotations", 0);
-            TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
-
-            // ---- BRANCH 2: Filter Logic (StartsWith and EndsWith) ----
-            string f1 = Path.Combine(_testDir, "service.20260325_000001.log");
-            string noise1 = Path.Combine(_testDir, "service_backup.log");
-            string noise2 = Path.Combine(_testDir, "service.20260325.txt");
-
-            File.WriteAllText(f1, "valid");
-            File.WriteAllText(noise1, "noise");
-            File.WriteAllText(noise2, "noise");
-
-            // ---- BRANCH 3: rotatedFiles.Count <= _maxRotations ----
-            TestReflection.SetField(writer, "_maxRotations", 5);
-            TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
-
-            Assert.True(File.Exists(f1));
-            Assert.True(File.Exists(noise1));
-            Assert.True(File.Exists(noise2));
-
-            // ---- BRANCH 4: Deletion happens (rotatedFiles.Count > _maxRotations) ----
-            string f2 = Path.Combine(_testDir, "service.20260325_000002.log");
-            File.WriteAllText(f2, "valid2");
-            File.SetLastWriteTimeUtc(f1, DateTime.UtcNow.AddMinutes(-10));
-            File.SetLastWriteTimeUtc(f2, DateTime.UtcNow);
-
-            TestReflection.SetField(writer, "_maxRotations", 1);
-            TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
-
-            Assert.True(File.Exists(f2));     // Kept (newest)
-            Assert.False(File.Exists(f1));    // Deleted
-            Assert.True(File.Exists(noise1));
-            Assert.True(File.Exists(noise2));
-
-            // ---- BRANCH 5: Deletion Failure (IOException) ----
-            File.WriteAllText(f1, "recreate");
-            File.SetLastWriteTimeUtc(f1, DateTime.UtcNow.AddMinutes(-10));
-
-            // Act & Assert
-            using (var locked = new FileStream(f1, FileMode.Open, FileAccess.Read, FileShare.None))
+            using (var writer = CreateWriter(baseLog, true, 1000))
             {
-                var ex = Record.Exception(() => TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations"));
-                Assert.Null(ex); // Resilient against locks
+                writer.Write(""); // force file creation
+
+                // ---- BRANCH 2: Glob noise ----
+                // Neither noise file matches the "service.*.log" search pattern, so Directory.GetFiles
+                // never returns them and the filter lambda is not what keeps them alive. The lambda's own
+                // timestamp check is pinned by EnforceMaxRotations_GlobMatchWithoutRotationStamp_IsNeverDeleted.
+                string f1 = Path.Combine(TempDirectory, "service.20260325_000001.log");
+                string noise1 = Path.Combine(TempDirectory, "service_backup.log");
+                string noise2 = Path.Combine(TempDirectory, "service.20260325.txt");
+
+                File.WriteAllText(f1, "valid");
+                File.WriteAllText(noise1, "noise");
+                File.WriteAllText(noise2, "noise");
+
+                // ---- BRANCH 1: _maxRotations <= 0 means unlimited, so nothing is ever deleted ----
+                // Exercised with rotated files already on disk: without the early return the
+                // "count <= maxRotations" check is false and every rotated file gets deleted.
+                string f0 = Path.Combine(TempDirectory, "service.20260325_000000.log");
+                File.WriteAllText(f0, "oldest");
+                File.SetLastWriteTimeUtc(f0, DateTime.UtcNow.AddHours(-1));
+
+                TestReflection.SetField(writer, "_maxRotations", 0);
+                TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
+
+                Assert.True(File.Exists(f0), "maxRotations 0 means unlimited; no rotated file may be deleted.");
+                Assert.True(File.Exists(f1));
+
+                // Remove the extra rotated file again so the branch 3 and 4 counts are unchanged
+                File.Delete(f0);
+
+                // ---- BRANCH 3: rotatedFiles.Count <= _maxRotations ----
+                TestReflection.SetField(writer, "_maxRotations", 5);
+                TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
+
+                Assert.True(File.Exists(f1));
+                Assert.True(File.Exists(noise1));
+                Assert.True(File.Exists(noise2));
+
+                // ---- BRANCH 4: Deletion happens (rotatedFiles.Count > _maxRotations) ----
+                string f2 = Path.Combine(TempDirectory, "service.20260325_000002.log");
+                File.WriteAllText(f2, "valid2");
+                File.SetLastWriteTimeUtc(f1, DateTime.UtcNow.AddMinutes(-10));
+                File.SetLastWriteTimeUtc(f2, DateTime.UtcNow);
+
+                TestReflection.SetField(writer, "_maxRotations", 1);
+                TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
+
+                Assert.True(File.Exists(f2));     // Kept (newest)
+                Assert.False(File.Exists(f1));    // Deleted
+                Assert.True(File.Exists(noise1));
+                Assert.True(File.Exists(noise2));
+
+                // ---- BRANCH 5: Deletion Failure (IOException) ----
+                File.WriteAllText(f1, "recreate");
+                File.SetLastWriteTimeUtc(f1, DateTime.UtcNow.AddMinutes(-10));
+
+                // Act & Assert
+                using (var locked = new FileStream(f1, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    var ex = Record.Exception(() => TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations"));
+                    Assert.Null(ex); // Resilient against locks
+                }
+            }
+        }
+
+        /// <summary>
+        /// A file that matches the <c>service.*.log</c> search pattern but carries no rotation timestamp must
+        /// never be deleted by retention. Only the lambda's final
+        /// <c>_rotatedTimestampRegex.IsMatch(middle)</c> check - the #603 fix - keeps it out of the retention
+        /// list, and without this case that line can be replaced with <c>return true;</c> with every test green.
+        /// </summary>
+        [Fact]
+        public void EnforceMaxRotations_GlobMatchWithoutRotationStamp_IsNeverDeleted()
+        {
+            // Arrange
+            string baseLog = Path.Combine(TempDirectory, "service.log");
+            File.WriteAllText(baseLog, "base");
+
+            // Matches the "service.*.log" search pattern but carries no rotation timestamp.
+            string unrelated = Path.Combine(TempDirectory, "service.backup.log");
+            string older = Path.Combine(TempDirectory, "service.20260325_000001.log");
+            string newer = Path.Combine(TempDirectory, "service.20260325_000002.log");
+            File.WriteAllText(unrelated, "keep me");
+            File.WriteAllText(older, "old");
+            File.WriteAllText(newer, "new");
+
+            // The unrelated file is the oldest, so it would be the first deletion if the filter let it through.
+            File.SetLastWriteTimeUtc(unrelated, DateTime.UtcNow.AddHours(-1));
+            File.SetLastWriteTimeUtc(older, DateTime.UtcNow.AddMinutes(-10));
+            File.SetLastWriteTimeUtc(newer, DateTime.UtcNow);
+
+            using (var writer = CreateWriter(baseLog, true, 1000, false, DateRotationType.Daily, 1))
+            {
+                writer.Write(""); // force file creation
+
+                // Act
+                TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
             }
 
-            writer.Dispose();
+            // Assert
+            Assert.True(File.Exists(unrelated), "A file without a rotation timestamp must never be deleted by retention.");
+            Assert.True(File.Exists(newer), "The newest rotated file is within the retention limit.");
+            Assert.False(File.Exists(older), "The pass must still run and delete the expired rotated file.");
+        }
+
+        [Fact]
+        public void EnforceMaxRotations_UsesLocalTimeOrderingClock_WhenConfigured()
+        {
+            // Arrange
+            string baseLog = Path.Combine(TempDirectory, "local-time.log");
+            File.WriteAllText(baseLog, "base");
+
+            using (var writer = CreateWriter(baseLog, true, 1000, false, DateRotationType.Daily, 0, true))
+            {
+                writer.Write(""); // force file creation
+
+                string older = Path.Combine(TempDirectory, "local-time.20260325_000001.log");
+                string newer = Path.Combine(TempDirectory, "local-time.20260325_000002.log");
+
+                File.WriteAllText(older, "old");
+                File.WriteAllText(newer, "new");
+                File.SetLastWriteTime(older, DateTime.Now.AddMinutes(-10));
+                File.SetLastWriteTime(newer, DateTime.Now);
+
+                // Act: the writer was built with useLocalTimeForRotation, so the ordering clock
+                // is File.GetLastWriteTime rather than File.GetLastWriteTimeUtc.
+                TestReflection.SetField(writer, "_maxRotations", 1);
+                TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
+
+                // Assert
+                Assert.True(File.Exists(newer), "Newest rotated file should be kept.");
+                Assert.False(File.Exists(older), "Oldest rotated file should be deleted.");
+            }
+        }
+
+        [Fact]
+        public void EnforceMaxRotations_PartialDeletionFailure_IncrementsPassCounter()
+        {
+            // Arrange
+            string baseLog = Path.Combine(TempDirectory, "partial.log");
+            File.WriteAllText(baseLog, "base");
+
+            using (var writer = CreateWriter(baseLog, true, 1000, false, DateRotationType.Daily, 1))
+            {
+                writer.Write(""); // Trigger lazy init
+
+                string oldRotated1 = Path.Combine(TempDirectory, "partial.20260325_000001.log");
+                string oldRotated2 = Path.Combine(TempDirectory, "partial.20260325_000002.log");
+                string newestRotated = Path.Combine(TempDirectory, "partial.20260325_000003.log");
+
+                File.WriteAllText(oldRotated1, "old1");
+                File.WriteAllText(oldRotated2, "old2");
+                File.WriteAllText(newestRotated, "newest");
+
+                File.SetLastWriteTimeUtc(oldRotated1, DateTime.UtcNow.AddMinutes(-20));
+                File.SetLastWriteTimeUtc(oldRotated2, DateTime.UtcNow.AddMinutes(-10));
+                File.SetLastWriteTimeUtc(newestRotated, DateTime.UtcNow);
+
+                // Lock oldRotated2 so its deletion fails, while oldRotated1 can be deleted
+                using (var lockStream = new FileStream(oldRotated2, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    // Act: Run EnforceMaxRotations where maxRotations=1
+                    TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
+
+                    // Assert: Counter should be 1 because oldRotated2 could not be deleted
+                    int consecutiveFailures = TestReflection.GetField<int>(writer, "_consecutiveDeletionFailures");
+                    Assert.Equal(1, consecutiveFailures);
+                    Assert.False(File.Exists(oldRotated1)); // Deleted successfully
+                    Assert.True(File.Exists(oldRotated2));  // Failed to delete
+                }
+
+                // Subsequent successful pass where all expired files are removed
+                TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
+                int consecutiveFailuresAfterSuccess = TestReflection.GetField<int>(writer, "_consecutiveDeletionFailures");
+                Assert.Equal(0, consecutiveFailuresAfterSuccess);
+                Assert.False(File.Exists(oldRotated2));
+            }
         }
 
         [Fact]
         public void EnforceMaxRotations_NoExtension_CoversIsNullOrEmpty()
         {
             // Arrange
-            string baseLog = Path.Combine(_testDir, "plainfile");
+            string baseLog = Path.Combine(TempDirectory, "plainfile");
             File.WriteAllText(baseLog, "base");
 
-            var writer = CreateWriter(baseLog, true, 1000);
-            writer.Write(""); // Trigger lazy init
+            using (var writer = CreateWriter(baseLog, true, 1000))
+            {
+                writer.Write(""); // Trigger lazy init
 
-            string f1 = Path.Combine(_testDir, "plainfile.20260325_000001");
-            File.WriteAllText(f1, "rotated");
-            File.SetLastWriteTimeUtc(f1, DateTime.UtcNow.AddMinutes(-10));
+                string f1 = Path.Combine(TempDirectory, "plainfile.20260325_000001");
+                File.WriteAllText(f1, "rotated");
+                File.SetLastWriteTimeUtc(f1, DateTime.UtcNow.AddMinutes(-10));
 
-            TestReflection.SetField(writer, "_maxRotations", 1);
+                TestReflection.SetField(writer, "_maxRotations", 1);
 
-            string f2 = Path.Combine(_testDir, "plainfile.20260325_000002");
-            File.WriteAllText(f2, "rotated2");
-            File.SetLastWriteTimeUtc(f2, DateTime.UtcNow);
+                string f2 = Path.Combine(TempDirectory, "plainfile.20260325_000002");
+                File.WriteAllText(f2, "rotated2");
+                File.SetLastWriteTimeUtc(f2, DateTime.UtcNow);
 
-            // Act
-            TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
+                // Act
+                TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations");
 
-            // Assert
-            Assert.True(File.Exists(f2));
-            Assert.False(File.Exists(f1));
-
-            writer.Dispose();
+                // Assert
+                Assert.True(File.Exists(f2));
+                Assert.False(File.Exists(f1));
+            }
         }
 
         [Fact]
         public void EnforceMaxRotations_DeletionFails_DoesNotThrow()
         {
             // Arrange
-            var logPath = Path.Combine(_testDir, "service.log");
+            var logPath = Path.Combine(TempDirectory, "service.log");
             File.WriteAllText(logPath, "current");
 
-            var rotated1 = Path.Combine(_testDir, "service.20260325_000001.log");
+            var rotated1 = Path.Combine(TempDirectory, "service.20260325_000001.log");
             File.WriteAllText(rotated1, "new");
 
-            var rotated2 = Path.Combine(_testDir, "service.20260325_000002.log");
+            var rotated2 = Path.Combine(TempDirectory, "service.20260325_000002.log");
             File.WriteAllText(rotated2, "old");
 
             File.SetLastWriteTime(rotated1, DateTime.Now.AddMinutes(0));
@@ -605,7 +721,8 @@ namespace Servy.Core.UnitTests.IO
             {
                 writer.Write(""); // create lazy file inner handle context without triggering auto-rotation
 
-                // Set file attribute to ReadOnly to force an intentional IOException on deletion
+                // Mark the file read-only so File.Delete throws UnauthorizedAccessException
+                // (the locked-file sibling in EnforceMaxRotations_CoversAllBranches covers IOException)
                 File.SetAttributes(rotated2, FileAttributes.ReadOnly);
 
                 // Act
@@ -615,7 +732,7 @@ namespace Servy.Core.UnitTests.IO
                 });
 
                 // Assert
-                Assert.Null(ex); // Verifies that the internal catch-block swallows the IOException gracefully
+                Assert.Null(ex); // The untyped catch in EnforceMaxRotations swallows it and logs a warning
 
                 // Reset attributes back to normal so the cleanup engine can purge the directory safely
                 File.SetAttributes(rotated2, FileAttributes.Normal);
@@ -626,7 +743,7 @@ namespace Servy.Core.UnitTests.IO
         public void DateRotation_Daily_Rotates_WhenDateBoundaryCrossed()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "daily.log");
+            var filePath = Path.Combine(TempDirectory, "daily.log");
             var fixedTime = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
 
             // Act
@@ -639,7 +756,7 @@ namespace Servy.Core.UnitTests.IO
             }
 
             // Assert
-            var rotated = Directory.GetFiles(_testDir, "daily.*.log").Where(f => !f.EndsWith("daily.log")).ToArray();
+            var rotated = Directory.GetFiles(TempDirectory, "daily.*.log").Where(f => !f.EndsWith("daily.log")).ToArray();
             Assert.NotEmpty(rotated);
             Assert.Contains(fixedTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture), rotated[0]);
         }
@@ -648,7 +765,7 @@ namespace Servy.Core.UnitTests.IO
         public void DateRotation_Weekly_Rotates_WhenYearBoundaryCrossed()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "weekly_year.log");
+            var filePath = Path.Combine(TempDirectory, "weekly_year.log");
 
             // Frozen time provider to ensure deterministic execution across both calendar and
             // ISO week boundaries regardless of execution date.
@@ -669,7 +786,7 @@ namespace Servy.Core.UnitTests.IO
             }
 
             // Assert
-            var rotated = Directory.GetFiles(_testDir, "weekly_year.*.log").Where(f => !f.EndsWith("weekly_year.log")).ToArray();
+            var rotated = Directory.GetFiles(TempDirectory, "weekly_year.*.log").Where(f => !f.EndsWith("weekly_year.log")).ToArray();
             Assert.NotEmpty(rotated);
         }
 
@@ -677,7 +794,7 @@ namespace Servy.Core.UnitTests.IO
         public void DateRotation_Weekly_DoesNotRotate_OnSameWeek()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "weekly_same.log");
+            var filePath = Path.Combine(TempDirectory, "weekly_same.log");
 
             // To prevent flakiness near the Monday 00:00 UTC ISO-week boundary,
             // calculate the previous hour relative to the current live clock day.
@@ -698,14 +815,13 @@ namespace Servy.Core.UnitTests.IO
                 // Explicitly align the last rotation date field to our safe mid-week anchor
                 TestReflection.SetField(writer, "_lastRotationDate", recently);
 
-                // Overwrite any internal live-clock tracking if your class maintains an internal baseline
-                // otherwise the write operation evaluates against the current system time window cleanly.
+                // _lastRotationDate was seeded above; the write below evaluates ShouldRotateByDate against it.
                 writer.WriteLine("should not rotate");
                 writer.Flush();
             }
 
             // Assert
-            var rotated = Directory.GetFiles(_testDir, "weekly_same.*.log").Where(f => !f.EndsWith("weekly_same.log"));
+            var rotated = Directory.GetFiles(TempDirectory, "weekly_same.*.log").Where(f => !f.EndsWith("weekly_same.log"));
             Assert.Empty(rotated);
         }
 
@@ -713,7 +829,7 @@ namespace Servy.Core.UnitTests.IO
         public void DateRotation_Monthly_Rotates_WhenMonthBoundaryCrossed()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "monthly.log");
+            var filePath = Path.Combine(TempDirectory, "monthly.log");
             var fixedTime = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
 
             // Act
@@ -726,7 +842,7 @@ namespace Servy.Core.UnitTests.IO
             }
 
             // Assert
-            var rotated = Directory.GetFiles(_testDir, "monthly.*.log").Where(f => !f.EndsWith("monthly.log")).ToArray();
+            var rotated = Directory.GetFiles(TempDirectory, "monthly.*.log").Where(f => !f.EndsWith("monthly.log")).ToArray();
             Assert.NotEmpty(rotated);
             Assert.Contains(fixedTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture), rotated[0]);
         }
@@ -735,7 +851,7 @@ namespace Servy.Core.UnitTests.IO
         public void DateRotation_Monthly_Rotates_WhenYearBoundaryCrossed()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "monthly.log");
+            var filePath = Path.Combine(TempDirectory, "monthly.log");
             var fixedTime = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
 
             // Act
@@ -748,44 +864,78 @@ namespace Servy.Core.UnitTests.IO
             }
 
             // Assert
-            var rotated = Directory.GetFiles(_testDir, "monthly.*.log").Where(f => !f.EndsWith("monthly.log")).ToArray();
+            var rotated = Directory.GetFiles(TempDirectory, "monthly.*.log").Where(f => !f.EndsWith("monthly.log")).ToArray();
             Assert.NotEmpty(rotated);
             Assert.Contains(fixedTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture), rotated[0]);
+        }
+
+        [Theory]
+        // Weekly: clock set back from Monday 00:15 (ISO week 16) to Sunday 23:30 (ISO week 15) - the #3211 DST case.
+        [InlineData(DateRotationType.Weekly, "2026-04-13T00:15:00", "2026-04-12T23:30:00")]
+        // Monthly: clock set back from June 1st 00:05 to May 31st 23:50.
+        [InlineData(DateRotationType.Monthly, "2026-06-01T00:05:00", "2026-05-31T23:50:00")]
+        // Weekly: forward two days, same ISO week (Monday -> Wednesday, both week 16) and under 7 days.
+        [InlineData(DateRotationType.Weekly, "2026-04-13T10:00:00", "2026-04-15T10:00:00")]
+        // Monthly: forward two weeks inside the same month.
+        [InlineData(DateRotationType.Monthly, "2026-06-01T00:05:00", "2026-06-15T10:00:00")]
+        public void ShouldRotateByDate_WeeklyAndMonthly_DoNotRotate_OnBackwardClockOrSameWeek(DateRotationType type, string last, string now)
+        {
+            // Arrange
+            // Explicit values rather than the live clock, so the Weekly arm's week comparison is
+            // reached on every day of the week (see the closed #3605 flakiness on the live clock).
+            var lastRotationDate = DateTime.SpecifyKind(DateTime.Parse(last, CultureInfo.InvariantCulture), DateTimeKind.Utc);
+            var nowUtc = DateTime.SpecifyKind(DateTime.Parse(now, CultureInfo.InvariantCulture), DateTimeKind.Utc);
+            var filePath = Path.Combine(TempDirectory, "no_rotate_" + type + ".log");
+
+            using (var writer = CreateWriter(filePath, false, 0, true, type, 0))
+            {
+                TestReflection.SetField(writer, "_lastRotationDate", lastRotationDate);
+
+                // Act
+                var shouldRotate = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", new object[] { nowUtc });
+
+                // Assert
+                // Rows 1 and 2 pin the forward-only guards #3211 added; row 3 pins the negative side
+                // of the week comparison, which no other test reaches deterministically.
+                Assert.False(shouldRotate, $"{type} must not rotate from {last} to {now}.");
+            }
         }
 
         [Fact]
         public void SizeAndDateRotation_SizePrecedence_WhenBothEnabled()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "sizeDate.log");
+            var filePath = Path.Combine(TempDirectory, "sizeDate.log");
             var fixedTime = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
+            var staleDate = fixedTime.AddDays(-1);
 
-            // Act
+            // Both triggers are armed: writing 6 bytes exceeds the 5-byte limit AND _lastRotationDate is backdated a day.
             using (var writer = CreateWriter(filePath, true, 5, true, DateRotationType.Daily, 0, false, () => fixedTime))
             {
-                TestReflection.SetField(writer, "_lastRotationDate", fixedTime.AddDays(-1));
+                TestReflection.SetField(writer, "_lastRotationDate", staleDate);
 
                 writer.Write("123456");
                 writer.Flush();
+
+                // Assert size rotation took precedence: PrepareRotation was called via the size branch,
+                // so ShouldRotateByDate was bypassed and _lastRotationDate was committed to fixedTime.
+                var updatedRotationDate = TestReflection.GetField<DateTime>(writer, "_lastRotationDate");
+                Assert.Equal(fixedTime, updatedRotationDate);
             }
 
-            // Assert
-            var rotated = Directory.GetFiles(_testDir, "sizeDate.*.log").Where(f => !f.EndsWith("sizeDate.log")).ToArray();
-            Assert.NotEmpty(rotated);
-
-            var latest = new DirectoryInfo(_testDir)
-                .GetFiles("sizeDate.*.log")
-                .Where(fi => !fi.Name.Equals("sizeDate.log"))
-                .OrderByDescending(fi => fi.LastWriteTimeUtc)
-                .First();
-            Assert.Contains("123456", File.ReadAllText(latest.FullName));
+            // Both triggers were armed, but the documented contract mandates exactly one rotation per write.
+            var rotated = Directory.GetFiles(TempDirectory, "sizeDate.*.log")
+                                   .Where(f => !f.EndsWith("sizeDate.log"))
+                                   .ToArray();
+            Assert.Single(rotated);
+            Assert.Contains("123456", File.ReadAllText(rotated[0]));
         }
 
         [Fact]
         public void SizeAndDateRotation_DateWhenSizeNotExceeded()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "dateOnlyWhenSizeNotExceeded.log");
+            var filePath = Path.Combine(TempDirectory, "dateOnlyWhenSizeNotExceeded.log");
             var fixedTime = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
 
             // Act
@@ -798,8 +948,10 @@ namespace Servy.Core.UnitTests.IO
             }
 
             // Assert
-            var rotated = Directory.GetFiles(_testDir, "dateOnlyWhenSizeNotExceeded.*.log").Where(f => !f.EndsWith("dateOnlyWhenSizeNotExceeded.log")).ToArray();
-            Assert.NotEmpty(rotated);
+            var rotated = Directory.GetFiles(TempDirectory, "dateOnlyWhenSizeNotExceeded.*.log")
+                                   .Where(f => !f.EndsWith("dateOnlyWhenSizeNotExceeded.log"))
+                                   .ToArray();
+            Assert.Single(rotated);
         }
 
         [Fact]
@@ -813,7 +965,7 @@ namespace Servy.Core.UnitTests.IO
 
                 // 2. Act: Provide the required DateTime parameter (even for the default/invalid case)
                 var args = new object[] { DateTime.UtcNow };
-                var result = (bool)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args)!;
+                var result = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args);
 
                 // 3. Assert: An unrecognized rotation type should safely return false
                 Assert.False(result);
@@ -824,7 +976,7 @@ namespace Servy.Core.UnitTests.IO
         public void Rotate_WhenFileIsLocked_SilentlyContinuesWithoutCrashing()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "locked_rotate.txt");
+            var filePath = Path.Combine(TempDirectory, "locked_rotate.txt");
 
             using (var writer = new RotatingStreamWriter(filePath, true, 5, false, DateRotationType.Daily, 0, false))
             {
@@ -844,7 +996,7 @@ namespace Servy.Core.UnitTests.IO
                     Assert.Null(exception);
                 }
 
-                var rotatedFiles = Directory.GetFiles(_testDir, "locked_rotate.*.txt")
+                var rotatedFiles = Directory.GetFiles(TempDirectory, "locked_rotate.*.txt")
                                            .Where(f => !f.EndsWith("locked_rotate.txt"))
                                            .ToList();
                 Assert.Empty(rotatedFiles);
@@ -856,7 +1008,7 @@ namespace Servy.Core.UnitTests.IO
         public void Rotate_WhenFileMissingOrEmpty_ReturnsEarly()
         {
             // Arrange: Set a small limit (5 bytes).
-            var filePath = Path.Combine(_testDir, "missing_rotate.txt");
+            var filePath = Path.Combine(TempDirectory, "missing_rotate.txt");
 
             using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 5))
             {
@@ -878,7 +1030,7 @@ namespace Servy.Core.UnitTests.IO
                 writer.Flush();
 
                 // Assert: Ensure no rotated file was generated
-                var rotatedFiles = Directory.GetFiles(_testDir, "missing_rotate.*.txt");
+                var rotatedFiles = Directory.GetFiles(TempDirectory, "missing_rotate.*.txt");
                 Assert.Empty(rotatedFiles);
 
                 // Assert: The original file should still be 0 bytes
@@ -917,40 +1069,58 @@ namespace Servy.Core.UnitTests.IO
         }
 
         [Fact]
-        public void DailyRotation_Local_DST_SafetyBuffer_PreventsEarlyRotation()
+        public void DailyRotation_Local_RotatesWhenCalendarDayChanges()
         {
-            // Arrange: Fix the timeline to simulate a 22-hour gap across midnight
-            // April 10th, 11:00 PM (23:00)
-            var lastRotationUtc = new DateTime(2026, 4, 10, 23, 0, 0, DateTimeKind.Utc);
-
-            // April 11th, 09:00 PM (21:00) -> 22 hours later
-            var nowUtc = lastRotationUtc.AddHours(22);
+            // Arrange: Simulate a 1-hour gap crossing midnight in local time (23:00 to 00:00 next day)
+            var lastRotation = new DateTime(2026, 4, 10, 23, 0, 0, DateTimeKind.Local);
+            var nextDay = new DateTime(2026, 4, 11, 0, 0, 0, DateTimeKind.Local);
 
             using (var writer = CreateWriter(_logFilePath, enableDateRotation: true, useLocalTimeForRotation: true))
             {
-                TestReflection.SetField(writer, "_lastRotationDate", lastRotationUtc);
+                TestReflection.SetField(writer, "_lastRotationDate", lastRotation);
 
                 // Act
-                var args = new object[] { nowUtc };
+                var args = new object[] { nextDay };
                 var shouldRotate = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args);
 
                 // Assert
-                // Even though it is a new day (April 11 vs April 10),
-                // the 23-hour buffer should block the rotation.
-                Assert.False(shouldRotate, "Should not rotate if < 23 hours have passed, even if the calendar day changed.");
+                Assert.True(shouldRotate, "Daily rotation in local time should trigger when crossing into a new calendar day.");
             }
         }
 
         [Fact]
-        public void DailyRotation_Local_Simulated_AllowsRotationAfterThreshold()
+        public void DailyRotation_Local_DST_FallBack_DoesNotTriggerDuplicateRotationOnSameDate()
         {
-            // Arrange: Use a fixed UTC date that is guaranteed to cross a day boundary
-            // April 10th, 10:00 AM UTC
+            // Arrange: Simulate the repeated hour of a DST fall-back. The local clock is set back,
+            // so the second reading of the ambiguous 01:xx hour is EARLIER on the wall clock than
+            // the first, while both readings are the same local calendar date. The two values have
+            // to differ, or the assertion below only proves that a value is not later than itself.
+            var initialRotationTime = new DateTime(2026, 10, 25, 1, 50, 0, DateTimeKind.Unspecified);
+            var repeatedTimeAfterFallBack = new DateTime(2026, 10, 25, 1, 10, 0, DateTimeKind.Unspecified);
+
+            using (var writer = CreateWriter(_logFilePath, enableDateRotation: true, useLocalTimeForRotation: true))
+            {
+                TestReflection.SetField(writer, "_lastRotationDate", initialRotationTime);
+
+                // Act
+                var args = new object[] { repeatedTimeAfterFallBack };
+                var shouldRotate = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args);
+
+                // Assert
+                Assert.False(shouldRotate, "DST fall-back within the same calendar date must not trigger a duplicate daily rotation.");
+            }
+        }
+
+        [Fact]
+        public void DailyRotation_Local_RotatesWhenNextCalendarDayIsReached()
+        {
+            // Arrange
+            // The Daily arm compares only the calendar dates of the two values it is given; it
+            // applies no minimum elapsed time and does no time-zone conversion.
+            // April 10th, 10:00 AM
             var lastRotationUtc = new DateTime(2026, 4, 10, 10, 0, 0, DateTimeKind.Utc);
 
-            // April 11th, 11:00 AM UTC (25 hours later)
-            // 25 hours ensures that even in the most extreme time zones,
-            // a new calendar day has started.
+            // April 11th, 11:00 AM - a later calendar date, which is all the arm asks for.
             var nowUtc = lastRotationUtc.AddHours(25);
 
             using (var writer = CreateWriter(_logFilePath, enableDateRotation: true, useLocalTimeForRotation: true))
@@ -967,25 +1137,24 @@ namespace Servy.Core.UnitTests.IO
         }
 
         [Fact]
-        public void DailyRotation_UTC_IgnoresSafetyBuffer()
+        public void DailyRotation_RotatesAsSoonAsTheCalendarDayFlips()
         {
-            // Arrange: Use local time configuration instead of UTC for log rotation, modifying the default setup.
-            // Last rotation was yesterday at 11:59:59 PM
+            // Arrange
+            // Two seconds apart, across midnight: the Daily arm needs no minimum gap, only a
+            // later calendar date.
             var lastRotationUtc = new DateTime(2026, 4, 10, 23, 59, 59, DateTimeKind.Utc);
-
-            // Now is today at 00:00:01 AM (Only 2 seconds passed, but day changed)
             var nowUtc = new DateTime(2026, 4, 11, 0, 0, 1, DateTimeKind.Utc);
 
             using (var writer = CreateWriter(_logFilePath, enableDateRotation: true, useLocalTimeForRotation: false))
             {
                 TestReflection.SetField(writer, "_lastRotationDate", lastRotationUtc);
 
-                // Act: Pass the simulated 'now'
+                // Act
                 var args = new object[] { nowUtc };
                 var shouldRotate = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args);
 
-                // Assert: In UTC mode, we ignore the 23h buffer and rotate on day change
-                Assert.True(shouldRotate, "UTC mode should rotate immediately when the calendar day flips.");
+                // Assert
+                Assert.True(shouldRotate, "Daily rotation should trigger as soon as the calendar day flips.");
             }
         }
 
@@ -1038,7 +1207,7 @@ namespace Servy.Core.UnitTests.IO
         public void CheckRotation_SizeRotation_TernaryCoverage(bool useLocal)
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, $"size_ternary_{useLocal}.log");
+            var filePath = Path.Combine(TempDirectory, $"size_ternary_{useLocal}.log");
 
             // Act: Set size to 1 byte so any write triggers rotateBySize = true
             using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 1, useLocalTimeForRotation: useLocal))
@@ -1057,14 +1226,15 @@ namespace Servy.Core.UnitTests.IO
         public void CheckRotation_DateRotation_TernaryCoverage(bool useLocal)
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, $"date_ternary_{useLocal}.log");
+            var filePath = Path.Combine(TempDirectory, $"date_ternary_{useLocal}.log");
 
             // Act & Assert
             using (var writer = CreateWriter(filePath, enableDateRotation: true, dateRotationType: DateRotationType.Daily, useLocalTimeForRotation: useLocal))
             {
                 writer.Write("init"); // Ensure file and writer exist
 
-                // Differentiate local vs UTC time variants across the branches to resolve the redundant ternary smell.
+                // _lastRotationDate must be seeded from the same clock the writer's time provider uses,
+                // otherwise the machine's UTC offset shifts the backdated value.
                 DateTime fakePast = useLocal ? DateTime.Now.AddDays(-2) : DateTime.UtcNow.AddDays(-2);
                 TestReflection.SetField(writer, "_lastRotationDate", fakePast);
 
@@ -1077,13 +1247,162 @@ namespace Servy.Core.UnitTests.IO
             }
         }
 
+        [Fact]
+        public void WaitForRotationToSettle_WhenTimeoutExceeded_PreventsHandleAttachment()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "timeout_protection.log");
+            File.WriteAllText(filePath, "initial log data");
+
+            using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 5))
+            {
+                // Nothing here ever clears _rotationInProgress or pulses _lock, so every wait on the
+                // gate runs to its full timeout - once in WriteLine below and once more in Dispose,
+                // which also waits since #5526. Shorten the seam so the arm costs milliseconds
+                // instead of the 15 s production default, twice over.
+                writer.RotationWaitTimeoutMs = 50;
+
+                // Trigger an initial write to initialize the stream
+                writer.WriteLine("hello");
+
+                // Simulate a closed writer state resulting from PrepareRotation()
+                TestReflection.SetField(writer, "_writer", null);
+
+                // Manually gate an in-flight rotation on disk
+                TestReflection.SetField(writer, "_rotationInProgress", true);
+
+                // Act: Attempt writing while rotation is marked in progress
+                // WaitForRotationToSettle will time out after RotationWaitTimeoutMs and return false.
+                writer.WriteLine("write_during_rotation_attempt");
+
+                // Assert: The writer property must remain null because InitializeWriter was skipped during the timeout
+                var currentWriter = TestReflection.GetField<StreamWriter>(writer, "_writer");
+                Assert.Null(currentWriter);
+            }
+        }
+
+        [Fact]
+        public void WaitForRotationToSettle_WhenRotationCompletes_WakesBlockedWriterAndWritesLine()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "settle_wakeup.log");
+
+            using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 1024 * 1024))
+            {
+                // Long enough that only a PulseAll, never the timeout, can release the blocked writer.
+                // The timeout arm is what WaitForRotationToSettle_WhenTimeoutExceeded_PreventsHandleAttachment
+                // above covers; this case is the other outcome of the same gate.
+                writer.RotationWaitTimeoutMs = 10_000;
+                writer.WriteLine("before_rotation");
+
+                var gate = TestReflection.GetField<object>(writer, "_lock");
+                TestReflection.SetField(writer, "_rotationInProgress", true);
+
+                // Mimic WriteInternal's finally block: clear the gate flag and pulse under the lock.
+                // The sleep only makes it likely that the writer is already inside Monitor.Wait when the
+                // pulse arrives; if the releaser wins the race the writer never waits and the assertions
+                // still hold, so the case cannot flake red.
+                var releaser = new Thread(() =>
+                {
+                    Thread.Sleep(200);
+                    lock (gate)
+                    {
+                        TestReflection.SetField(writer, "_rotationInProgress", false);
+                        Monitor.PulseAll(gate);
+                    }
+                })
+                {
+                    IsBackground = true
+                };
+                releaser.Start();
+
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+                // Act
+                writer.WriteLine("after_rotation");
+                stopwatch.Stop();
+                releaser.Join();
+
+                // Assert
+                Assert.True(stopwatch.ElapsedMilliseconds < 5_000,
+                    $"Writer was released by the timeout, not by the pulse ({stopwatch.ElapsedMilliseconds} ms).");
+            }
+
+            // The line is on disk only if WaitForRotationToSettle returned true after being woken;
+            // the timeout arm returns false and WriteInternal drops the write.
+            var content = File.ReadAllText(filePath);
+            Assert.Contains("before_rotation", content);
+            Assert.Contains("after_rotation", content);
+        }
+
+        /// <summary>
+        /// Drives a REAL rotation and lets WriteInternal's own finally block release the parked
+        /// writer. <see cref="WaitForRotationToSettle_WhenRotationCompletes_WakesBlockedWriterAndWritesLine"/>
+        /// pulses the gate from the test thread instead, so the production
+        /// <c>Monitor.PulseAll</c> never runs there.
+        /// </summary>
+        [Fact]
+        public async Task WriteInternal_WhenRotationEnds_ProductionPulseWakesWriterParkedOnGate()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "gate_pulse.log");
+            File.WriteAllText(filePath, "initial_data");
+            var testTime = new DateTime(2026, 6, 9, 9, 5, 0, DateTimeKind.Utc);
+
+            // Signals that a writer has reached CheckRotation.
+            using (var rotationChecked = new ManualResetEventSlim(false))
+            using (var writer = new RotatingStreamWriter(
+                filePath,
+                enableSizeRotation: true,
+                rotationSizeInBytes: 5,
+                enableDateRotation: false,
+                dateRotationType: DateRotationType.Daily,
+                maxRotations: 0,
+                useLocalTimeForRotation: false,
+                timeProvider: () => { rotationChecked.Set(); return testTime; }))
+            {
+                // The constructor calls timeProvider once, so drop that Set: the next one comes from
+                // CheckRotation, which runs under _lock and therefore publishes _rotationInProgress
+                // before this thread can enter WriteInternal.
+                rotationChecked.Reset();
+
+                // Only the production PulseAll, never this timeout, can release the parked writer in time.
+                writer.RotationWaitTimeoutMs = 10_000;
+
+                long parkedWriterMs;
+
+                // A reader without FileShare.Delete makes File.Move fail, so PerformPhysicalRotation
+                // burns its LogRotationMaxSyncRetries attempts and the gate stays shut meanwhile.
+                using (new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    var rotator = Task.Run(() => writer.WriteLine("trigger_rotation"), TestContext.Current.CancellationToken);
+                    rotationChecked.Wait(2000, TestContext.Current.CancellationToken);
+
+                    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+                    // Act
+                    writer.WriteLine("during_rotation");
+                    parkedWriterMs = stopwatch.ElapsedMilliseconds;
+                    await rotator;
+                }
+
+                // Assert
+                Assert.True(parkedWriterMs < 5_000,
+                    $"The parked writer was released by the timeout, not by WriteInternal's PulseAll ({parkedWriterMs} ms).");
+                writer.Flush();
+            }
+
+            // A writer released by the timeout drops its line, so the line on disk is a second witness.
+            Assert.Contains("during_rotation", File.ReadAllText(filePath));
+        }
+
         #region Circuit Breaker & Permanent Failure Tests
 
         [Fact]
         public void CheckRotation_EarlyReturn_WhenDisabled()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "gatekeeper.log");
+            var filePath = Path.Combine(TempDirectory, "gatekeeper.log");
             using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 1000))
             {
                 writer.Write("initial_data");
@@ -1101,7 +1420,7 @@ namespace Servy.Core.UnitTests.IO
                 writer.Flush();
 
                 // 3. Assert: Filter out the base file to check ONLY for rotated ones
-                var rotatedFiles = Directory.GetFiles(_testDir, "gatekeeper.*.log")
+                var rotatedFiles = Directory.GetFiles(TempDirectory, "gatekeeper.*.log")
                                             .Where(f => !f.EndsWith("gatekeeper.log"));
                 Assert.Empty(rotatedFiles);
             }
@@ -1111,7 +1430,7 @@ namespace Servy.Core.UnitTests.IO
         public async Task Rotate_TransientIOException_SucceedsOnRetry()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "transient.log");
+            var filePath = Path.Combine(TempDirectory, "transient.log");
             File.WriteAllText(filePath, "initial_data");
 
             // Provide a frozen baseline clock so live timestamps don't introduce drifts
@@ -1150,10 +1469,8 @@ namespace Servy.Core.UnitTests.IO
                         // Block the test execution thread until the background worker thread provably enters the rotation lifecycle
                         writeReachedRotationCheckSignal.Wait(2000, TestContext.Current.CancellationToken);
 
-                        // Small intentional delay to allow the unlocked move try loop to actively crash against the file lock handle
-                        Thread.Sleep(50);
-
-                        locker.Dispose(); // Release lock to let retry succeed
+                        // Release the file lock before PerformPhysicalRotation exhausts all sync retry attempts
+                        locker.Dispose();
                         await rotateTask;
                     }
                     finally
@@ -1170,8 +1487,8 @@ namespace Servy.Core.UnitTests.IO
 
                     SpinWait.SpinUntil(() =>
                     {
-                        isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled")!;
-                        cooldown = TestReflection.GetField<DateTime>(writer, "_rotationCooldownUntil")!;
+                        isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled");
+                        cooldown = TestReflection.GetField<DateTime>(writer, "_rotationCooldownUntil");
                         return cooldown == DateTime.MinValue;
                     }, TimeSpan.FromSeconds(1));
 
@@ -1186,7 +1503,7 @@ namespace Servy.Core.UnitTests.IO
         public void Rotate_PersistentIOException_ReachedLimit_SetsCooldown()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "persistent.log");
+            var filePath = Path.Combine(TempDirectory, "persistent.log");
             // Ensure the file has content so it isn't skipped by the "Length == 0" guard
             File.WriteAllText(filePath, "initial content");
 
@@ -1210,8 +1527,8 @@ namespace Servy.Core.UnitTests.IO
 
                 SpinWait.SpinUntil(() =>
                 {
-                    isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled")!;
-                    cooldown = TestReflection.GetField<DateTime>(writer, "_rotationCooldownUntil")!;
+                    isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled");
+                    cooldown = TestReflection.GetField<DateTime>(writer, "_rotationCooldownUntil");
                     return cooldown > DateTime.MinValue;
                 }, TimeSpan.FromSeconds(1));
 
@@ -1227,11 +1544,116 @@ namespace Servy.Core.UnitTests.IO
         }
 
         [Fact]
+        public void Write_SizeRotationDisabled_DoesNotRotatePastTheThreshold()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "size_off.log");
+
+            // Act
+            using (var writer = CreateWriter(filePath, enableSizeRotation: false, rotationSizeInBytes: 5))
+            {
+                writer.Write("123456"); // 6 bytes, over the 5-byte threshold
+                writer.Write("789");
+            }
+
+            // Assert
+            var rotated = Directory.GetFiles(TempDirectory, "size_off.*.log").Where(f => !f.EndsWith("size_off.log"));
+            Assert.Empty(rotated);
+            Assert.Equal("123456789", File.ReadAllText(filePath));
+        }
+
+        [Fact]
+        public void WriteLine_DateRotationDisabled_DoesNotRotateAfterTheDayChanged()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "date_off.log");
+            var fixedTime = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
+
+            // Act
+            using (var writer = CreateWriter(filePath, false, 0, false, DateRotationType.Daily, 0, false, () => fixedTime))
+            {
+                TestReflection.SetField(writer, "_lastRotationDate", fixedTime.AddDays(-1));
+                writer.WriteLine("no date rotation");
+            }
+
+            // Assert
+            var rotated = Directory.GetFiles(TempDirectory, "date_off.*.log").Where(f => !f.EndsWith("date_off.log"));
+            Assert.Empty(rotated);
+            Assert.True(File.Exists(filePath));
+        }
+
+        [Fact]
+        public void Write_AfterADeferredRotation_DoesNotRetryUntilTheCooldownExpires()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "cooldown.log");
+            File.WriteAllText(filePath, "initial content");
+            var now = new DateTime(2026, 6, 9, 9, 5, 0, DateTimeKind.Utc);
+
+            using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 5, timeProvider: () => now))
+            {
+                // A reader without FileShare.Delete makes File.Move fail, so the first rotation is deferred
+                using (new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    writer.Write("first");
+
+                    // Act: still over the threshold and still the same instant, so inside LogRotationCooldownMs
+                    writer.Write("second");
+
+                    // Assert: no second attempt was prepared - PrepareRotation would have closed the writer again
+                    Assert.NotNull(TestReflection.GetField<StreamWriter?>(writer, "_writer"));
+                }
+
+                // Act: the lock is released and the cooldown has run out
+                now = now.AddMilliseconds(AppConfig.LogRotationCooldownMs);
+                writer.Write("third");
+            }
+
+            // Assert
+            var rotated = Directory.GetFiles(TempDirectory, "cooldown.*.log").Where(f => !f.EndsWith("cooldown.log")).ToArray();
+            Assert.Single(rotated);
+            Assert.Contains("second", File.ReadAllText(rotated[0]));
+        }
+
+        [Fact]
+        public void DateRotation_RenameDeferred_KeepsLastRotationDateAndRetriesAfterTheCooldown()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "date_deferred.log");
+            File.WriteAllText(filePath, "initial content");
+            var now = new DateTime(2026, 4, 19, 12, 0, 0, DateTimeKind.Utc);
+            var staleDate = now.AddDays(-1);
+
+            using (var writer = CreateWriter(filePath, false, 0, true, DateRotationType.Daily, 0, false, () => now))
+            {
+                TestReflection.SetField(writer, "_lastRotationDate", staleDate);
+
+                // A reader without FileShare.Delete makes File.Move fail, so the date rotation is deferred
+                using (new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    // Act
+                    writer.WriteLine("deferred");
+                }
+
+                // Assert: the date is committed only by a successful move (#1463)
+                Assert.Equal(staleDate, TestReflection.GetField<DateTime>(writer, "_lastRotationDate"));
+
+                // Act: same day, cooldown over, lock released
+                now = now.AddMilliseconds(AppConfig.LogRotationCooldownMs);
+                writer.WriteLine("retried");
+            }
+
+            // Assert
+            var rotated = Directory.GetFiles(TempDirectory, "date_deferred.*.log").Where(f => !f.EndsWith("date_deferred.log")).ToArray();
+            Assert.Single(rotated);
+        }
+
+        [Fact]
         [Trait("Category", "Stress")]
         public void Rotate_PermanentFailure_TripsBreaker()
         {
             // Arrange
-            var subDir = Path.Combine(_testDir, "BreakerTest");
+            var subDir = Path.Combine(TempDirectory, "BreakerTest");
             Directory.CreateDirectory(subDir);
             var filePath = Path.Combine(subDir, "breaker_test.log");
 
@@ -1274,9 +1696,41 @@ namespace Servy.Core.UnitTests.IO
                 writer.Flush();
 
                 // 4. Assert: Verify the circuit breaker tripped due to the Exception.
-                bool isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled")!;
+                bool isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled");
                 Assert.True(isDisabled, "Circuit breaker should trip on permanent failure (Unique filename exhaustion).");
             }
+        }
+
+        [Fact]
+        public void Dispose_WhenTheWriterFlushThrows_DoesNotThrowAndStillReleasesTheFileHandle()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "flush_fails.log");
+            var writer = CreateWriter(filePath, true, 1024);
+            writer.WriteLine("before the failure"); // opens _baseStream on the real file
+
+            // Swap the StreamWriter for one whose stream fails on Flush; _baseStream keeps the real handle.
+            TestReflection.SetField(writer, "_writer", new StreamWriter(new FlushFailingStream()));
+
+            // Act
+            var ex = Record.Exception(writer.Dispose);
+
+            // Assert
+            Assert.Null(ex);
+            Assert.Null(TestReflection.GetField<StreamWriter?>(writer, "_writer"));
+            Assert.Null(TestReflection.GetField<FileStream?>(writer, "_baseStream"));
+
+            // The handle is really gone: an exclusive open succeeds.
+            using (new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.None)) { }
+        }
+
+        /// <summary>
+        /// A stream whose <see cref="Flush"/> always throws, used to make the writer's flush fail.
+        /// </summary>
+        private sealed class FlushFailingStream : MemoryStream
+        {
+            /// <inheritdoc />
+            public override void Flush() => throw new IOException("Simulated flush failure");
         }
 
         #endregion
@@ -1287,7 +1741,7 @@ namespace Servy.Core.UnitTests.IO
         public void CheckRotation_CircuitBreaker_HealsAfterCooldownExpires()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "healing.log");
+            var filePath = Path.Combine(TempDirectory, "healing.log");
             using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 10))
             {
                 writer.Write("initial");
@@ -1297,15 +1751,15 @@ namespace Servy.Core.UnitTests.IO
                 TestReflection.SetField(writer, "_rotationDisabled", true);
                 TestReflection.SetField(writer, "_disabledCooldownUntil", DateTime.UtcNow.AddMinutes(-1));
 
-                // 2. Act: This write should trigger the healing logic, reset the breaker, and rotate
+                // 2. Act: This should trigger the healing logic, reset the breaker, and rotate
                 writer.Write("this_forces_rotation");
                 writer.Flush();
 
                 // 3. Assert
-                bool isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled")!;
+                bool isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled");
                 Assert.False(isDisabled, "Breaker should reset automatically after the cooldown expires.");
 
-                var rotated = Directory.GetFiles(_testDir, "healing.*.log").Where(f => !f.EndsWith("healing.log"));
+                var rotated = Directory.GetFiles(TempDirectory, "healing.*.log").Where(f => !f.EndsWith("healing.log"));
                 Assert.NotEmpty(rotated); // Proves the rotation actually resumed
             }
         }
@@ -1314,7 +1768,7 @@ namespace Servy.Core.UnitTests.IO
         public void CheckRotation_WhenDisabledAndFileIsHuge_DoesNotRotateAndDoesNotThrow()
         {
             // Arrange: Set limit to 10 bytes
-            var filePath = Path.Combine(_testDir, "huge.log");
+            var filePath = Path.Combine(TempDirectory, "huge.log");
 
             using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 10))
             {
@@ -1335,7 +1789,7 @@ namespace Servy.Core.UnitTests.IO
                 Assert.Null(exception); // Handled gracefully without throwing
 
                 // Verify the file was allowed to grow without generating any rotated files
-                var rotated = Directory.GetFiles(_testDir, "huge.*.log").Where(f => !f.EndsWith("huge.log"));
+                var rotated = Directory.GetFiles(TempDirectory, "huge.*.log").Where(f => !f.EndsWith("huge.log"));
                 Assert.Empty(rotated);
 
                 // Optional: Verify the base file is indeed huge
@@ -1347,12 +1801,16 @@ namespace Servy.Core.UnitTests.IO
         public void DateRotation_Weekly_Rotates_WhenSameCalendarYearButOver7Days()
         {
             // Arrange
-            // This specifically covers Bug #1116 (ISO Calendar Year Mismatch)
-            var filePath = Path.Combine(_testDir, "weekly_iso_bug.log");
+            // Calendar.GetWeekOfYear is not ISO 8601: it never assigns a late-December date to
+            // week 1 of the following year, so the two dates below report different week numbers.
+            // They are 362 days apart as well, so the elapsed-days term allows the rotation too and
+            // this test pins neither term on its own; the week-number term is pinned on its own by
+            // DateRotation_Weekly_Rotates_WhenMondayStartsANewWeekLessThan7DaysLater below.
+            var filePath = Path.Combine(TempDirectory, "weekly_iso_bug.log");
 
-            // Wed, Jan 1, 2025 (ISO Week 1 of 2025)
+            // Wed, Jan 1, 2025 - week 1
             var lastRotationDate = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-            // Mon, Dec 29, 2025 (ISO Week 1 of 2026, but still Calendar Year 2025)
+            // Mon, Dec 29, 2025 - week 53 under FirstFourDayWeek/Monday, not week 1 of 2026
             var nowUtc = new DateTime(2025, 12, 29, 0, 0, 0, DateTimeKind.Utc);
 
             using (var writer = CreateWriter(filePath, false, 0, true, DateRotationType.Weekly, 0))
@@ -1363,8 +1821,69 @@ namespace Servy.Core.UnitTests.IO
                 var args = new object[] { nowUtc };
                 var shouldRotate = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args);
 
-                // Assert: The 7-day fallback should catch this and allow rotation
-                Assert.True(shouldRotate, "Should rotate because > 7 days have passed, despite both dates reporting as ISO Week 1 of Calendar Year 2025.");
+                // Assert
+                Assert.True(shouldRotate, "Should rotate because the two dates report different week numbers (1 and 53).");
+            }
+        }
+
+        [Fact]
+        public void DateRotation_Weekly_Rotates_WhenBothDatesShareWeekNumberAYearApart()
+        {
+            // Arrange
+            // Covers #1116: GetWeekOfYear(FirstFourDayWeek, Monday) returns 1 for both dates, so
+            // the week-number comparison alone would not rotate; only the elapsed-days term can.
+            var filePath = Path.Combine(TempDirectory, "weekly_same_week_number.log");
+            var lastRotationDate = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var nowUtc = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+            using (var writer = CreateWriter(filePath, false, 0, true, DateRotationType.Weekly, 0))
+            {
+                TestReflection.SetField(writer, "_lastRotationDate", lastRotationDate);
+
+                // Guard the premise: if a runtime ever changed GetWeekOfYear, this fails here and
+                // says why, rather than letting the test go vacuous again.
+                var calendar = CultureInfo.InvariantCulture.Calendar;
+                Assert.Equal(
+                    calendar.GetWeekOfYear(lastRotationDate, CalendarWeekRule.FirstFourDayWeek, DayOfWeek.Monday),
+                    calendar.GetWeekOfYear(nowUtc, CalendarWeekRule.FirstFourDayWeek, DayOfWeek.Monday));
+
+                // Act
+                var args = new object[] { nowUtc };
+                var shouldRotate = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args);
+
+                // Assert
+                Assert.True(shouldRotate, "Should rotate because a full year has passed, although both dates are week 1.");
+            }
+        }
+
+        [Fact]
+        public void DateRotation_Weekly_Rotates_WhenMondayStartsANewWeekLessThan7DaysLater()
+        {
+            // Arrange
+            // One day apart, so the elapsed-days term of the Weekly arm is false and only the
+            // week-number term can allow the rotation.
+            var filePath = Path.Combine(TempDirectory, "weekly_new_week.log");
+            var lastRotationDate = new DateTime(2026, 4, 12, 12, 0, 0, DateTimeKind.Utc); // Sunday, week 15
+            var nowUtc = new DateTime(2026, 4, 13, 0, 0, 1, DateTimeKind.Utc);            // Monday, week 16
+
+            using (var writer = CreateWriter(filePath, false, 0, true, DateRotationType.Weekly, 0))
+            {
+                TestReflection.SetField(writer, "_lastRotationDate", lastRotationDate);
+
+                // Guard the premise: the two dates must be under 7 days apart and in different weeks,
+                // so a runtime that changed GetWeekOfYear fails here and says why.
+                var calendar = CultureInfo.InvariantCulture.Calendar;
+                Assert.True((nowUtc.Date - lastRotationDate.Date).TotalDays < 7);
+                Assert.NotEqual(
+                    calendar.GetWeekOfYear(lastRotationDate, CalendarWeekRule.FirstFourDayWeek, DayOfWeek.Monday),
+                    calendar.GetWeekOfYear(nowUtc, CalendarWeekRule.FirstFourDayWeek, DayOfWeek.Monday));
+
+                // Act
+                var args = new object[] { nowUtc };
+                var shouldRotate = (bool?)TestReflection.InvokeNonPublic(writer, "ShouldRotateByDate", args);
+
+                // Assert
+                Assert.True(shouldRotate, "A Weekly log should roll over when a new calendar week starts, even less than 7 days after the last rotation.");
             }
         }
 
@@ -1372,7 +1891,7 @@ namespace Servy.Core.UnitTests.IO
         public void PerformPhysicalRotation_NonIOException_TripsCircuitBreaker()
         {
             // Arrange
-            var filePath = Path.Combine(_testDir, "non_io.log");
+            var filePath = Path.Combine(TempDirectory, "non_io.log");
             using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 10))
             {
                 writer.Write("init");
@@ -1387,7 +1906,9 @@ namespace Servy.Core.UnitTests.IO
                 try
                 {
                     // This will throw an ArgumentException ("Cannot determine directory from path...")
-                    // which is caught by the broad `catch (Exception)` block in PerformPhysicalRotation.
+                    // which is caught by the catch around GenerateUniqueFileName, so the breaker trips
+                    // before the move loop runs. The move loop's own catch-all is covered by
+                    // PerformPhysicalRotation_MoveThrowsNonIOException_TripsCircuitBreaker.
                     TestReflection.InvokeNonPublic(writer, "PerformPhysicalRotation", new object[] { filePath, badRotatedPath });
                 }
                 finally
@@ -1396,29 +1917,466 @@ namespace Servy.Core.UnitTests.IO
                 }
 
                 // Assert
-                bool isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled")!;
-                DateTime cooldown = TestReflection.GetField<DateTime>(writer, "_disabledCooldownUntil")!;
+                bool isDisabled = TestReflection.GetField<bool>(writer, "_rotationDisabled");
+                DateTime cooldown = TestReflection.GetField<DateTime>(writer, "_disabledCooldownUntil");
 
                 Assert.True(isDisabled, "A non-IOException should successfully trip the circuit breaker.");
                 Assert.True(cooldown > DateTime.UtcNow, "Circuit breaker cooldown should be set to the future.");
             }
         }
 
+        /// <summary>
+        /// A non-transient <c>File.Move</c> failure must reach the move loop's own catch-all and trip the
+        /// circuit breaker, rather than escaping onto the writing thread or breaking out of the loop
+        /// silently. This is the arm that separates a permanent failure from the
+        /// IOException/UnauthorizedAccessException retry-and-defer path of #1469.
+        /// </summary>
+        [Fact]
+        public void PerformPhysicalRotation_MoveThrowsNonIOException_TripsCircuitBreaker()
+        {
+            // Arrange
+            var filePath = Path.Combine(TempDirectory, "move_arg.log");
+
+            // Does not exist, so GenerateUniqueFileName returns it unchanged and the move loop is reached.
+            var rotatedPath = Path.Combine(TempDirectory, "move_arg.20260101_120000.log");
+
+            using (var writer = CreateWriter(filePath, enableSizeRotation: true, rotationSizeInBytes: 10))
+            {
+                writer.Write("init");
+                writer.Flush();
+
+                // Act: an empty source path makes File.Move throw ArgumentException, which is neither
+                // IOException nor UnauthorizedAccessException, so it reaches the loop's catch-all rather
+                // than the retry filter.
+                TestReflection.InvokeNonPublic(writer, "PerformPhysicalRotation", new object[] { string.Empty, rotatedPath });
+
+                // Assert
+                Assert.True(TestReflection.GetField<bool>(writer, "_rotationDisabled"), "A non-IO move failure must trip the circuit breaker.");
+                Assert.True(TestReflection.GetField<DateTime>(writer, "_disabledCooldownUntil") > DateTime.UtcNow, "The breaker cooldown should be set to the future.");
+                Assert.False(File.Exists(rotatedPath), "No rotated file may be produced by a failed move.");
+            }
+        }
+
         #endregion
 
-        public void Dispose()
+        #region Reparse-point refusal (#7527)
+
+        /// <summary>
+        /// Creates a writer that refuses reparse points, with the ancestor check and the handle-path check supplied by the test.
+        /// </summary>
+        private static RotatingStreamWriter CreateRefusingWriter(
+            string path,
+            Func<string, bool> hasAncestorReparsePoint,
+            Func<SafeFileHandle, string, bool> handleNamesPath,
+            long rotationSizeInBytes = 1024,
+            int maxRotations = 0,
+            Func<DateTime>? timeProvider = null)
         {
+            return new RotatingStreamWriter(
+                path,
+                true,
+                rotationSizeInBytes,
+                false,
+                DateRotationType.Daily,
+                maxRotations,
+                false,
+                timeProvider,
+                hasAncestorReparsePoint,
+                handleNamesPath);
+        }
+
+        [Fact]
+        public void Constructor_RefusingReparsePoints_AncestorIsReparsePoint_ThrowsBeforeCreatingDirectory()
+        {
+            // Arrange
+            var junctionedDir = Path.Combine(TempDirectory, "junctioned");
+            var logPath = Path.Combine(junctionedDir, "service.log");
+
+            // Act
+            var ex = Record.Exception(() => CreateRefusingWriter(logPath, _ => true, (handle, path) => true));
+
+            // Assert
+            Assert.IsType<IOException>(ex);
+            Assert.Contains("junction", ex.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(junctionedDir), "The directory must not be created under a refused path.");
+        }
+
+        [Fact]
+        public void Constructor_RefusingReparsePoints_AncestorBecomesReparsePointAfterDirectoryIsCreated_Throws()
+        {
+            // Arrange
+            var newDir = Path.Combine(TempDirectory, "created-then-junctioned");
+            var logPath = Path.Combine(newDir, "service.log");
+            int calls = 0;
+
+            // Act
+            var ex = Record.Exception(() => CreateRefusingWriter(logPath, _ => ++calls > 1, (handle, path) => true));
+
+            // Assert
+            Assert.IsType<IOException>(ex);
+            Assert.Contains("junction", ex.Message, StringComparison.Ordinal);
+            Assert.Equal(2, calls);
+            Assert.True(Directory.Exists(newDir), "The first check passed, so the directory was created before the re-check refused.");
+            Assert.False(File.Exists(logPath), "No log file may be opened on a path refused during construction.");
+        }
+
+        [Fact]
+        public void WriteLine_RefusingReparsePoints_AncestorBecomesReparsePointAfterConstruction_DropsWritesForGood()
+        {
+            // Arrange
+            bool ancestorIsReparsePoint = false;
+            var writer = CreateRefusingWriter(_logFilePath, _ => ancestorIsReparsePoint, (handle, path) => true);
+            ancestorIsReparsePoint = true;
+
+            // Act
+            writer.WriteLine("refused line");
+            ancestorIsReparsePoint = false;
+            writer.WriteLine("line after the refusal");
+            writer.Dispose();
+
+            // Assert
+            Assert.False(File.Exists(_logFilePath), "No handle may be opened on a refused path, not even after the check passes again.");
+            Assert.True(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+        }
+
+        [Fact]
+        public void WriteLine_RefusingReparsePoints_HandleDoesNotResolveToPath_WritesNothingAndDisablesCapture()
+        {
+            // Arrange
+            var writer = CreateRefusingWriter(_logFilePath, _ => false, (handle, path) => false);
+
+            // Act
+            writer.WriteLine("line through a redirected handle");
+            writer.Dispose();
+
+            // Assert
+            Assert.Equal(0, new FileInfo(_logFilePath).Length);
+            Assert.Null(TestReflection.GetField<StreamWriter?>(writer, "_writer"));
+            Assert.True(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+        }
+
+        [Fact]
+        public void Rotation_RefusingReparsePoints_AncestorBecomesReparsePointBeforeRename_KeepsFileAndDisablesCapture()
+        {
+            // Arrange
+            bool ancestorIsReparsePoint = false;
+            bool armed = false;
+
+            // CheckRotation reads the clock after the write and before the rename, so the swap lands between the two.
+            Func<DateTime> clock = () =>
+            {
+                if (armed) ancestorIsReparsePoint = true;
+                return DateTime.UtcNow;
+            };
+            var writer = CreateRefusingWriter(_logFilePath, _ => ancestorIsReparsePoint, (handle, path) => true, rotationSizeInBytes: 10, timeProvider: clock);
+            armed = true;
+
+            // Act
+            writer.WriteLine("a line longer than the rotation size");
+            writer.Dispose();
+
+            // Assert
+            Assert.True(File.Exists(_logFilePath), "The refused rename must leave the log file in place.");
+            Assert.Empty(Directory.GetFiles(TempDirectory, "test.2*.log"));
+            Assert.True(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+        }
+
+        [Fact]
+        public void EnforceMaxRotations_RefusingReparsePoints_DeletesExpiredFilesThroughVerifiedHandle()
+        {
+            // Arrange
+            var expiredOld = Path.Combine(TempDirectory, "test.20200101_000000.log");
+            var expiredNewer = Path.Combine(TempDirectory, "test.20200102_000000.log");
+            File.WriteAllText(expiredOld, "old");
+            File.WriteAllText(expiredNewer, "newer");
+            File.SetLastWriteTimeUtc(expiredOld, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+            File.SetLastWriteTimeUtc(expiredNewer, new DateTime(2020, 1, 2, 0, 0, 0, DateTimeKind.Utc));
+
+            var verifiedPaths = new List<string>();
+            var writer = CreateRefusingWriter(
+                _logFilePath,
+                _ => false,
+                (_, path) => { lock (verifiedPaths) { verifiedPaths.Add(path); } return true; },
+                rotationSizeInBytes: 10,
+                maxRotations: 1);
+
+            // Act
+            writer.WriteLine("a line longer than the rotation size");
+            writer.Dispose();
+
+            // Assert
+            Assert.False(File.Exists(expiredOld), "The oldest expired file should have been deleted.");
+            Assert.False(File.Exists(expiredNewer), "The second expired file should have been deleted.");
+            Assert.Contains(Path.GetFullPath(expiredOld), verifiedPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains(Path.GetFullPath(expiredNewer), verifiedPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Single(Directory.GetFiles(TempDirectory, "test.2*.log"));
+            Assert.False(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+        }
+
+        [Fact]
+        public void EnforceMaxRotations_RefusingReparsePoints_DeleteHandleDoesNotResolveToPath_KeepsFileAndDisablesCapture()
+        {
+            // Arrange
+            var expired = Path.Combine(TempDirectory, "test.20200101_000000.log");
+            File.WriteAllText(expired, "old");
+            File.SetLastWriteTimeUtc(expired, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+            var logFullPath = Path.GetFullPath(_logFilePath);
+            var writer = CreateRefusingWriter(
+                _logFilePath,
+                _ => false,
+                (_, path) => string.Equals(path, logFullPath, StringComparison.OrdinalIgnoreCase),
+                rotationSizeInBytes: 10,
+                maxRotations: 1);
+
+            // Act
+            writer.WriteLine("a line longer than the rotation size");
+            writer.Dispose();
+
+            // Assert
+            Assert.True(File.Exists(expired), "A delete through an unverified handle must be refused.");
+            Assert.True(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+        }
+
+        [Fact]
+        public void Constructor_RefusingReparsePoints_LogFileIsSymbolicLink_ThrowsAndLeavesTargetUntouched()
+        {
+            // Arrange
+            var target = Path.Combine(TempDirectory, "real-target.log");
+            File.WriteAllText(target, "original");
             try
             {
-                if (Directory.Exists(_testDir))
+                File.CreateSymbolicLink(_logFilePath, target);
+            }
+            catch (Exception skip) when (skip is IOException || skip is UnauthorizedAccessException)
+            {
+                Assert.Skip("Symlink creation unavailable on this runner");
+            }
+
+            // Act
+            var ex = Assert.Throws<IOException>(() => CreateRefusingWriter(_logFilePath, _ => false, (handle, path) => true));
+
+            // Assert
+            Assert.Contains("the file is a junction, symbolic link, or mount point", ex.Message);
+            Assert.Equal("original", File.ReadAllText(target));
+        }
+
+        [Fact]
+        public void EnforceMaxRotations_RefusingReparsePoints_ExpiredFilePathIsReparsePoint_KeepsFileAndDisablesCapture()
+        {
+            // Arrange
+            var expired = Path.Combine(TempDirectory, "test.20200101_000000.log");
+            File.WriteAllText(expired, "old");
+            File.SetLastWriteTimeUtc(expired, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+            // Refuses only the path check made right before the delete handle is opened
+            var expiredFullPath = Path.GetFullPath(expired);
+            var writer = CreateRefusingWriter(
+                _logFilePath,
+                p => string.Equals(p, expiredFullPath, StringComparison.OrdinalIgnoreCase),
+                (_, path) => true,
+                rotationSizeInBytes: 10,
+                maxRotations: 1);
+
+            // Act
+            writer.WriteLine("a line longer than the rotation size");
+            writer.Dispose();
+
+            // Assert
+            Assert.True(File.Exists(expired), "A delete whose path check refuses must leave the file in place.");
+            Assert.True(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+        }
+
+        [Fact]
+        public void EnforceMaxRotations_RefusingReparsePoints_RefusalStopsThePass_OlderExpiredFileIsKept()
+        {
+            // Arrange
+            var expiredOld = Path.Combine(TempDirectory, "test.20200101_000000.log");
+            var expiredNewer = Path.Combine(TempDirectory, "test.20200102_000000.log");
+            File.WriteAllText(expiredOld, "old");
+            File.WriteAllText(expiredNewer, "newer");
+            File.SetLastWriteTimeUtc(expiredOld, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+            File.SetLastWriteTimeUtc(expiredNewer, new DateTime(2020, 1, 2, 0, 0, 0, DateTimeKind.Utc));
+
+            // Refuses the handle of the newer expired file only; the log file and the older file pass.
+            var refusedFullPath = Path.GetFullPath(expiredNewer);
+            var writer = CreateRefusingWriter(
+                _logFilePath,
+                _ => false,
+                (_, path) => !string.Equals(path, refusedFullPath, StringComparison.OrdinalIgnoreCase),
+                rotationSizeInBytes: 10,
+                maxRotations: 1);
+
+            // Act
+            writer.WriteLine("a line longer than the rotation size");
+            writer.Dispose();
+
+            // Assert
+            Assert.True(File.Exists(expiredNewer), "A delete through an unverified handle must be refused.");
+            Assert.True(File.Exists(expiredOld), "The pass must stop at the first refusal instead of deleting the files after it.");
+            Assert.True(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+        }
+
+        #endregion
+    }
+
+    /// <summary>
+    /// Covers <c>EnforceMaxRotations</c>'s "Persistent failure" escalation, which is only observable
+    /// through the static <c>Logger</c>. Asserting on that writer requires
+    /// <see cref="LoggerCollection"/>, so this case lives in a class of its own rather than taking
+    /// the whole of <see cref="RotatingStreamWriterTests"/> out of parallel execution.
+    /// </summary>
+    [Collection(LoggerCollection.Name)] // the escalation is asserted through the static Logger
+    public class RotatingStreamWriterRetentionAlarmTests : TempDirectoryTestBase
+    {
+        /// <summary>
+        /// The incomplete retention pass that reaches
+        /// <see cref="AppConfig.LogRotationDeletionFailureEscalationThreshold"/> must log the
+        /// "Persistent failure" error, and the pass before it must not. Without this case the
+        /// <c>Logger.Error</c> block can be deleted, or its <c>&gt;=</c> turned into <c>&gt;</c>,
+        /// with every test green - which is how the defect fixed in #5944 could return unnoticed.
+        /// </summary>
+        /// <param name="priorFailures">Consecutive incomplete passes already recorded before this pass.</param>
+        /// <param name="expectError">Whether this pass is expected to escalate to an error.</param>
+        [Theory]
+        [InlineData(AppConfig.LogRotationDeletionFailureEscalationThreshold - 2, false)]
+        [InlineData(AppConfig.LogRotationDeletionFailureEscalationThreshold - 1, true)]
+        public void EnforceMaxRotations_IncompletePassReachingThreshold_LogsPersistentFailureError(
+            int priorFailures,
+            bool expectError)
+        {
+            // Arrange
+            string baseLog = Path.Combine(TempDirectory, "alarm.log");
+            File.WriteAllText(baseLog, "base");
+
+            string expired = Path.Combine(TempDirectory, "alarm.20260325_000001.log");
+            string kept = Path.Combine(TempDirectory, "alarm.20260325_000002.log");
+            File.WriteAllText(expired, "old");
+            File.WriteAllText(kept, "new");
+            File.SetLastWriteTimeUtc(expired, DateTime.UtcNow.AddMinutes(-10));
+            File.SetLastWriteTimeUtc(kept, DateTime.UtcNow);
+
+            string log;
+            int failuresAfterPass;
+
+            using (var writer = new RotatingStreamWriter(baseLog, true, 1000, false, DateRotationType.Daily, 1, false))
+            {
+                writer.Write(string.Empty); // trigger lazy init, as the sibling retention tests do
+
+                // maxRotations is 1, so the pass targets the oldest rotated file only. Holding it
+                // open with FileShare.None is what makes that single deletion fail.
+                using (new FileStream(expired, FileMode.Open, FileAccess.Read, FileShare.None))
                 {
-                    Directory.Delete(_testDir, true);
+                    TestReflection.SetField(writer, "_consecutiveDeletionFailures", priorFailures);
+
+                    // Act
+                    (_, log) = LogCapture.Run(() => TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations"));
+                    failuresAfterPass = TestReflection.GetField<int>(writer, "_consecutiveDeletionFailures");
                 }
             }
-            catch
+
+            // Assert
+            Assert.Equal(priorFailures + 1, failuresAfterPass);
+            Assert.True(File.Exists(expired), "The locked expired file should survive the incomplete pass.");
+            Assert.True(File.Exists(kept), "The newest rotated file is within the retention limit.");
+
+            // Pins that the capture really received this pass's output, so the no-escalation row
+            // cannot pass on an empty log.
+            Assert.True(
+                log.IndexOf("Consecutive incomplete passes", StringComparison.Ordinal) >= 0,
+                "The incomplete-pass warning should have been captured.");
+            Assert.Equal(
+                expectError,
+                log.IndexOf("Persistent failure to enforce log rotation limit", StringComparison.Ordinal) >= 0);
+        }
+
+        /// <summary>
+        /// The enumeration-failure arm of <c>EnforceMaxRotations</c> - the #1315 catch around
+        /// <c>Directory.GetFiles</c> - must count towards the same consecutive-failure counter as a failed
+        /// deletion, warn every time, and escalate to the "Persistent failure to enumerate" error once
+        /// <see cref="AppConfig.LogRotationDeletionFailureEscalationThreshold"/> is reached. It is the twin of
+        /// the deletion-failure escalation pinned above (#7092): without this case the Interlocked.Increment
+        /// can be dropped, the catch deleted, or its error block removed, with every test green.
+        /// </summary>
+        /// <param name="priorFailures">Consecutive failures already recorded before this pass.</param>
+        /// <param name="expectError">Whether this pass is expected to escalate to an error.</param>
+        [Theory]
+        [InlineData(AppConfig.LogRotationDeletionFailureEscalationThreshold - 2, false)]
+        [InlineData(AppConfig.LogRotationDeletionFailureEscalationThreshold - 1, true)]
+        public void EnforceMaxRotations_EnumerationFailureReachingThreshold_LogsPersistentFailureError(
+            int priorFailures,
+            bool expectError)
+        {
+            // Arrange
+            string logDir = Path.Combine(TempDirectory, "enum-fail");
+            Directory.CreateDirectory(logDir);
+            string baseLog = Path.Combine(logDir, "enum.log");
+
+            var writer = new RotatingStreamWriter(baseLog, true, 1000, false, DateRotationType.Daily, 1, false);
+            writer.Write(string.Empty); // trigger lazy init, as the sibling retention tests do
+            writer.Dispose();           // release the handle so the directory can be removed
+
+            // EnforceMaxRotations resolves the directory from _file and does not check _disposed, so with
+            // the directory gone Directory.GetFiles throws DirectoryNotFoundException on net10.0 and net48
+            // alike - no production seam needed.
+            Directory.Delete(logDir, true);
+
+            TestReflection.SetField(writer, "_consecutiveDeletionFailures", priorFailures);
+
+            // Act
+            var (_, log) = LogCapture.Run(() => TestReflection.InvokeNonPublic(writer, "EnforceMaxRotations"));
+            int failuresAfterPass = TestReflection.GetField<int>(writer, "_consecutiveDeletionFailures");
+
+            // Assert
+            Assert.Equal(priorFailures + 1, failuresAfterPass);
+
+            // Pins that the capture really received this pass's output, so the no-escalation row
+            // cannot pass on an empty log.
+            Assert.True(
+                log.IndexOf("Failed to enumerate rotated log files", StringComparison.Ordinal) >= 0,
+                "The enumeration-failure warning should have been captured.");
+            Assert.Equal(
+                expectError,
+                log.IndexOf("Persistent failure to enumerate rotated log files", StringComparison.Ordinal) >= 0);
+        }
+
+        /// <summary>
+        /// A reparse-point refusal after construction goes through <c>DisableCapture</c>, whose
+        /// <c>Logger.Error</c> is the only place anything outside the writer learns that output capture
+        /// stopped and why. Without this case that line can be deleted, with every test green, and the
+        /// writer would drop the wrapped process's output without a trace (twin of #7092 and #7114).
+        /// </summary>
+        [Fact]
+        public void WriteLine_RefusingReparsePoints_RefusalAfterConstruction_LogsWhyCaptureWasDisabled()
+        {
+            // Arrange
+            string logPath = Path.Combine(TempDirectory, "refused.log");
+            bool ancestorIsReparsePoint = false;
+            var writer = new RotatingStreamWriter(
+                logPath,
+                true,
+                1024,
+                false,
+                DateRotationType.Daily,
+                0,
+                false,
+                null,
+                _ => ancestorIsReparsePoint,
+                (handle, path) => true);
+            ancestorIsReparsePoint = true;
+
+            // Act
+            string log = LogCapture.Run(() =>
             {
-                // ignore cleanup errors
-            }
+                writer.WriteLine("refused line");
+            });
+            writer.Dispose();
+
+            // Assert
+            Assert.True(TestReflection.GetField<bool>(writer, "_captureDisabled"));
+            Assert.Contains("Refusing to open log file", log, StringComparison.Ordinal);
+            Assert.Contains("refused.log", log, StringComparison.Ordinal);
+            Assert.Contains("Output capture to this file is disabled", log, StringComparison.Ordinal);
         }
     }
 }

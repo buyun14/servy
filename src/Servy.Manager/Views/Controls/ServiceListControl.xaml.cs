@@ -28,7 +28,7 @@ namespace Servy.Manager.Views.Controls
         /// </summary>
         public ObservableCollection<ServiceItemBase>? Services
         {
-            get => (ObservableCollection<ServiceItemBase>)GetValue(ServicesProperty);
+            get => (ObservableCollection<ServiceItemBase>?)GetValue(ServicesProperty);
             set => SetValue(ServicesProperty, value);
         }
 
@@ -47,7 +47,7 @@ namespace Servy.Manager.Views.Controls
         /// </summary>
         public ServiceItemBase? SelectedService
         {
-            get => (ServiceItemBase)GetValue(SelectedServiceProperty);
+            get => (ServiceItemBase?)GetValue(SelectedServiceProperty);
             set => SetValue(SelectedServiceProperty, value);
         }
 
@@ -65,10 +65,11 @@ namespace Servy.Manager.Views.Controls
 
         /// <summary>
         /// Gets or sets the search text used to filter the services list.
+        /// This property supports two-way binding by default.
         /// </summary>
         public string? SearchText
         {
-            get => (string)GetValue(SearchTextProperty);
+            get => (string?)GetValue(SearchTextProperty);
             set => SetValue(SearchTextProperty, value);
         }
 
@@ -90,7 +91,7 @@ namespace Servy.Manager.Views.Controls
         /// </summary>
         public string? SearchButtonText
         {
-            get => (string)GetValue(SearchButtonTextProperty);
+            get => (string?)GetValue(SearchButtonTextProperty);
             set => SetValue(SearchButtonTextProperty, value);
         }
 
@@ -105,7 +106,7 @@ namespace Servy.Manager.Views.Controls
 
         /// <summary>
         /// Gets or sets a value indicating whether the control is currently busy.
-        /// Used to disable user interactions while background operations are running.
+        /// Disables the search button while it is <see langword="true"/>; the search box and the services list stay enabled.
         /// </summary>
         public bool IsBusy
         {
@@ -127,7 +128,7 @@ namespace Servy.Manager.Views.Controls
         /// </summary>
         public ICommand? SearchCommand
         {
-            get => (ICommand)GetValue(SearchCommandProperty);
+            get => (ICommand?)GetValue(SearchCommandProperty);
             set => SetValue(SearchCommandProperty, value);
         }
 

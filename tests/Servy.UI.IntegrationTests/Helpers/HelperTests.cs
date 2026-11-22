@@ -1,7 +1,7 @@
-using Servy.Testing;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using Servy.Testing;
 
 namespace Servy.UI.IntegrationTests.Helpers
 {
@@ -14,6 +14,7 @@ namespace Servy.UI.IntegrationTests.Helpers
         {
             Helper.RunOnSTA(() =>
             {
+                // Arrange
                 // Branch: Loop i < GetChildrenCount (zero count)
                 var border = new Border();
 
@@ -21,16 +22,20 @@ namespace Servy.UI.IntegrationTests.Helpers
                 border.Measure(new Size(100, 100));
                 border.Arrange(new Rect(0, 0, 100, 100));
 
+                // Act
                 var result = UI.Helpers.Helper.GetVisualChild<ScrollViewer>(border);
+
+                // Assert
                 Assert.Null(result);
             });
         }
 
         [Fact]
-        public async Task GetVisualChild_ImmediateChildFound_ReturnsChild()
+        public void GetVisualChild_ImmediateChildFound_ReturnsChild()
         {
-            await Helper.RunOnSTA(async () =>
+            Helper.RunOnSTA(() =>
             {
+                // Arrange
                 // Branch: if (child is T t) return t;
                 var grid = new Grid();
                 var scrollViewer = new ScrollViewer();
@@ -41,18 +46,20 @@ namespace Servy.UI.IntegrationTests.Helpers
                 grid.Arrange(new Rect(0, 0, 100, 100));
                 grid.UpdateLayout();
 
+                // Act
                 var result = UI.Helpers.Helper.GetVisualChild<ScrollViewer>(grid);
 
-                Assert.NotNull(result);
+                // Assert
                 Assert.Same(scrollViewer, result);
             });
         }
 
         [Fact]
-        public async Task GetVisualChild_DeepChildFound_ReturnsChild()
+        public void GetVisualChild_DeepChildFound_ReturnsChild()
         {
-            await Helper.RunOnSTA(async () =>
+            Helper.RunOnSTA(() =>
             {
+                // Arrange
                 // Branch: var res = GetVisualChild<T>(child); if (res != null) return res;
                 var grid = new Grid();
                 var border = new Border();
@@ -66,9 +73,39 @@ namespace Servy.UI.IntegrationTests.Helpers
                 grid.Arrange(new Rect(0, 0, 100, 100));
                 grid.UpdateLayout();
 
+                // Act
                 var result = UI.Helpers.Helper.GetVisualChild<ScrollViewer>(grid);
 
-                Assert.NotNull(result);
+                // Assert
+                Assert.Same(scrollViewer, result);
+            });
+        }
+
+        [Fact]
+        public void GetVisualChild_SiblingWithoutMatch_ContinuesToNextChild()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                // Arrange
+                // Branch: the for loop's back-edge - the first child and its subtree are not a
+                // match, so both ifs are false on that iteration and the loop has to continue to
+                // the next sibling instead of returning on i == 0.
+                var grid = new Grid();
+                var emptyBorder = new Border();
+                var scrollViewer = new ScrollViewer();
+
+                grid.Children.Add(emptyBorder);
+                grid.Children.Add(scrollViewer);
+
+                // Force WPF to build the visual tree in memory
+                grid.Measure(new Size(100, 100));
+                grid.Arrange(new Rect(0, 0, 100, 100));
+                grid.UpdateLayout();
+
+                // Act
+                var result = UI.Helpers.Helper.GetVisualChild<ScrollViewer>(grid);
+
+                // Assert
                 Assert.Same(scrollViewer, result);
             });
         }
@@ -109,14 +146,22 @@ namespace Servy.UI.IntegrationTests.Helpers
         [InlineData(1000000, "1,000,000")]
         public void FormatNumber_Integers_ReturnsInvariantCultureFormatting(int number, string expected)
         {
+            // Arrange
             var prev = CultureInfo.CurrentCulture;
             try
             {
                 CultureInfo.CurrentCulture = new CultureInfo("de-DE"); // Wrap the assertion in a non-comma culture to prove invariance
+
+                // Act
                 var result = UI.Helpers.Helper.FormatNumber(number);   // Still comma-grouped
+
+                // Assert
                 Assert.Equal(expected, result);
             }
-            finally { CultureInfo.CurrentCulture = prev; }
+            finally
+            {
+                CultureInfo.CurrentCulture = prev;
+            }
         }
 
         #endregion
@@ -130,24 +175,33 @@ namespace Servy.UI.IntegrationTests.Helpers
         [Fact]
         public void GetRowsInfo_CountZero_ReturnsNoneFormat()
         {
+            // Arrange & Act
             // Branch: if (count == 0)
             var result = UI.Helpers.Helper.GetRowsInfo(0, TimeSpan.FromSeconds(1), None, One, Many);
+
+            // Assert
             Assert.Equal("None: 1s", result);
         }
 
         [Fact]
         public void GetRowsInfo_CountOne_ReturnsOneFormat()
         {
+            // Arrange & Act
             // Branch: if (count == 1)
             var result = UI.Helpers.Helper.GetRowsInfo(1, TimeSpan.FromSeconds(1), None, One, Many);
+
+            // Assert
             Assert.Equal("One: 1s", result);
         }
 
         [Fact]
         public void GetRowsInfo_CountMany_ReturnsManyFormat()
         {
+            // Arrange & Act
             // Branch: Default/Many
             var result = UI.Helpers.Helper.GetRowsInfo(1234, TimeSpan.FromSeconds(1), None, One, Many);
+
+            // Assert
             Assert.Equal("Many: 1,234 1s", result);
         }
 

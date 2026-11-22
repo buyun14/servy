@@ -19,6 +19,44 @@ namespace Servy.CLI.Commands
         private readonly IServiceRepository _serviceRepository;
 
         /// <summary>
+        /// Test seam delegate for validating file path and creating file streams during export.
+        /// Defaults to <see cref="PathSecurityGuard.ValidatePath"/>.
+        /// </summary>
+        internal Func<string, FileMode, FileAccess, FileShare, PathSecurityResultWithStream> PathValidator { get; set; }
+            = (userPath, mode, access, share) =>
+            {
+                var result = PathSecurityGuard.ValidatePath(userPath, mode, access, share, out var stream);
+                return new PathSecurityResultWithStream(result, stream);
+            };
+
+        /// <summary>
+        /// Container holding the result of a path security check along with the opened file stream.
+        /// </summary>
+        internal readonly struct PathSecurityResultWithStream
+        {
+            /// <summary>
+            /// Gets the result of the path security validation pipeline.
+            /// </summary>
+            public PathSecurityResult Result { get; }
+
+            /// <summary>
+            /// Gets the opened file stream associated with the path validation, or <c>null</c> if validation failed or no stream was created.
+            /// </summary>
+            public FileStream? Stream { get; }
+
+            /// <summary>
+            /// Initializes a new instance of the <see cref="PathSecurityResultWithStream"/> struct.
+            /// </summary>
+            /// <param name="result">The validation result outcome.</param>
+            /// <param name="stream">The optional opened file stream handle.</param>
+            public PathSecurityResultWithStream(PathSecurityResult result, FileStream? stream)
+            {
+                Result = result;
+                Stream = stream;
+            }
+        }
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="ExportServiceCommand"/> class.
         /// </summary>
         /// <param name="serviceRepository">Service repository.</param>
@@ -55,9 +93,12 @@ namespace Servy.CLI.Commands
                     return CommandResult.Fail(Strings.Msg_PathRequired);
 
                 // Pre-flight elevation check
-                SecurityHelper.EnsureAdministrator();
+                if (!BypassElevationCheck)
+                {
+                    SecurityHelper.EnsureAdministrator();
+                }
 
-                var exists = await _serviceRepository.GetByNameAsync(opts.ServiceName, cancellationToken: cancellationToken);
+                var exists = await _serviceRepository.GetByNameAsync(opts.ServiceName, decrypt: false, cancellationToken: cancellationToken);
 
                 if (exists == null)
                     return CommandResult.Fail(Core.Resources.Strings.Msg_ServiceNotFound);
@@ -65,20 +106,32 @@ namespace Servy.CLI.Commands
                 string content;
                 string typeLabel = configFileType.ToString().ToUpperInvariant();
 
-                // 1. Perform Export based on type using standard switch syntax
-                switch (configFileType)
+                // 1. Perform Export based on type using standard switch syntax. A stored row that no longer decrypts is
+                // refused rather than written without its sensitive fields; say why, with what to do, rather than a generic failure.
+                try
                 {
-                    case ConfigFileType.Xml:
-                        content = await _serviceRepository.ExportXmlAsync(opts.ServiceName, cancellationToken: cancellationToken);
-                        break;
+                    switch (configFileType)
+                    {
+                        case ConfigFileType.Xml:
+                            content = await _serviceRepository.ExportXmlAsync(opts.ServiceName, cancellationToken: cancellationToken);
+                            break;
 
-                    case ConfigFileType.Json:
-                        content = await _serviceRepository.ExportJsonAsync(opts.ServiceName, cancellationToken: cancellationToken);
-                        break;
+                        case ConfigFileType.Json:
+                            content = await _serviceRepository.ExportJsonAsync(opts.ServiceName, cancellationToken: cancellationToken);
+                            break;
 
-                    default:
-                        // Providing a specific failure if an unsupported type is somehow passed
-                        return CommandResult.Fail(string.Format(Strings.Msg_UnsupportedFileType, configFileType));
+                        default:
+                            // Providing a specific failure if an unsupported type is somehow passed
+                            return CommandResult.Fail(string.Format(Strings.Msg_UnsupportedFileType, configFileType));
+                    }
+                }
+                catch (ServiceDecryptionFailedException ex)
+                {
+                    // A field refused by the pre-v2 encryption policy is not a key problem; name the upgrade route instead.
+                    var refusal = ex.IsLegacyEncryption
+                        ? Core.Resources.Strings.Msg_ExportLegacyEncryptionBlocked
+                        : Core.Resources.Strings.Msg_ExportDecryptionFailed;
+                    return CommandResult.Fail(string.Format(refusal, opts.ServiceName));
                 }
 
                 // 2. Save the file (Logic extracted from the switch to avoid duplication)
@@ -100,12 +153,26 @@ namespace Servy.CLI.Commands
         /// </summary>
         /// <param name="userPath">The target file path provided via the CLI.</param>
         /// <param name="content">The serialized configuration string.</param>
-        /// <exception cref="SecurityException">Thrown when validation fails with a "Security Alert" or "Access Denied" message:
-        /// UNC path, reserved device name, unsupported file type, or a protected system directory.</exception>
-        /// <exception cref="ArgumentException">Thrown for any other validation failure (e.g. handle validation rejected).</exception>
+        /// <exception cref="SecurityException">Thrown when validation fails for a security reason:
+        /// UNC path, network drive, reparse point, protected system directory, or handle-resolution failure.</exception>
+        /// <exception cref="ArgumentException">Thrown for argument-level validation failures:
+        /// invalid path, reserved device name, or unsupported file type.</exception>
         /// <exception cref="IOException">Thrown if the directory chain cannot be created or the file cannot be written.</exception>
         private void SaveFile(string userPath, string content)
         {
+            // Run path pre-flight security checks BEFORE creating the directory chain or opening the target
+            var preflight = PathSecurityGuard.ValidatePathOnly(userPath, FileMode.OpenOrCreate);
+            if (!preflight.IsValid)
+            {
+                string preflightError = preflight.ErrorMessage ?? "Security Guard Failure: Target path rejected.";
+                if (preflight.FailureKind == PathSecurityFailureKind.Security)
+                {
+                    throw new SecurityException(preflightError);
+                }
+
+                throw new ArgumentException(preflightError);
+            }
+
             string fullPath = Path.GetFullPath(userPath);
             string? parentDir = Path.GetDirectoryName(fullPath);
 
@@ -142,12 +209,14 @@ namespace Servy.CLI.Commands
             bool existedBefore = File.Exists(fullPath);
             bool createdByUs = !existedBefore;
 
-            var validationResult = PathSecurityGuard.ValidatePath(
+            var valWithStream = PathValidator(
                 userPath,
                 FileMode.OpenOrCreate,
                 FileAccess.ReadWrite,
-                FileShare.None,
-                out var fileStream);
+                FileShare.None);
+
+            var validationResult = valWithStream.Result;
+            var fileStream = valWithStream.Stream;
 
             if (!validationResult.IsValid || fileStream == null)
             {

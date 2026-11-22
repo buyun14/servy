@@ -1,7 +1,8 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
-    Builds the Servy self-contained installer and portable ZIP package.
+    Builds the Servy self-contained installer and portable 7z package.
 
 .DESCRIPTION
     This script compiles all Servy applications (WPF, CLI, Manager) as self-contained,
@@ -9,10 +10,10 @@
     and generates a portable 7z package containing the published executables.
 
 .PARAMETER Tfm
-     Target framework moniker (e.g., "net10.0-windows"). Defaults to the value in build-config.ps1.
+    Target framework moniker (e.g., "net10.0-windows"). Defaults to the value in build-config.ps1.
 
 .PARAMETER Version
-    Application version used for installer and ZIP output file names.
+    Application version used for installer and portable 7z output file names. Defaults to the value in build-config.ps1.
 
 .PARAMETER Pause
     Optional switch that pauses the script before exiting.
@@ -22,7 +23,9 @@
       - .NET SDK
       - Inno Setup (ISCC.exe)
       - 7-Zip (7z.exe)
-      - setup/signpath.ps1
+    Optional:
+      - setup/signpath.ps1: signs the installer when present; when absent, signing is
+        skipped with a warning and the installer remains unsigned.
 #>
 [CmdletBinding()]
 param(
@@ -34,12 +37,12 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptDir = $PSScriptRoot
 
-# Import newly extracted common functions first to make Assert-ServyVersion available
+# Import the common functions first so Assert-ServyVersion is available
 . (Join-Path $scriptDir "publish-common.ps1")
 
 # Load central defaults
 $configPath = Join-Path $scriptDir "build-config.ps1"
-if (Test-Path $configPath) {
+if (Test-Path -LiteralPath $configPath) {
     $buildConfig = & $configPath
     if (-not $Tfm) { $Tfm = $buildConfig.Tfm }
     if (-not $Version) { $Version = $buildConfig.Version }
@@ -56,7 +59,7 @@ Assert-ServyVersion -Version $Version
 # Configuration
 # ========================
 # Resolve the root once at the start (this is safe as the script is running inside it)
-$rootDir    = (Resolve-Path (Join-Path $scriptDir "..")).Path
+$rootDir    = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..")).Path
 $servyDir   = Join-Path $rootDir "src\Servy"
 $cliDir     = Join-Path $rootDir "src\Servy.CLI"
 $managerDir = Join-Path $rootDir "src\Servy.Manager"
@@ -66,7 +69,7 @@ $signPath      = Join-Path $rootDir "setup\signpath.ps1"
 $issFile       = Join-Path $scriptDir "servy.iss"
 $arch          = if ($Runtime -eq "win-arm64") { "arm64" } else { "x64" }
 $packageFolder = Join-Path $scriptDir "servy-$Version-$arch-portable"
-$outputZip     = "$packageFolder.7z"
+$outputArchive = "$packageFolder.7z"
 $installerPath = Join-Path $rootDir "setup\servy-$Version-$arch-installer.exe"
 
 # ---------------------------------------------------------
@@ -103,36 +106,28 @@ foreach ($project in $projects) {
     Write-Host "--- Publishing $projectName ---" -ForegroundColor Cyan
 
     $publishScript = Join-Path $project "publish.ps1"
+    if (-not (Test-Path -LiteralPath $publishScript)) {
+        throw "Publish script not found for ${projectName}: $publishScript"
+    }
 
-    if (Test-Path $publishScript) {
-        & $publishScript -BuildConfiguration $BuildConfiguration -Tfm $Tfm -Runtime $Runtime
-        Assert-LastExitCode "$publishScript failed"
-    }
-    else {
-        Write-Warning "Publish script not found for $projectName. Using generic dotnet publish."
-        & dotnet restore $project
-        Assert-LastExitCode "dotnet restore failed"
-        & dotnet clean $project -c $BuildConfiguration
-        Assert-LastExitCode "Project clean failed"
-        & dotnet publish $project -c $BuildConfiguration -f $Tfm -r $Runtime --self-contained true
-        Assert-LastExitCode "dotnet publish failed"
-    }
+    & $publishScript -BuildConfiguration $BuildConfiguration -Tfm $Tfm -Runtime $Runtime
+    Assert-LastExitCode "$publishScript failed"
 }
 
 # ========================
 # Step 2: Build & Sign Installer
 # ========================
 Remove-ItemSafely -Path $installerPath
-Build-Installer -InnoCompiler $innoCompiler -IssFile $issFile -Version $Version -Arch $arch
+Invoke-BuildInstaller -InnoCompiler $innoCompiler -IssFile $issFile -Version $Version -Arch $arch -BuildConfiguration $BuildConfiguration -Tfm $Tfm
 
 # Validate the installer exists before attempting to sign
-if (Test-Path $installerPath) {
+if (Test-Path -LiteralPath $installerPath) {
     # Resolve the absolute path for the signer
-    $resolvedInstaller = (Resolve-Path $installerPath).Path
+    $resolvedInstaller = (Resolve-Path -LiteralPath $installerPath).Path
 
     # Validate the signing script exists before trying to execute it
-    if (Test-Path $signPath) {
-        $resolvedSigner = (Resolve-Path $signPath).Path
+    if (Test-Path -LiteralPath $signPath) {
+        $resolvedSigner = (Resolve-Path -LiteralPath $signPath).Path
         Write-Host "--- Signing Artifacts ---" -ForegroundColor Cyan
         & $resolvedSigner -Path $resolvedInstaller
         Assert-LastExitCode "Signing artifacts failed"
@@ -148,7 +143,7 @@ if (Test-Path $installerPath) {
 # ========================
 Write-Host "--- Packaging Portable ZIP ---" -ForegroundColor Cyan
 
-Remove-ItemSafely -Path $outputZip
+Remove-ItemSafely -Path $outputArchive
 Remove-ItemSafely -Path $packageFolder
 
 try {
@@ -162,15 +157,15 @@ try {
     }
 
     foreach ($item in $binaries.GetEnumerator()) {
-        if (Test-Path $item.Value) {
-            Copy-Item -Path $item.Value -Destination (Join-Path $packageFolder $item.Name) -Force
+        if (Test-Path -LiteralPath $item.Value) {
+            Copy-Item -LiteralPath $item.Value -Destination (Join-Path $packageFolder $item.Name) -Force
         } else {
             throw "Critical binary missing: $($item.Value)"
         }
     }
 
     Copy-CommonArtifacts -ScriptDir $scriptDir -CliDir $cliDir -DestFolder $packageFolder
-    New-PortablePackage -SevenZipExe $sevenZipExe -OutputZip $outputZip -PackageFolder $packageFolder
+    New-PortablePackage -SevenZipExe $sevenZipExe -OutputArchive $outputArchive -PackageFolder $packageFolder
 }
 catch {
     Write-Error "Packaging failed: $_"

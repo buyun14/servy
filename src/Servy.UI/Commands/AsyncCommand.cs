@@ -23,7 +23,7 @@ namespace Servy.UI.Commands
         /// <param name="canExecute">An optional predicate to determine if the command is allowed to execute.</param>
         /// <param name="name">Command name.</param>
         /// <exception cref="ArgumentNullException">Thrown if <paramref name="execute"/> is null.</exception>
-        public AsyncCommand(Func<object?, Task>? execute, Predicate<object?>? canExecute = null, string? name = null)
+        public AsyncCommand(Func<object?, Task> execute, Predicate<object?>? canExecute = null, string? name = null)
         {
             _execute = execute ?? throw new ArgumentNullException(nameof(execute));
             _canExecute = canExecute;
@@ -58,7 +58,8 @@ namespace Servy.UI.Commands
             }
             catch (Exception ex)
             {
-                // Log and surface - never let an async void exception escape into the dispatcher.
+                // Log only - never let an async void exception escape into the dispatcher. Nothing is shown
+                // to the user here; a command that needs a dialog on failure must raise it inside its delegate.
                 Logger.Error($"AsyncCommand '{_name ?? "<unnamed>"}' execution failed.", ex);
             }
         }
@@ -103,11 +104,13 @@ namespace Servy.UI.Commands
 
         /// <summary>
         /// Triggers a global re-evaluation of all command bindings within the UI.
-        /// Utilizes <see cref="CommandManager.InvalidateRequerySuggested"/> to safely marshal the update to the UI thread.
+        /// Utilizes <see cref="CommandManager.InvalidateRequerySuggested"/> to requery command bindings
+        /// registered on the current thread's CommandManager. Must be called on the UI thread.
         /// </summary>
         public void RaiseCanExecuteChanged()
         {
-            // Note: Inversion of control - this automatically dispatches to the UI thread!
+            // Note: CommandManager is thread-affine. Must be called on the UI thread;
+            // calling from a background thread operates on that thread's CommandManager and is a silent no-op.
             CommandManager.InvalidateRequerySuggested();
         }
     }

@@ -2,7 +2,7 @@ using Servy.Core.Config;
 using Servy.Core.Enums;
 using Servy.Core.Helpers;
 using Servy.Manager.Models;
-using UiAppConfig = Servy.Manager.Config.UiAppConfig;
+using Servy.Manager.Resources;
 
 namespace Servy.Manager.Mappers
 {
@@ -30,7 +30,9 @@ namespace Servy.Manager.Mappers
         /// <param name="calculatePerf">Whether to calculate CPU and RAM usage.</param>
         /// <param name="processHelper">Injected process helper used to gather usage metrics.</param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
-        /// <returns>A UI-friendly <see cref="Service"/> model.</returns>
+        /// <returns>
+        /// A UI-friendly <see cref="Service"/> model, or <see langword="null"/> when <paramref name="service"/> is null or has no name.
+        /// </returns>
         public static async Task<Service?> ToModelAsync(
             Core.Domain.Service? service,
             bool isDesktopAppAvailable,
@@ -53,14 +55,14 @@ namespace Servy.Manager.Mappers
             return new Service
             {
                 Name = service.Name,
+                DisplayName = service.DisplayName ?? string.Empty,
                 Description = service.Description ?? string.Empty,
                 StartupType = null,
                 Status = ServiceStatus.None,
-                LogOnAs = service.RunAsLocalSystem ? UiAppConfig.LocalSystem : GetLogOnAsDisplayName(service.UserAccount),
+                LogOnAs = service.RunAsLocalSystem ? Strings.Account_LocalSystem : GetLogOnAsDisplayName(service.UserAccount),
                 IsInstalled = false,
                 IsDesktopAppAvailable = isDesktopAppAvailable,
                 Pid = service.Pid,
-                IsPidEnabled = service.Pid != null,
                 CpuUsage = cpuUsage,
                 RamUsage = ramUsage,
                 StdoutPath = service.StdoutPath ?? string.Empty,
@@ -79,8 +81,9 @@ namespace Servy.Manager.Mappers
         /// </returns>
         /// <remarks>
         /// This method facilitates the mapping between UI/DTO service items and the WPF Service UI model.
-        /// It includes polymorphic handling: if the input is a <see cref="ConsoleService"/>, the
-        /// <c>StdoutPath</c> and <c>StderrPath</c> properties are also preserved in the resulting model.
+        /// It provides a full model projection from <see cref="ServiceItemBase"/>: if the input is a
+        /// <see cref="ConsoleService"/>, the <c>StdoutPath</c> and <c>StderrPath</c> properties are preserved
+        /// on the resulting model for UI completeness.
         /// </remarks>
         public static Service? ToModel(ServiceItemBase? item)
         {
@@ -89,7 +92,6 @@ namespace Servy.Manager.Mappers
             {
                 Name = item.Name,
                 Pid = item.Pid,
-                IsPidEnabled = item.Pid != null,
             };
             if (item is ConsoleService consoleService)
             {
@@ -103,22 +105,26 @@ namespace Servy.Manager.Mappers
         /// Resolves the appropriate display name for a service's logon account based on the raw session string provided by the system.
         /// </summary>
         /// <param name="userSession">The raw account name or session string retrieved from the service configuration or the Windows Service Control Manager (SCM).</param>
-        /// <returns>A localized display string representing the account, defaulting to the localized Local System string if the input matches system-level credentials.</returns>
+        /// <returns>
+        /// The display label for the matched built-in account (Local System, Local Service or Network Service),
+        /// or <paramref name="userSession"/> unchanged when it does not match a built-in alias set.
+        /// A null or empty input is treated as Local System.
+        /// </returns>
         public static string GetLogOnAsDisplayName(string? userSession)
         {
             // Resolving display name for service account identity.
-            // If the string is null, empty, or matches the internal "LocalSystem" SCM name, we return the UI-friendly constant.
+            // If the string is null, empty, or matches the internal "LocalSystem" SCM name, we return the localized UI label.
             if (string.IsNullOrEmpty(userSession))
-                return UiAppConfig.LocalSystem;
+                return Strings.Account_LocalSystem;
 
             if (ServiceAccounts.LocalSystemAliases.Contains(userSession))
-                return UiAppConfig.LocalSystem;
+                return Strings.Account_LocalSystem;
 
             if (ServiceAccounts.LocalServiceAliases.Contains(userSession))
-                return UiAppConfig.LocalService;
+                return Strings.Account_LocalService;
 
             if (ServiceAccounts.NetworkServiceAliases.Contains(userSession))
-                return UiAppConfig.NetworkService;
+                return Strings.Account_NetworkService;
 
             return userSession;
         }

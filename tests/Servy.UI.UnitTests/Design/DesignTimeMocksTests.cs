@@ -1,9 +1,10 @@
 using Servy.Core.DTOs;
 using Servy.Core.Enums;
-using Servy.Core.Helpers;
 using Servy.Core.Services;
+using Servy.Testing;
 using Servy.UI.Design;
 using System.ServiceProcess;
+using System.Windows.Input;
 using System.Windows.Threading;
 
 namespace Servy.UI.UnitTests.Design
@@ -22,11 +23,12 @@ namespace Servy.UI.UnitTests.Design
         [Fact]
         public void DesignTimeProcessHelper_CanBeInstantiated()
         {
-            // Arrange & Act
-            var helper = new DesignTimeProcessHelper();
-
-            // Assert: Verify it inherits from the base ProcessHelper
-            Assert.IsAssignableFrom<ProcessHelper>(helper);
+            // Arrange & Act & Assert
+            // Covers the parameterless constructor the XAML designer needs, which runs the
+            // base ProcessHelper constructor. Inheritance from ProcessHelper is compile-time
+            // enforced, so asserting it here cannot fail.
+            var exception = Record.Exception(() => new DesignTimeProcessHelper());
+            Assert.Null(exception);
         }
 
         #endregion
@@ -40,12 +42,7 @@ namespace Servy.UI.UnitTests.Design
             var repo = new DesignTimeServiceRepository();
             var ct = TestContext.Current.CancellationToken;
 
-            // Act & Assert - Sync branches
-            Assert.Null(repo.GetByName("test"));
-            Assert.Null(repo.GetByName("test", decrypt: false));
-
             // Act & Assert - Async branches (Task.FromResult coverage)
-            Assert.Null(await repo.GetByIdAsync(1, cancellationToken: ct));
             Assert.Null(await repo.GetByNameAsync("test", cancellationToken: ct));
             Assert.Null(await repo.GetServicePidAsync("test", cancellationToken: ct));
             Assert.Null(await repo.GetServiceConsoleStateAsync("test", cancellationToken: ct));
@@ -55,14 +52,30 @@ namespace Servy.UI.UnitTests.Design
 
             Assert.Equal(string.Empty, await repo.ExportXmlAsync("test", cancellationToken: ct));
             Assert.Equal(string.Empty, await repo.ExportJsonAsync("test", cancellationToken: ct));
-            Assert.True((await repo.ImportXmlAsync("<xml/>", cancellationToken: ct)).IsSuccess);
-            Assert.True((await repo.ImportJsonAsync("{}", cancellationToken: ct)).IsSuccess);
 
             // Act & Assert - Void/Int branches
-            repo.Upsert(new ServiceDto());
-            repo.Delete("test");
-            Assert.Equal(0, repo.Update(new ServiceDto(), true, true));
-            Assert.Equal(0, await repo.DeleteAsync(1, cancellationToken: ct));
+            Assert.Equal(0, await repo.DeleteAsync("test", cancellationToken: ct));
+            Assert.Equal(0, await repo.UpsertAsync(new ServiceDto(), preserveExistingRuntimeState: true, preserveExistingCredentials: true, cancellationToken: ct));
+        }
+
+        [Fact]
+        public async Task DesignTimeServiceRepository_RuntimeAndRestartMembers_ReturnNeutralValues()
+        {
+            // Arrange
+            var repo = new DesignTimeServiceRepository();
+            var ct = TestContext.Current.CancellationToken;
+
+            // Act
+            var runtime = await repo.UpdateRuntimeStateAsync("test", new ServiceRuntimeStateDto(), cancellationToken: ct);
+            var description = await repo.UpdateDescriptionAndStartupTypeAsync("test", "desc", 2, cancellationToken: ct);
+            var attempts = await repo.GetRestartAttemptsAsync("test", ct);
+            var written = await repo.UpdateRestartAttemptsAsync("test", 3, DateTime.UtcNow, ct);
+
+            // Assert - the designer stubs complete with a neutral value and never report a write
+            Assert.Equal(0, runtime);
+            Assert.Equal(0, description);
+            Assert.Null(attempts);
+            Assert.Equal(0, written);
         }
 
         #endregion
@@ -86,13 +99,38 @@ namespace Servy.UI.UnitTests.Design
             Assert.True((await manager.RestartServiceAsync("test", cancellationToken: ct)).IsSuccess);
 
             // Act & Assert - Status branches
-            Assert.Equal(ServiceControllerStatus.Stopped, manager.GetServiceStatus("test", cancellationToken: ct));
+            Assert.Null(manager.GetServiceStatus("test", cancellationToken: ct));
             Assert.False(manager.IsServiceInstalled("test", ct));
             Assert.Equal(ServiceStartType.Manual, manager.GetServiceStartupType("test", cancellationToken: ct));
 
             // Act & Assert - Collection branches
             Assert.Empty(manager.GetAllServices(cancellationToken: ct));
             Assert.Null(manager.GetDependencies("test", ct));
+
+            // Act & Assert - No-op branches
+            // Capture the tasks instead of awaiting them: awaiting an already-completed task
+            // asserts nothing, while synchronous completion is the property the designer depends
+            // on - a stub that started yielding would leave it awaiting something that never resumes.
+            Assert.True(manager.RevokeVaultAccessIfUnusedAsync(null, ct).IsCompletedSuccessfully);
+            Assert.True(manager.RevokeVaultAccessIfUnusedAsync(new ServiceDto { Name = "test" }, ct).IsCompletedSuccessfully);
+        }
+
+        #endregion
+
+        #region Event Log Service Tests
+
+        [Fact]
+        public async Task DesignTimeEventLogService_SearchAsync_ReturnsEmpty()
+        {
+            // Arrange
+            var service = new DesignTimeEventLogService();
+            var ct = TestContext.Current.CancellationToken;
+
+            // Act
+            var result = await service.SearchAsync(keyword: "test", level: EventLogLevel.All, startDate: DateTime.MinValue, endDate: DateTime.Now, token: ct);
+
+            // Assert
+            Assert.Empty(result);
         }
 
         #endregion
@@ -100,54 +138,65 @@ namespace Servy.UI.UnitTests.Design
         #region UI Services Tests
 
         [Fact]
-        public async Task DesignTimeMessageBoxService_ReturnsTrueAndCompletes()
+        public async Task DesignTimeMessageBoxService_Methods_ReturnAlreadyCompletedTasks()
         {
             // Arrange
             var service = new DesignTimeMessageBoxService();
 
             // Act & Assert
-            Assert.True(await service.ShowConfirmAsync("Message", "Caption"));
-
-            await service.ShowErrorAsync("Err", "Cap");
-            await service.ShowInfoAsync("Inf", "Cap");
-            await service.ShowWarningAsync("Warn", "Cap");
+            // Capture the tasks instead of awaiting them: awaiting an already-completed task
+            // asserts nothing, while synchronous completion is the property the designer depends
+            // on - a stub that started yielding would leave it awaiting something that never resumes.
+            var confirm = service.ShowConfirmAsync("Message", "Caption");
+            Assert.True(confirm.IsCompletedSuccessfully);
+            Assert.True(await confirm);
+            Assert.True(service.ShowErrorAsync("Err", "Cap").IsCompletedSuccessfully);
+            Assert.True(service.ShowInfoAsync("Inf", "Cap").IsCompletedSuccessfully);
+            Assert.True(service.ShowWarningAsync("Warn", "Cap").IsCompletedSuccessfully);
         }
 
         [Fact]
-        public void DesignTimeCursorService_ResetCursor_DoesNotThrow()
+        public void DesignTimeCursorService_DoesNotTouchGlobalCursor()
         {
-            // Arrange
-            var service = new DesignTimeCursorService();
+            // The contract worth pinning is not "the no-op did not crash" - an empty body has no
+            // statement that could throw, so that assertion has no failing input - but that the
+            // stub leaves WPF's global cursor exactly as it found it. That is observable on an
+            // STA thread, and it fails the moment either stub is given a real body.
+            Helper.RunOnSTA(() =>
+            {
+                // Arrange
+                var service = new DesignTimeCursorService();
+                Mouse.OverrideCursor = Cursors.Hand;
 
-            // Act & Assert
-            // Branch: Simple no-op method body
-            var exception = Record.Exception(() => service.ResetCursor());
-            Assert.Null(exception);
+                try
+                {
+                    // Act & Assert
+                    service.SetWaitCursor();
+                    Assert.Same(Cursors.Hand, Mouse.OverrideCursor);   // not Cursors.Wait
+
+                    service.ResetCursor();
+                    Assert.Same(Cursors.Hand, Mouse.OverrideCursor);   // not null
+                }
+                finally
+                {
+                    Mouse.OverrideCursor = null;
+                }
+            });
         }
 
         [Fact]
-        public void DesignTimeCursorService_SetWaitCursor_DoesNotThrow()
-        {
-            // Arrange
-            var service = new DesignTimeCursorService();
-
-            // Act
-            var exception = Record.Exception(() => service.SetWaitCursor());
-
-            // Assert
-            Assert.Null(exception);
-        }
-
-        [Fact]
-        public async Task DesignTimeHelpService_Methods_Complete()
+        public void DesignTimeHelpService_Methods_ReturnAlreadyCompletedTasks()
         {
             // Arrange
             var service = new DesignTimeHelpService();
 
             // Act & Assert
-            await service.OpenDocumentationAsync("caption");
-            await service.CheckUpdatesAsync("caption");
-            await service.OpenAboutDialogAsync("about", "caption");
+            // Capture the tasks instead of awaiting them: awaiting an already-completed task
+            // asserts nothing, while synchronous completion is the property the designer depends
+            // on - a stub that started yielding would leave it awaiting something that never resumes.
+            Assert.True(service.OpenDocumentationAsync("caption", TestContext.Current.CancellationToken).IsCompletedSuccessfully);
+            Assert.True(service.CheckUpdatesAsync("caption", TestContext.Current.CancellationToken).IsCompletedSuccessfully);
+            Assert.True(service.OpenAboutDialogAsync("about", "caption", TestContext.Current.CancellationToken).IsCompletedSuccessfully);
         }
 
         [Fact]
@@ -179,10 +228,13 @@ namespace Servy.UI.UnitTests.Design
             bool wasExecuted = false;
 
             // Act
-            Task task = _dispatcher.InvokeAsync(() => wasExecuted = true);
+            // A statement body has no value, so only the Action overload is applicable. The
+            // expression form '() => wasExecuted = true' binds to InvokeAsync<bool>(Func<bool>)
+            // instead, which is what left the Action overload without a test.
+            Task task = _dispatcher.InvokeAsync(() => { wasExecuted = true; });
 
             // Assert
-            Assert.True(task.IsCompleted, "Task should be completed immediately.");
+            Assert.True(task.IsCompletedSuccessfully, "Task should be completed immediately.");
             Assert.False(wasExecuted, "Action should not be executed in design-time mode.");
         }
 
@@ -196,22 +248,28 @@ namespace Servy.UI.UnitTests.Design
             Task task = _dispatcher.InvokeAsync(() => wasExecuted = true, DispatcherPriority.Normal);
 
             // Assert
-            Assert.True(task.IsCompleted, "Task should be completed immediately.");
+            Assert.True(task.IsCompletedSuccessfully, "Task should be completed immediately.");
             Assert.False(wasExecuted, "Action should not be executed in design-time mode.");
         }
 
         [Fact]
-        public async Task InvokeAsync_GenericFunc_ReturnsDefaultValue()
+        public async Task InvokeAsync_GenericFunc_ReturnsDefaultValueWithoutInvokingCallback()
         {
-            // Arrange & Act - Reference type
-            Task<string> refTask = _dispatcher.InvokeAsync(() => "Value");
+            // Arrange
+            bool wasExecuted = false;
 
-            // Arrange & Act - Value type
+            // Act - Reference type. A statement body still returns a value, so it binds to
+            // InvokeAsync<string>(Func<string>); there is no Func<T> overload taking a
+            // DispatcherPriority to compete with it.
+            Task<string> refTask = _dispatcher.InvokeAsync(() => { wasExecuted = true; return "Value"; });
+
+            // Act - Value type
             Task<int> valTask = _dispatcher.InvokeAsync(() => 42);
 
             // Assert
             Assert.Null(await refTask);
             Assert.Equal(0, await valTask);
+            Assert.False(wasExecuted, "Callback should not be executed in design-time mode.");
         }
 
         [Fact]
@@ -221,7 +279,7 @@ namespace Servy.UI.UnitTests.Design
             Task task = _dispatcher.YieldAsync();
 
             // Assert
-            Assert.True(task.IsCompleted, "YieldAsync task should return completed state.");
+            Assert.True(task.IsCompletedSuccessfully, "YieldAsync should return an already successfully completed task.");
         }
 
         #endregion

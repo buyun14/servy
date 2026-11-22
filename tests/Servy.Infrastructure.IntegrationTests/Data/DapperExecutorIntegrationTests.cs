@@ -10,7 +10,7 @@ using System.Data.SQLite;
 
 namespace Servy.Infrastructure.IntegrationTests.Data
 {
-    [Collection("SequentialDatabaseTests")]
+    [Collection(DatabaseTestCollection.Name)]
     public class DapperExecutorIntegrationTests : TempDirectoryTestBase
     {
         #region Shared Test Doubles Base Infrastructure
@@ -22,9 +22,16 @@ namespace Servy.Infrastructure.IntegrationTests.Data
         private abstract class TestDbConnectionBase : DbConnection
         {
             /// <summary>
+            /// Gets the number of times this connection container instance has been disposed.
+            /// Counted rather than flagged so a test can pin one release per acquisition on the
+            /// retry paths, where the executor re-enters the whole action once per attempt.
+            /// </summary>
+            public int DisposeCount { get; private set; }
+
+            /// <summary>
             /// Gets a value indicating whether this connection container instance has been disposed.
             /// </summary>
-            public bool WasDisposed { get; private set; }
+            public bool WasDisposed => DisposeCount > 0;
 
             /// <inheritdoc />
             public override string ConnectionString { get; set; } = "Data Source=:memory:;";
@@ -55,7 +62,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             {
                 if (disposing)
                 {
-                    WasDisposed = true;
+                    DisposeCount++;
                 }
                 base.Dispose(disposing);
             }
@@ -96,7 +103,11 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             }
 
             /// <inheritdoc />
-            public override void Open() => ThrowSQLiteException();
+            public override void Open()
+            {
+                OpenAttempts++;
+                ThrowSQLiteException();
+            }
 
             /// <inheritdoc />
             public override Task OpenAsync(CancellationToken cancellationToken)
@@ -120,20 +131,99 @@ namespace Servy.Infrastructure.IntegrationTests.Data
         }
 
         /// <summary>
+        /// Concrete test double simulating transient SQLite faults for a configured number of initial attempts
+        /// before delegating to a real <see cref="SQLiteConnection"/> to test retry recovery loops.
+        /// </summary>
+        private class TransientFailureDbConnection : TestDbConnectionBase
+        {
+            private readonly SQLiteErrorCode _errorCode;
+            private readonly int _failuresBeforeSuccess;
+            private readonly string _realConnectionString;
+            private SQLiteConnection? _realConnection;
+
+            /// <summary>
+            /// Gets the total number of connection open operations attempted against this instance.
+            /// </summary>
+            public int OpenAttempts { get; private set; }
+
+            public TransientFailureDbConnection(SQLiteErrorCode errorCode, int failuresBeforeSuccess, string realConnectionString)
+            {
+                _errorCode = errorCode;
+                _failuresBeforeSuccess = failuresBeforeSuccess;
+                _realConnectionString = realConnectionString;
+            }
+
+            /// <inheritdoc />
+            public override void Open()
+            {
+                OpenAttempts++;
+                if (OpenAttempts <= _failuresBeforeSuccess)
+                {
+                    throw new SQLiteException(_errorCode, "Transient SQLite error.");
+                }
+
+                _realConnection = new SQLiteConnection(_realConnectionString);
+                _realConnection.Open();
+            }
+
+            /// <inheritdoc />
+            public override async Task OpenAsync(CancellationToken cancellationToken)
+            {
+                OpenAttempts++;
+                if (OpenAttempts <= _failuresBeforeSuccess)
+                {
+                    throw new SQLiteException(_errorCode, "Transient SQLite error.");
+                }
+
+                _realConnection = new SQLiteConnection(_realConnectionString);
+                await _realConnection.OpenAsync(cancellationToken);
+            }
+
+            /// <inheritdoc />
+            public override ConnectionState State => _realConnection?.State ?? ConnectionState.Closed;
+
+            /// <inheritdoc />
+            protected override DbCommand CreateDbCommand() =>
+                _realConnection?.CreateCommand() ?? throw new InvalidOperationException("Connection is not open.");
+
+            /// <inheritdoc />
+            protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+                _realConnection?.BeginTransaction(isolationLevel) ?? throw new InvalidOperationException("Connection is not open.");
+
+            /// <inheritdoc />
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    _realConnection?.Dispose();
+                }
+                base.Dispose(disposing);
+            }
+        }
+
+        /// <summary>
         /// Concrete test stub configured to toggle execution flow routing behaviors for transaction pipeline evaluations.
         /// </summary>
         private class FlexibleDbConnectionStub : TestDbConnectionBase
         {
             private readonly bool _forceSyncTransactionPath;
+            private readonly IsolationLevel? _transactionIsolationLevel;
 
             /// <summary>
             /// Gets a value indicating whether the fallback synchronous transaction initialization tracker path was traversed.
             /// </summary>
             public bool SyncTransactionWasCalled { get; private set; }
 
-            public FlexibleDbConnectionStub(bool forceSyncTransactionPath = false)
+            /// <param name="forceSyncTransactionPath">Routes the async initialization track back onto the synchronous fallback when set.</param>
+            /// <param name="transactionIsolationLevel">
+            /// Isolation level the stub transaction reports. Left null the stub transaction is unconfigured, exactly as before;
+            /// pinned to a value the SQLite provider never selects on its own, it lets a caller tell a forwarded level apart
+            /// from a hard-coded one.
+            /// </param>
+            public FlexibleDbConnectionStub(bool forceSyncTransactionPath = false, IsolationLevel? transactionIsolationLevel = null)
             {
                 _forceSyncTransactionPath = forceSyncTransactionPath;
+                _transactionIsolationLevel = transactionIsolationLevel;
             }
 
             /// <inheritdoc />
@@ -156,8 +246,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                     return base.BeginDbTransactionAsync(isolationLevel, cancellationToken);
                 }
 
-                var mockTx = new Mock<DbTransaction>().Object;
-                return new ValueTask<DbTransaction>(mockTx);
+                return new ValueTask<DbTransaction>(CreateStubTransaction());
             }
 
             /// <summary>
@@ -166,7 +255,22 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
             {
                 SyncTransactionWasCalled = true;
-                return new Mock<DbTransaction>().Object;
+                return CreateStubTransaction();
+            }
+
+            /// <summary>
+            /// Builds the stub transaction both initialization tracks hand back, applying the pinned
+            /// isolation level when the test supplied one.
+            /// </summary>
+            private DbTransaction CreateStubTransaction()
+            {
+                var mockTx = new Mock<DbTransaction>();
+                if (_transactionIsolationLevel.HasValue)
+                {
+                    mockTx.Setup(tx => tx.IsolationLevel).Returns(_transactionIsolationLevel.Value);
+                }
+
+                return mockTx.Object;
             }
         }
 
@@ -374,6 +478,29 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             Assert.Equal(2, totalCount);
         }
 
+        [Fact]
+        public async Task ExecuteAsync_WithActiveTransaction_RollbackRevertsTheWrite()
+        {
+            // Arrange
+            long before = _executor.ExecuteScalar<long>("SELECT COUNT(*) FROM TestServices;");
+
+            // Act
+            using (var tx = await _executor.BeginTransactionAsync(TestContext.Current.CancellationToken))
+            {
+                var affected = await _executor.ExecuteAsync(
+                    "INSERT INTO TestServices (ServiceName, Status) VALUES ('TxAsync', 1);",
+                    transaction: tx,
+                    cancellationToken: TestContext.Current.CancellationToken);
+
+                Assert.Equal(1, affected);
+                tx.Rollback();
+            }
+
+            // Assert
+            long after = _executor.ExecuteScalar<long>("SELECT COUNT(*) FROM TestServices;");
+            Assert.Equal(before, after);
+        }
+
         #endregion
 
         #region Targeted Requirements Coverage Tests
@@ -448,8 +575,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             // ==========================================================================================
             // Branch 3: Concrete Provider Check
             // ------------------------------------------------------------------------------------------
-            // Uses the real SQLite connection object to test the high-performance operational layout
-            // natively against a physical ADO.NET database engine driver configuration.
+            // Points CreateConnection() at a real SQLiteConnection instead of a stub.
             // ==========================================================================================
             // Arrange
             _mockDbContext.Setup(db => db.CreateConnection()).Returns(() => new SQLiteConnection(_connectionString));
@@ -461,6 +587,24 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 Assert.NotNull(tx3);
                 Assert.NotNull(tx3.Connection);
                 Assert.Equal(ConnectionState.Open, tx3.Connection.State);
+            }
+        }
+
+        [Fact]
+        public void BeginTransaction_IsolationLevel_ForwardsInnerTransactionLevel()
+        {
+            // Arrange
+            // The stub's transaction reports a level the SQLite provider never selects on its own, so the
+            // assertion below can only hold if the wrapper forwards the inner transaction's value rather
+            // than answering with one of its own.
+            var pinnedLevelStub = new FlexibleDbConnectionStub(transactionIsolationLevel: IsolationLevel.RepeatableRead);
+            _mockDbContext.Setup(db => db.CreateConnection()).Returns(pinnedLevelStub);
+
+            // Act
+            using (var tx = _executor.BeginTransaction())
+            {
+                // Assert
+                Assert.Equal(IsolationLevel.RepeatableRead, tx.IsolationLevel);
             }
         }
 
@@ -483,7 +627,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 _mockDbContext.Setup(db => db.CreateConnection()).Returns(busyMockConn.Object);
                 _executor.ExecuteScalar<int>("SELECT COUNT(*) FROM TestServices;");
             });
-            Assert.Equal(AppConfig.DbSyncMaxRetries, executedAttempts);
+            Assert.Equal(AppConfig.DbSyncMaxAttempts, executedAttempts);
         }
 
         [Fact]
@@ -499,50 +643,206 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 await _executor.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM TestServices;", cancellationToken: TestContext.Current.CancellationToken);
             });
 
-            // Verify the engine systematically retried across the configured loop allocation space
-            Assert.Equal(AppConfig.DbAsyncMaxRetries, busyConnectionSpy.OpenAttempts);
+            // Verify the engine systematically retried across the configured loop allocation space,
+            // releasing the connection its using block acquired on every one of those attempts.
+            Assert.Equal(AppConfig.DbAsyncMaxAttempts, busyConnectionSpy.OpenAttempts);
+            Assert.Equal(AppConfig.DbAsyncMaxAttempts, busyConnectionSpy.DisposeCount);
+        }
+
+        [Fact]
+        public void ExecuteWithRetry_NonTransientSQLiteError_IsThrownOnTheFirstAttempt()
+        {
+            // Arrange: a failure that waiting cannot cure
+            var corrupt = new FaultyAsyncDbConnection(SQLiteErrorCode.Corrupt, "database disk image is malformed");
+            _mockDbContext.Setup(db => db.CreateConnection()).Returns(corrupt);
+
+            // Act
+            var ex = Assert.Throws<SQLiteException>(() => _executor.ExecuteScalar<int>("SELECT COUNT(*) FROM TestServices;"));
+
+            // Assert: thrown as it is, after one attempt and one release
+            Assert.Equal(SQLiteErrorCode.Corrupt, ex.ResultCode);
+            Assert.Equal(1, corrupt.OpenAttempts);
+            Assert.Equal(1, corrupt.DisposeCount);
+        }
+
+        [Fact]
+        public async Task ExecuteWithRetryAsync_NonTransientSQLiteError_IsThrownOnTheFirstAttempt()
+        {
+            // Arrange: a failure that waiting cannot cure
+            var corrupt = new FaultyAsyncDbConnection(SQLiteErrorCode.Corrupt, "database disk image is malformed");
+            _mockDbContext.Setup(db => db.CreateConnection()).Returns(corrupt);
+
+            // Act
+            var ex = await Assert.ThrowsAsync<SQLiteException>(() =>
+                _executor.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM TestServices;", cancellationToken: TestContext.Current.CancellationToken));
+
+            // Assert: thrown as it is, after one attempt and one release
+            Assert.Equal(SQLiteErrorCode.Corrupt, ex.ResultCode);
+            Assert.Equal(1, corrupt.OpenAttempts);
+            Assert.Equal(1, corrupt.DisposeCount);
+        }
+
+        /// <summary>
+        /// Registers a <see cref="IAppDbContext.CreateConnection"/> factory that mints a FRESH
+        /// <see cref="TransientFailureDbConnection"/> per call, the way production behaves: the connection is
+        /// created inside the retried lambda and released by its using block at the end of every attempt.
+        /// The first <paramref name="failuresBeforeSuccess"/> connections refuse to open; the next one succeeds.
+        /// </summary>
+        /// <param name="errorCode">The transient SQLite error code the failing connections raise.</param>
+        /// <param name="failuresBeforeSuccess">How many connections fail to open before one succeeds.</param>
+        /// <returns>The live list of connections handed out, in creation order.</returns>
+        private List<TransientFailureDbConnection> SetupTransientConnectionFactory(SQLiteErrorCode errorCode, int failuresBeforeSuccess)
+        {
+            var createdConnections = new List<TransientFailureDbConnection>();
+
+            _mockDbContext.Setup(db => db.CreateConnection()).Returns(() =>
+            {
+                // Each instance is opened at most once, so it fails on its own first (and only) attempt
+                // until the configured number of failing connections has been handed out.
+                int failuresForThisInstance = createdConnections.Count < failuresBeforeSuccess ? 1 : 0;
+
+                var connection = new TransientFailureDbConnection(errorCode, failuresForThisInstance, _connectionString);
+                createdConnections.Add(connection);
+
+                return connection;
+            });
+
+            return createdConnections;
+        }
+
+        [Fact]
+        public void ExecuteWithRetry_TransientBusyThenSuccess_RecoversAndReturnsResult()
+        {
+            // Arrange
+            const int failuresBeforeSuccess = 2;
+            var createdConnections = SetupTransientConnectionFactory(SQLiteErrorCode.Busy, failuresBeforeSuccess);
+
+            // Act
+            long count = _executor.ExecuteScalar<long>("SELECT COUNT(*) FROM TestServices;");
+
+            // Assert
+            Assert.Equal(2, count);
+
+            // A fresh connection per attempt, each opened exactly once. Hoisting CreateConnection() out of
+            // the retried lambda would open one connection three times and fail these two assertions.
+            Assert.Equal(failuresBeforeSuccess + 1, createdConnections.Count);
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.OpenAttempts));
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.DisposeCount));
+        }
+
+        [Fact]
+        public void ExecuteWithRetry_TransientLockedThenSuccess_RecoversAndReturnsResult()
+        {
+            // Arrange
+            const int failuresBeforeSuccess = 1;
+            var createdConnections = SetupTransientConnectionFactory(SQLiteErrorCode.Locked, failuresBeforeSuccess);
+
+            // Act
+            long count = _executor.ExecuteScalar<long>("SELECT COUNT(*) FROM TestServices;");
+
+            // Assert
+            Assert.Equal(2, count);
+            Assert.Equal(failuresBeforeSuccess + 1, createdConnections.Count);
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.OpenAttempts));
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.DisposeCount));
+        }
+
+        [Fact]
+        public async Task ExecuteWithRetryAsync_TransientBusyThenSuccess_RecoversAndReturnsResult()
+        {
+            // Arrange
+            const int failuresBeforeSuccess = 2;
+            var createdConnections = SetupTransientConnectionFactory(SQLiteErrorCode.Busy, failuresBeforeSuccess);
+
+            // Act
+            long count = await _executor.ExecuteScalarAsync<long>(
+                "SELECT COUNT(*) FROM TestServices;",
+                cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(2, count);
+            Assert.Equal(failuresBeforeSuccess + 1, createdConnections.Count);
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.OpenAttempts));
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.DisposeCount));
+        }
+
+        [Fact]
+        public async Task ExecuteWithRetryAsync_TransientLockedThenSuccess_RecoversAndReturnsResult()
+        {
+            // Arrange
+            const int failuresBeforeSuccess = 1;
+            var createdConnections = SetupTransientConnectionFactory(SQLiteErrorCode.Locked, failuresBeforeSuccess);
+
+            // Act
+            long count = await _executor.ExecuteScalarAsync<long>(
+                "SELECT COUNT(*) FROM TestServices;",
+                cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(2, count);
+            Assert.Equal(failuresBeforeSuccess + 1, createdConnections.Count);
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.OpenAttempts));
+            Assert.All(createdConnections, connection => Assert.Equal(1, connection.DisposeCount));
         }
 
         [Fact]
         public void ExecuteScalar_WithActiveTransaction_UsesActiveTxConnection()
         {
-            // Act
+            // Arrange
             using (var tx = _executor.BeginTransaction())
             {
+                _executor.Execute(
+                    "INSERT INTO TestServices (ServiceName, Status) VALUES ('Uncommitted', 1);",
+                    transaction: tx);
+
+                // Act
                 var result = _executor.ExecuteScalar<long>("SELECT COUNT(*) FROM TestServices;", transaction: tx);
 
                 // Assert
-                Assert.Equal(2, result);
+                // 3 = the two seeded rows plus the uncommitted one; a fresh connection would answer 2.
+                Assert.Equal(3, result);
             }
         }
 
         [Fact]
         public void Query_WithActiveTransaction_UsesActiveTxConnection()
         {
-            // Act
+            // Arrange
             using (var tx = _executor.BeginTransaction())
             {
+                _executor.Execute(
+                    "INSERT INTO TestServices (ServiceName, Status) VALUES ('Uncommitted', 1);",
+                    transaction: tx);
+
+                // Act
                 var result = _executor.Query<TestServiceDto>("SELECT * FROM TestServices;", transaction: tx);
 
                 // Assert
-                Assert.Equal(2, result.Count());
+                // 3 = the two seeded rows plus the uncommitted one; a fresh connection would answer 2.
+                Assert.Equal(3, result.Count());
             }
         }
 
         [Fact]
         public void QuerySingleOrDefault_WithActiveTransaction_UsesActiveTxConnection()
         {
-            // Act
+            // Arrange
             using (var tx = _executor.BeginTransaction())
             {
+                _executor.Execute(
+                    "INSERT INTO TestServices (ServiceName, Status) VALUES ('Uncommitted', 1);",
+                    transaction: tx);
+
+                // Act
                 var result = _executor.QuerySingleOrDefault<TestServiceDto>(
                     "SELECT * FROM TestServices WHERE ServiceName = @Name;",
-                    new { Name = "ServyEngine" },
+                    new { Name = "Uncommitted" },
                     transaction: tx);
 
                 // Assert
+                // Only the transaction's own connection sees the uncommitted row; a fresh connection would return null.
                 Assert.NotNull(result);
-                Assert.Equal("ServyEngine", result.ServiceName);
+                Assert.Equal("Uncommitted", result.ServiceName);
             }
         }
 
@@ -593,23 +893,31 @@ namespace Servy.Infrastructure.IntegrationTests.Data
         [Fact]
         public async Task QuerySingleOrDefaultAsync_AllBranchesAndVariants_Covered()
         {
+            // Arrange
+            // Rows are seeded by the fixture; each scenario below supplies only its own inputs.
+
+            // Act
             // 1. Query with result variant (Single entry found match)
             var singleMatch = await _executor.QuerySingleOrDefaultAsync<TestServiceDto>(
                 "SELECT * FROM TestServices WHERE ServiceName = @Name;",
                 new { Name = "ServyEngine" },
                 cancellationToken: TestContext.Current.CancellationToken);
 
+            // Assert
             Assert.NotNull(singleMatch);
             Assert.Equal("ServyEngine", singleMatch.ServiceName);
 
+            // Act
             // 2. Query empty variant (Zero records found returns default / null)
             var noMatch = await _executor.QuerySingleOrDefaultAsync<TestServiceDto>(
                 "SELECT * FROM TestServices WHERE ServiceName = @Name;",
                 new { Name = "NonExistent" },
                 cancellationToken: TestContext.Current.CancellationToken);
 
+            // Assert
             Assert.Null(noMatch);
 
+            // Act
             // 3. Query with active transaction branch verification path
             using (var tx = await _executor.BeginTransactionAsync(TestContext.Current.CancellationToken))
             {
@@ -619,10 +927,12 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                     transaction: tx,
                     cancellationToken: TestContext.Current.CancellationToken);
 
+                // Assert
                 Assert.NotNull(txMatch);
                 Assert.Equal("ServyWatcher", txMatch.ServiceName);
             }
 
+            // Act & Assert
             // 4. Test validation ArgumentNullException path branch on null query string parameters
             await Assert.ThrowsAsync<ArgumentNullException>(async () =>
             {
@@ -637,8 +947,8 @@ namespace Servy.Infrastructure.IntegrationTests.Data
         [Theory]
         [InlineData("SELECT * FROM MyTable\r\nWHERE Id = 1", null, "SELECT * FROM MyTable  WHERE Id = 1")]
         [InlineData("SELECT LongQueryStringThatExceedsTheStandardTruncationLimitForLogs", null, "SELECT LongQueryStringThatExceedsTheStandardTruncationLimitF...")] // Default 60-char limit
-        [InlineData("SELECT VeryLongQueryStringThatNeedsCustomTruncationParametersForTesting", 25, "SELECT VeryLongQueryStrin...")] // Sync logger profile bound (25 chars + ...)
-        [InlineData("SELECT VeryLongQueryStringThatNeedsCustomTruncationParametersForTesting", 50, "SELECT VeryLongQueryStringThatNeedsCustomTruncatio...")] // Async logger profile bound (50 chars + ...)
+        [InlineData("SELECT VeryLongQueryStringThatNeedsCustomTruncationParametersForTesting", 25, "SELECT VeryLongQueryStrin...")] // Explicit maxLength (25 chars + ...); both production call sites use the 60-char default
+        [InlineData("SELECT VeryLongQueryStringThatNeedsCustomTruncationParametersForTesting", 50, "SELECT VeryLongQueryStringThatNeedsCustomTruncatio...")] // Explicit maxLength (50 chars + ...); both production call sites use the 60-char default
         [InlineData("", null, "Unknown Query")]
         [InlineData(null, null, "Unknown Query")]
         public void FormatSqlForLog_Variants_EvaluatesCorrectly(string? inputSql, int? maxLength, string expectedLoggedSql)

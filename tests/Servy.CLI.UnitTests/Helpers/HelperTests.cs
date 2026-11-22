@@ -1,8 +1,9 @@
 using CommandLine;
 using Servy.CLI.Enums;
-using Servy.CLI.Helpers;
 using Servy.CLI.Models;
 using Servy.CLI.Resources;
+using Servy.Testing;
+using Helper = Servy.CLI.Helpers.Helper;
 
 namespace Servy.CLI.UnitTests.Helpers
 {
@@ -10,89 +11,9 @@ namespace Servy.CLI.UnitTests.Helpers
     internal class TestOptions { }
 
     // Enforce sequential execution across the entire suite run pass to stop cross-thread Console static corruption.
-    [Collection("SequentialConsoleTests")]
+    [Collection(ConsoleTestCollection.Name)]
     public class HelperTests
     {
-        // Single SemaphoreSlim(1, 1) to gate access to the static Console object.
-        private static readonly SemaphoreSlim _consoleSemaphore = new SemaphoreSlim(1, 1);
-
-        // Consolidated, robust console capture mechanism with synchronized lock bounds
-        // Returns a tuple containing captured stdout/stderr text for assertion.
-        private (string StdOut, string StdErr) RunTestWithConsoleCapture(Action testAction)
-        {
-            // Synchronously drain the semaphore to block multi-threaded interleaved tests
-            _consoleSemaphore.Wait();
-            var oldOut = Console.Out;
-            var oldErr = Console.Error;
-
-            try
-            {
-                using (var swOut = new StringWriter())
-                using (var swErr = new StringWriter())
-                {
-                    Console.SetOut(swOut);
-                    Console.SetError(swErr);
-
-                    testAction();
-
-                    // Explicitly restore static console output paths BEFORE the StringWriter streams
-                    // are disposed to prevent ObjectDisposedExceptions from trailing execution writes.
-                    Console.SetOut(oldOut);
-                    Console.SetError(oldErr);
-
-                    return (swOut.ToString(), swErr.ToString());
-                }
-            }
-            finally
-            {
-                // CRITICAL: Ensure static console state restoration is guaranteed fallback safety
-                Console.SetOut(oldOut);
-                Console.SetError(oldErr);
-                _consoleSemaphore.Release();
-            }
-        }
-
-        /// <summary>
-        /// Asynchronous capture mechanism that hijacks the console stream for the duration of the test action,
-        /// allowing for non-blocking execution across thread hops without deadlocks.
-        /// Returns a tuple containing captured stdout/stderr text for assertion.
-        /// </summary>
-        private async Task<(string StdOut, string StdErr)> RunTestWithConsoleCaptureAsync(Func<Task> testAction)
-        {
-            // Arrange: Acquire async semaphore to gate access to static Console state
-            await _consoleSemaphore.WaitAsync();
-
-            // Capture original streams
-            var oldOut = Console.Out;
-            var oldErr = Console.Error;
-
-            try
-            {
-                using (var swOut = new StringWriter())
-                using (var swErr = new StringWriter())
-                {
-                    // Act: Redirect streams
-                    Console.SetOut(swOut);
-                    Console.SetError(swErr);
-
-                    // Await the action, which cleanly yields control to the thread pool
-                    // while the hijacked console remains correctly redirected.
-                    await testAction();
-
-                    return (swOut.ToString(), swErr.ToString());
-                }
-            }
-            finally
-            {
-                // Assert/Cleanup: Restore original console state
-                Console.SetOut(oldOut);
-                Console.SetError(oldErr);
-
-                // Always release the semaphore, regardless of test pass/fail
-                _consoleSemaphore.Release();
-            }
-        }
-
         [Fact]
         public void GetVerbName_ValidOptionsClass_ReturnsName()
         {
@@ -117,8 +38,8 @@ namespace Servy.CLI.UnitTests.Helpers
             var verbs = Helper.GetVerbs();
 
             // Assert
-            Assert.Contains("version", verbs);
-            Assert.Contains("--version", verbs);
+            Assert.Contains("install", verbs);   // Discovered via [Verb] reflection
+            Assert.Contains("version", verbs);   // Hardcoded addition
         }
 
         [Fact]
@@ -126,17 +47,13 @@ namespace Servy.CLI.UnitTests.Helpers
         {
             // Arrange
             var result = CommandResult.Ok("Success!");
-            int exitCode = -1;
 
             // Act
-            var consoleOutput = RunTestWithConsoleCapture(() =>
-            {
-                exitCode = Helper.PrintAndReturn(result);
-            });
+            var consoleOutput = ConsoleCapture.Run(() => Helper.PrintAndReturn(result));
 
             // Assert
             // Validate message content is natively dispatched to standard output stream.
-            Assert.Equal(0, exitCode);
+            Assert.Equal(0, consoleOutput.Result);
             Assert.Contains("Success!", consoleOutput.StdOut);
             Assert.Empty(consoleOutput.StdErr);
         }
@@ -146,17 +63,13 @@ namespace Servy.CLI.UnitTests.Helpers
         {
             // Arrange
             var result = CommandResult.Fail("Error!", 1);
-            int exitCode = -1;
 
             // Act
-            var consoleOutput = RunTestWithConsoleCapture(() =>
-            {
-                exitCode = Helper.PrintAndReturn(result);
-            });
+            var consoleOutput = ConsoleCapture.Run(() => Helper.PrintAndReturn(result));
 
             // Assert
             // Validate message content is natively dispatched to standard error stream.
-            Assert.Equal(1, exitCode);
+            Assert.Equal(1, consoleOutput.Result);
             Assert.Contains("Error!", consoleOutput.StdErr);
             Assert.Empty(consoleOutput.StdOut);
         }
@@ -165,25 +78,75 @@ namespace Servy.CLI.UnitTests.Helpers
         public async Task PrintAndReturnAsync_ReturnsExitCode()
         {
             // Arrange
-            int exitCode = -1;
             var task = Task.FromResult(CommandResult.Ok("Async Success"));
 
             // Act: Use the fully asynchronous redirection wrapper to capture state cleanly
-            var consoleOutput = await RunTestWithConsoleCaptureAsync(async () =>
+            var consoleOutput = await ConsoleCapture.RunAsync(async () =>
             {
-                exitCode = await Helper.PrintAndReturnAsync(task);
+                return await Helper.PrintAndReturnAsync(task);
             });
 
             // Assert
             // Assert the content payload in the async wrapper context.
-            Assert.Equal(0, exitCode);
+            Assert.Equal(0, consoleOutput.Result);
             Assert.Contains("Async Success", consoleOutput.StdOut);
             Assert.Empty(consoleOutput.StdErr);
+        }
+
+        [Fact]
+        public void PrintAndReturn_NullResult_ReturnsOneWithoutPrinting()
+        {
+            // Arrange & Act
+            var consoleOutput = ConsoleCapture.Run(() => Helper.PrintAndReturn(null!));
+
+            // Assert
+            // The null guard returns the literal 1, not result.ExitCode, so it is a distinct
+            // contract rather than an alias of the failure path.
+            Assert.Equal(1, consoleOutput.Result);
+            Assert.Empty(consoleOutput.StdOut);
+            Assert.Empty(consoleOutput.StdErr);
+        }
+
+        [Fact]
+        public void PrintAndReturn_BlankMessage_PrintsNothingButKeepsExitCode()
+        {
+            // Arrange
+            var result = CommandResult.Fail("   ", 3);
+
+            // Act
+            var consoleOutput = ConsoleCapture.Run(() => Helper.PrintAndReturn(result));
+
+            // Assert
+            // The blank-message arm is the only path where a non-zero exit code arrives with
+            // nothing written to either stream.
+            Assert.Equal(3, consoleOutput.Result);
+            Assert.Empty(consoleOutput.StdOut);
+            Assert.Empty(consoleOutput.StdErr);
+        }
+
+        [Fact]
+        public async Task PrintAndReturnAsync_FailureResult_RoutesToStdErrAndReturnsExitCode()
+        {
+            // Arrange
+            var task = Task.FromResult(CommandResult.Fail("Async Error", 1));
+
+            // Act: the direct mirror of PrintAndReturn_FailureResult_PrintsRedMessage, so the
+            // "behavior is identical across both paths" claim is verified on both outcomes.
+            var consoleOutput = await ConsoleCapture.RunAsync(async () =>
+            {
+                return await Helper.PrintAndReturnAsync(task);
+            });
+
+            // Assert
+            Assert.Equal(1, consoleOutput.Result);
+            Assert.Contains("Async Error", consoleOutput.StdErr);
+            Assert.Empty(consoleOutput.StdOut);
         }
 
         [Theory]
         [InlineData("Xml", ConfigFileType.Xml)]
         [InlineData("JSON", ConfigFileType.Json)]
+        [InlineData("  xml  ", ConfigFileType.Xml)]
         public void TryParseFileType_ValidInputs_ReturnsTrueAndMapsCorrectly(string input, ConfigFileType expectedType)
         {
             // Arrange & Act
@@ -213,6 +176,7 @@ namespace Servy.CLI.UnitTests.Helpers
         [InlineData("invalid")]
         [InlineData("123")]
         [InlineData("xml,json")]
+        [InlineData(" bogus ")]
         public void TryParseFileType_InvalidInputs_ReturnsFalseAndSetsError(string? input)
         {
             // Arrange & Act
@@ -220,7 +184,7 @@ namespace Servy.CLI.UnitTests.Helpers
 
             // Assert
             Assert.False(result);
-            Assert.Equal(string.Format(Strings.Msg_UnsupportedFileType, input), error);
+            Assert.Equal(string.Format(Strings.Msg_UnsupportedFileType, input!.Trim()), error);
         }
     }
 }

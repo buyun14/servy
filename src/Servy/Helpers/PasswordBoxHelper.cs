@@ -57,8 +57,11 @@ namespace Servy.Helpers
         /// Sets the bound password value for the specified <see cref="PasswordBox"/>.
         /// </summary>
         /// <param name="dp">The <see cref="DependencyObject"/> (should be a <see cref="PasswordBox"/>).</param>
-        /// <param name="value">The new password value to set.</param>
-        public static void SetBoundPassword(DependencyObject dp, string value) =>
+        /// <param name="value">
+        /// The new password value to set. <see langword="null"/> is accepted and clears the control,
+        /// which is the property's default state before a view model supplies a value.
+        /// </param>
+        public static void SetBoundPassword(DependencyObject dp, string? value) =>
             dp.SetValue(BoundPasswordProperty, value);
 
         /// <summary>
@@ -114,10 +117,6 @@ namespace Servy.Helpers
                 try
                 {
                     SetBoundPassword(passwordBox, passwordBox.Password);
-
-                    // Force the binding source to update immediately
-                    BindingExpression be = BindingOperations.GetBindingExpression(passwordBox, BoundPasswordProperty);
-                    be?.UpdateSource();
                 }
                 finally
                 {
@@ -125,6 +124,5 @@ namespace Servy.Helpers
                 }
             }
         }
-
     }
 }

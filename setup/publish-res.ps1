@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Publishes a Servy project and copies its build artifacts into a target Resources folder.
@@ -21,7 +22,7 @@
     The build configuration ("Debug" or "Release").
 
 .PARAMETER Tfm
-    Target framework moniker. Default: net10.0-windows.
+    Target framework moniker. Defaults to the value in build-config.ps1.
 
 .PARAMETER Runtime
     Target runtime. Default: win-x64.
@@ -40,13 +41,22 @@ param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration,
 
-    [string]$Tfm = "net10.0-windows",
+    [string]$Tfm = "",
     [string]$Runtime = "win-x64",
 
     [string]$OutputSuffix = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+# Load central defaults
+$configPath = Join-Path $PSScriptRoot "build-config.ps1"
+if (Test-Path -LiteralPath $configPath) {
+    $buildConfig = & $configPath
+    if (-not $Tfm) { $Tfm = $buildConfig.Tfm }
+} else {
+    throw "Central build configuration not found at $configPath"
+}
 
 # Import shared helpers (single source of truth for Assert-LastExitCode)
 . (Join-Path $PSScriptRoot "common-helpers.ps1")
@@ -60,12 +70,12 @@ $scriptDir = $PSScriptRoot
 $sourceDir = Join-Path $scriptDir "..\src\$ProjectName"
 
 # Fail fast if the project directory is missing (clean checkout, wrong -ProjectName)
-if (-not (Test-Path $sourceDir)) {
+if (-not (Test-Path -LiteralPath $sourceDir)) {
     throw "CRITICAL: Project directory not found at $sourceDir"
 }
 
 # Ensure the target resources folder exists
-if (-not (Test-Path $TargetResourcesFolder)) {
+if (-not (Test-Path -LiteralPath $TargetResourcesFolder)) {
     Write-Host "Creating missing resources folder: $TargetResourcesFolder" -ForegroundColor Gray
     New-Item -ItemType Directory -Path $TargetResourcesFolder -Force | Out-Null
 }
@@ -74,7 +84,7 @@ if (-not (Test-Path $TargetResourcesFolder)) {
 # Step 1: Publish source project
 # ---------------------------------------------------------------------------------
 $publishScript = Join-Path $sourceDir "publish.ps1"
-if (-not (Test-Path $publishScript)) {
+if (-not (Test-Path -LiteralPath $publishScript)) {
     throw "Required script not found: $publishScript"
 }
 
@@ -105,10 +115,10 @@ if (-not [string]::IsNullOrWhiteSpace($OutputSuffix)) {
 $destExe = "$ProjectName$suffix.exe"
 $destPdb = "$ProjectName$suffix.pdb"
 
-Copy-Item -Path (Join-Path $publishFolder $sourceExe) -Destination (Join-Path $TargetResourcesFolder $destExe) -Force
+Copy-Item -LiteralPath (Join-Path $publishFolder $sourceExe) -Destination (Join-Path $TargetResourcesFolder $destExe) -Force
 Write-Host "Copied $sourceExe -> $destExe"
 
-Copy-Item -Path (Join-Path $buildFolder $sourcePdb) -Destination (Join-Path $TargetResourcesFolder $destPdb) -Force
+Copy-Item -LiteralPath (Join-Path $buildFolder $sourcePdb) -Destination (Join-Path $TargetResourcesFolder $destPdb) -Force
 Write-Host "Copied $sourcePdb -> $destPdb"
 
 # ---------------------------------------------------------------------------------

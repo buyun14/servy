@@ -1,3 +1,4 @@
+using Servy.Core.Logging;
 using Servy.Core.Security;
 using Servy.Testing;
 using System.Security.AccessControl;
@@ -5,16 +6,11 @@ using System.Security.Principal;
 
 namespace Servy.Core.UnitTests.Security
 {
-    public class SecurityHelperTests : IDisposable
+    // Teardown deletes the tree either way: elevated runs inherit access from the mandatory
+    // Administrators ACE, non-elevated runs get the explicit current-user ACE
+    // ApplySecurityRules adds when IsAdministrator() is false.
+    public class SecurityHelperTests : TempDirectoryTestBase
     {
-        private readonly string _testBaseDir;
-
-        public SecurityHelperTests()
-        {
-            _testBaseDir = Path.Combine(Path.GetTempPath(), "SecurityHelperTests_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(_testBaseDir);
-        }
-
         [Theory]
         [InlineData(null)]
         [InlineData("")]
@@ -25,11 +21,29 @@ namespace Servy.Core.UnitTests.Security
             Assert.Throws<ArgumentException>(() => SecurityHelper.CreateSecureDirectory(invalidPath!));
         }
 
+        [Theory]
+        [InlineData(WellKnownSidType.BuiltinUsersSid, true)]
+        [InlineData(WellKnownSidType.AuthenticatedUserSid, true)]
+        [InlineData(WellKnownSidType.WorldSid, true)]
+        [InlineData(WellKnownSidType.BuiltinAdministratorsSid, false)]
+        [InlineData(WellKnownSidType.LocalSystemSid, false)]
+        public void IsBroadUnprivilegedSid_KnownSid_ReturnsWhetherItIsABroadGroup(WellKnownSidType sidType, bool expected)
+        {
+            // Arrange
+            var sid = new SecurityIdentifier(sidType, null);
+
+            // Act
+            var result = SecurityHelper.IsBroadUnprivilegedSid(sid);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
         [Fact]
         public void CreateSecureDirectory_ExistingDirectory_UpgradesSecurity()
         {
             // Arrange
-            var path = Path.Combine(_testBaseDir, "UpgradeDir");
+            var path = Path.Combine(TempDirectory, "UpgradeDir");
             Directory.CreateDirectory(path);
 
             var initialAcl = new DirectoryInfo(path).GetAccessControl();
@@ -47,7 +61,7 @@ namespace Servy.Core.UnitTests.Security
         public void CreateSecureDirectory_PurgesExplicitUsersGroupRules()
         {
             // Arrange
-            var path = Path.Combine(_testBaseDir, "PurgeUsersDir");
+            var path = Path.Combine(TempDirectory, "PurgeUsersDir");
             Directory.CreateDirectory(path);
             var dirInfo = new DirectoryInfo(path);
 
@@ -69,18 +83,45 @@ namespace Servy.Core.UnitTests.Security
             Assert.DoesNotContain(rules, r => r.IdentityReference == usersSid);
         }
 
-        [Fact]
-        public void CreateSecureDirectory_PreservesSpecificExplicitRulesWhilePurgingBroadGroups()
+        [Theory]
+        [InlineData(WellKnownSidType.AuthenticatedUserSid)]
+        [InlineData(WellKnownSidType.WorldSid)]
+        public void CreateSecureDirectory_PurgesOtherBroadUnprivilegedSids(WellKnownSidType sidType)
         {
             // Arrange
-            var path = Path.Combine(_testBaseDir, "PreserveExplicitDir");
+            // The purge removes every explicit rule whatever its principal (#7526); this theory pins it
+            // for the two broad groups other than BuiltinUsers, which the sibling test above covers.
+            var path = Path.Combine(TempDirectory, "PurgeOtherSidDir_" + sidType);
             Directory.CreateDirectory(path);
             var dirInfo = new DirectoryInfo(path);
 
-            // 1. Use LocalService as a "legitimate" manual rule that SHOULD be kept
-            var localServiceSid = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var sid = new SecurityIdentifier(sidType, null);
+            var acl = dirInfo.GetAccessControl();
+            acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.Read, AccessControlType.Allow));
+            dirInfo.SetAccessControl(acl);
 
-            // 2. Use Everyone as a broad rule that SHOULD be purged
+            // Act
+            SecurityHelper.CreateSecureDirectory(path);
+
+            // Assert
+            var finalAcl = dirInfo.GetAccessControl();
+            var rules = finalAcl.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                               .Cast<FileSystemAccessRule>();
+
+            Assert.DoesNotContain(rules, r => r.IdentityReference == sid);
+        }
+
+        [Fact]
+        public void CreateSecureDirectory_PurgesEveryNonAdministrativeExplicitRule()
+        {
+            // Arrange
+            // A standard user who created the directory before Servy did can add explicit rules for any principal,
+            // not only for the broad groups, so none of them may survive (#7526).
+            var path = Path.Combine(TempDirectory, "PurgeEveryExplicitDir");
+            Directory.CreateDirectory(path);
+            var dirInfo = new DirectoryInfo(path);
+
+            var localServiceSid = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
             var everyoneSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
 
             var acl = dirInfo.GetAccessControl();
@@ -97,15 +138,76 @@ namespace Servy.Core.UnitTests.Security
                                .Cast<FileSystemAccessRule>()
                                .ToList();
 
-            // Verify preservation: LocalService should still be there
-            Assert.Contains(rules, r => r.IdentityReference == localServiceSid);
-
-            // Verify purge: Everyone should be GONE
+            Assert.DoesNotContain(rules, r => r.IdentityReference == localServiceSid);
             Assert.DoesNotContain(rules, r => r.IdentityReference == everyoneSid);
 
             // Verify standard high-privilege accounts exist
             var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
             Assert.Contains(rules, r => r.IdentityReference == adminSid);
+        }
+
+        [Fact]
+        public void CreateSecureDirectory_ExistingDirectoryOwnedByAnotherPrincipal_HandsItToAdministrators()
+        {
+            // Only an elevated process can make Administrators the owner
+            Assert.SkipUnless(SecurityHelper.IsAdministrator(), "Not elevated: only an elevated process can hand the directory to Administrators.");
+
+            // Arrange
+            var path = Path.Combine(TempDirectory, "ForeignOwnerDir");
+            Directory.CreateDirectory(path);
+            var dirInfo = new DirectoryInfo(path);
+
+            SecurityIdentifier currentUserSid;
+            using (var identity = WindowsIdentity.GetCurrent())
+            {
+                currentUserSid = identity.User!;
+            }
+
+            // The owner keeps an implicit right to rewrite the DACL, so a directory owned by its creator is not hardened
+            var ownerAcl = dirInfo.GetAccessControl(AccessControlSections.Owner);
+            ownerAcl.SetOwner(currentUserSid);
+            dirInfo.SetAccessControl(ownerAcl);
+            Assert.Equal(currentUserSid, dirInfo.GetAccessControl(AccessControlSections.Owner).GetOwner(typeof(SecurityIdentifier)));
+
+            // Act
+            SecurityHelper.CreateSecureDirectory(path);
+
+            // Assert
+            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            Assert.Equal(adminSid, dirInfo.GetAccessControl(AccessControlSections.Owner).GetOwner(typeof(SecurityIdentifier)));
+        }
+
+        [Fact]
+        public void CreateSecureDirectory_VaultRootIsALink_LeavesTheLinkedDirectoryUnchanged()
+        {
+            // Arrange: a real directory carrying an entry for Users, and a vault root that links to it
+            var realDir = Path.Combine(TempDirectory, "RealVault");
+            Directory.CreateDirectory(realDir);
+            var usersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+            var realInfo = new DirectoryInfo(realDir);
+            var acl = realInfo.GetAccessControl(AccessControlSections.Access);
+            acl.AddAccessRule(new FileSystemAccessRule(usersSid, FileSystemRights.Read, AccessControlType.Allow));
+            realInfo.SetAccessControl(acl);
+            var linkDir = Path.Combine(TempDirectory, "LinkedVault");
+
+            try
+            {
+                Directory.CreateSymbolicLink(linkDir, realDir);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                Assert.Skip("Symlink creation unavailable on this runner");
+            }
+
+            // Act
+            var exception = Record.Exception(() => SecurityHelper.CreateSecureDirectory(linkDir, breakInheritance: true));
+
+            // Assert: refused with a warning, not an exception, and neither the link nor its target was rewritten
+            Assert.Null(exception);
+            Assert.False(new DirectoryInfo(linkDir).GetAccessControl(AccessControlSections.Access).AreAccessRulesProtected);
+            var after = realInfo.GetAccessControl(AccessControlSections.Access);
+            Assert.False(after.AreAccessRulesProtected);
+            Assert.Contains(after.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>(), r => usersSid.Equals(r.IdentityReference));
         }
 
         [Fact]
@@ -117,7 +219,7 @@ namespace Servy.Core.UnitTests.Security
                 "Elevated run: the current user is covered transitively by the Administrators ACE, so no distinct current-user ACE is written.");
 
             // Arrange
-            var path = Path.Combine(_testBaseDir, "CurrentUserDir");
+            var path = Path.Combine(TempDirectory, "CurrentUserDir");
             SecurityIdentifier currentUserSid;
             using (var identity = WindowsIdentity.GetCurrent())
             {
@@ -130,8 +232,8 @@ namespace Servy.Core.UnitTests.Security
             // Assert
             var acl = new DirectoryInfo(path).GetAccessControl();
             var rules = acl.GetAccessRules(true, false, typeof(SecurityIdentifier))
-                           .Cast<FileSystemAccessRule>()
-                           .ToList();
+                               .Cast<FileSystemAccessRule>()
+                               .ToList();
 
             Assert.Contains(rules, r => r.IdentityReference == currentUserSid && r.FileSystemRights == FileSystemRights.FullControl);
         }
@@ -140,7 +242,7 @@ namespace Servy.Core.UnitTests.Security
         public void CreateSecureDirectory_NewDirectory_SetsStandardMandatoryAcls()
         {
             // Arrange
-            var path = Path.Combine(_testBaseDir, "NewSecureDir");
+            var path = Path.Combine(TempDirectory, "NewSecureDir");
 
             // Act
             SecurityHelper.CreateSecureDirectory(path);
@@ -161,7 +263,6 @@ namespace Servy.Core.UnitTests.Security
 
         [Theory]
         [InlineData(WellKnownSidType.LocalSystemSid)]
-        [InlineData(WellKnownSidType.BuiltinAdministratorsSid)]
         [InlineData(null)]
         public void ApplySecurityRules_HighPrivilegeOrNullUser_SkipsDuplicateOrEmptyAclEntry(WellKnownSidType? wellKnownSidType)
         {
@@ -171,16 +272,80 @@ namespace Servy.Core.UnitTests.Security
                 ? new SecurityIdentifier(wellKnownSidType.Value, null)
                 : null;
 
+            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+
             // Act
             InvokeApplySecurityRules(security, sidToTest);
 
             // Assert
-            var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier));
+            var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                                .Cast<FileSystemAccessRule>()
+                                .ToList();
 
-            // Core logic verification: Check that the total ACL count evaluates cleanly to
-            // exactly 2 rules (Local System and Administrators), verifying that duplicate
-            // assignments or null objects are cleanly skipped.
+            // Core logic verification: Validate exact mandatory ACEs (Local System and Administrators),
+            // verifying that duplicate LocalSystem or null user assignments do not create additional ACE entries.
+            Assert.Contains(rules, r => r.IdentityReference == adminSid && r.FileSystemRights == FileSystemRights.FullControl);
+            Assert.Contains(rules, r => r.IdentityReference == systemSid && r.FileSystemRights == FileSystemRights.FullControl);
             Assert.Equal(2, rules.Count);
+        }
+
+        [Fact]
+        public void ApplySecurityRules_NonPrivilegedUser_AddsCurrentUserAce()
+        {
+            // Skip on elevated runs: when elevated, the current-user ACE is intentionally skipped via IsAdministrator().
+            Assert.SkipWhen(SecurityHelper.IsAdministrator(), "Elevated run: the current-user ACE is skipped via IsAdministrator().");
+
+            // Arrange
+            var security = new DirectorySecurity();
+            var nonPrivilegedSid = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+
+            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+
+            // Act
+            InvokeApplySecurityRules(security, nonPrivilegedSid);
+
+            // Assert
+            var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                                .Cast<FileSystemAccessRule>()
+                                .ToList();
+
+            Assert.Contains(rules, r => r.IdentityReference == adminSid && r.FileSystemRights == FileSystemRights.FullControl);
+            Assert.Contains(rules, r => r.IdentityReference == systemSid && r.FileSystemRights == FileSystemRights.FullControl);
+            Assert.Contains(rules, r => r.IdentityReference == nonPrivilegedSid && r.FileSystemRights == FileSystemRights.FullControl);
+            Assert.Equal(3, rules.Count);
+        }
+
+        [Fact]
+        public void ApplySecurityRules_ExplicitDenyRulesForMandatoryPrincipals_ArePurged()
+        {
+            // Arrange
+            // The purge removes every explicit rule, Deny included, whatever its principal (#7526);
+            // no other ApplySecurityRules_* test in this class seeds a Deny rule, so this one pins
+            // that case for the three mandatory principals.
+            var security = new DirectorySecurity();
+            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var currentUserSid = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+
+            security.AddAccessRule(new FileSystemAccessRule(adminSid, FileSystemRights.FullControl, AccessControlType.Deny));
+            security.AddAccessRule(new FileSystemAccessRule(systemSid, FileSystemRights.FullControl, AccessControlType.Deny));
+            security.AddAccessRule(new FileSystemAccessRule(currentUserSid, FileSystemRights.FullControl, AccessControlType.Deny));
+
+            // Act
+            InvokeApplySecurityRules(security, currentUserSid);
+
+            // Assert
+            var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                                .Cast<FileSystemAccessRule>()
+                                .ToList();
+
+            // One assertion per principal, so a regression that stops removing a Deny rule names
+            // the principal it kept.
+            Assert.DoesNotContain(rules, r => r.AccessControlType == AccessControlType.Deny && r.IdentityReference == adminSid);
+            Assert.DoesNotContain(rules, r => r.AccessControlType == AccessControlType.Deny && r.IdentityReference == systemSid);
+            Assert.DoesNotContain(rules, r => r.AccessControlType == AccessControlType.Deny && r.IdentityReference == currentUserSid);
         }
 
         #region breakInheritance:false Branch Coverage Tests
@@ -208,7 +373,7 @@ namespace Servy.Core.UnitTests.Security
         public void CreateSecureDirectory_WithBreakInheritanceFalse_LeavesDirectoryInheritanceEnabled()
         {
             // Arrange
-            var path = Path.Combine(_testBaseDir, "HealedInheritanceDir");
+            var path = Path.Combine(TempDirectory, "HealedInheritanceDir");
 
             // Act
             // Trigger public overload configuration with breakInheritance: false parameter assignment
@@ -226,7 +391,7 @@ namespace Servy.Core.UnitTests.Security
         #region Non-Admin Graceful Fallback Coverage Tests
 
         [Fact]
-        public void HandleNonAdminFallback_LogsWarningMessageWithoutThrowing()
+        public void HandleNonAdminFallback_DoesNotThrow()
         {
             // Arrange
             var ex = new UnauthorizedAccessException("Access to the path is denied.");
@@ -244,15 +409,31 @@ namespace Servy.Core.UnitTests.Security
         public void CreateSecureDirectory_ExistingDirectoryWithBreakInheritanceTrue_GracefullyHandlesNonAdminFailure()
         {
             // Skip on elevated runs
-            Assert.SkipWhen(SecurityHelper.IsAdministrator(), "Elevated run: SetAccessControl succeeds, so the non-admin fallback branch is never reached.");
+            Assert.SkipWhen(SecurityHelper.IsAdministrator(),
+                "Elevated run: SeTakeOwnershipPrivilege / SeBackupPrivilege bypass the OWNER RIGHTS restriction.");
 
             // Arrange
-            var path = Path.Combine(_testBaseDir, "ExistingRootVaultDir");
+            var path = Path.Combine(TempDirectory, "ExistingRootVaultDir");
             Directory.CreateDirectory(path);
 
+            var dirInfo = new DirectoryInfo(path);
+            var acl = dirInfo.GetAccessControl(AccessControlSections.Access);
+
+            // OWNER RIGHTS (S-1-3-4) replaces the owner's implicit READ_CONTROL + WRITE_DAC with
+            // exactly what this ACE grants. Withholding ChangePermissions is what makes
+            // SetAccessControl fail; everything else is kept so Dispose can still clean up.
+            acl.SetAccessRuleProtection(isProtected: true, preserveInheritance: true);
+            acl.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier("S-1-3-4"),
+                FileSystemRights.FullControl & ~FileSystemRights.ChangePermissions,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            dirInfo.SetAccessControl(acl);
+
             // Act & Assert
-            // When executing on existing directories, CreateSecureDirectory handles ACL re-hardening gracefully
-            // for non-admin contexts if access is denied on SetAccessControl.
+            // The hardening pass must hit UnauthorizedAccessException on SetAccessControl and be
+            // swallowed by the non-admin fallback rather than surfacing to the caller.
             var exception = Record.Exception(() => SecurityHelper.CreateSecureDirectory(path, breakInheritance: true));
             Assert.Null(exception);
         }
@@ -260,28 +441,142 @@ namespace Servy.Core.UnitTests.Security
         #endregion
 
         /// <summary>
-        /// Helper to invoke the internal method via reflection.
+        /// Invokes the public <see cref="SecurityHelper.ApplySecurityRules"/> through <see cref="TestReflection"/>.
         /// </summary>
         /// <param name="security">The security descriptor context.</param>
         /// <param name="sid">The identity reference SID target.</param>
         /// <param name="breakInheritance"><c>true</c> to break DACL cascading.</param>
         private void InvokeApplySecurityRules(DirectorySecurity security, IdentityReference? sid, bool breakInheritance = true)
             => TestReflection.InvokePublicStatic(typeof(SecurityHelper), "ApplySecurityRules", security, sid, breakInheritance);
+    }
 
-        public void Dispose()
+    /// <summary>
+    /// Names the xUnit collection of the tests that swap <see cref="SecurityHelper.IsAdministratorCore"/>. The seam is
+    /// process-global and other classes read <see cref="SecurityHelper.IsAdministrator"/>, so the swapping tests must
+    /// not run in parallel with the rest of the assembly.
+    /// </summary>
+    [CollectionDefinition(Name, DisableParallelization = true)]
+    public class ElevationSeamCollection
+    {
+        /// <summary>Collection name; reference this instead of repeating the string literal.</summary>
+        public const string Name = "ElevationSeamSequential";
+    }
+
+    /// <summary>
+    /// Pins the current-user ACE of <see cref="SecurityHelper.ApplySecurityRules"/> against a synthetic elevation state,
+    /// so it is checked on elevated runners too, where the tests that read the real token skip themselves.
+    /// </summary>
+    [Collection(ElevationSeamCollection.Name)]
+    public class SecurityHelperElevationTests
+    {
+        [Theory]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        public void ApplySecurityRules_OrdinaryUser_GetsTheCurrentUserAceOnlyWhenNotElevated(bool elevated, bool expectAce)
         {
-            if (Directory.Exists(_testBaseDir))
+            // Arrange
+            var security = new DirectorySecurity();
+            var ordinarySid = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            var originalSeam = SecurityHelper.IsAdministratorCore;
+            SecurityHelper.IsAdministratorCore = () => elevated;
+
+            try
             {
-                try
-                {
-                    // This should now succeed because the CurrentUser is added to the ACL
-                    Directory.Delete(_testBaseDir, true);
-                }
-                catch
-                {
-                    // Best-effort cleanup
-                }
+                // Act
+                SecurityHelper.ApplySecurityRules(security, ordinarySid);
             }
+            finally
+            {
+                SecurityHelper.IsAdministratorCore = originalSeam;
+            }
+
+            // Assert: Full Control for the current user only without elevation, next to the two mandatory ACEs
+            var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                                .Cast<FileSystemAccessRule>()
+                                .ToList();
+            Assert.Equal(expectAce, rules.Any(r => r.IdentityReference.Equals(ordinarySid) && r.FileSystemRights == FileSystemRights.FullControl));
+            Assert.Equal(expectAce ? 3 : 2, rules.Count);
+        }
+
+        [Theory]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        public void CreateSecureDirectory_ChildFolderCannotBeCreated_RethrowsAndWarnsOnlyWhenNotElevated(bool elevated, bool expectWarning)
+        {
+            // Arrange: a parent that denies everyone the right to create a subfolder
+            var parent = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            Directory.CreateDirectory(parent);
+            var parentInfo = new DirectoryInfo(parent);
+            var deny = new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                FileSystemRights.CreateDirectories,
+                AccessControlType.Deny);
+            var acl = parentInfo.GetAccessControl(AccessControlSections.Access);
+            acl.AddAccessRule(deny);
+            parentInfo.SetAccessControl(acl);
+            var child = Path.Combine(parent, "child");
+            var originalSeam = SecurityHelper.IsAdministratorCore;
+            SecurityHelper.IsAdministratorCore = () => elevated;
+
+            try
+            {
+                // Act
+                Exception? exception = null;
+                var log = LogCapture.Run(() =>
+                {
+                    exception = Record.Exception(() => SecurityHelper.CreateSecureDirectory(child, breakInheritance: false));
+                });
+
+                // Assert
+                Assert.IsType<UnauthorizedAccessException>(exception);
+                Assert.False(Directory.Exists(child));
+                Assert.Equal(expectWarning, log.Contains("Could not create directory", StringComparison.Ordinal));
+            }
+            finally
+            {
+                SecurityHelper.IsAdministratorCore = originalSeam;
+                var restore = parentInfo.GetAccessControl(AccessControlSections.Access);
+                restore.RemoveAccessRuleSpecific(deny);
+                parentInfo.SetAccessControl(restore);
+                Directory.Delete(parent, recursive: true);
+            }
+        }
+
+        [Fact]
+        public void ApplySecurityRules_ExplicitRulesForOtherPrincipals_LeavesOnlyTheMandatoryAces()
+        {
+            // Arrange
+            // Every explicit rule goes, an Allow for a principal outside the broad groups included (#7526)
+            var security = new DirectorySecurity();
+            var localServiceSid = new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null);
+            var networkServiceSid = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            security.AddAccessRule(new FileSystemAccessRule(localServiceSid, FileSystemRights.Modify, AccessControlType.Allow));
+            security.AddAccessRule(new FileSystemAccessRule(networkServiceSid, FileSystemRights.Read, AccessControlType.Deny));
+
+            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var originalSeam = SecurityHelper.IsAdministratorCore;
+            SecurityHelper.IsAdministratorCore = () => true;
+
+            try
+            {
+                // Act
+                SecurityHelper.ApplySecurityRules(security, null);
+            }
+            finally
+            {
+                SecurityHelper.IsAdministratorCore = originalSeam;
+            }
+
+            // Assert
+            var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                                .Cast<FileSystemAccessRule>()
+                                .ToList();
+            Assert.DoesNotContain(rules, r => r.IdentityReference.Equals(localServiceSid));
+            Assert.DoesNotContain(rules, r => r.IdentityReference.Equals(networkServiceSid));
+            Assert.Contains(rules, r => r.IdentityReference.Equals(adminSid) && r.FileSystemRights == FileSystemRights.FullControl);
+            Assert.Contains(rules, r => r.IdentityReference.Equals(systemSid) && r.FileSystemRights == FileSystemRights.FullControl);
+            Assert.Equal(2, rules.Count);
         }
     }
 }

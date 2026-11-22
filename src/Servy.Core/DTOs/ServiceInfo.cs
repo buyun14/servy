@@ -14,39 +14,40 @@ namespace Servy.Core.DTOs
         public string? Name { get; set; }
 
         /// <summary>
+        /// Gets or sets the display name of the service.
+        /// </summary>
+        public string? DisplayName { get; set; }
+
+        /// <summary>
         /// Gets or sets the current state of the service.
-        /// Uses <see cref="Servy.Core.Enums.ServiceStatus"/> enum.
+        /// Uses <see cref="ServiceStatus"/> enum.
         /// </summary>
         public ServiceStatus Status { get; set; }
 
         /// <summary>
         /// Gets or sets the startup type of the service.
-        /// Uses <see cref="Servy.Core.Enums.ServiceStartType"/> enum.
+        /// Uses <see cref="ServiceStartType"/> enum.
         /// </summary>
-        public ServiceStartType StartupType { get; set; }
+        public ServiceStartType StartupType { get; set; } = AppConfig.DefaultStartupType;
 
         /// <summary>
         /// Gets or sets the user account under which the service runs.
-        /// Defaults to <c>LocalSystem</c> if not specified.
+        /// Populated from the SCM; a null SCM value is resolved to <c>LocalSystem</c>, the Win32 default.
         /// </summary>
-        public string LogOnAs { get; set; }
+        public string LogOnAs { get; set; } = string.Empty;
 
         /// <summary>
         /// Gets or sets the description of the service.
         /// This corresponds to the <c>Description</c> field in Windows services.
         /// </summary>
-        public string Description { get; set; }
+        public string Description { get; set; } = string.Empty;
 
         /// <summary>
-        /// Initializes a new instance of <see cref="ServiceInfo"/> with default values.
+        /// Gets or sets a value indicating whether the native details could not be read, so that
+        /// <see cref="Description"/> holds a placeholder text rather than the service's description and
+        /// <see cref="LogOnAs"/> and the delayed auto-start refinement of <see cref="StartupType"/> may be missing.
         /// </summary>
-        public ServiceInfo()
-        {
-            Status = ServiceStatus.None;
-            StartupType = AppConfig.DefaultStartupType;
-            LogOnAs = ServiceAccounts.LocalSystem;
-            Description = string.Empty;
-        }
+        public bool DetailsUnavailable { get; set; }
     }
 }
 

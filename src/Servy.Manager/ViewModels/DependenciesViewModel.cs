@@ -47,11 +47,9 @@ namespace Servy.Manager.ViewModels
                 _selectedService = value;
                 OnPropertyChanged(nameof(SelectedService));
                 OnPropertyChanged(nameof(IsServiceSelected));
-
+                SetPidText(value); // value may be null; SetPidText already falls back to NotAvailable
                 _ = LoadDependencyTreeAsync(null);
-
                 CopyPidCommand.RaiseCanExecuteChanged();
-
                 StopMonitoring();
                 StartMonitoring();
             }
@@ -143,12 +141,12 @@ namespace Servy.Manager.ViewModels
         protected override ServiceItemBase? SelectedServiceItem => SelectedService;
 
         /// <inheritdoc />
-        protected override int RefreshIntervalMs => _appConfig.DependenciesRefreshIntervalInMs;
+        protected override int RefreshIntervalMs => _appConfig.DependenciesRefreshIntervalMs;
 
         /// <inheritdoc />
         protected override ServiceItemBase CreateServiceItem(Service? service)
         {
-            return new DependencyService { Name = service?.Name, Pid = null };
+            return new DependencyService { Name = service?.Name, Pid = service?.Pid };
         }
 
         /// <inheritdoc />
@@ -219,6 +217,77 @@ namespace Servy.Manager.ViewModels
             }
         }
 
+        /// <summary>
+        /// Collects the service names of the nodes that are currently expanded, walking the specified
+        /// collection and all their children.
+        /// Uses the same explicit stack and visited set as <see cref="SetExpansion"/>, because the
+        /// dependency graph is a DAG in which one node instance is shared across several branches.
+        /// </summary>
+        /// <param name="nodes">The collection of <see cref="ServiceDependencyNode"/> to process.</param>
+        /// <returns>
+        /// A case-insensitive set of the service names whose nodes were expanded; empty when none was.
+        /// </returns>
+        private HashSet<string> CollectExpanded(IEnumerable<ServiceDependencyNode> nodes)
+        {
+            var expanded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var visited = new HashSet<ServiceDependencyNode>();
+            var stack = new Stack<ServiceDependencyNode>(nodes);
+
+            while (stack.Count > 0)
+            {
+                var node = stack.Pop();
+                if (!visited.Add(node)) continue;
+
+                if (node.IsExpanded && !string.IsNullOrEmpty(node.ServiceName))
+                {
+                    expanded.Add(node.ServiceName);
+                }
+
+                if (node.Dependencies != null)
+                {
+                    foreach (var child in node.Dependencies)
+                    {
+                        stack.Push(child);
+                    }
+                }
+            }
+
+            return expanded;
+        }
+
+        /// <summary>
+        /// Re-expands the nodes whose service name is contained in the specified set, walking the
+        /// specified collection and all their children. Nodes outside the set are left untouched,
+        /// so the freshly expanded root stays open.
+        /// Uses the same explicit stack and visited set as <see cref="SetExpansion"/>.
+        /// </summary>
+        /// <param name="nodes">The collection of <see cref="ServiceDependencyNode"/> to process.</param>
+        /// <param name="expanded">The service names to re-expand, as returned by <see cref="CollectExpanded"/>.</param>
+        private void RestoreExpansion(IEnumerable<ServiceDependencyNode> nodes, HashSet<string> expanded)
+        {
+            var visited = new HashSet<ServiceDependencyNode>();
+            var stack = new Stack<ServiceDependencyNode>(nodes);
+
+            while (stack.Count > 0)
+            {
+                var node = stack.Pop();
+                if (!visited.Add(node)) continue;
+
+                if (expanded.Contains(node.ServiceName))
+                {
+                    node.IsExpanded = true;
+                }
+
+                if (node.Dependencies != null)
+                {
+                    foreach (var child in node.Dependencies)
+                    {
+                        stack.Push(child);
+                    }
+                }
+            }
+        }
+
         #endregion
 
         #region Public Methods
@@ -226,17 +295,15 @@ namespace Servy.Manager.ViewModels
         /// <summary>
         /// Asynchronously retrieves and sets the dependency tree for the current selected service.
         /// </summary>
+        /// <param name="parameter">Optional command parameter (not used).</param>
+        /// <returns>A task that completes when the load has finished, been superseded by a newer load, or failed.</returns>
         public async Task LoadDependencyTreeAsync(object? parameter)
         {
             // 1. Thread-safe atomic swap to cancel any existing load operation
             var newCts = new CancellationTokenSource();
             var token = newCts.Token;
             var oldCts = Interlocked.Exchange(ref _loadTreeCts, newCts);
-
-            if (oldCts != null)
-            {
-                Helpers.Helper.CancelAndDisposeSafely(oldCts);
-            }
+            Helpers.Helper.CancelAndDisposeSafely(oldCts);
 
             string? serviceName = null;
             try
@@ -248,12 +315,19 @@ namespace Servy.Manager.ViewModels
                 }
                 serviceName = SelectedService.Name;
 
+                // Capture which branches the user had open only if the currently displayed tree
+                // belongs to the same service being reloaded. This prevents expansion leakage across
+                // different service selections while preserving branch expansion on refreshes.
+                var expanded = DependencyTree.Count > 0 && string.Equals(DependencyTree[0].ServiceName, serviceName, StringComparison.OrdinalIgnoreCase)
+                    ? CollectExpanded(DependencyTree)
+                    : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                 IsBusy = true;
                 DependencyTree.Clear();
 
                 // 2. Offload the synchronous SCM call to a background thread
                 var root = await Task.Run(() =>
-                    _serviceManager.GetDependencies(serviceName), token);
+                    _serviceManager.GetDependencies(serviceName, cancellationToken: token), token);
 
                 // 3. Check if we are still on the same service/task before updating UI
                 if (token.IsCancellationRequested) return;
@@ -262,6 +336,12 @@ namespace Servy.Manager.ViewModels
                 {
                     root.IsExpanded = true;
                     DependencyTree.Add(root);
+
+                    // Restore the previous expansion state; the root stays open regardless.
+                    if (expanded.Count > 0)
+                    {
+                        RestoreExpansion(DependencyTree, expanded);
+                    }
                 }
             }
             catch (OperationCanceledException) { /* Ignored */ }

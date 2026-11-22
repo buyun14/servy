@@ -1,11 +1,24 @@
 using Servy.Core.EnvironmentVariables;
-using Servy.Core.Helpers;
 using Servy.Core.Resources;
 
 namespace Servy.Core.UnitTests.EnvironmentVariables
 {
     public class EnvironmentVariablesValidatorTests
     {
+        [Fact]
+        public void Validate_NullInput_ReturnsTrue()
+        {
+            // Arrange
+            string? input = null;
+
+            // Act
+            bool result = EnvironmentVariablesValidator.Validate(input, out List<string> error);
+
+            // Assert
+            Assert.True(result);
+            Assert.Empty(error);
+        }
+
         [Fact]
         public void Validate_EmptyInput_ReturnsTrue()
         {
@@ -93,7 +106,6 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
         #region Parameterized Escaped Delimiter Evaluation Tests
 
         [Theory]
-        [InlineData(@"KEY\=PART=VALUE")]  // Escaped Equals In Key
         [InlineData(@"KEY\;PART=VALUE")]  // Escaped Semicolon In Key
         [InlineData(@"KEY\\PART=VALUE")]  // Escaped Backslash In Key
         [InlineData(@"KEY=VALUE\=PART")]  // Escaped Equals In Value
@@ -124,7 +136,7 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
 
             // Assert
             Assert.False(result);
-            Assert.Contains(error, e => e.Contains(Strings.Msg_EnvironmentVariableMissingEquals));
+            Assert.Contains(error, e => e.Contains(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 1)));
         }
 
         [Fact]
@@ -138,7 +150,23 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
 
             // Assert
             Assert.False(result);
-            Assert.Contains(error, e => e.Contains(Strings.Msg_EnvironmentVariableKeyEmpty));
+            Assert.Contains(error, e => e.Contains(string.Format(Strings.Msg_EnvironmentVariableKeyEmpty, 1)));
+        }
+
+        [Fact]
+        public void Validate_EmptySegmentBeforeABadRecord_StillCountsTowardItsPosition()
+        {
+            // Arrange
+            // The split yields "A=1", "" and "NOEQUALS", so the bad record is the third.
+            string input = "A=1;;NOEQUALS";
+
+            // Act
+            bool isValid = EnvironmentVariablesValidator.Validate(input, out List<string> errorMessages);
+
+            // Assert
+            Assert.False(isValid);
+            var error = Assert.Single(errorMessages);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 3), error);
         }
 
         [Fact]
@@ -182,7 +210,7 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
 
             // Assert
             Assert.False(result);
-            Assert.Contains(error, e => e.Contains(Strings.Msg_EnvironmentVariableMissingEquals));
+            Assert.Contains(error, e => e.Contains(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 1)));
         }
 
         [Fact]
@@ -196,7 +224,7 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
 
             // Assert
             Assert.False(result);
-            Assert.Contains(error, e => e.Contains(Strings.Msg_EnvironmentVariableKeyEmpty));
+            Assert.Contains(error, e => e.Contains(string.Format(Strings.Msg_EnvironmentVariableKeyEmpty, 1)));
         }
 
         [Fact]
@@ -214,38 +242,19 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
         }
 
         [Fact]
-        public void FormatEnvironmentVariables_WithLiteralNewlines_EscapesCarriageReturnAndLineFeed()
+        public void Validate_NewlineSeparatedRecordMissingEquals_ReturnsFalse()
         {
-            // Arrange
-            // Provide a realistic multi-variable input containing sequential Windows newline sequences (\r\n)
-            string rawInput = @"MULTILINE_KEY=line1\r\nline2;STANDARD_KEY=value2";
-
-            // Act
-            string formatted = StringHelper.FormatEnvironmentVariables(rawInput);
-
-            // Assert
-            // Ensure both the carriage return and line feed escape characters double their backslashes correctly
-            Assert.Contains(@"MULTILINE_KEY=line1\\r\\nline2", formatted);
-            Assert.Contains(@"STANDARD_KEY=value2", formatted);
-
-            List<string> error;
-            bool isValid = EnvironmentVariablesValidator.Validate(formatted, out error);
-            Assert.True(isValid, $"Validator rejected formatted output with errors count: {error.Count}");
-        }
-
-        [Fact]
-        public void Validate_UnescapedNewlineWithinSegment_FailsValidation()
-        {
-            // Arrange
-            string corruptedInput = "KEY=line1\nline2_with_no_equals";
+            // Arrange: the newline separates two records; the second one has no equals sign
+            string input = "KEY=line1\nline2_with_no_equals";
 
             // Act
             List<string> errorMessages;
-            bool isValid = EnvironmentVariablesValidator.Validate(corruptedInput, out errorMessages);
+            bool isValid = EnvironmentVariablesValidator.Validate(input, out errorMessages);
 
             // Assert
             Assert.False(isValid);
-            Assert.Contains(errorMessages, e => e.Contains(Strings.Msg_EnvironmentVariableMissingEquals));
+            Assert.Single(errorMessages);
+            Assert.Contains(errorMessages, e => e.Contains(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 2)));
         }
 
         [Fact]
@@ -263,7 +272,53 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
             Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableValueInvalidChars, "KEY"), errorMessages[0]);
         }
 
+        [Fact]
+        public void Validate_MissingEquals_FormatsTheRecordPositionIntoTheMessage()
+        {
+            // Arrange
+            var input = "A=1;NOEQUALS";
+
+            // Act
+            var valid = EnvironmentVariablesValidator.Validate(input, out var errors);
+
+            // Assert
+            Assert.False(valid);
+            var error = Assert.Single(errors);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 2), error);
+            Assert.DoesNotContain("{0}", error);
+        }
+
+        [Fact]
+        public void Validate_CrlfSeparatedRecordMissingEquals_ReportsTheSamePositionAsParse()
+        {
+            // Arrange
+            var input = "A=1\r\nNOEQUALS";
+
+            // Act
+            var valid = EnvironmentVariablesValidator.Validate(input, out var errors);
+
+            // Assert
+            Assert.False(valid);
+            var error = Assert.Single(errors);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 2), error);
+        }
+
         #region Key Formatting and Security Robustness Rule Tests
+
+        [Fact]
+        public void Validate_VariableWithEscapedCarriageReturnInKey_ReturnsFalse()
+        {
+            // Arrange
+            string input = "KEY_START\\\rKEY_END=Value";
+
+            // Act
+            bool isValid = EnvironmentVariablesValidator.Validate(input, out List<string> errorMessages);
+
+            // Assert
+            Assert.False(isValid);
+            var error = Assert.Single(errorMessages);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableForbiddenNewline, "KEY_START\rKEY_END"), error);
+        }
 
         [Fact]
         public void Validate_VariableWithEscapedNewlineInKey_ReturnsFalse()
@@ -281,6 +336,21 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
         }
 
         [Fact]
+        public void Validate_VariableWithEscapedNewlineInValue_ReturnsFalse()
+        {
+            // Arrange
+            string input = "KEY=line1\\\nline2";
+
+            // Act
+            bool isValid = EnvironmentVariablesValidator.Validate(input, out List<string> errorMessages);
+
+            // Assert
+            Assert.False(isValid);
+            Assert.NotEmpty(errorMessages);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableForbiddenNewline, "KEY"), errorMessages[0]);
+        }
+
+        [Fact]
         public void Validate_VariableWithNullTerminatorInKey_ReturnsFalse()
         {
             // Arrange
@@ -295,6 +365,42 @@ namespace Servy.Core.UnitTests.EnvironmentVariables
             Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableKeyInvalidChars, "KEY\0ATTACK"), errorMessages[0]);
         }
 
+        [Fact]
+        public void Validate_VariableWithEscapedEqualsInKey_ReturnsFalse()
+        {
+            // Arrange
+            string input = @"PATH\=Z=C:\tools";
+
+            // Act
+            bool isValid = EnvironmentVariablesValidator.Validate(input, out List<string> errorMessages);
+
+            // Assert
+            Assert.False(isValid);
+            Assert.NotEmpty(errorMessages);
+            Assert.Equal(string.Format(Strings.Msg_EnvironmentVariableKeyInvalidChars, "PATH=Z"), errorMessages[0]);
+        }
+
         #endregion
+
+        [Fact]
+        public void Validate_SeveralBadRecords_ReportsEveryOneWithItsOwnPosition()
+        {
+            // Arrange: record 1 is valid, 2 has no '=', 3 is valid, 4 has an empty key, 5 has a null terminator in its value
+            string input = "A=1;NOEQUALS;B=2;=EMPTYKEY;C=VAL\0UE";
+
+            // Act
+            bool isValid = EnvironmentVariablesValidator.Validate(input, out List<string> errorMessages);
+
+            // Assert
+            Assert.False(isValid);
+            Assert.Equal(
+                new[]
+                {
+                    string.Format(Strings.Msg_EnvironmentVariableMissingEquals, 2),
+                    string.Format(Strings.Msg_EnvironmentVariableKeyEmpty, 4),
+                    string.Format(Strings.Msg_EnvironmentVariableValueInvalidChars, "C"),
+                },
+                errorMessages);
+        }
     }
 }

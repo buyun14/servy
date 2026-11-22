@@ -1,5 +1,6 @@
 using Servy.Core.Config;
 using Servy.Core.EnvironmentVariables;
+using Servy.Core.Helpers;
 using Servy.Core.Logging;
 using System.Collections;
 using System.Text.RegularExpressions;
@@ -20,7 +21,7 @@ namespace Servy.Service.Helpers
     ///     new EnvironmentVariable { Name = "APP_HOME", Value = "%LOG_DIR%\\bin" }
     /// };
     ///
-    /// var expandedEnv = EnvironmentVariableHelper.ExpandEnvironmentVariables(customVars);
+    /// var expandedEnv = EnvironmentVariableHelper.ExpandEnvironmentVariables(customVars, allowOverriddenRuntimeVars: false);
     ///
     /// // expandedEnv["LOG_DIR"] = "C:\\ProgramData\\Servy\\logs"
     /// // expandedEnv["APP_HOME"] = "C:\\ProgramData\\Servy\\logs\\bin"
@@ -42,15 +43,26 @@ namespace Servy.Service.Helpers
         internal const string PercentEscapeToken = "\uFFFD_SERVY_ESC_PERCENT_\uFFFD";
 
         /// <summary>
-        /// Gets a read-only collection of protected system variable names that should never be overridden by user configuration.
+        /// Gets a read-only collection of immutable protected system variable names that should never be overridden by user configuration under any circumstance.
         /// </summary>
-        internal static IReadOnlyCollection<string> ProtectedVariableNames => ProtectedVariables;
+        internal static IReadOnlyCollection<string> ImmutableProtectedVariableNames => ImmutableProtectedVariables;
 
         /// <summary>
-        /// Protected system variables that should never be overridden by user configuration
-        /// to prevent privilege escalation, process hijacking, and system instability.
+        /// Gets a read-only collection of overridable protected variable names that are blocked by default to prevent injection,
+        /// but can be safely overridden when explicitly permitted by service policy.
         /// </summary>
-        private static readonly HashSet<string> ProtectedVariables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        internal static IReadOnlyCollection<string> OverridableProtectedVariableNames => OverridableProtectedVariables;
+
+        /// <summary>
+        /// Gets a read-only collection of all protected system variable names (both immutable core system variables and default-blocked runtime variables).
+        /// </summary>
+        internal static IReadOnlyCollection<string> ProtectedVariableNames => AllProtectedVariables;
+
+        /// <summary>
+        /// Core system integrity, identity, and security variables that can NEVER be overridden
+        /// under any circumstance to prevent privilege escalation, process hijacking, and system instability.
+        /// </summary>
+        private static readonly HashSet<string> ImmutableProtectedVariables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             // --- System Integrity ---
             "PATH", "COMSPEC", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP", "PATHEXT",
@@ -65,6 +77,25 @@ namespace Servy.Service.Helpers
             // --- User & Profile Integrity ---
             "USERNAME", "USERPROFILE", "ALLUSERSPROFILE", "PROGRAMDATA", "PSMODULEPATH",
 
+            // --- Windows AppCompat / Debugger Injection Vectors ---
+            "__COMPAT_LAYER", "SHIM_FILE_LOG", "SHIM_DEBUG_LEVEL",
+            "_NT_SYMBOL_PATH", "_NT_ALT_SYMBOL_PATH", "_NT_SOURCE_PATH",
+            "MICROSOFT_TELEMETRY_ENV_OVERRIDE",
+
+            // Global/Unix-like fallback (for MinGW/WSL/Cygwin contexts)
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+
+            // PowerShell Injection / Hardening Bypass
+            "__PSLockDownPolicy",          // Forces a weaker LanguageMode at PS startup
+            "PSExecutionPolicyPreference", // Overrides ExecutionPolicy at PS startup
+        };
+
+        /// <summary>
+        /// Runtime application, framework, and diagnostic variables that are blocked by default to prevent injection,
+        /// but can be overridden on a per-service basis if explicitly allowed by configuration policy.
+        /// </summary>
+        private static readonly HashSet<string> OverridableProtectedVariables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
             // --- Runtime Injection & Hijack Vectors ---
 
             // .NET & CLR Runtime Injection / Diagnostics (Legacy & Modern CoreCLR)
@@ -74,27 +105,27 @@ namespace Servy.Service.Helpers
             "DOTNET_BUNDLE_EXTRACT_BASE_DIR", "DOTNET_ADDITIONAL_DEPS", "DOTNET_SHARED_STORE",
 
             // Modern Diagnostic Attach Surfaces
-            "DOTNET_DiagnosticPorts",          "COMPlus_DiagnosticPorts",
-            "DOTNET_EnableDiagnostics",        "COMPlus_EnableDiagnostics",
-            "DOTNET_EnableDiagnostics_IPC",    "COMPlus_EnableDiagnostics_IPC",
+            "DOTNET_DiagnosticPorts",           "COMPlus_DiagnosticPorts",
+            "DOTNET_EnableDiagnostics",         "COMPlus_EnableDiagnostics",
+            "DOTNET_EnableDiagnostics_IPC",     "COMPlus_EnableDiagnostics_IPC",
             "DOTNET_EnableDiagnostics_Profiler","COMPlus_EnableDiagnostics_Profiler",
-            "DOTNET_EnableEventPipe",          "COMPlus_EnableEventPipe",
+            "DOTNET_EnableEventPipe",           "COMPlus_EnableEventPipe",
 
             // Runtime Custom Component Loading & Assembly Layout Adjustments
-            "DOTNET_GCName",                   "COMPlus_GCName",
-            "DOTNET_GCPath",                   "COMPlus_GCPath",
+            "DOTNET_GCName",                    "COMPlus_GCName",
+            "DOTNET_GCPath",                    "COMPlus_GCPath",
             "DOTNET_LegacyHostPolicy",          "COMPlus_LegacyHostPolicy",
-            "DOTNET_LegacyTransform",          "COMPlus_LegacyTransform",
+            "DOTNET_LegacyTransform",           "COMPlus_LegacyTransform",
             "DOTNET_PerfMapEnabled",            "COMPlus_PerfMapEnabled",
             "DOTNET_ZapDisable",                "COMPlus_ZapDisable",
 
             // MiniDump Storage Layout Targets (Prevents sensitive memory leakage redirection)
-            "DOTNET_DbgEnableMiniDump",        "COMPlus_DbgEnableMiniDump",
-            "DOTNET_DbgMiniDumpName",          "COMPlus_DbgMiniDumpName",
-            "DOTNET_DbgMiniDumpType",          "COMPlus_DbgMiniDumpType",
+            "DOTNET_DbgEnableMiniDump",         "COMPlus_DbgEnableMiniDump",
+            "DOTNET_DbgMiniDumpName",           "COMPlus_DbgMiniDumpName",
+            "DOTNET_DbgMiniDumpType",           "COMPlus_DbgMiniDumpType",
 
-            // Java Injection - Covers direct java.exe (TOOL_OPTIONS) and common shell-wrapper launchers (OPTS)
-            "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JAVA_OPTS", "JAVA_OPTIONS",
+            // Java Injection - Covers direct java.exe (TOOL_OPTIONS, JDK_JAVA_OPTIONS) and common shell-wrapper launchers (OPTS)
+            "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS", "JAVA_OPTIONS",
             "CATALINA_OPTS", "CATALINA_JAVA_OPTS",
             "MAVEN_OPTS", "M2_OPTS",
             "GRADLE_OPTS",
@@ -106,28 +137,30 @@ namespace Servy.Service.Helpers
             "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",
             "NPM_CONFIG_PREFIX", "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG",
 
+            // TLS Trust Store & OpenSSL Configuration - Rogue CA injection, provider/engine module loading,
+            // and outbound traffic redirection via a proxy of the attacker's choosing
+            "OPENSSL_CONF", "OPENSSL_MODULES",
+            "SSL_CERT_FILE", "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+
             // Python Injection - Covers interpreters and package manager wrappers
             "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME",
-            "PYTHONIOENCODING", "PYTHONFAULTHANDLER", "PYTHONUSERBASE", "PYTHONEXECUTABLE",
+            "PYTHONUSERBASE", "PYTHONEXECUTABLE",
 
             // Ruby & Perl Injection
-            "RUBYOPT", "RUBYLIB", "PERL5OPT", "PERL5LIB",
+            "RUBYOPT", "RUBYLIB", "PERL5OPT", "PERL5LIB", "PERLLIB",
 
             // PHP Injection - Prevents loading malicious extensions or rogue php.ini files
             "PHPRC", "PHP_INI_SCAN_DIR",
-
-            // Global/Unix-like fallback (for MinGW/WSL/Cygwin contexts)
-            "LD_PRELOAD", "LD_LIBRARY_PATH",
-
-            // --- Windows AppCompat / Debugger Injection Vectors ---
-            "__COMPAT_LAYER", "SHIM_FILE_LOG", "SHIM_DEBUG_LEVEL",
-            "_NT_SYMBOL_PATH", "_NT_ALT_SYMBOL_PATH", "_NT_SOURCE_PATH",
-            "MICROSOFT_TELEMETRY_ENV_OVERRIDE",
-
-            // PowerShell Injection / Hardening Bypass
-            "__PSLockDownPolicy",          // Forces a weaker LanguageMode at PS startup
-            "PSExecutionPolicyPreference", // Overrides ExecutionPolicy at PS startup
         };
+
+        /// <summary>
+        /// Combined lookup set containing both immutable system core variables and default-blocked runtime variables.
+        /// </summary>
+        private static readonly HashSet<string> AllProtectedVariables = new HashSet<string>(
+            ImmutableProtectedVariables.Concat(OverridableProtectedVariables),
+            StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Builds a dictionary of environment variables by merging the current system environment
@@ -138,11 +171,44 @@ namespace Servy.Service.Helpers
         /// <param name="environmentVariables">
         /// A list of custom environment variables to include. May be <c>null</c>.
         /// </param>
+        /// <param name="allowOverriddenRuntimeVars">
+        /// If set to <c>true</c>, permits overriding framework/runtime options (such as JAVA_OPTS or NODE_OPTIONS).
+        /// Core OS system variables (such as PATH or SYSTEMROOT) remain strictly immutable regardless of this flag.
+        /// </param>
         /// <returns>
         /// A dictionary containing system environment variables combined with the provided custom ones,
         /// with all values fully expanded using a multi-pass fixed-point resolution to safely handle cross-references.
         /// </returns>
-        public static Dictionary<string, string?> ExpandEnvironmentVariables(List<EnvironmentVariable> environmentVariables)
+        public static Dictionary<string, string?> ExpandEnvironmentVariables(
+            List<EnvironmentVariable> environmentVariables,
+            bool allowOverriddenRuntimeVars)
+        {
+            return DecodePercentEscapes(ExpandEnvironmentVariablesEncoded(environmentVariables, allowOverriddenRuntimeVars));
+        }
+
+        /// <summary>
+        /// Performs the same expansion as <see cref="ExpandEnvironmentVariables(List{EnvironmentVariable}, bool)"/>,
+        /// but leaves every '%%' escape encoded as <see cref="PercentEscapeToken"/> instead of collapsing it to '%'.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="PercentEscapeToken"/> contains no '%', so a caller can audit the result for unexpanded
+        /// placeholders without mistaking an escaped percent for one, then pass it to
+        /// <see cref="DecodePercentEscapes(Dictionary{string, string})"/> to obtain the public result.
+        /// </remarks>
+        /// <param name="environmentVariables">
+        /// A list of custom environment variables to include. May be <c>null</c>.
+        /// </param>
+        /// <param name="allowOverriddenRuntimeVars">
+        /// If set to <c>true</c>, permits overriding framework/runtime options (such as JAVA_OPTS or NODE_OPTIONS).
+        /// Core OS system variables (such as PATH or SYSTEMROOT) remain strictly immutable regardless of this flag.
+        /// </param>
+        /// <returns>
+        /// A dictionary containing system environment variables combined with the provided custom ones,
+        /// fully expanded, with '%%' escapes still encoded as <see cref="PercentEscapeToken"/>.
+        /// </returns>
+        internal static Dictionary<string, string?> ExpandEnvironmentVariablesEncoded(
+            List<EnvironmentVariable> environmentVariables,
+            bool allowOverriddenRuntimeVars)
         {
             var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
@@ -150,7 +216,10 @@ namespace Servy.Service.Helpers
             var customSnapshot = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
             var systemEnv = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
-            // 1. Load System Environment
+            // 1. Load System Environment. A service inherits the Service Control Manager's environment, built at boot;
+            //    bring the process up to date with the System variables added, changed or removed since, so the child
+            //    process and the expansion below see what a freshly started service would see (#7393).
+            SystemEnvironmentHelper.RefreshProcessEnvironment();
             foreach (DictionaryEntry entry in Environment.GetEnvironmentVariables())
             {
                 string key = (string)entry.Key;
@@ -167,11 +236,23 @@ namespace Servy.Service.Helpers
                 {
                     if (string.IsNullOrWhiteSpace(envVar.Name)) continue;
 
-                    if (ProtectedVariables.Contains(envVar.Name))
+                    // Tier 1: Immutable Core System Variables - NEVER allowed to be overridden
+                    if (ImmutableProtectedVariables.Contains(envVar.Name))
                     {
-                        // Log the violation - this is critical for auditing
-                        Logger.Warn($"Security: Blocked an attempt to override protected variable '{envVar.Name}'. Custom values for this variable are ignored to prevent privilege escalation.");
+                        Logger.Warn($"Security: Blocked an attempt to override immutable system variable '{envVar.Name}'. Custom values for this variable are ignored to prevent core OS instability or privilege escalation.");
                         continue;
+                    }
+
+                    // Tier 2: Overridable Runtime Variables - Blocked by default unless explicitly allowed by policy
+                    if (OverridableProtectedVariables.Contains(envVar.Name))
+                    {
+                        if (!allowOverriddenRuntimeVars)
+                        {
+                            Logger.Warn($"Security: Blocked an attempt to override protected runtime variable '{envVar.Name}'. Custom values for this variable are ignored to prevent runtime injection. Enable 'AllowOverriddenRuntimeVars' in service settings to allow this override.");
+                            continue;
+                        }
+
+                        Logger.Info($"Security Audit: Override for protected runtime variable '{envVar.Name}' permitted by service policy configuration.");
                     }
 
                     // Encode '%%' into a temporary token to prevent the expansion engine
@@ -179,6 +260,21 @@ namespace Servy.Service.Helpers
                     string? sanitizedValue = envVar.Value?.Replace("%%", PercentEscapeToken);
                     result[envVar.Name] = sanitizedValue;
                     customSnapshot[envVar.Name] = sanitizedValue;
+                }
+            }
+
+            // Direct-cycle diagnosis happens here, once per custom variable, because the token scan
+            // inside ExpandWithDictionary is re-entered once per variable per pass and would repeat
+            // the identical warning for every one of them.
+            foreach (var key in customSnapshot.Keys)
+            {
+                string? definition = customSnapshot[key];
+                if (definition == null) continue;
+
+                if (definition.IndexOf("%" + key + "%", StringComparison.OrdinalIgnoreCase) >= 0
+                    && string.IsNullOrEmpty(Environment.GetEnvironmentVariable(key)))
+                {
+                    Logger.Warn($"Direct cycle detected for variable '{key}'; leaving literal placeholder.");
                 }
             }
 
@@ -224,11 +320,6 @@ namespace Servy.Service.Helpers
             }
             while (changed && pass < AppConfig.MaxEnvVarExpansionPasses);
 
-            if (pass >= AppConfig.MaxEnvVarExpansionPasses && changed)
-            {
-                Logger.Warn("Environment variable expansion reached maximum pass limit. Indirect circular reference detected (e.g., A=%B%, B=%A%).");
-            }
-
             // 4. Final layer: Apply System-level expansion for any remaining unmapped system placeholders
             foreach (var key in customSnapshot.Keys)
             {
@@ -240,13 +331,25 @@ namespace Servy.Service.Helpers
                 result[key] = Environment.ExpandEnvironmentVariables(systemExpanded);
             }
 
+            return result;
+        }
+
+        /// <summary>
+        /// Collapses every <see cref="PercentEscapeToken"/> in the values of <paramref name="values"/> into a literal '%'.
+        /// </summary>
+        /// <param name="values">
+        /// A dictionary returned by <see cref="ExpandEnvironmentVariablesEncoded(List{EnvironmentVariable}, bool)"/>. It is updated in place.
+        /// </param>
+        /// <returns>The same <paramref name="values"/> instance, with every escape decoded.</returns>
+        internal static Dictionary<string, string?> DecodePercentEscapes(Dictionary<string, string?> values)
+        {
             // 5. Decode escaped percentages: Collapse the protective token into a literal '%'
-            foreach (var key in result.Keys.Where(k => !string.IsNullOrEmpty(result[k])).ToList())
+            foreach (var key in values.Keys.Where(k => !string.IsNullOrEmpty(values[k])).ToList())
             {
-                result[key] = result[key]!.Replace(PercentEscapeToken, "%");
+                values[key] = values[key]!.Replace(PercentEscapeToken, "%");
             }
 
-            return result;
+            return values;
         }
 
         /// <summary>
@@ -255,12 +358,34 @@ namespace Servy.Service.Helpers
         /// </summary>
         /// <param name="input">The string containing environment variable references (e.g. "%ProgramFiles%\\MyApp").</param>
         /// <param name="expandedEnv">
-        /// A dictionary of environment variables previously built by <see cref="ExpandEnvironmentVariables(List{EnvironmentVariable})"/>.
+        /// A dictionary of environment variables previously built by <see cref="ExpandEnvironmentVariables(List{EnvironmentVariable}, bool)"/>.
         /// </param>
         /// <returns>
         /// The input string with all environment variable references expanded, and escaped '%%' collapsed to '%'.
         /// </returns>
         public static string ExpandEnvironmentVariables(string input, IDictionary<string, string?> expandedEnv)
+        {
+            return DecodePercentEscapes(ExpandEnvironmentVariablesEncoded(input, expandedEnv));
+        }
+
+        /// <summary>
+        /// Performs the same expansion as <see cref="ExpandEnvironmentVariables(string, IDictionary{string, string})"/>,
+        /// but leaves every '%%' escape encoded as <see cref="PercentEscapeToken"/> instead of collapsing it to '%'.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="PercentEscapeToken"/> contains no '%', so a caller can audit the result for unexpanded
+        /// placeholders without mistaking an escaped percent for one, then pass it to
+        /// <see cref="DecodePercentEscapes(string)"/> to obtain the public result.
+        /// </remarks>
+        /// <param name="input">The string containing environment variable references (e.g. "%ProgramFiles%\\MyApp").</param>
+        /// <param name="expandedEnv">
+        /// A dictionary of environment variables previously built by <see cref="ExpandEnvironmentVariables(List{EnvironmentVariable}, bool)"/>.
+        /// </param>
+        /// <returns>
+        /// The input string with all environment variable references expanded, and '%%' escapes still encoded
+        /// as <see cref="PercentEscapeToken"/>.
+        /// </returns>
+        internal static string ExpandEnvironmentVariablesEncoded(string input, IDictionary<string, string?> expandedEnv)
         {
             if (string.IsNullOrEmpty(input)) return input;
 
@@ -271,10 +396,22 @@ namespace Servy.Service.Helpers
             // only one pass is needed here. We pass 'protectInjectedValues: true' so that any literal
             // '%' characters injected from the dictionary aren't accidentally re-expanded by the OS.
             string result = ExpandWithDictionary(encodedInput, expandedEnv, null, null, protectInjectedValues: true);
-            result = Environment.ExpandEnvironmentVariables(result);
+            // The service inherits the Service Control Manager's environment, built at boot; the expansion first brings
+            // the process up to date with the System variables in the registry (#7393)
+            return SystemEnvironmentHelper.ExpandSystemEnvironmentVariables(result);
+        }
+
+        /// <summary>
+        /// Collapses every <see cref="PercentEscapeToken"/> in <paramref name="value"/> into a literal '%'.
+        /// </summary>
+        /// <param name="value">A string returned by <see cref="ExpandEnvironmentVariablesEncoded(string, IDictionary{string, string})"/>.</param>
+        /// <returns><paramref name="value"/> unchanged when it is <c>null</c> or empty; otherwise the decoded string.</returns>
+        internal static string DecodePercentEscapes(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return value;
 
             // Decode '%%' protection token back to a single literal '%'
-            return result.Replace(PercentEscapeToken, "%");
+            return value.Replace(PercentEscapeToken, "%");
         }
 
         /// <summary>
@@ -309,15 +446,16 @@ namespace Servy.Service.Helpers
 
         /// <summary>
         /// Expands environment variables in a string using the provided dictionary of variables.
-        /// Custom variables override system variables. Windows built-in expansion is also applied
-        /// to handle system-defined placeholders such as %SystemRoot%.
+        /// Only the names in <paramref name="variables"/> are substituted. Windows built-in expansion of
+        /// the remaining system-defined placeholders such as %SystemRoot% is applied afterwards by the callers.
         /// </summary>
         /// <param name="value">The string to expand.</param>
         /// <param name="variables">The dictionary of environment variables to use during expansion.</param>
+        /// <param name="systemEnv">A dictionary of active system environment variables used to verify whether a percentage token represents a recognized OS variable.</param>
         /// <param name="currentKey">The specific variable key currently being expanded, if any.</param>
         /// <param name="protectInjectedValues">If true, encodes '%' in the substituted values to prevent later OS expansion.</param>
         /// <returns>The expanded string.</returns>
-        private static string ExpandWithDictionary(
+        internal static string ExpandWithDictionary(
             string value,
             IDictionary<string, string?> variables,
             IDictionary<string, string?>? systemEnv = null,
@@ -348,9 +486,11 @@ namespace Servy.Service.Helpers
 
                     // If there is no inherited OS value to append to, leave the placeholder
                     // intact so the user understands why the append operation did not occur.
+                    // The warning for this case is emitted once per variable by
+                    // ExpandEnvironmentVariablesEncoded(List<EnvironmentVariable>, bool); this scan runs once per
+                    // variable per pass, so warning here would repeat the same line.
                     if (string.IsNullOrEmpty(inheritedValue))
                     {
-                        Logger.Warn($"Direct cycle detected for variable '{kvp.Key}'; leaving literal placeholder.");
                         continue;
                     }
 
@@ -398,14 +538,17 @@ namespace Servy.Service.Helpers
         }
 
         /// <summary>
-        /// Truncates a string value to a specified maximum boundary limit, checking for and removing
-        /// any partial or malformed <see cref="PercentEscapeToken"/> segments split during the cut operation.
+        /// Truncates <paramref name="value"/> to <paramref name="maxLength"/> characters. If the cut would split a
+        /// <see cref="PercentEscapeToken"/>, the cut is moved back to the start of that token so no partial token remains.
         /// </summary>
-        /// <param name="value">The expanded string payload currently requiring boundary verification.</param>
-        /// <param name="maxLength">The maximum character allowance ceiling permitted for the environment block.</param>
-        /// <returns>A clean, validated string guaranteed to contain no corrupt sentinel marker fragments.</returns>
+        /// <param name="value">The string to truncate.</param>
+        /// <param name="maxLength">The maximum number of characters to keep.</param>
+        /// <returns><paramref name="value"/> if it is already short enough; otherwise a prefix of at most
+        /// <paramref name="maxLength"/> characters that does not end inside an escape token.</returns>
         private static string TrimToSafeBoundary(string value, int maxLength)
         {
+            // Defensive: guards intentionally kept in case a future caller invokes this without
+            // pre-checking length/emptiness. Both are unreachable from the current two call sites.
             if (string.IsNullOrEmpty(value)) return string.Empty;
             if (value.Length <= maxLength) return value;
 

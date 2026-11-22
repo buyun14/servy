@@ -12,7 +12,6 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -43,16 +42,22 @@ namespace Servy.UI.Bootstrapping
         private ErrorEventHandler? _availabilityErrorHandler;
         private readonly CancellationTokenSource _appLifetimeCts = new CancellationTokenSource();
         private DateTime _lastErrorDialogShown = DateTime.MinValue;
-        private string _lastErrorDialogMessage = string.Empty;
+        private string _lastErrorDialogSignature = string.Empty;
 
         #endregion
 
         #region Properties
 
         /// <summary>
+        /// Gets the token cancelled when the application begins shutting down, so services doing I/O
+        /// can unwind instead of resuming after <see cref="OnExit"/>.
+        /// </summary>
+        public CancellationToken AppLifetimeToken => _appLifetimeCts.Token;
+
+        /// <summary>
         /// Gets the initialized database context.
         /// </summary>
-        public AppDbContext? DbContext { get; private set; }
+        private AppDbContext? DbContext { get; set; }
 
         /// <summary>
         /// Gets the repository for service data access.
@@ -62,22 +67,22 @@ namespace Servy.UI.Bootstrapping
         /// <summary>
         /// Gets the secure data provider for encryption operations.
         /// </summary>
-        public ISecureData? SecureData { get; private set; }
+        private ISecureData? SecureData { get; set; }
 
         /// <summary>
         /// Gets the active database connection string.
         /// </summary>
-        public string? ConnectionString { get; private set; }
+        private string? ConnectionString { get; set; }
 
         /// <summary>
         /// Gets the file path for the AES encryption key.
         /// </summary>
-        public string? AESKeyFilePath { get; private set; }
+        private string? AESKeyFilePath { get; set; }
 
         /// <summary>
         /// Gets the file path for the AES initialization vector.
         /// </summary>
-        public string? AESIVFilePath { get; private set; }
+        private string? AESIVFilePath { get; set; }
 
         /// <summary>
         /// Gets a value indicating whether software rendering has been forced.
@@ -94,6 +99,13 @@ namespace Servy.UI.Bootstrapping
         public AppBootstrapper(BootstrapperOptions options, IProcessKiller processKiller)
         {
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            if (string.IsNullOrWhiteSpace(options.LogFileName)) throw new ArgumentException("BootstrapperOptions.LogFileName is required.", nameof(options));
+            if (string.IsNullOrWhiteSpace(options.AppSettingsFileName)) throw new ArgumentException("BootstrapperOptions.AppSettingsFileName is required.", nameof(options));
+            if (string.IsNullOrWhiteSpace(options.ResourcesNamespace)) throw new ArgumentException("BootstrapperOptions.ResourcesNamespace is required.", nameof(options));
+            if (string.IsNullOrWhiteSpace(options.SecurityWarningTitle)) throw new ArgumentException("BootstrapperOptions.SecurityWarningTitle is required.", nameof(options));
+            if (string.IsNullOrWhiteSpace(options.SecurityWarningMessage)) throw new ArgumentException("BootstrapperOptions.SecurityWarningMessage is required.", nameof(options));
+            if (string.IsNullOrWhiteSpace(options.SqliteVersionWarningTitle)) throw new ArgumentException("BootstrapperOptions.SqliteVersionWarningTitle is required.", nameof(options));
+            if (string.IsNullOrWhiteSpace(options.SqliteVersionWarningMessageFormat)) throw new ArgumentException("BootstrapperOptions.SqliteVersionWarningMessageFormat is required.", nameof(options));
             _processKiller = processKiller ?? throw new ArgumentNullException(nameof(processKiller));
         }
 
@@ -119,8 +131,8 @@ namespace Servy.UI.Bootstrapping
                 Exception? ex = args.ExceptionObject as Exception;
                 Logger.Error("FATAL: AppDomain Unhandled Exception. Process is terminating.", ex);
 
-                var dispatcher = Application.Current?.Dispatcher;
-                if (dispatcher != null && !dispatcher.HasShutdownStarted)
+                var dispatcher = app.Dispatcher;
+                if (!dispatcher.HasShutdownStarted)
                 {
                     try
                     {
@@ -145,8 +157,8 @@ namespace Servy.UI.Bootstrapping
                 if (args.Exception is OutOfMemoryException)
                 {
                     // ROBUSTNESS CRASH STRATEGY: Intentionally let the process fail-fast on OOM.
-                    // Dropping the dead app.Shutdown call allows the exception to bubble up naturally
-                    // and trigger OS-level diagnostic handlers rather than hanging on a stalled event pump.
+                    // Leaving the exception unhandled lets it bubble up naturally and trigger
+                    // OS-level diagnostic handlers rather than hanging on a stalled event pump.
                     Logger.Error("Non-recoverable OutOfMemoryException detected. Terminating process pipeline.");
                     args.Handled = false;
                     return;
@@ -156,16 +168,19 @@ namespace Servy.UI.Bootstrapping
                 lock (_errorDialogLock)
                 {
                     var now = DateTime.UtcNow;
-                    // Combine exception type and message to differentiate between unique concurrent faults
-                    var currentExceptionSignature = args.Exception?.GetType().FullName + ":" + args.Exception?.Message;
 
-                    // Allow the dialog if it is a new exception type/message, or if the debounce window has elapsed
-                    shouldShowDialog = currentExceptionSignature != _lastErrorDialogMessage
+                    // Key on the fault SITE, not the fault instance message: exception messages embed PIDs,
+                    // file paths, and timestamps, which causes a varying message to defeat the rate limit entirely.
+                    var site = args.Exception.TargetSite is MethodBase m ? $"{m.DeclaringType?.FullName}.{m.Name}" : "?";
+                    var currentExceptionSignature = args.Exception.GetType().FullName + "@" + site;
+
+                    // Allow the dialog if it is a new exception signature, or if the debounce window has elapsed
+                    shouldShowDialog = currentExceptionSignature != _lastErrorDialogSignature
                                        || (now - _lastErrorDialogShown) > TimeSpan.FromSeconds(AppConfig.UnexpectedErrorDialogDebounceSeconds);
 
                     if (shouldShowDialog)
                     {
-                        _lastErrorDialogMessage = currentExceptionSignature;
+                        _lastErrorDialogSignature = currentExceptionSignature;
                         _lastErrorDialogShown = now;
                     }
                 }
@@ -233,9 +248,10 @@ namespace Servy.UI.Bootstrapping
 #endif
             _configuration = builder.Build();
 
-            ConnectionString = _configuration.GetConnectionString("DefaultConnection") ?? AppConfig.DefaultConnectionString;
-            AESKeyFilePath = _configuration["Security:AESKeyFilePath"] ?? AppConfig.DefaultAESKeyPath;
-            AESIVFilePath = _configuration["Security:AESIVFilePath"] ?? AppConfig.DefaultAESIVPath;
+            var coreSettings = CoreSettingsLoader.Load();
+            ConnectionString = coreSettings.ConnectionString;
+            AESKeyFilePath = coreSettings.AESKeyFilePath;
+            AESIVFilePath = coreSettings.AESIVFilePath;
         }
 
         /// <summary>
@@ -243,11 +259,9 @@ namespace Servy.UI.Bootstrapping
         /// </summary>
         private void ApplyLoggerSettings()
         {
-            if (_configuration == null) return;
-
-            LoggerConfigurator.ConfigureFromAppSettings(_configuration);
-
-            _options.CustomConfigAction?.Invoke(_configuration);
+            LoggerConfigurator.ConfigureFromAppSettings(_configuration!);
+            CoreSettingsLoader.WarnAboutIgnoredSettings(_configuration, Path.GetFileName(_options.AppSettingsFileName!));
+            _options.CustomConfigAction?.Invoke(_configuration!);
         }
 
         /// <summary>
@@ -263,6 +277,10 @@ namespace Servy.UI.Bootstrapping
             try
             {
                 await InitializeAppAsync(app, e);
+            }
+            catch (OperationCanceledException)
+            {
+                Logger.Info("Startup cancelled; application is shutting down.");
             }
             catch (Exception ex)
             {
@@ -296,6 +314,9 @@ namespace Servy.UI.Bootstrapping
         /// <returns>A <see cref="Task"/> representing the asynchronous initialization process.</returns>
         public async Task InitializeAppAsync(Application app, StartupEventArgs e)
         {
+            // Record the System variables as they are at start, so one changed later is picked up (#7393)
+            SystemEnvironmentHelper.InitializeForApplication();
+
             string? serviceName = null;
             var showSplash = true;
             var positionalArgs = e.Args.Where(arg => !arg.Equals(AppConfig.ForceSoftwareRenderingArg, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -326,69 +347,163 @@ namespace Servy.UI.Bootstrapping
                     await Task.Yield(); // Allow the UI thread to pump messages and render the window
                 }
 
-                Helper.EnsureEventSourceExists();
-
                 // 2. Background Initialization (I/O & DB)
                 // Note: Configuration and Logger settings are already loaded synchronously in OnStartup.
                 await Task.Run(async () =>
                 {
-                    if (string.IsNullOrEmpty(ConnectionString) || string.IsNullOrEmpty(AESKeyFilePath) || string.IsNullOrEmpty(AESIVFilePath))
-                    {
-                        throw new InvalidOperationException(
-                            $"Critical configuration values are missing. Ensure that the {_options.AppSettingsFileName} file is present and correctly configured.");
-                    }
-
                     var stopwatch = Stopwatch.StartNew();
 
-                    AppFoldersHelper.EnsureFolders(ConnectionString, AESKeyFilePath, AESIVFilePath);
+                    // Registry-backed and unbounded; must not run on the UI thread, and must be
+                    // inside the measured window so the splash floor reflects real elapsed time.
+                    Helper.EnsureEventSourceExists();
+
+                    AppFoldersHelper.EnsureFolders(ConnectionString!, AESKeyFilePath!, AESIVFilePath!);
 
                     var asm = Assembly.GetEntryAssembly() ?? Assembly.GetExecutingAssembly();
 
-                    DbContext = new AppDbContext(ConnectionString);
-                    DatabaseInitializer.InitializeDatabase(DbContext, SQLiteDbInitializer.Initialize);
+                    // The keys come first: a schema migration may have to encrypt values stored in clear text (#7579)
+                    _protectedKeyProvider = new ProtectedKeyProvider(AESKeyFilePath!, AESIVFilePath!);
+                    SecureData = new SecureData(_protectedKeyProvider);
+
+                    DbContext = new AppDbContext(ConnectionString!);
+                    var secureData = SecureData;
+                    DatabaseInitializer.InitializeDatabase(DbContext, connection => SQLiteDbInitializer.Initialize(connection, secureData));
 
                     var dapperExecutor = new DapperExecutor(DbContext);
-                    _protectedKeyProvider = new ProtectedKeyProvider(AESKeyFilePath, AESIVFilePath);
-                    SecureData = new SecureData(_protectedKeyProvider);
 
                     var xmlSerializer = new XmlServiceSerializer();
                     var jsonSerializer = new JsonServiceSerializer();
 
                     ServiceRepository = new ServiceRepository(dapperExecutor, SecureData, xmlSerializer, jsonSerializer);
                     var sh = new ServiceHelper(ServiceRepository);
-                    var resourceHelper = new ResourceHelper(sh, _processKiller);
+                    var resourceHelper = new ResourceHelper(_processKiller);
 
-                    // Copy embedded files
-                    if (!await resourceHelper.CopyEmbeddedResource(asm, _options.ResourcesNamespace!, AppConfig.ServyServiceUIFileName, "exe", cancellationToken: CancellationToken.None))
+                    var ct = _appLifetimeCts.Token;
+
+                    Func<string, IServiceControllerWrapper> controllerFactory = name => new ServiceControllerWrapper(name);
+                    var hostInstaller = new ServyHostInstaller(new WindowsServiceApi(), new Win32ErrorProvider(), new ServiceControllerProvider(controllerFactory));
+
+                    // Replacing the service wrapper or the host needs every running Servy service and the host stopped. They
+                    // are stopped once for all the files and the host reinstall, and started once at the end, rather than
+                    // once per file: after an upgrade on a machine with many services that would delay start-up a lot.
+                    // Non-critical warnings are collected while the services are paused and shown after the resume: a modal
+                    // dialog awaited inside the try keeps every service the pause stopped down until someone clicks OK.
+                    var deferredWarnings = new List<(string Message, string? Title)>();
+
+                    var pause = new ServyServicesPause(sh, hostInstaller);
+                    try
                     {
-                        string resourceName = $"{AppConfig.ServyServiceUIFileName}.exe";
-                        throw new InvalidOperationException($"Failed to extract embedded resource '{resourceName}'. " +
-                            "Manager cannot start safely - see file log for details.");
+                        if (resourceHelper.IsExtractionNeeded(asm, _options.ResourcesNamespace!, AppConfig.ServyServiceUIFileName, "exe")
+                            || resourceHelper.IsExtractionNeeded(asm, _options.ResourcesNamespace!, AppConfig.ServyHostFileName, "exe"))
+                        {
+                            await pause.PauseAsync(ct);
+                        }
+
+                        // Copy embedded files
+                        if (!await resourceHelper.CopyEmbeddedResourceAsync(asm, _options.ResourcesNamespace!, AppConfig.ServyServiceUIFileName, "exe", cancellationToken: ct))
+                        {
+                            string resourceName = $"{AppConfig.ServyServiceUIFileName}.exe";
+                            throw new InvalidOperationException($"Failed to extract embedded resource '{resourceName}'. " +
+                                "The application cannot start safely - see file log for details.");
+                        }
+
+                        // The service wrapper launches the restarter from its own folder, so it is extracted next to it.
+                        // No running service holds it open, so there is nothing to stop before overwriting it.
+                        if (!await resourceHelper.CopyEmbeddedResourceAsync(asm, _options.ResourcesNamespace!, AppConfig.ServyRestarterFileName, "exe", cancellationToken: ct))
+                        {
+                            throw new InvalidOperationException($"Failed to extract embedded resource '{AppConfig.ServyRestarterExe}'. " +
+                                "The application cannot start safely - see file log for details.");
+                        }
+
+                        // The Servy host service serves every Servy service its configuration
+                        if (!await resourceHelper.CopyEmbeddedResourceAsync(asm, _options.ResourcesNamespace!, AppConfig.ServyHostFileName, "exe", cancellationToken: ct))
+                        {
+                            throw new InvalidOperationException($"Failed to extract embedded resource '{AppConfig.ServyHostExe}'. " +
+                                "The application cannot start safely - see file log for details.");
+                        }
+
+                        // File locks are found through the Restart Manager now: remove the Sysinternals Handle executables
+                        // an earlier version extracted to the vault. A failure is logged and does not stop the start-up.
+                        resourceHelper.DeleteLegacyHandleExecutables();
+
+    #if DEBUG
+                        if (!await resourceHelper.CopyEmbeddedResourceAsync(asm, _options.ResourcesNamespace!, AppConfig.ServyServiceUIFileName, "pdb", cancellationToken: ct))
+                        {
+                            deferredWarnings.Add((
+                                string.Format(Resources.Strings.Msg_FailedCopyingEmbeddedResource, $"{AppConfig.ServyServiceUIFileName}.pdb"),
+                                _options.ResourceExtractionWarningTitle));
+                        }
+
+                        if (!await resourceHelper.CopyEmbeddedResourceAsync(asm, _options.ResourcesNamespace!, AppConfig.ServyRestarterFileName, "pdb", cancellationToken: ct))
+                        {
+                            deferredWarnings.Add((
+                                string.Format(Resources.Strings.Msg_FailedCopyingEmbeddedResource, $"{AppConfig.ServyRestarterFileName}.pdb"),
+                                _options.ResourceExtractionWarningTitle));
+                        }
+
+                        if (!await resourceHelper.CopyEmbeddedResourceAsync(asm, _options.ResourcesNamespace!, AppConfig.ServyHostFileName, "pdb", cancellationToken: ct))
+                        {
+                            deferredWarnings.Add((
+                                string.Format(Resources.Strings.Msg_FailedCopyingEmbeddedResource, $"{AppConfig.ServyHostFileName}.pdb"),
+                                _options.ResourceExtractionWarningTitle));
+                        }
+    #else
+                        // Purge every non-administrative entry in the vault, then grant the service accounts their access
+                        // again, newly extracted files included (#7526). Debug builds extract next to the executable instead.
+                        await new ServyExePermissionsHardener().SecureVaultAsync(ServiceRepository!, ct);
+    #endif
+                        // Install the Servy host service when it is missing, keep its startup type Automatic, and start it
+                        var hostExePath = Path.Combine(resourceHelper.BaseExtractionDirectory, AppConfig.ServyHostExe);
+                        var hostResult = await hostInstaller.EnsureInstalledAndRunningAsync(hostExePath, sh, ct);
+                        if (hostResult.IsSuccess)
+                        {
+                            // Services installed by an earlier version do not depend on the host yet
+                            var installed = await ServiceRepository!.GetAllAsync(decrypt: false, ct);
+                            await hostInstaller.EnsureServicesDependOnHostAsync(installed.Select(s => s.Name), ct);
+                        }
+                        else
+                        {
+                            deferredWarnings.Add((
+                                string.Format(Resources.Strings.Msg_ServyHostUnavailable, hostResult.ErrorMessage),
+                                Resources.Strings.Msg_ServyHostUnavailableTitle));
+                        }
+                    }
+                    finally
+                    {
+                        await pause.ResumeAsync();
                     }
 
-                    var handleExeFileName = RuntimeInformation.OSArchitecture == Architecture.Arm64
-                        ? AppConfig.HandleExeARM64FileName
-                        : AppConfig.HandleExeX64FileName;
-
-                    if (!await resourceHelper.CopyEmbeddedResource(asm, _options.ResourcesNamespace!, handleExeFileName, "exe", false, cancellationToken: CancellationToken.None))
+                    // The paused services are running again, so a dialog may now wait for the user: one dialog for
+                    // all the warnings, rather than one per warning in a row.
+                    if (deferredWarnings.Count > 0)
                     {
-                        string resourceName = $"{handleExeFileName}.exe";
-                        Logger.Warn($"Failed to extract embedded resource '{resourceName}'. " +
-                            "File-lock diagnostics will be unavailable this session.");
-                        await app.Dispatcher.InvokeAsync(() => MessageBox.Show(string.Format(Resources.Strings.Msg_FailedCopyingEmbeddedResource, resourceName)));
+                        var (message, title) = CombineWarnings(deferredWarnings);
+                        await app.Dispatcher.InvokeAsync(() =>
+                        {
+                            Window? owner = splash ?? app.MainWindow;
+                            if (owner != null)
+                            {
+                                MessageBox.Show(owner, message, title, MessageBoxButton.OK, MessageBoxImage.Warning);
+                            }
+                            else
+                            {
+                                // No splash and no main window yet (started with "false"): MessageBox.Show(Window, ...)
+                                // throws on a null owner, and an owner-less dialog is safe - nothing Topmost can cover it.
+                                MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Warning);
+                            }
+                        });
                     }
 
-#if DEBUG
-                    if (!await resourceHelper.CopyEmbeddedResource(asm, _options.ResourcesNamespace!, AppConfig.ServyServiceUIFileName, "pdb", false, cancellationToken: CancellationToken.None))
-                    {
-                        await app.Dispatcher.InvokeAsync(() => MessageBox.Show(string.Format(Resources.Strings.Msg_FailedCopyingEmbeddedResource, $"{AppConfig.ServyServiceUIFileName}.pdb")));
-                    }
-#endif
                     stopwatch.Stop();
 
-                    if (showSplash && stopwatch.ElapsedMilliseconds < AppConfig.SplashMinDisplayThresholdMs)
+                    // Prevent "splash screen flicker" by ensuring it stays visible for a minimum duration
+                    if (splash != null)
                     {
-                        await Task.Delay(AppConfig.SplashMinDisplayPaddingMs);
+                        var remainingMs = AppConfig.SplashMinDisplayThresholdMs - (int)stopwatch.ElapsedMilliseconds;
+                        if (remainingMs > 0)
+                        {
+                            await Task.Delay(remainingMs);
+                        }
                     }
                 });
 
@@ -410,7 +525,7 @@ namespace Servy.UI.Bootstrapping
             }
             finally
             {
-                if (showSplash && splash?.IsVisible == true)
+                if (splash?.IsVisible == true)
                 {
                     splash.Close();
                 }
@@ -430,7 +545,7 @@ namespace Servy.UI.Bootstrapping
             string? directory = Path.GetDirectoryName(targetAppPublishPath);
             string fileName = Path.GetFileName(targetAppPublishPath);
 
-            if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName)) return;
+            if (string.IsNullOrWhiteSpace(directory) || string.IsNullOrEmpty(fileName)) return;
 
             // Outer loop keeps the monitor alive for the lifetime of the application
             while (!_appLifetimeCts.Token.IsCancellationRequested)
@@ -466,7 +581,8 @@ namespace Servy.UI.Bootstrapping
                     _availabilityWatcher.Changed += _availabilityChangedHandler;
                     _availabilityWatcher.Renamed += _availabilityRenamedHandler;
 
-                    // Log unexpected buffer overflows, but we no longer rely on this for directory renames
+                    // Error reports buffer overflows only; a renamed or deleted root directory is
+                    // detected by the Phase 3 heartbeat below.
                     _availabilityWatcher.Error += _availabilityErrorHandler;
 
                     _availabilityWatcher.EnableRaisingEvents = true;   // arm last
@@ -512,10 +628,7 @@ namespace Servy.UI.Bootstrapping
             // Dispatch to UI thread to safely update data-bound properties from the watcher's background thread
             app.Dispatcher.InvokeAsync(() =>
             {
-                if (!string.IsNullOrEmpty(targetAppPublishPath))
-                {
-                    updateAvailabilityCallback(File.Exists(targetAppPublishPath));
-                }
+                updateAvailabilityCallback(File.Exists(targetAppPublishPath));
             });
         }
 
@@ -588,6 +701,25 @@ namespace Servy.UI.Bootstrapping
                 // fatal but should be noted for debugging resource leaks.
                 Logger.Warn($"{name} cleanup failed", ex);
             }
+        }
+
+        /// <summary>
+        /// Combines the non-critical start-up warnings into the text and caption of the one dialog that shows them.
+        /// </summary>
+        /// <param name="warnings">The warnings collected while the Servy services were paused, in the order they occurred; at least one.</param>
+        /// <returns>
+        /// The single warning's own message and caption when there is one; otherwise every message, in order and separated by a
+        /// blank line, under the generic <see cref="Resources.Strings.Msg_StartupWarningsTitle"/> caption.
+        /// </returns>
+        private static (string Message, string? Title) CombineWarnings(IReadOnlyList<(string Message, string? Title)> warnings)
+        {
+            if (warnings.Count == 1)
+            {
+                return warnings[0];
+            }
+
+            var message = string.Join(Environment.NewLine + Environment.NewLine, warnings.Select(w => w.Message));
+            return (message, Resources.Strings.Msg_StartupWarningsTitle);
         }
     }
 }

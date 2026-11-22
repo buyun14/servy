@@ -1,41 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0-windows</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-
-    <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <OutputType>Exe</OutputType>
   </PropertyGroup>
 
   <PropertyGroup>
     <AssemblyTitle>Servy.CLI.IntegrationTests</AssemblyTitle>
-    <AssemblyDescription>Servy.CLI integration tests</AssemblyDescription>
+    <Description>Servy.CLI integration tests</Description>
     <Product>Servy.CLI.IntegrationTests</Product>
   </PropertyGroup>
-
-  <ItemGroup>
-    <Using Include="Xunit" />
-  </ItemGroup>
-
-  <PropertyGroup>
-    <ValidateExecutableReferencesMatchSelfContained>false</ValidateExecutableReferencesMatchSelfContained>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="coverlet.collector">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageReference>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" />
-    <PackageReference Include="xunit.runner.visualstudio">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageReference>
-    <PackageReference Include="xunit.v3" />
-  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Servy.CLI\Servy.CLI.csproj" />

@@ -7,12 +7,16 @@ using Helper = Servy.Testing.Helper;
 
 namespace Servy.UnitTests.Helpers
 {
+    /// <summary>
+    /// WPF control creation requires an STA thread, so every test here runs its body through
+    /// <see cref="Helper.RunOnSTA(Action, bool)"/> with an Application instance.
+    /// </summary>
     public class PasswordBoxHelperTests
     {
         /// <summary>
         /// Verifies standard getter and setter flows for the attached property.
         /// </summary>
-        [Fact] // Executes test on an STA thread to allow WPF control creation
+        [Fact]
         public void BoundPassword_GetAndSet_WorksCorrectly()
         {
             Helper.RunOnSTA(() =>
@@ -126,6 +130,29 @@ namespace Servy.UnitTests.Helpers
         }
 
         /// <summary>
+        /// Verifies that setting <see cref="PasswordBoxHelper.BoundPasswordProperty"/> to <see langword="null"/>
+        /// safely falls back to <see cref="string.Empty"/> and clears the control password without throwing an exception.
+        /// </summary>
+        [Fact]
+        public void OnBoundPasswordChanged_NullValue_ClearsPasswordInsteadOfThrowing()
+        {
+            Helper.RunOnSTA(() =>
+            {
+                // Arrange
+                var passwordBox = new PasswordBox();
+                PasswordBoxHelper.SetBoundPassword(passwordBox, "ExistingPassword123");
+
+                // Act
+                var exception = Record.Exception(() =>
+                    passwordBox.SetValue(PasswordBoxHelper.BoundPasswordProperty, null));
+
+                // Assert
+                Assert.Null(exception);
+                Assert.Equal(string.Empty, passwordBox.Password);
+            }, createApp: true);
+        }
+
+        /// <summary>
         /// Covers the PasswordBox_PasswordChanged event branch where user input updates the control password,
         /// which correctly syncs the value back up to the attached property.
         /// </summary>
@@ -151,39 +178,25 @@ namespace Servy.UnitTests.Helpers
         }
 
         /// <summary>
-        /// Covers the binding infrastructure branch where an active BindingExpression
-        /// is evaluated and forced to execute an immediate UpdateSource().
+        /// Verifies that a view-model update still reaches the control after a user edit, which is
+        /// what the IsUpdating reset in PasswordBox_PasswordChanged exists for.
         /// </summary>
         [Fact]
-        public void PasswordBox_PasswordChanged_WithActiveBinding_UpdatesSource()
+        public void OnBoundPasswordChanged_AfterAUserEdit_StillUpdatesPasswordBoxPassword()
         {
             Helper.RunOnSTA(() =>
             {
                 // Arrange
                 var passwordBox = new PasswordBox();
-                var dummyViewModel = new FakePasswordViewModel { Password = "Initial" };
-
-                // Set up a standard Two-Way binding to simulate realistic application configuration
-                var binding = new Binding("Password")
-                {
-                    Source = dummyViewModel,
-                    Mode = BindingMode.TwoWay,
-                    UpdateSourceTrigger = UpdateSourceTrigger.Explicit // explicit to test the UpdateSource line directly
-                };
-                BindingOperations.SetBinding(passwordBox, PasswordBoxHelper.BoundPasswordProperty, binding);
+                PasswordBoxHelper.SetBoundPassword(passwordBox, string.Empty); // wires PasswordChanged
+                passwordBox.Password = "UserTypedThisInUI";                    // runs PasswordBox_PasswordChanged
 
                 // Act
-                passwordBox.Password = "ChangedInUI";
+                PasswordBoxHelper.SetBoundPassword(passwordBox, "VmDrivenPassword");
 
                 // Assert
-                // If the explicit trigger updated the source, our viewmodel will receive the string immediately
-                Assert.Equal("ChangedInUI", dummyViewModel.Password);
+                Assert.Equal("VmDrivenPassword", passwordBox.Password);
             }, createApp: true);
-        }
-
-        private class FakePasswordViewModel
-        {
-            public string Password { get; set; } = string.Empty;
         }
     }
 }

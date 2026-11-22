@@ -15,16 +15,24 @@ namespace Servy.Manager.Config
         public bool ForceSoftwareRendering => false;
 
         public int RefreshIntervalInSeconds => Core.Config.AppConfig.DefaultRefreshIntervalInSeconds;
-        public int PerformanceRefreshIntervalInMs => Core.Config.AppConfig.DefaultPerformanceRefreshIntervalInMs;
-        public int ConsoleRefreshIntervalInMs => Core.Config.AppConfig.DefaultConsoleRefreshIntervalInMs;
-        public int DependenciesRefreshIntervalInMs => Core.Config.AppConfig.DefaultDependenciesRefreshIntervalInMs;
+        public int PerformanceRefreshIntervalMs => Core.Config.AppConfig.DefaultMonitoringRefreshIntervalMs;
+        public int ConsoleRefreshIntervalMs => Core.Config.AppConfig.DefaultMonitoringRefreshIntervalMs;
+        public int DependenciesRefreshIntervalMs => Core.Config.AppConfig.DefaultMonitoringRefreshIntervalMs;
 
         public int ConsoleMaxLines => Core.Config.AppConfig.DefaultConsoleMaxLines;
         public int LogsWindowDays => Core.Config.AppConfig.DefaultLogsWindowDays;
         public int SearchDebounceDelayMs => Core.Config.AppConfig.DefaultSearchDebounceDelayMs; // Standard UI responsiveness delay
         public int MaxBulkOperationParallelism => Core.Config.AppConfig.DefaultMaxBulkOperationParallelism;
 
-        string? IAppConfiguration.DesktopAppPublishPath => Core.Config.AppConfig.DefaultDesktopAppPublishPath;
+        public string? DesktopAppPublishPath => Core.Config.AppConfig.DefaultDesktopAppPublishPath;
+
+        public string ServicesHiddenColumns => string.Empty;
+        public string LogsHiddenColumns => string.Empty;
+        public bool IsDisplayNameColumnMigrated => false;
+
+        public string MainWindowPlacement => string.Empty;
+        public string ServicesColumnWidths => string.Empty;
+        public string LogsColumnWidths => string.Empty;
 
         public event PropertyChangedEventHandler? PropertyChanged
         {

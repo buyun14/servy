@@ -6,7 +6,8 @@ namespace Servy.Core.Config
 {
     /// <summary>
     /// Centralizes the initialization and configuration of the Servy logging subsystem
-    /// to prevent configuration drift across the CLI, Restarter, Service, and Manager entry points.
+    /// to prevent configuration drift across the CLI, Restarter, Service, Host, Manager and
+    /// Desktop entry points (the last two via <c>Servy.UI.AppBootstrapper</c>).
     /// </summary>
     public static class LoggerConfigurator
     {
@@ -64,7 +65,7 @@ namespace Servy.Core.Config
             string eventLogStatus = instanceLogger != null ? isEventLogEnabled.ToString() : "n/a (no event-log sink in this process)";
 
             // Centralized debug logging prevents asymmetric log outputs
-            Logger.Debug("Servy Logger Configuration Loaded:" + Environment.NewLine +
+            Logger.Report(LogLevel.Debug, "Servy Logger Configuration Loaded:",
                 $"  LogLevel: {logLevel}" + Environment.NewLine +
                 $"  EnableSizeRotation: {enableSizeRotation}" + Environment.NewLine +
                 $"  LogRotationSizeMB: {logRotationSizeMB}" + Environment.NewLine +

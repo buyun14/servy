@@ -1,11 +1,20 @@
 namespace Servy.Infrastructure.Data
 {
     /// <summary>
-    /// Centralized source of truth for all Service table operations.
-    /// Dynamically builds SQL clauses to prevent column divergence using inline initialization.
+    /// Centralized source of truth for the column SET of the Service table: every SQL clause below
+    /// is built from the one list, so the clauses cannot diverge from each other.
     /// </summary>
+    /// <remarks>
+    /// It owns which columns exist, not what type they get - the column types come from the
+    /// <c>[SqlColumn]</c> attributes on <c>ServiceDto</c>. Adding a name here without the matching
+    /// attribute is caught at the first database open; adding the attribute without a name here has no
+    /// runtime guard, which is why both directions are pinned by <c>SqlColumnContractAntiDriftTests</c>.
+    /// </remarks>
     public static class SqlConstants
     {
+        /// <summary>
+        /// Name of the table every statement in this class targets.
+        /// </summary>
         public const string ServicesTableName = "Services";
 
         // SINGLE SOURCE OF TRUTH: Add standard columns here.
@@ -52,6 +61,7 @@ namespace Servy.Infrastructure.Data
 
             // Advanced Tab
             "EnvironmentVariables",
+            "AllowOverriddenRuntimeVars",
             "ServiceDependencies",
 
             // LogOn Tab
@@ -90,28 +100,29 @@ namespace Servy.Infrastructure.Data
             // System / Active State
             "Pid",
             "ActiveStdoutPath",
-            "ActiveStderrPath"
+            "ActiveStderrPath",
+            "RestartAttempts",
+            "RestartAttemptsUpdatedAtTicks"
         };
 
-        // 1. INSERT COLUMNS
+        /// <summary>
+        /// Column list for an INSERT: Name, every standard column, then PreviousStopTimeout.
+        /// </summary>
         public static readonly string InsertColumns =
             "Name, " + string.Join(", ", StandardColumns) + ", PreviousStopTimeout";
 
-        // 2. INSERT VALUES
+        /// <summary>
+        /// Parameter list matching <see cref="InsertColumns"/>, in the same order.
+        /// </summary>
         public static readonly string InsertValues =
             "@Name, " + string.Join(", ", StandardColumns.Select(c => $"@{c}")) + ", @PreviousStopTimeout";
 
-        // 3. UPDATE SET
-        // Includes 'Name' and specialized COALESCE logic for PreviousStopTimeout
-        public static readonly string UpdateSet =
-            "Name = @Name, " +
-            string.Join(", ", StandardColumns.Select(c => $"{c} = @{c}")) +
-            ", PreviousStopTimeout = COALESCE(@PreviousStopTimeout, PreviousStopTimeout)";
-
-        // 4. UPSERT SET
-        // Excludes 'Name' (as it's the conflict target) and specialized COALESCE logic for PreviousStopTimeout
+        /// <summary>
+        /// SET clause for the ON CONFLICT upsert. Excludes Name (the conflict target), and assigns
+        /// PreviousStopTimeout through COALESCE so a null incoming value preserves the stored one.
+        /// </summary>
         public static readonly string UpsertSet =
             string.Join(", ", StandardColumns.Select(c => $"{c} = excluded.{c}")) +
-            ", PreviousStopTimeout = COALESCE(excluded.PreviousStopTimeout, Services.PreviousStopTimeout)";
+            ", PreviousStopTimeout = COALESCE(excluded.PreviousStopTimeout, " + ServicesTableName + ".PreviousStopTimeout)";
     }
 }

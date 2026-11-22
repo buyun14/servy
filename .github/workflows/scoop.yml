@@ -1,15 +1,17 @@
-# ===========================================
+# ==========================================================================================
 # GitHub Actions Workflow - Scoop
-# -------------------------------------------
-# Automates the update of Servy’s Scoop manifest.
+# ------------------------------------------------------------------------------------------
+# Automates the update of Servy's Scoop manifest.
 # When a new release is published (or triggered
 # manually), this workflow:
-#           • Downloads the latest portable archive
-#           • Computes its SHA256 hash
-#           • Updates the manifest in `aelassas/scoop-bucket`
-#           • Optionally creates a PR to update the manifest
-#             in `ScoopInstaller/Extras`
-# ===========================================
+#    - Downloads the x64 and arm64 portable archives
+#      of the resolved release tag
+#    - Computes their SHA256 hashes
+#    - Updates the manifest in this repository and
+#      in `aelassas/scoop-bucket`
+#    - Optionally creates a PR to update the manifest
+#      in `ScoopInstaller/Extras`
+# ==========================================================================================
 
 name: scoop
 
@@ -48,6 +50,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 #v6.0.3
+        with:
+          ref: main # Force checkout of the main branch, not the release tag
 
       - name: Initialize Git Script Helpers
         uses: ./.github/actions/setup-git-helpers
@@ -55,7 +59,7 @@ jobs:
       - name: Set version vars
         uses: ./.github/actions/resolve-version
         with:
-          manual_tag: ${{ github.event.inputs.tag }}
+          manual_tag: ${{ inputs.tag }}
           release_tag: ${{ github.event.release.tag_name }}
 
       - name: Stage Scoop Download Target
@@ -189,8 +193,7 @@ jobs:
           Write-ScoopManifest -jsonObj $jsonObj -jsonPath (Resolve-Path $manifestPath)
 
           # Commit and push back to aelassas/servy
-          Invoke-Git config user.name "github-actions[bot]"
-          Invoke-Git config user.email "github-actions[bot]@users.noreply.github.com"
+          Set-BotGitIdentity
 
           $hasChanges = (Invoke-Git status --porcelain $manifestPath) -join "`n"
           if (-not [string]::IsNullOrWhiteSpace($hasChanges)) {
@@ -229,8 +232,7 @@ jobs:
 
           Write-ScoopManifest -jsonObj $jsonObj -jsonPath (Join-Path (Get-Location) $manifestPath)
 
-          Invoke-Git config user.name "github-actions[bot]"
-          Invoke-Git config user.email "github-actions[bot]@users.noreply.github.com"
+          Set-BotGitIdentity
 
           $hasChanges = (Invoke-Git status --porcelain $manifestPath) -join "`n"
           if (-not [string]::IsNullOrWhiteSpace($hasChanges)) {
@@ -295,8 +297,7 @@ jobs:
           $extractX64 = "servy-${env:VERSION}-x64-portable"
           $extractArm64 = "servy-${env:VERSION}-arm64-portable"
 
-          Invoke-Git config user.name "github-actions[bot]"
-          Invoke-Git config user.email "github-actions[bot]@users.noreply.github.com"
+          Set-BotGitIdentity
 
           if (-Not (Test-Path $manifestPath)) {
               # Source canonical metadata fields directly from the updated reference file in the workspace
@@ -349,7 +350,6 @@ jobs:
               }
           }
           Invoke-Git push origin $branchName --force-with-lease
-          if ($LASTEXITCODE -ne 0) { throw "git push failed (exit $LASTEXITCODE)" }
 
       - name: Open Pull Request in ScoopInstaller/Extras
         if: env.RUN_EXTRAS_PR == 'true' && env.SKIP_PR_CREATE != 'true'

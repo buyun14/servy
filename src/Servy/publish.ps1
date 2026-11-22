@@ -1,16 +1,19 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
-    Publishes the Servy WPF application as a self-contained executable and signs it.
+    Publishes the Servy WPF application as a self-contained executable and optionally signs it.
 
 .DESCRIPTION
     This script performs the following steps:
-      1. Runs the resource publishing script (publish-res-debug.ps1 or publish-res-release.ps1, selected by -BuildConfiguration).
-      2. Builds and publishes `Servy.csproj` as a self-contained win-x64 executable
-      3. Signs the published executable using SignPath (if enabled)
+      1. Runs the resource publishing script (publish-res-debug.ps1 or publish-res-release.ps1, selected by -BuildConfiguration),
+         which builds Servy.Host.exe, Servy.Service.exe and Servy.Restarter.exe into Resources to be embedded.
+      2. Builds and publishes `Servy.csproj` as a self-contained executable for the specified runtime.
+      3. Signs the published executable with SignPath when -BuildConfiguration is Release
+         and setup/signpath.ps1 is present; otherwise signing is skipped with a warning.
 
 .PARAMETER Tfm
-    Target Framework Moniker (default: "net10.0-windows").
+    Target Framework Moniker. Defaults to the value in build-config.ps1.
 
 .PARAMETER BuildConfiguration
     Build configuration to use (default: "Release").
@@ -21,7 +24,9 @@
 .NOTES
     Requirements:
       - .NET SDK must be installed
-      - The SignPath script (signpath.ps1) must exist in ../../setup/
+    Optional:
+      - setup/signpath.ps1: used to sign the output when -BuildConfiguration is Release;
+        when absent, signing is skipped with a warning.
 
 .EXAMPLE
     ./publish.ps1
@@ -30,13 +35,24 @@
 .EXAMPLE
     ./publish.ps1 -Tfm "net10.0-windows" -BuildConfiguration "Debug" -Runtime "win-x64"
 #>
+[CmdletBinding()]
 param(
-    [string]$Tfm                = "net10.0-windows",
+    [string]$Tfm                = "",
+    [ValidateSet('Debug', 'Release')]
     [string]$BuildConfiguration = "Release",
     [string]$Runtime            = "win-x64"
 )
 
 $P_PublishDir = $PSScriptRoot
+
+# Load central defaults
+$configPath = Join-Path $P_PublishDir "..\..\setup\build-config.ps1"
+if (Test-Path -LiteralPath $configPath) {
+    $buildConfig = & $configPath
+    if (-not $Tfm) { $Tfm = $buildConfig.Tfm }
+} else {
+    throw "Central build configuration not found at $configPath"
+}
 
 . (Join-Path $P_PublishDir "..\..\setup\build-common.ps1")
 

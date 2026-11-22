@@ -1,12 +1,9 @@
-using Servy.Core.Common;
 using Servy.Core.Config;
 using Servy.Core.Data;
 using Servy.Core.DTOs;
 using Servy.Core.Logging;
-using Servy.Core.Resources;
 using Servy.Core.Security;
 using Servy.Core.Services;
-using System.Data;
 
 namespace Servy.Infrastructure.Data
 {
@@ -16,6 +13,10 @@ namespace Servy.Infrastructure.Data
     /// </summary>
     public class ServiceRepository : IServiceRepository
     {
+        private const string CorruptMarkerFormat = DecryptionFailureMarker.CorruptFormat;
+        private const string LegacyBlockedMarker = DecryptionFailureMarker.LegacyBlocked;
+        private const string OriginalDescriptionSeparator = DecryptionFailureMarker.OriginalDescriptionSeparator;
+
         private readonly IDapperExecutor _dapper;
         private readonly ISecureData _secureData;
         private readonly IXmlServiceSerializer _xmlServiceSerializer;
@@ -27,15 +28,16 @@ namespace Servy.Infrastructure.Data
         /// </summary>
         private static readonly (Func<ServiceDto, string?> Get, Action<ServiceDto, string?> Set, string Name)[] SensitiveFields =
         {
-            (d => d.Parameters,                     (d, v) => d.Parameters = v,                     nameof(ServiceDto.Parameters)),
-            (d => d.FailureProgramParameters,      (d, v) => d.FailureProgramParameters = v,      nameof(ServiceDto.FailureProgramParameters)),
-            (d => d.PreLaunchParameters,           (d, v) => d.PreLaunchParameters = v,           nameof(ServiceDto.PreLaunchParameters)),
-            (d => d.PostLaunchParameters,          (d, v) => d.PostLaunchParameters = v,          nameof(ServiceDto.PostLaunchParameters)),
-            (d => d.Password,                      (d, v) => d.Password = v,                      nameof(ServiceDto.Password)),
-            (d => d.EnvironmentVariables,          (d, v) => d.EnvironmentVariables = v,          nameof(ServiceDto.EnvironmentVariables)),
+            (d => d.Parameters,                      (d, v) => d.Parameters = v,                      nameof(ServiceDto.Parameters)),
+            (d => d.FailureProgramParameters,       (d, v) => d.FailureProgramParameters = v,       nameof(ServiceDto.FailureProgramParameters)),
+            (d => d.PreLaunchParameters,            (d, v) => d.PreLaunchParameters = v,            nameof(ServiceDto.PreLaunchParameters)),
+            (d => d.PostLaunchParameters,           (d, v) => d.PostLaunchParameters = v,           nameof(ServiceDto.PostLaunchParameters)),
+            (d => d.Password,                       (d, v) => d.Password = v,                       nameof(ServiceDto.Password)),
+            (d => d.EnvironmentVariables,           (d, v) => d.EnvironmentVariables = v,           nameof(ServiceDto.EnvironmentVariables)),
             (d => d.PreLaunchEnvironmentVariables, (d, v) => d.PreLaunchEnvironmentVariables = v, nameof(ServiceDto.PreLaunchEnvironmentVariables)),
-            (d => d.PreStopParameters,             (d, v) => d.PreStopParameters = v,             nameof(ServiceDto.PreStopParameters)),
-            (d => d.PostStopParameters,            (d, v) => d.PostStopParameters = v,            nameof(ServiceDto.PostStopParameters)),
+            (d => d.PreStopParameters,              (d, v) => d.PreStopParameters = v,              nameof(ServiceDto.PreStopParameters)),
+            (d => d.PostStopParameters,             (d, v) => d.PostStopParameters = v,             nameof(ServiceDto.PostStopParameters)),
+            (d => d.HeartbeatUrl,                   (d, v) => d.HeartbeatUrl = v,                   nameof(ServiceDto.HeartbeatUrl)),
         };
 
         /// <summary>
@@ -62,63 +64,10 @@ namespace Servy.Infrastructure.Data
         #region DTO methods
 
         /// <inheritdoc />
-        public virtual async Task<int> AddAsync(ServiceDto service, CancellationToken cancellationToken = default)
-        {
-            var encryptedService = CreateEncryptedClone(service);
-
-            var sql = $@"
-                INSERT INTO {SqlConstants.ServicesTableName} ({SqlConstants.InsertColumns})
-                VALUES ({SqlConstants.InsertValues});
-                SELECT last_insert_rowid();";
-
-            var id = await _dapper.ExecuteScalarAsync<int>(sql, encryptedService, cancellationToken: cancellationToken);
-            service.Id = id;
-
-            return id;
-        }
-
-        /// <inheritdoc />
-        public virtual async Task<int> UpdateAsync(ServiceDto service, bool preserveExistingRuntimeState, bool preserveExistingCredentials, CancellationToken cancellationToken = default)
-        {
-            var encryptedService = CreateEncryptedClone(service);
-
-            await PatchRuntimeStateAsync(
-                incoming: encryptedService,
-                preserveExistingRuntimeState: preserveExistingRuntimeState,
-                preserveExistingCredentials: preserveExistingCredentials,
-                cancellationToken: cancellationToken);
-
-            var sql = $@"
-                UPDATE {SqlConstants.ServicesTableName} SET
-                {SqlConstants.UpdateSet}
-                WHERE Id = @Id;";
-
-            return await _dapper.ExecuteAsync(sql, encryptedService, cancellationToken: cancellationToken);
-        }
-
-        /// <inheritdoc />
-        public virtual int Update(ServiceDto service, bool preserveExistingRuntimeState, bool preserveExistingCredentials)
-        {
-            var encryptedService = CreateEncryptedClone(service);
-
-            PatchRuntimeState(
-                incoming: encryptedService,
-                preserveExistingRuntimeState: preserveExistingRuntimeState,
-                preserveExistingCredentials: preserveExistingCredentials
-                );
-
-            var sql = $@"
-                UPDATE {SqlConstants.ServicesTableName} SET
-                {SqlConstants.UpdateSet}
-                WHERE Id = @Id;";
-
-            return _dapper.Execute(sql, encryptedService);
-        }
-
-        /// <inheritdoc />
         public virtual async Task<int> UpsertAsync(ServiceDto service, bool preserveExistingRuntimeState, bool preserveExistingCredentials, CancellationToken cancellationToken = default)
         {
-            var encryptedService = CreateEncryptedClone(service);
+            EnsureStoredRowDecryptable(service, await GetByNameAsync(service?.Name, decrypt: false, cancellationToken));
+            var encryptedService = CreateEncryptedClone(service!);
 
             await PatchRuntimeStateAsync(
                 incoming: encryptedService,
@@ -134,119 +83,9 @@ namespace Servy.Infrastructure.Data
                 SELECT id FROM {SqlConstants.ServicesTableName} WHERE Name = @Name COLLATE UNICODE_NOCASE;";
 
             var id = await _dapper.ExecuteScalarAsync<int>(sql, encryptedService, cancellationToken: cancellationToken);
-            service.Id = id;
+            service!.Id = id;
 
             return id;
-        }
-
-        /// <inheritdoc />
-        public virtual async Task<int> UpsertBatchAsync(IEnumerable<ServiceDto> services, CancellationToken cancellationToken = default)
-        {
-            var serviceList = services?.ToList();
-            if (serviceList == null || !serviceList.Any()) return 0;
-
-            // 1. Bulk pre-fetching dictionary optimization to bypass N+1 sequential row reads.
-            var existingMap = new Dictionary<string, ServiceDto>(StringComparer.OrdinalIgnoreCase);
-            for (int i = 0; i < serviceList.Count; i += AppConfig.DbBatchIdSyncChunkSize)
-            {
-                var currentChunk = serviceList.Skip(i).Take(AppConfig.DbBatchIdSyncChunkSize).ToList();
-                var chunkNames = currentChunk.Select(s => s.Name).Where(n => !string.IsNullOrEmpty(n)).ToList();
-
-                if (chunkNames.Any())
-                {
-                    var existingRows = (await _dapper.QueryAsync<ServiceDto>(
-                        $"SELECT * FROM {SqlConstants.ServicesTableName} WHERE Name COLLATE UNICODE_NOCASE IN @chunkNames",
-                        new { chunkNames },
-                        cancellationToken: cancellationToken)).ToList();
-
-                    foreach (var row in existingRows)
-                    {
-                        if (!string.IsNullOrEmpty(row.Name))
-                        {
-                            // CRITICAL: Decrypt the existing DB record back to plain text
-                            // so that ApplyRuntimeState passes clear values to CreateEncryptedClone
-                            SafeDecrypt(row);
-                            existingMap[row.Name] = row;
-                        }
-                    }
-                }
-            }
-
-            // 2. Patch runtime state and credentials on raw plain-text objects,
-            // then create isolated encrypted clones for safe database persistence.
-            var encryptedServices = new List<ServiceDto>();
-            foreach (var rawDto in serviceList)
-            {
-                var localClone = (ServiceDto)rawDto.Clone();
-
-                if (!string.IsNullOrEmpty(localClone.Name) && existingMap.TryGetValue(localClone.Name, out var existing))
-                {
-                    ApplyRuntimeState(
-                        incoming: localClone,
-                        existing: existing,
-                        preserveExistingRuntimeState: true,
-                        preserveExistingCredentials: true);
-                }
-
-                // Encrypt the finalized object properties cleanly right before pushing to disk
-                encryptedServices.Add(CreateEncryptedClone(localClone));
-            }
-
-            var sql = $@"
-                INSERT INTO {SqlConstants.ServicesTableName} ({SqlConstants.InsertColumns})
-                VALUES ({SqlConstants.InsertValues})
-                ON CONFLICT(Name COLLATE UNICODE_NOCASE) DO UPDATE SET
-                {SqlConstants.UpsertSet};";
-
-            // Wrap the entire batch sequence in an explicit transaction to enforce snapshot isolation.
-            using (var tx = await _dapper.BeginTransactionAsync(cancellationToken))
-            {
-                // 3. Execute the batch upsert within the transaction scope
-                var affectedRows = await _dapper.ExecuteAsync(sql, encryptedServices, transaction: tx, cancellationToken: cancellationToken);
-
-                // 4. Sync IDs back to the original DTOs
-                // SQLite has a default limit of 999 parameters. For larger batches,
-                // we process the ID sync in chunks to avoid 'Too many SQL variables' errors.
-                for (int i = 0; i < serviceList.Count; i += AppConfig.DbBatchIdSyncChunkSize)
-                {
-                    var currentChunk = serviceList.Skip(i).Take(AppConfig.DbBatchIdSyncChunkSize).ToList();
-
-                    // Pass original names; let SQLite lower both sides in the SQL itself
-                    var names = currentChunk.Select(s => s.Name).Where(n => !string.IsNullOrEmpty(n)).ToList();
-
-                    var idMap = (await _dapper.QueryAsync<(int Id, string Name)>(
-                        $"SELECT Id, Name FROM {SqlConstants.ServicesTableName} WHERE Name COLLATE UNICODE_NOCASE IN @names",
-                        new { names },
-                        transaction: tx,
-                        cancellationToken: cancellationToken))
-                        .ToDictionary(x => x.Name, x => x.Id, StringComparer.OrdinalIgnoreCase);
-
-                    // Update the original DTO references
-                    foreach (var service in currentChunk)
-                    {
-                        if (string.IsNullOrEmpty(service.Name)) continue;
-
-                        // OrdinalIgnoreCase here handles the mapping between the
-                        // user's input (MyService) and the DB's stored casing (myservice).
-                        if (idMap.TryGetValue(service.Name, out var id))
-                        {
-                            service.Id = id;
-                        }
-                    }
-                }
-
-                // Commit all changes atomically only after the DTO ID fields have been successfully resolved
-                tx.Commit();
-
-                return affectedRows;
-            }
-        }
-
-        /// <inheritdoc />
-        public virtual async Task<int> DeleteAsync(int id, CancellationToken cancellationToken = default)
-        {
-            string sql = $"DELETE FROM {SqlConstants.ServicesTableName} WHERE Id = @Id;";
-            return await _dapper.ExecuteAsync(sql, new { Id = id }, cancellationToken: cancellationToken);
         }
 
         /// <inheritdoc />
@@ -266,39 +105,12 @@ namespace Servy.Infrastructure.Data
         }
 
         /// <inheritdoc />
-        public virtual async Task<ServiceDto?> GetByIdAsync(int id, bool decrypt = true, CancellationToken cancellationToken = default)
-        {
-            string sql = $"SELECT * FROM {SqlConstants.ServicesTableName} WHERE Id = @Id;";
-            var dto = await _dapper.QuerySingleOrDefaultAsync<ServiceDto>(sql, new { Id = id }, cancellationToken: cancellationToken);
-
-            if (decrypt) SafeDecrypt(dto);
-            return dto;
-        }
-
-        /// <inheritdoc />
         public virtual async Task<ServiceDto?> GetByNameAsync(string? name, bool decrypt = true, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(name)) return null;
 
             string sql = $"SELECT * FROM {SqlConstants.ServicesTableName} WHERE Name = @Name COLLATE UNICODE_NOCASE;";
             var dto = await ResolveByNameAsync<ServiceDto?>(sql, name, cancellationToken: cancellationToken);
-
-            if (decrypt) SafeDecrypt(dto);
-            return dto;
-        }
-
-        /// <inheritdoc />
-        public virtual ServiceDto? GetByName(string? name, bool decrypt = true)
-        {
-            if (string.IsNullOrWhiteSpace(name)) return null;
-            string sql = $"SELECT * FROM {SqlConstants.ServicesTableName} WHERE Name = @Name COLLATE UNICODE_NOCASE;";
-
-            var dto = ResolveWithLegacyFallback<ServiceDto?>(
-                sql: sql,
-                queryExecutor: (executedSql, parameters) => _dapper.QuerySingleOrDefault<ServiceDto?>(executedSql, parameters),
-                name: name,
-                fallbackEvaluationPredicate: result => EqualityComparer<ServiceDto?>.Default.Equals(result, default)
-            );
 
             if (decrypt) SafeDecrypt(dto);
             return dto;
@@ -327,6 +139,91 @@ namespace Servy.Infrastructure.Data
         }
 
         /// <inheritdoc />
+        public virtual async Task<int> UpdateRuntimeStateAsync(string? name, ServiceRuntimeStateDto state, CancellationToken cancellationToken = default)
+        {
+            if (state == null) throw new ArgumentNullException(nameof(state));
+            if (string.IsNullOrWhiteSpace(name)) return 0;
+
+            string previousStopTimeout = state.UpdatePreviousStopTimeout ? ", PreviousStopTimeout = @PreviousStopTimeout" : string.Empty;
+            string sql = $@"
+                UPDATE {SqlConstants.ServicesTableName}
+                SET Pid = @Pid, ActiveStdoutPath = @ActiveStdoutPath, ActiveStderrPath = @ActiveStderrPath{previousStopTimeout}
+                WHERE Name = @Name COLLATE UNICODE_NOCASE;";
+
+            return await ExecuteByNameAsync(sql, name!, n => new
+            {
+                Name = n,
+                state.Pid,
+                state.ActiveStdoutPath,
+                state.ActiveStderrPath,
+                state.PreviousStopTimeout,
+            }, cancellationToken);
+        }
+
+        /// <inheritdoc />
+        public virtual async Task<int> UpdateDescriptionAndStartupTypeAsync(string? name, string? description, int? startupType, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return 0;
+
+            string startupTypeAssignment = startupType.HasValue ? ", StartupType = @StartupType" : string.Empty;
+            string sql = $@"
+                UPDATE {SqlConstants.ServicesTableName}
+                SET Description = @Description{startupTypeAssignment}
+                WHERE Name = @Name COLLATE UNICODE_NOCASE;";
+
+            return await ExecuteByNameAsync(sql, name!, n => new
+            {
+                Name = n,
+                Description = description,
+                StartupType = startupType,
+            }, cancellationToken);
+        }
+
+        /// <inheritdoc />
+        public virtual async Task<RestartAttemptsDto?> GetRestartAttemptsAsync(string? name, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            string sql = $@"
+                SELECT Name, RestartAttempts, RestartAttemptsUpdatedAtTicks
+                FROM {SqlConstants.ServicesTableName}
+                WHERE Name = @Name COLLATE UNICODE_NOCASE
+                LIMIT 1;";
+
+            var row = await ResolveByNameAsync<ServiceDto?>(sql, name!, cancellationToken);
+            if (row == null) return null;
+
+            return new RestartAttemptsDto
+            {
+                Attempts = row.RestartAttempts.GetValueOrDefault() < 0 ? 0 : row.RestartAttempts.GetValueOrDefault(),
+                UpdatedAtUtc = row.RestartAttemptsUpdatedAtTicks.HasValue
+                    && row.RestartAttemptsUpdatedAtTicks.Value >= DateTime.MinValue.Ticks
+                    && row.RestartAttemptsUpdatedAtTicks.Value <= DateTime.MaxValue.Ticks
+                    ? new DateTime(row.RestartAttemptsUpdatedAtTicks.Value, DateTimeKind.Utc)
+                    : (DateTime?)null,
+            };
+        }
+
+        /// <inheritdoc />
+        public virtual async Task<int> UpdateRestartAttemptsAsync(string? name, int attempts, DateTime updatedAtUtc, CancellationToken cancellationToken = default)
+        {
+            if (attempts < 0) throw new ArgumentOutOfRangeException(nameof(attempts), "The restart attempts counter cannot be negative.");
+            if (string.IsNullOrWhiteSpace(name)) return 0;
+
+            string sql = $@"
+                UPDATE {SqlConstants.ServicesTableName}
+                SET RestartAttempts = @RestartAttempts, RestartAttemptsUpdatedAtTicks = @RestartAttemptsUpdatedAtTicks
+                WHERE Name = @Name COLLATE UNICODE_NOCASE;";
+
+            long ticks = updatedAtUtc.Kind == DateTimeKind.Local ? updatedAtUtc.ToUniversalTime().Ticks : updatedAtUtc.Ticks;
+            return await ExecuteByNameAsync(sql, name!, n => new
+            {
+                Name = n,
+                RestartAttempts = attempts,
+                RestartAttemptsUpdatedAtTicks = ticks,
+            }, cancellationToken);
+        }
+
+        /// <inheritdoc />
         public virtual async Task<IEnumerable<ServiceDto>> GetAllAsync(bool decrypt = true, CancellationToken cancellationToken = default)
         {
             string sql = $"SELECT * FROM {SqlConstants.ServicesTableName} ORDER BY Name COLLATE UNICODE_NOCASE ASC;";
@@ -345,26 +242,13 @@ namespace Servy.Infrastructure.Data
                 return await GetAllAsync(decrypt, cancellationToken: cancellationToken);
             }
 
-            // Optimized query layout configuration. SQLite executes 'LIKE' operations case-insensitively for standard ASCII
-            // elements inherently by default configuration, but leveraging explicit ESCAPE patterns protects complex paths.
-            var sql = $@"
-                SELECT * FROM {SqlConstants.ServicesTableName}
-                WHERE Name       LIKE @Pattern ESCAPE '\'
-                   OR Description LIKE @Pattern ESCAPE '\'
-                ORDER BY Name COLLATE UNICODE_NOCASE ASC;";
+            var all = await GetAllAsync(decrypt, cancellationToken: cancellationToken);
+            var needle = keyword.Trim();
 
-            var escapedKeyword = keyword.Trim()
-                .Replace(@"\", @"\\")
-                .Replace("%", @"\%")
-                .Replace("_", @"\_");
-
-            var pattern = $"%{escapedKeyword}%";
-
-            var list = (await _dapper.QueryAsync<ServiceDto>(sql, new { Pattern = pattern }, cancellationToken: cancellationToken)).ToList();
-
-            if (decrypt) SafeDecryptAll(list, cancellationToken);
-
-            return list;
+            return all.Where(s =>
+                (s.Name?.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                (s.Description?.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0))
+                .ToList();
         }
 
         /// <inheritdoc />
@@ -375,39 +259,15 @@ namespace Servy.Infrastructure.Data
             var service = await GetByNameAsync(name, decrypt: true, cancellationToken: cancellationToken);
             if (service == null) return string.Empty;
 
+            // A row read with a field that does not decrypt comes back with every sensitive field cleared, and one refused
+            // for its pre-v2 encryption with ciphertext still in the fields that were not decrypted. Written to a file
+            // either would look complete, and an import would store it over the real values.
+            if (DecryptionFailureMarker.HasDecryptionFailure(service))
+                throw service.LegacyEncryptionBlocked
+                    ? ServiceDecryptionFailedException.ForLegacyEncryption(service.Name, null, null)
+                    : new ServiceDecryptionFailedException(service.Name, null);
+
             return _xmlServiceSerializer.Serialize(service) ?? string.Empty;
-        }
-
-        /// <inheritdoc />
-        public virtual async Task<OperationResult> ImportXmlAsync(string xml, CancellationToken cancellationToken = default)
-        {
-            if (string.IsNullOrWhiteSpace(xml))
-                return OperationResult.Failure(Strings.Msg_ImportXmlNullOrEmpty);
-
-            try
-            {
-                var service = _xmlServiceSerializer.Deserialize(xml);
-                if (service == null)
-                    return OperationResult.Failure(Strings.Msg_ImportXmlDeserializationFailed);
-
-                // Preserve runtime state (PID, ActiveStdoutPath/ActiveStderrPath paths) if the service exists and is running.
-                await UpsertAsync(
-                    service,
-                    preserveExistingRuntimeState: true,
-                    preserveExistingCredentials: true,
-                    cancellationToken: cancellationToken
-                    );
-                return OperationResult.Success();
-            }
-            catch (OperationCanceledException)
-            {
-                throw;   // let the caller observe cancellation
-            }
-            catch (Exception ex)
-            {
-                Logger.Error("Failed to import service from XML.", ex);
-                return OperationResult.Failure(string.Format(Strings.Msg_ImportXmlFailed, ex.Message));
-            }
         }
 
         /// <inheritdoc />
@@ -417,38 +277,15 @@ namespace Servy.Infrastructure.Data
             var service = await GetByNameAsync(name, decrypt: true, cancellationToken: cancellationToken);
             if (service == null) return string.Empty;
 
+            // A row read with a field that does not decrypt comes back with every sensitive field cleared, and one refused
+            // for its pre-v2 encryption with ciphertext still in the fields that were not decrypted. Written to a file
+            // either would look complete, and an import would store it over the real values.
+            if (DecryptionFailureMarker.HasDecryptionFailure(service))
+                throw service.LegacyEncryptionBlocked
+                    ? ServiceDecryptionFailedException.ForLegacyEncryption(service.Name, null, null)
+                    : new ServiceDecryptionFailedException(service.Name, null);
+
             return _jsonServiceSerializer.Serialize(service) ?? string.Empty;
-        }
-
-        /// <inheritdoc />
-        public virtual async Task<OperationResult> ImportJsonAsync(string json, CancellationToken cancellationToken = default)
-        {
-            if (string.IsNullOrWhiteSpace(json))
-                return OperationResult.Failure(Strings.Msg_ImportJsonNullOrEmpty);
-
-            try
-            {
-                var service = _jsonServiceSerializer.Deserialize(json);
-                if (service == null)
-                    return OperationResult.Failure(Strings.Msg_ImportJsonDeserializationFailed);
-
-                await UpsertAsync(
-                    service,
-                    preserveExistingRuntimeState: true,
-                    preserveExistingCredentials: true,
-                    cancellationToken: cancellationToken
-                    );
-                return OperationResult.Success();
-            }
-            catch (OperationCanceledException)
-            {
-                throw;   // let the caller observe cancellation
-            }
-            catch (Exception ex)
-            {
-                Logger.Error("Failed to import service from JSON.", ex);
-                return OperationResult.Failure(string.Format(Strings.Msg_ImportJsonFailed, ex.Message));
-            }
         }
 
         #endregion
@@ -456,8 +293,8 @@ namespace Servy.Infrastructure.Data
         #region Private Helpers
 
         /// <summary>
-        /// Executes an asynchronous single-row retrieval query by a service name parameter,
-        /// funneling execution through the centralized legacy tracking fallback pipeline.
+        /// Runs an asynchronous single-row lookup by service name, through the legacy
+        /// whitespace fallback helper.
         /// </summary>
         /// <typeparam name="T">The expected return type of the database record or primitive scalar value.</typeparam>
         /// <param name="sql">The target parameterized SQL statement to execute.</param>
@@ -479,6 +316,31 @@ namespace Servy.Infrastructure.Data
         }
 
         /// <summary>
+        /// Executes a write keyed by service name with the same legacy whitespace fallback as the reads: the trimmed name
+        /// first, then the verbatim name when nothing was written and the two differ (Servy &lt;= 8.3 rows).
+        /// </summary>
+        /// <param name="sql">The parameterized SQL statement to execute (must use a @Name parameter).</param>
+        /// <param name="name">The service name as given.</param>
+        /// <param name="parametersFor">Builds the statement's parameters for one variant of the name.</param>
+        /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
+        /// <returns>The number of rows written.</returns>
+        private async Task<int> ExecuteByNameAsync(string sql, string name, Func<string, object> parametersFor, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var trimmed = name.Trim();
+            var rows = await _dapper.ExecuteAsync(sql, parametersFor(trimmed), cancellationToken: cancellationToken);
+
+            if (rows == 0 && name != trimmed)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                rows = await _dapper.ExecuteAsync(sql, parametersFor(name), cancellationToken: cancellationToken);
+            }
+
+            return rows;
+        }
+
+        /// <summary>
         /// Orchestrates an asynchronous data store command using a unified legacy whitespace fallback execution pattern.
         /// Evaluates the primary trimmed criteria, conditionally routing to verbatim untrimmed parameters if a historical
         /// record configuration (Servy &lt;= 8.3 zombie rows) matches the evaluation predicate.
@@ -486,7 +348,9 @@ namespace Servy.Infrastructure.Data
         /// <typeparam name="T">The type of the expected query return payload or operational status identifier.</typeparam>
         /// <param name="sql">The parameterized SQL statement to execute (must use a @Name parameter).</param>
         /// <param name="queryExecutor">Delegate that runs <paramref name="sql"/> with the supplied parameters.</param>
+        /// <param name="name">The service name as given; queried trimmed first, then verbatim.</param>
         /// <param name="fallbackEvaluationPredicate">Returns true when the trimmed-name result is "empty" and the verbatim-name fallback should be attempted.</param>
+        /// <param name="cancellationToken">A token to monitor for cancellation requests; checked before each query.</param>
         /// <returns>A task representing the asynchronous orchestration. The task result contains the trimmed-name query, or the verbatim-name fallback result for legacy whitespace rows.</returns>
         private static async Task<T?> ResolveWithLegacyFallbackAsync<T>(
             string sql,
@@ -510,33 +374,6 @@ namespace Servy.Infrastructure.Data
         }
 
         /// <summary>
-        /// Orchestrates a synchronous data store command using a unified legacy whitespace fallback execution pattern.
-        /// Evaluates the primary trimmed criteria, conditionally routing to verbatim untrimmed parameters if a historical
-        /// record configuration (Servy &lt;= 8.3 zombie rows) matches the evaluation predicate.
-        /// </summary>
-        /// <typeparam name="T">The type of the expected query return payload or operational status identifier.</typeparam>
-        /// <param name="sql">The parameterized SQL statement to execute (must use a @Name parameter).</param>
-        /// <param name="queryExecutor">Delegate that runs <paramref name="sql"/> with the supplied parameters.</param>
-        /// <param name="fallbackEvaluationPredicate">Returns true when the trimmed-name result is "empty" and the verbatim-name fallback should be attempted.</param>
-        /// <returns>The result of the trimmed-name query, or the verbatim-name fallback result for legacy whitespace rows.</returns>
-        private static T? ResolveWithLegacyFallback<T>(
-            string sql,
-            Func<string, object, T?> queryExecutor,
-            string name,
-            Func<T?, bool> fallbackEvaluationPredicate)
-        {
-            var result = queryExecutor(sql, new { Name = name.Trim() });
-
-            // Legacy rows (Servy <= 8.3) stored Name with whitespace verbatim.
-            if (fallbackEvaluationPredicate(result) && name != name.Trim())
-            {
-                result = queryExecutor(sql, new { Name = name });
-            }
-
-            return result;
-        }
-
-        /// <summary>
         /// Safely attempts decryption on a single DTO, channeling errors to isolation logic.
         /// </summary>
         private void SafeDecrypt(ServiceDto? dto)
@@ -547,10 +384,33 @@ namespace Servy.Infrastructure.Data
             {
                 DecryptDto(dto);
             }
+            catch (SecureDataLegacyBlockedException ex)
+            {
+                HandleLegacyBlockedDecryption(dto, ex);
+            }
             catch (InvalidOperationException ex)
             {
                 HandleCorruptServiceDecryption(dto, ex);
             }
+        }
+
+        /// <summary>
+        /// Flags a record whose ciphertext was refused by legacy policy. The payload was never examined,
+        /// so the record is intact; the field that was refused and the ones after it are left as stored ciphertext,
+        /// while the ones <see cref="DecryptDto"/> had already decrypted stay in clear text.
+        /// </summary>
+        private void HandleLegacyBlockedDecryption(ServiceDto? dto, SecureDataLegacyBlockedException ex)
+        {
+            if (dto == null) return;
+
+            Logger.Warn($"Legacy ciphertext refused by policy for service '{dto.Name}'. {ex.Message}");
+
+            // The marker is display text; this flag is what every save-side refusal reads, so a stored
+            // marker left behind by a v9.5 save (#5186) cannot refuse a row whose secrets do decrypt.
+            dto.DecryptionFailed = true;
+            dto.LegacyEncryptionBlocked = true;
+
+            dto.Description = $"{LegacyBlockedMarker}{OriginalDescriptionSeparator}{dto.Description}";
         }
 
         /// <summary>
@@ -571,7 +431,7 @@ namespace Servy.Infrastructure.Data
         /// its PID or active log paths, which would break Manager tracking.
         /// </summary>
         /// <param name="incoming">The DTO deserialized from an import file.</param>
-        /// <param name="preserveExistingRuntimeState">Required flag to preserve runtime state (PID, ActiveStdoutPath, ActiveStderrPath, PreviousStopTimeout).</param>
+        /// <param name="preserveExistingRuntimeState">Required flag to preserve runtime state (PID, ActiveStdoutPath, ActiveStderrPath, PreviousStopTimeout, RestartAttempts and its timestamp).</param>
         /// <param name="preserveExistingCredentials">Required flag to preserve existing credentials (RunAsLocalSystem, UserAccount, Password).</param>
         /// <param name="cancellationToken">A token to cancel the asynchronous operation.</param>
         private async Task PatchRuntimeStateAsync(ServiceDto incoming, bool preserveExistingRuntimeState, bool preserveExistingCredentials, CancellationToken cancellationToken)
@@ -593,34 +453,8 @@ namespace Servy.Infrastructure.Data
         }
 
         /// <summary>
-        /// Retrieves the existing runtime state from the database and applies it to the incoming DTO.
-        /// This ensures that importing a configuration over a running service does not clobber
-        /// its PID or active log paths, which would break Manager tracking.
-        /// </summary>
-        /// <param name="incoming">The DTO deserialized from an import file.</param>
-        /// <param name="preserveExistingRuntimeState">Required flag to preserve runtime state (PID, ActiveStdoutPath, ActiveStderrPath, PreviousStopTimeout).</param>
-        /// <param name="preserveExistingCredentials">Required flag to preserve existing credentials (RunAsLocalSystem, UserAccount, Password).</param>
-        private void PatchRuntimeState(ServiceDto incoming, bool preserveExistingRuntimeState, bool preserveExistingCredentials)
-        {
-            if (!preserveExistingRuntimeState && !preserveExistingCredentials) return;
-
-            if (string.IsNullOrWhiteSpace(incoming.Name)) return;
-
-            // Fetch current state without decryption (performance optimization)
-            var existing = GetByName(incoming.Name, decrypt: false);
-
-            if (existing != null)
-                ApplyRuntimeState(
-                    incoming: incoming,
-                    existing: existing,
-                    preserveExistingRuntimeState: preserveExistingRuntimeState,
-                    preserveExistingCredentials: preserveExistingCredentials
-                    );
-        }
-
-        /// <summary>
-        /// Synchronizes transient, runtime-only operational fields from a verified database record
-        /// into an incoming configuration instance before execution mutations.
+        /// Copies the stored row's runtime state and, when asked, its credentials into an incoming configuration
+        /// before it is written, so a write that does not carry them does not erase them.
         /// </summary>
         /// <remarks>
         /// <para>
@@ -628,15 +462,16 @@ namespace Servy.Infrastructure.Data
         /// that are excluded from external export files (where <c>ShouldSerialize*() => false</c>).
         /// </para>
         /// <para>
-        /// If these fields are omitted or unmapped during an entry import lifecycle, the persistence engine
-        /// would inadvertently overwrite critical operational telemetry columns with <c>NULL</c> values,
-        /// decoupling the active running background processes from system instrumentation tracking hooks.
+        /// If these fields are omitted on import, the update would overwrite <c>Pid</c> and the active
+        /// log paths with <c>NULL</c>, and the Manager would lose track of the running process.
         /// </para>
         /// </remarks>
         /// <param name="incoming">The fresh configuration DTO targeted for database persistence.</param>
         /// <param name="existing">The row currently stored in the database for the same service name.</param>
-        /// <param name="preserveExistingRuntimeState">Required flag to preserve runtime state (PID, ActiveStdoutPath, ActiveStderrPath, PreviousStopTimeout).</param>
-        /// <param name="preserveExistingCredentials">Required flag to preserve existing credentials (RunAsLocalSystem, UserAccount, Password).</param>
+        /// <param name="preserveExistingRuntimeState">Required flag to preserve runtime state (PID, ActiveStdoutPath, ActiveStderrPath, PreviousStopTimeout, RestartAttempts and its timestamp).</param>
+        /// <param name="preserveExistingCredentials">Required flag to preserve existing credentials (RunAsLocalSystem, UserAccount, Password),
+        /// unless <paramref name="incoming"/> names a passwordless account (a local one with no password included), which is then kept,
+        /// or the stored account is itself passwordless (one an export writes), which is then reset to the LocalSystem baseline.</param>
         private static void ApplyRuntimeState(ServiceDto incoming, ServiceDto existing, bool preserveExistingRuntimeState, bool preserveExistingCredentials)
         {
             if (preserveExistingRuntimeState)
@@ -646,15 +481,89 @@ namespace Servy.Infrastructure.Data
                 incoming.ActiveStdoutPath = existing.ActiveStdoutPath;
                 incoming.ActiveStderrPath = existing.ActiveStderrPath;
                 incoming.PreviousStopTimeout = existing.PreviousStopTimeout;
+                incoming.RestartAttempts = existing.RestartAttempts;
+                incoming.RestartAttemptsUpdatedAtTicks = existing.RestartAttemptsUpdatedAtTicks;
             }
 
-            if (preserveExistingCredentials)
+            // A passwordless account named by the import file is applied as it stands: it carries no secret, so
+            // the file holds the whole identity and keeping the stored one would silently discard it. The import
+            // keeps a local account only after a blank-password logon for it succeeded, so one that reaches this
+            // point with no password is passwordless too, and no second logon is attempted here.
+            var incomingIsPasswordless = incoming.RunAsLocalSystem == false
+                && string.IsNullOrEmpty(incoming.Password)
+                && ServiceAccounts.CanBePasswordless(incoming.UserAccount);
+            if (preserveExistingCredentials && !incomingIsPasswordless)
             {
-                // Credentials & account - intentionally excluded from export for security,
-                // but must be preserved on import so updates do not wipe them.
+                // A stored passwordless account is written to every export, so a file that does not name it had
+                // it removed: the service goes back to the password-less LocalSystem baseline instead.
+                if (existing.ShouldSerializeUserAccount())
+                {
+                    incoming.RunAsLocalSystem = AppConfig.DefaultRunAsLocalSystem;
+                    incoming.UserAccount = null;
+                    incoming.Password = null;
+                    return;
+                }
+
+                // Credentials & account - an account that needs a password is excluded from export for
+                // security, so it must be preserved on import so updates do not wipe it.
                 incoming.RunAsLocalSystem = existing.RunAsLocalSystem;
                 incoming.UserAccount = existing.UserAccount;
                 incoming.Password = existing.Password;
+
+                // Say so here, where it is decided: the import notice only describes the file, which never
+                // carries a password, so it cannot tell the operator that this account was kept.
+                if (existing.RunAsLocalSystem == false
+                    && !string.IsNullOrEmpty(existing.UserAccount)
+                    && !string.IsNullOrEmpty(existing.Password))
+                {
+                    Logger.Info($"Import: Service '{incoming.Name}' already exists with the logon account '{existing.UserAccount}', which has a stored password. " +
+                                "An import file never carries a password, so the stored account and its password are kept.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Refuses to write a service whose stored row has a sensitive field that no longer decrypts with the current key,
+        /// or that was itself read from such a row, so the stored ciphertext is never replaced with blanks. A stored field
+        /// that uses the disabled pre-v2 encryption is refused with a message of its own, because the key is not involved.
+        /// </summary>
+        /// <param name="incoming">The service about to be written.</param>
+        /// <param name="stored">The service's row as stored, not decrypted, or <see langword="null"/> when it has none.</param>
+        /// <exception cref="ServiceDecryptionFailedException">Thrown when the row cannot be decrypted; nothing is written.</exception>
+        private void EnsureStoredRowDecryptable(ServiceDto? incoming, ServiceDto? stored)
+        {
+            if (incoming == null) return;
+
+            if (DecryptionFailureMarker.HasDecryptionFailure(incoming) && stored != null)
+            {
+                var refused = incoming.LegacyEncryptionBlocked
+                    ? ServiceDecryptionFailedException.ForLegacyEncryption(incoming.Name, null, null)
+                    : new ServiceDecryptionFailedException(incoming.Name, null);
+                Logger.Error(refused.Message);
+                throw refused;
+            }
+
+            if (stored == null) return;
+
+            foreach (var (get, _, name) in SensitiveFields)
+            {
+                try
+                {
+                    DecryptIfPresent(get(stored));
+                }
+                catch (SecureDataLegacyBlockedException ex)
+                {
+                    // Policy refusal of pre-v2 ciphertext: the key is not involved, so say so and name the route that works.
+                    var refused = ServiceDecryptionFailedException.ForLegacyEncryption(stored.Name ?? incoming.Name, name, ex);
+                    Logger.Error(refused.Message, ex);
+                    throw refused;
+                }
+                catch (Exception ex)
+                {
+                    var refused = new ServiceDecryptionFailedException(stored.Name ?? incoming.Name, name, ex);
+                    Logger.Error(refused.Message, ex);
+                    throw refused;
+                }
             }
         }
 
@@ -668,8 +577,6 @@ namespace Servy.Infrastructure.Data
         /// <exception cref="InvalidOperationException">Thrown when a specific field fails to encrypt.</exception>
         private ServiceDto CreateEncryptedClone(ServiceDto source)
         {
-            // Implemented explicit entrance argument null verification pattern matching code conventions
-            // to stop propagation bugs before causing deeply nested NullReferenceExceptions.
             if (source == null)
             {
                 throw new ArgumentNullException(nameof(source));
@@ -677,6 +584,12 @@ namespace Servy.Infrastructure.Data
 
             // 1. Perform the shallow clone to isolate mutations from the original DTO
             var clone = (ServiceDto)source.Clone();
+
+            // Strip any temporary UI decryption error markers from the description before persisting
+            if (!string.IsNullOrEmpty(clone.Description))
+            {
+                clone.Description = DecryptionFailureMarker.Strip(clone.Description);
+            }
 
             // 2. Iterate the SensitiveFields triplets to maintain parity with the decryption path
             foreach (var (get, set, name) in SensitiveFields)
@@ -716,6 +629,11 @@ namespace Servy.Infrastructure.Data
                     // DecryptIfPresent handles the null/whitespace check internally
                     set(dto, DecryptIfPresent(get(dto)));
                 }
+                catch (SecureDataLegacyBlockedException)
+                {
+                    // Policy refusal, not a decryption failure - propagate the classification intact.
+                    throw;
+                }
                 catch (Exception ex)
                 {
                     // Log with specific field and service context for faster triage
@@ -750,21 +668,17 @@ namespace Servy.Infrastructure.Data
             // Capture the original root cause name if available for actionable diagnostic feedback
             string rootCauseName = ex.InnerException?.GetType().Name ?? ex.GetType().Name;
 
+            // The marker is display text; this flag is what every save-side refusal reads, so a stored
+            // marker left behind by a v9.5 save (#5186) cannot refuse a row whose secrets do decrypt.
+            dto.DecryptionFailed = true;
+
             // Explicitly update descriptions to flag the target record in the UI
-            dto.Description = $"[DECRYPTION FAILED: {rootCauseName}] The record's key or payload is corrupt. " +
-                              $"Original Description: {dto.Description}";
+            dto.Description = $"{string.Format(CorruptMarkerFormat, rootCauseName)}{OriginalDescriptionSeparator}{dto.Description}";
 
             // Scrub every sensitive field via the SensitiveFields delegate table
             foreach (var field in SensitiveFields)
             {
-                try
-                {
-                    field.Set(dto, null);
-                }
-                catch (Exception internalEx)
-                {
-                    Logger.Warn($"Could not safely sanitize corrupted field '{field.Name}' for service '{dto.Name}': {internalEx.Message}");
-                }
+                field.Set(dto, null);
             }
         }
 

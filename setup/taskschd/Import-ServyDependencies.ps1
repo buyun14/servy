@@ -1,4 +1,5 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Centralized macro runner to validate and import script dependencies into the caller's active scope.
@@ -10,7 +11,7 @@
 .NOTES
     Required Caller-Scope Variables:
     - $RequiredDependencies : String array of dependency filenames to import (e.g. @('Servy-Watermark.psm1')).
-    - $scriptDir           : Resolved absolute path to the directory containing script dependencies.
+    - $scriptDir            : Resolved absolute path to the directory containing script dependencies.
     - $EVENT_ID_DEPENDENCY_ERROR : Integer event ID for logging missing dependency warnings to Windows Application Event Log.
 #>
 
@@ -28,12 +29,15 @@ if (-not $EVENT_ID_DEPENDENCY_ERROR) {
 foreach ($dep in $RequiredDependencies) {
     $depPath = Join-Path $scriptDir $dep
 
-    if (-not (Test-Path $depPath)) {
+    if (-not (Test-Path -LiteralPath $depPath)) {
         $errorMsg = "Servy Notification Error: Required dependency not found at '$depPath'. Please ensure the file exists in the script directory."
 
         # 1. Attempt to log to Event Log for administrator visibility
         try {
             # Best-effort: the 'Servy' event source may not be registered, so guard with try/catch.
+            # NOTE (-EntryType Warning): Written at Warning (Level 3) rather than Error (Level 2) on purpose.
+            # The Task Scheduler notification trigger strictly filters for Level = 2 (Error). Logging a missing
+            # script dependency at Warning prevents the EventTrigger from firing recursively on missing files (see #3160 / #4038).
             Write-EventLog -LogName Application -Source "Servy" -EventId $EVENT_ID_DEPENDENCY_ERROR `
                 -EntryType Warning -Message $errorMsg -ErrorAction Stop
         } catch {

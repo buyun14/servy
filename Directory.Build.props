@@ -1,10 +1,26 @@
 <Project>
   <PropertyGroup>
     <Company>Akram El Assas</Company>
-    <Version>9.5.0</Version>
-    <FileVersion>9.5.0.0</FileVersion>
-    <AssemblyVersion>9.5.0.0</AssemblyVersion>
+    <Version>11.0.0</Version>
+    <FileVersion>11.0.0.0</FileVersion>
+    <AssemblyVersion>11.0.0.0</AssemblyVersion>
     <Copyright>Copyright © 2026 Akram El Assas. All rights reserved.</Copyright>
+
+    <!-- Shared SDK settings: one value, every project, no exceptions -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Every shipped executable is published self-contained: the dotnet publish command
+         line in setup/build-common.ps1 (Invoke-StandardPublish, which the six
+         src/*/publish.ps1 scripts call, and setup/publish-sc.ps1 reaches through them)
+         and the ones in .github/workflows/publish.yml all pass self-contained true. The
+         condition keeps this property out of the RID-less projects
+         (the libraries and the test projects), because MSBuild fails with NETSDK1191,
+         "a runtime identifier for the property 'SelfContained' couldn't be inferred",
+         when SelfContained is set without a RuntimeIdentifier. A publish supplies one
+         with -r, so the property applies exactly where it is meaningful. -->
+    <SelfContained Condition="'$(RuntimeIdentifier)' != ''">true</SelfContained>
 
     <!-- Globalization & Localization Optimizations -->
     <NeutralResourcesLanguage>en</NeutralResourcesLanguage>

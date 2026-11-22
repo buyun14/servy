@@ -1,7 +1,6 @@
 using Moq;
 using Servy.Core.Data;
 using Servy.Core.DTOs;
-using Servy.Core.Resources;
 using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Infrastructure.Data;
@@ -29,7 +28,8 @@ namespace Servy.Infrastructure.UnitTests.Data
             { nameof(ServiceDto.PreLaunchEnvironmentVariables), "pre_env" },
             { nameof(ServiceDto.PostLaunchParameters), "post_args" },
             { nameof(ServiceDto.PreStopParameters), "pre_stop" },
-            { nameof(ServiceDto.PostStopParameters), "post_stop" }
+            { nameof(ServiceDto.PostStopParameters), "post_stop" },
+            { nameof(ServiceDto.HeartbeatUrl), "https://hc-ping.com/token" }
         };
 
         public ServiceRepositoryTests()
@@ -63,28 +63,32 @@ namespace Servy.Infrastructure.UnitTests.Data
         public void Constructor_NullDapper_Throws()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ServiceRepository(null!, _mockSecureData.Object, _mockXmlServiceSerializer.Object, _mockJsonServiceSerializer.Object));
+            var ex = Assert.Throws<ArgumentNullException>(() => new ServiceRepository(null!, _mockSecureData.Object, _mockXmlServiceSerializer.Object, _mockJsonServiceSerializer.Object));
+            Assert.Equal("dapper", ex.ParamName);
         }
 
         [Fact]
         public void Constructor_NullSecureData_Throws()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ServiceRepository(_mockDapper.Object, null!, _mockXmlServiceSerializer.Object, _mockJsonServiceSerializer.Object));
+            var ex = Assert.Throws<ArgumentNullException>(() => new ServiceRepository(_mockDapper.Object, null!, _mockXmlServiceSerializer.Object, _mockJsonServiceSerializer.Object));
+            Assert.Equal("secureData", ex.ParamName);
         }
 
         [Fact]
         public void Constructor_NullXmlServiceSerializer_Throws()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ServiceRepository(_mockDapper.Object, _mockSecureData.Object, null!, _mockJsonServiceSerializer.Object));
+            var ex = Assert.Throws<ArgumentNullException>(() => new ServiceRepository(_mockDapper.Object, _mockSecureData.Object, null!, _mockJsonServiceSerializer.Object));
+            Assert.Equal("xmlServiceSerializer", ex.ParamName);
         }
 
         [Fact]
         public void Constructor_NullJsonServiceSerializer_Throws()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new ServiceRepository(_mockDapper.Object, _mockSecureData.Object, _mockXmlServiceSerializer.Object, null!));
+            var ex = Assert.Throws<ArgumentNullException>(() => new ServiceRepository(_mockDapper.Object, _mockSecureData.Object, _mockXmlServiceSerializer.Object, null!));
+            Assert.Equal("jsonServiceSerializer", ex.ParamName);
         }
 
         #endregion
@@ -133,13 +137,13 @@ namespace Servy.Infrastructure.UnitTests.Data
         #region Mutator Operations & Auditing
 
         [Fact]
-        public async Task AddAsync_FullSecurityAudit_EncryptsAllNineSensitiveFields()
+        public async Task UpsertAsync_FullSecurityAudit_EncryptsAllTenSensitiveFields()
         {
             // Arrange & Act & Assert
             await ExecuteFullSecurityAuditTestAsync(
                 async (repo, dto) =>
                 {
-                    var id = await repo.AddAsync(dto, TestContext.Current.CancellationToken);
+                    var id = await repo.UpsertAsync(dto, preserveExistingRuntimeState: false, preserveExistingCredentials: false, TestContext.Current.CancellationToken);
                     Assert.Equal(99, id);
                     Assert.Equal(99, dto.Id);
                     return id;
@@ -152,29 +156,56 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task UpdateAsync_FullSecurityAudit_EncryptsAllNineSensitiveFields()
+        public async Task UpsertAsync_WithPreserveExistingCredentialsTrue_FetchesExistingAndPreservesCredentialsOnConflict()
         {
-            // Arrange & Act & Assert
-            await ExecuteFullSecurityAuditTestAsync(
-                async (repo, dto) => await repo.UpdateAsync(dto, false, false, TestContext.Current.CancellationToken),
-                captureAction => _mockDapper
-                    .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
-                    .Callback<string, object, IDbTransaction, CancellationToken>((sql, param, _, token) => captureAction(param))
-                    .ReturnsAsync(1)
-            );
-        }
+            // Arrange
+            var repo = CreateRepository();
+            var incoming = new ServiceDto
+            {
+                Name = "UpsertTargetService",
+                ExecutablePath = "C:\\upsert_updated.exe",
+                RunAsLocalSystem = true,
+                UserAccount = "UpsertNewUser",
+                Password = "UpsertNewPassword"
+            };
 
-        [Fact]
-        public async Task Update_FullSecurityAudit_EncryptsAllNineSensitiveFields()
-        {
-            // Arrange & Act & Assert
-            await ExecuteFullSecurityAuditTestAsync(
-                (repo, dto) => Task.FromResult<object>(repo.Update(dto, false, false)),
-                captureAction => _mockDapper
-                    .Setup(d => d.Execute(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>()))
-                    .Callback<string, object, IDbTransaction>((sql, param, _) => captureAction(param))
-                    .Returns(1)
-            );
+            var existingInDb = new ServiceDto
+            {
+                Id = 30,
+                Name = "UpsertTargetService",
+                ExecutablePath = "C:\\upsert_old.exe",
+                RunAsLocalSystem = false,
+                UserAccount = "Domain\\UpsertOrigUser",
+                Password = "UpsertEncryptedOrigPassword"
+            };
+
+            // Setup lookup by name for PatchRuntimeStateAsync
+            _mockDapper.Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto>(
+                It.Is<string>(sql => sql.Contains("WHERE Name = @Name")),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync(existingInDb);
+
+            ServiceDto? capturedDto = null;
+            _mockDapper.Setup(d => d.ExecuteScalarAsync<int>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((sql, param, _, token) => capturedDto = param as ServiceDto)
+                .ReturnsAsync(30);
+
+            // Act
+            int upsertedId = await repo.UpsertAsync(incoming, preserveExistingRuntimeState: false, preserveExistingCredentials: true, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(30, upsertedId);
+            Assert.NotNull(capturedDto);
+            Assert.Equal("C:\\upsert_updated.exe", capturedDto.ExecutablePath);
+            Assert.False(capturedDto.RunAsLocalSystem);
+            Assert.Equal("Domain\\UpsertOrigUser", capturedDto.UserAccount);
+            Assert.Equal("UpsertEncryptedOrigPassword", capturedDto.Password);
         }
 
         [Fact]
@@ -244,221 +275,6 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task UpsertBatchAsync_NullServices_ReturnsZero()
-        {
-            // Arrange
-            var repo = CreateRepository();
-
-            // Act
-            var result = await repo.UpsertBatchAsync(null!, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.Equal(0, result);
-            _mockDapper.Verify(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Never);
-        }
-
-        [Fact]
-        public async Task UpsertBatchAsync_EmptyServices_ReturnsZero()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var services = new List<ServiceDto>();
-
-            // Act
-            var result = await repo.UpsertBatchAsync(services, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.Equal(0, result);
-            _mockDapper.Verify(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Never);
-        }
-
-        [Fact]
-        public async Task UpsertBatchAsync_FullyPopulatedServices_MapsAllColumnsAndEncrypts()
-        {
-            // Arrange
-            var repo = CreateRepository();
-
-            var service = new ServiceDto
-            {
-                Name = "FullService",
-                DisplayName = "Display Name",
-                Description = "Description",
-                Pid = 1234,
-                ExecutablePath = "C:\\path.exe",
-                StartupDirectory = "C:\\dir",
-                Parameters = "--args",
-                StartupType = 2,
-                Priority = 1,
-                StartTimeout = 45,
-                StopTimeout = 45,
-                RunAsLocalSystem = false,
-                UserAccount = "User",
-                Password = "plain_password",
-                StdoutPath = "C:\\out.log",
-                StderrPath = "C:\\err.log",
-                EnableSizeRotation = true,
-                RotationSize = 10,
-                MaxRotations = 5,
-                EnableDateRotation = true,
-                DateRotationType = 1,
-                UseLocalTimeForRotation = true,
-                EnableHealthMonitoring = true,
-                HeartbeatInterval = 30,
-                MaxFailedChecks = 3,
-                RecoveryAction = 1,
-                MaxRestartAttempts = 5,
-                EnvironmentVariables = "VAR=VAL",
-                ServiceDependencies = "Dep1",
-                EnableDebugLogs = true,
-                PreLaunchExecutablePath = "C:\\pre.exe",
-                PreLaunchStartupDirectory = "C:\\pre_dir",
-                PreLaunchParameters = "--pre",
-                PreLaunchEnvironmentVariables = "PRE_VAR=VAL",
-                PreLaunchStdoutPath = "C:\\pre_out.log",
-                PreLaunchStderrPath = "C:\\pre_err.log",
-                PreLaunchTimeoutSeconds = 60,
-                PreLaunchRetryAttempts = 2,
-                PreLaunchIgnoreFailure = true,
-                FailureProgramPath = "C:\\fail.exe",
-                FailureProgramStartupDirectory = "C:\\fail_dir",
-                FailureProgramParameters = "--fail",
-                PostLaunchExecutablePath = "C:\\post.exe",
-                PostLaunchStartupDirectory = "C:\\post_dir",
-                PostLaunchParameters = "--post",
-                PreStopExecutablePath = "C:\\pre_stop.exe",
-                PreStopStartupDirectory = "C:\\pre_stop_dir",
-                PreStopParameters = "--pre-stop",
-                PreStopTimeoutSeconds = 15,
-                PreStopLogAsError = true,
-                PostStopExecutablePath = "C:\\post_stop.exe",
-                PostStopStartupDirectory = "C:\\post_stop_dir",
-                PostStopParameters = "--post-stop"
-            };
-
-            var services = new List<ServiceDto> { service };
-            const string encryptedPrefix = "encrypted_";
-
-            var mockTx = new Mock<IDbTransaction>();
-            _mockDapper.Setup(d => d.BeginTransactionAsync(It.IsAny<CancellationToken>())).ReturnsAsync(mockTx.Object);
-
-            _mockSecureData.Setup(s => s.Encrypt(It.IsAny<string>()))
-                           .Returns((string input) => encryptedPrefix + input);
-
-            _mockDapper.Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
-                       .ReturnsAsync(1);
-
-            _mockDapper.Setup(d => d.QueryAsync<(int Id, string Name)>(
-                           It.Is<string>(sql => sql.Contains($"SELECT Id, Name FROM {SqlConstants.ServicesTableName}")),
-                           It.IsAny<object>(),
-                           It.IsAny<IDbTransaction>(),
-                           It.IsAny<CancellationToken>()))
-                       .ReturnsAsync(new List<(int Id, string Name)> { (Id: 1, Name: "FullService") });
-
-            // Act
-            await repo.UpsertBatchAsync(services, TestContext.Current.CancellationToken);
-
-            // Assert
-            _mockDapper.Verify(d => d.ExecuteAsync(
-                 It.Is<string>(sql =>
-                     sql.Contains($"INSERT INTO {SqlConstants.ServicesTableName}") &&
-                     sql.Contains("ON CONFLICT(Name COLLATE UNICODE_NOCASE) DO UPDATE SET") &&
-                     sql.Contains("PreStopParameters = excluded.PreStopParameters") &&
-                     sql.Contains("UseLocalTimeForRotation = excluded.UseLocalTimeForRotation")),
-                 It.Is<IEnumerable<ServiceDto>>(list =>
-                     list.Count() == 1 && VerifyAllProperties(list.First(), service, encryptedPrefix)),
-                 It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Once);
-
-            mockTx.Verify(t => t.Commit(), Times.Once);
-        }
-
-        /// <summary>
-        /// Exhaustively verifies that every property on the actual DTO matches the expected DTO.
-        /// Used to ensure 100% mapping accuracy for bulk database operations.
-        /// </summary>
-        private bool VerifyAllProperties(ServiceDto actual, ServiceDto expected, string enc)
-        {
-            // Arrange & Act - Property evaluation groups matching AAA validation rules
-
-            bool coreOk = actual.Name == expected.Name &&
-                          actual.DisplayName == expected.DisplayName &&
-                          actual.Description == expected.Description &&
-                          actual.Pid == expected.Pid;
-
-            bool encryptedOk = actual.Password == (enc + expected.Password) &&
-                               actual.Parameters == (enc + expected.Parameters) &&
-                               actual.EnvironmentVariables == (enc + expected.EnvironmentVariables) &&
-                               actual.FailureProgramParameters == (enc + expected.FailureProgramParameters) &&
-                               actual.PreLaunchParameters == (enc + expected.PreLaunchParameters) &&
-                               actual.PostLaunchParameters == (enc + expected.PostLaunchParameters) &&
-                               actual.PreLaunchEnvironmentVariables == (enc + expected.PreLaunchEnvironmentVariables) &&
-                               actual.PreStopParameters == (enc + expected.PreStopParameters) &&
-                               actual.PostStopParameters == (enc + expected.PostStopParameters);
-
-            bool executionOk = actual.ExecutablePath == expected.ExecutablePath &&
-                               actual.StartupDirectory == expected.StartupDirectory &&
-                               actual.StartupType == expected.StartupType &&
-                               actual.Priority == expected.Priority &&
-                               actual.StartTimeout == expected.StartTimeout &&
-                               actual.StopTimeout == expected.StopTimeout &&
-                               actual.RunAsLocalSystem == expected.RunAsLocalSystem &&
-                               actual.UserAccount == expected.UserAccount;
-
-            bool loggingOk = actual.StdoutPath == expected.StdoutPath &&
-                             actual.StderrPath == expected.StderrPath &&
-                             actual.EnableSizeRotation == expected.EnableSizeRotation &&
-                             actual.RotationSize == expected.RotationSize &&
-                             actual.MaxRotations == expected.MaxRotations &&
-                             actual.EnableDateRotation == expected.EnableDateRotation &&
-                             actual.DateRotationType == expected.DateRotationType &&
-                             actual.UseLocalTimeForRotation == expected.UseLocalTimeForRotation;
-
-            bool hooksOk = actual.EnableHealthMonitoring == expected.EnableHealthMonitoring &&
-                           actual.HeartbeatInterval == expected.HeartbeatInterval &&
-                           actual.MaxFailedChecks == expected.MaxFailedChecks &&
-                           actual.RecoveryAction == expected.RecoveryAction &&
-                           actual.RecoveryOnCleanExit == expected.RecoveryOnCleanExit &&
-                           actual.MaxRestartAttempts == expected.MaxRestartAttempts &&
-                           actual.ServiceDependencies == expected.ServiceDependencies &&
-                           actual.EnableDebugLogs == expected.EnableDebugLogs;
-
-            bool preLaunchOk = actual.PreLaunchExecutablePath == expected.PreLaunchExecutablePath &&
-                               actual.PreLaunchStartupDirectory == expected.PreLaunchStartupDirectory &&
-                               actual.PreLaunchStdoutPath == expected.PreLaunchStdoutPath &&
-                               actual.PreLaunchStderrPath == expected.PreLaunchStderrPath &&
-                               actual.PreLaunchTimeoutSeconds == expected.PreLaunchTimeoutSeconds &&
-                               actual.PreLaunchRetryAttempts == expected.PreLaunchRetryAttempts &&
-                               actual.PreLaunchIgnoreFailure == expected.PreLaunchIgnoreFailure;
-
-            bool structuralRecoveryOk = actual.FailureProgramPath == expected.FailureProgramPath &&
-                                        actual.FailureProgramStartupDirectory == expected.FailureProgramStartupDirectory;
-
-            bool lifecycleExtensionsOk = actual.PostLaunchExecutablePath == expected.PostLaunchExecutablePath &&
-                                         actual.PostLaunchStartupDirectory == expected.PostLaunchStartupDirectory &&
-                                         actual.PreStopExecutablePath == expected.PreStopExecutablePath &&
-                                         actual.PreStopStartupDirectory == expected.PreStopStartupDirectory &&
-                                         actual.PreStopLogAsError == expected.PreStopLogAsError &&
-                                         actual.PostStopExecutablePath == expected.PostStopExecutablePath &&
-                                         actual.PostStopStartupDirectory == expected.PostStopStartupDirectory;
-
-            // Assert
-            return coreOk && encryptedOk && executionOk && loggingOk && hooksOk && preLaunchOk && structuralRecoveryOk && lifecycleExtensionsOk;
-        }
-
-        [Fact]
-        public async Task DeleteAsync_ById_ReturnsAffectedRows()
-        {
-            // Arrange
-            _mockDapper.Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>())).ReturnsAsync(1);
-            var repo = CreateRepository();
-
-            // Act
-            var rows = await repo.DeleteAsync(10, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.Equal(1, rows);
-        }
-
-        [Fact]
         public async Task DeleteAsync_ByName_ReturnsAffectedRows()
         {
             // Arrange
@@ -472,8 +288,11 @@ namespace Servy.Infrastructure.UnitTests.Data
             Assert.Equal(1, rows);
         }
 
-        [Fact]
-        public async Task DeleteAsync_ByName_ReturnsZero()
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task DeleteAsync_ByName_ReturnsZero(string? name)
         {
             // Arrange
             // Explicitly configure no database behavior setup for ExecuteAsync here.
@@ -482,7 +301,7 @@ namespace Servy.Infrastructure.UnitTests.Data
             var repo = CreateRepository();
 
             // Act
-            var rows = await repo.DeleteAsync(string.Empty, TestContext.Current.CancellationToken);
+            var rows = await repo.DeleteAsync(name, TestContext.Current.CancellationToken);
 
             // Assert
             // 1. Verify that the method cleanly returned a neutral 0-row metric count
@@ -501,6 +320,72 @@ namespace Servy.Infrastructure.UnitTests.Data
         #endregion
 
         #region Retrieval Operations & Decryption
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task GetByNameAsync_BlankName_ReturnsNullWithoutQuerying(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.GetByNameAsync(name, true, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Null(result);
+            _mockDapper.Verify(d => d.QuerySingleOrDefaultAsync<ServiceDto>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task GetServicePidAsync_BlankName_ReturnsNullWithoutQuerying(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.GetServicePidAsync(name, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Null(result);
+            _mockDapper.Verify(d => d.QuerySingleOrDefaultAsync<int?>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task GetServiceConsoleStateAsync_BlankName_ReturnsNullWithoutQuerying(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.GetServiceConsoleStateAsync(name, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Null(result);
+            _mockDapper.Verify(d => d.QuerySingleOrDefaultAsync<ServiceConsoleStateDto?>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
 
         private static ServiceDto CreateEncryptedServiceDto()
         {
@@ -524,29 +409,10 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task GetByIdAsync_DecryptsPassword()
+        public async Task GetByNameAsync_NullPassword()
         {
             // Arrange
-            var dto = CreateEncryptedServiceDto();
-            _mockDapper
-                .Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync(dto);
-
-            SetupDecryptPassthrough();
-            var repo = CreateRepository();
-
-            // Act
-            var result = await repo.GetByIdAsync(1, true, TestContext.Current.CancellationToken);
-
-            // Assert
-            AssertDecryptedDtoProperties(result);
-        }
-
-        [Fact]
-        public async Task GetByIdAsync_NullPassword()
-        {
-            // Arrange
-            var dto = new ServiceDto { Id = 1, Password = null! };
+            var dto = new ServiceDto { Id = 1, Name = "S", Password = null };
             _mockDapper
                 .Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(dto);
@@ -554,17 +420,17 @@ namespace Servy.Infrastructure.UnitTests.Data
             var repo = CreateRepository();
 
             // Act
-            var result = await repo.GetByIdAsync(1, true, TestContext.Current.CancellationToken);
+            var result = await repo.GetByNameAsync("S", true, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.Null(result!.Password);
         }
 
         [Fact]
-        public async Task GetByIdAsync_EmptyPassword()
+        public async Task GetByNameAsync_EmptyPassword()
         {
             // Arrange
-            var dto = new ServiceDto { Id = 1, Password = string.Empty };
+            var dto = new ServiceDto { Id = 1, Name = "S", Password = string.Empty };
             _mockDapper
                 .Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(dto);
@@ -572,7 +438,7 @@ namespace Servy.Infrastructure.UnitTests.Data
             var repo = CreateRepository();
 
             // Act
-            var result = await repo.GetByIdAsync(1, true, TestContext.Current.CancellationToken);
+            var result = await repo.GetByNameAsync("S", true, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.NotNull(result!.Password);
@@ -580,7 +446,7 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task GetByIdAsync_NullDto()
+        public async Task GetByNameAsync_NullDto()
         {
             // Arrange
             ServiceDto dto = null!;
@@ -591,7 +457,7 @@ namespace Servy.Infrastructure.UnitTests.Data
             var repo = CreateRepository();
 
             // Act
-            var result = await repo.GetByIdAsync(1, true, TestContext.Current.CancellationToken);
+            var result = await repo.GetByNameAsync("S", true, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.Null(result);
@@ -616,22 +482,322 @@ namespace Servy.Infrastructure.UnitTests.Data
             AssertDecryptedDtoProperties(result);
         }
 
-        [Fact]
-        public void GetByName_DecryptsPassword()
+        #region Runtime State and Restart Attempts
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task UpdateRuntimeStateAsync_BlankName_ReturnsZeroWithoutWriting(string? name)
         {
             // Arrange
-            var dto = CreateEncryptedServiceDto();
-            _mockDapper.Setup(d => d.QuerySingleOrDefault<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>())).Returns(dto);
-
-            SetupDecryptPassthrough();
             var repo = CreateRepository();
 
             // Act
-            var result = repo.GetByName("S", true);
+            var result = await repo.UpdateRuntimeStateAsync(name, new ServiceRuntimeStateDto { Pid = 1 }, TestContext.Current.CancellationToken);
 
             // Assert
-            AssertDecryptedDtoProperties(result);
+            Assert.Equal(0, result);
+            _mockDapper.Verify(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Never);
         }
+
+        [Fact]
+        public async Task UpdateRuntimeStateAsync_NullState_Throws()
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act & Assert
+            await Assert.ThrowsAsync<ArgumentNullException>(() => repo.UpdateRuntimeStateAsync("svc", null!, TestContext.Current.CancellationToken));
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task UpdateRuntimeStateAsync_WritesOnlyTheRuntimeColumns(bool updatePreviousStopTimeout)
+        {
+            // Arrange
+            string? sql = null;
+            object? parameters = null;
+            _mockDapper
+                .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((s, p, _, _) => { sql = s; parameters = p; })
+                .ReturnsAsync(1);
+            var repo = CreateRepository();
+            var state = new ServiceRuntimeStateDto
+            {
+                Pid = 42,
+                ActiveStdoutPath = "out.log",
+                ActiveStderrPath = "err.log",
+                UpdatePreviousStopTimeout = updatePreviousStopTimeout,
+                PreviousStopTimeout = 60,
+            };
+
+            // Act
+            var result = await repo.UpdateRuntimeStateAsync(" svc ", state, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(1, result);
+            Assert.NotNull(sql);
+            Assert.Contains("SET Pid = @Pid, ActiveStdoutPath = @ActiveStdoutPath, ActiveStderrPath = @ActiveStderrPath", sql);
+            Assert.Equal(updatePreviousStopTimeout, sql!.Contains("PreviousStopTimeout = @PreviousStopTimeout"));
+
+            // No configuration column is ever part of the statement
+            foreach (var column in new[] { "ExecutablePath", "Parameters", "Password", "UserAccount", "RestartAttempts" })
+                Assert.DoesNotContain(column + " =", sql);
+
+            Assert.Equal("svc", parameters!.GetType().GetProperty("Name")!.GetValue(parameters));
+            Assert.Equal(42, parameters.GetType().GetProperty("Pid")!.GetValue(parameters));
+        }
+
+        [Fact]
+        public async Task UpdateRuntimeStateAsync_LegacyPaddedName_RetriesWithTheVerbatimName()
+        {
+            // Arrange: no row under the trimmed name, one under the verbatim (Servy <= 8.3) name
+            var names = new List<string>();
+            _mockDapper
+                .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((_, p, _, _) => names.Add((string)p.GetType().GetProperty("Name")!.GetValue(p)!))
+                .ReturnsAsync(() => names.Count == 1 ? 0 : 1);
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.UpdateRuntimeStateAsync(" padded ", new ServiceRuntimeStateDto(), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(1, result);
+            Assert.Equal(new[] { "padded", " padded " }, names);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task UpdateDescriptionAndStartupTypeAsync_BlankName_ReturnsZeroWithoutWriting(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.UpdateDescriptionAndStartupTypeAsync(name, "desc", 2, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(0, result);
+            _mockDapper.Verify(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Theory]
+        [InlineData(2)]
+        [InlineData(null)]
+        public async Task UpdateDescriptionAndStartupTypeAsync_WritesOnlyTheTwoMetadataColumns(int? startupType)
+        {
+            // Arrange
+            string? sql = null;
+            object? parameters = null;
+            _mockDapper
+                .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((s, p, _, _) => { sql = s; parameters = p; })
+                .ReturnsAsync(1);
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.UpdateDescriptionAndStartupTypeAsync(" svc ", "from the SCM", startupType, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(1, result);
+            Assert.NotNull(sql);
+            Assert.Contains("SET Description = @Description", sql);
+            Assert.Equal(startupType.HasValue, sql!.Contains("StartupType = @StartupType"));
+            Assert.Contains("WHERE Name = @Name COLLATE UNICODE_NOCASE", sql);
+
+            // No sensitive or runtime column is ever part of the statement: this is the whole point of the
+            // call, because the refresh tick's DTO is a display read and not the stored row (#7328)
+            foreach (var column in new[] { "Parameters", "EnvironmentVariables", "PreLaunchEnvironmentVariables", "PreStopParameters", "PostStopParameters", "Password", "Pid" })
+                Assert.DoesNotContain(column + " =", sql);
+
+            Assert.Equal("svc", parameters!.GetType().GetProperty("Name")!.GetValue(parameters));
+            Assert.Equal("from the SCM", parameters.GetType().GetProperty("Description")!.GetValue(parameters));
+            Assert.Equal(startupType, parameters.GetType().GetProperty("StartupType")!.GetValue(parameters));
+        }
+
+        [Fact]
+        public async Task UpdateDescriptionAndStartupTypeAsync_LegacyPaddedName_RetriesWithTheVerbatimName()
+        {
+            // Arrange: no row under the trimmed name, one under the verbatim (Servy <= 8.3) name
+            var names = new List<string>();
+            _mockDapper
+                .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((_, p, _, _) => names.Add((string)p.GetType().GetProperty("Name")!.GetValue(p)!))
+                .ReturnsAsync(() => names.Count == 1 ? 0 : 1);
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.UpdateDescriptionAndStartupTypeAsync(" padded ", "desc", 2, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(1, result);
+            Assert.Equal(new[] { "padded", " padded " }, names);
+        }
+
+        [Fact]
+        public async Task UpdateRestartAttemptsAsync_NegativeAttempts_Throws()
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act & Assert
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => repo.UpdateRestartAttemptsAsync("svc", -1, DateTime.UtcNow, TestContext.Current.CancellationToken));
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task UpdateRestartAttemptsAsync_BlankName_ReturnsZeroWithoutWriting(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.UpdateRestartAttemptsAsync(name, 3, DateTime.UtcNow, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(0, result);
+            _mockDapper.Verify(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task UpdateRestartAttemptsAsync_WritesTheCounterAndItsUtcTicks()
+        {
+            // Arrange
+            object? parameters = null;
+            string? sql = null;
+            _mockDapper
+                .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((s, p, _, _) => { sql = s; parameters = p; })
+                .ReturnsAsync(1);
+            var repo = CreateRepository();
+            var when = new DateTime(2026, 10, 2, 12, 0, 0, DateTimeKind.Utc);
+
+            // Act
+            var result = await repo.UpdateRestartAttemptsAsync("svc", 3, when, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(1, result);
+            Assert.Contains("SET RestartAttempts = @RestartAttempts, RestartAttemptsUpdatedAtTicks = @RestartAttemptsUpdatedAtTicks", sql);
+            Assert.Equal(3, parameters!.GetType().GetProperty("RestartAttempts")!.GetValue(parameters));
+            Assert.Equal(when.Ticks, parameters.GetType().GetProperty("RestartAttemptsUpdatedAtTicks")!.GetValue(parameters));
+        }
+
+        [Fact]
+        public async Task UpdateRestartAttemptsAsync_ZeroAttempts_IsWrittenAsTheReset()
+        {
+            // Arrange: zero is what the wrapper sends once the service is healthy again
+            object? parameters = null;
+            _mockDapper
+                .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((_, p, _, _) => parameters = p)
+                .ReturnsAsync(1);
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.UpdateRestartAttemptsAsync("svc", 0, DateTime.UtcNow, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(1, result);
+            Assert.Equal(0, parameters!.GetType().GetProperty("RestartAttempts")!.GetValue(parameters));
+        }
+
+        [Fact]
+        public async Task UpdateRestartAttemptsAsync_LocalTime_IsStoredAsUtc()
+        {
+            // Arrange
+            object? parameters = null;
+            _mockDapper
+                .Setup(d => d.ExecuteAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((_, p, _, _) => parameters = p)
+                .ReturnsAsync(1);
+            var repo = CreateRepository();
+            var local = new DateTime(2026, 10, 2, 12, 0, 0, DateTimeKind.Local);
+
+            // Act
+            await repo.UpdateRestartAttemptsAsync("svc", 1, local, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(local.ToUniversalTime().Ticks, parameters!.GetType().GetProperty("RestartAttemptsUpdatedAtTicks")!.GetValue(parameters));
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task GetRestartAttemptsAsync_BlankName_ReturnsNullWithoutQuerying(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.GetRestartAttemptsAsync(name, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Null(result);
+            _mockDapper.Verify(d => d.QuerySingleOrDefaultAsync<ServiceDto?>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public async Task GetRestartAttemptsAsync_NoRow_ReturnsNull()
+        {
+            // Arrange
+            _mockDapper
+                .Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto?>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((ServiceDto?)null);
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.GetRestartAttemptsAsync("ghost", TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Null(result);
+        }
+
+        [Theory]
+        [InlineData(null, null, 0, false)]          // never written
+        [InlineData(5, 638_000_000_000_000_000L, 5, true)]
+        [InlineData(-3, 638_000_000_000_000_000L, 0, true)]  // a negative stored value reads back as 0
+        [InlineData(2, -1L, 2, false)]              // ticks out of DateTime's range read back as no time
+        [InlineData(2, long.MaxValue, 2, false)]    // ticks above DateTime.MaxValue read back as no time, not as an exception
+        [InlineData(2, 3_155_378_975_999_999_999L, 2, true)] // DateTime.MaxValue.Ticks is still a time
+        [InlineData(2, 0L, 2, true)]                // DateTime.MinValue.Ticks is still a time
+        public async Task GetRestartAttemptsAsync_Row_MapsCounterAndTimestamp(int? stored, long? ticks, int expectedAttempts, bool expectTime)
+        {
+            // Arrange
+            _mockDapper
+                .Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto?>(
+                    It.Is<string>(s => s.Contains("SELECT Name, RestartAttempts, RestartAttemptsUpdatedAtTicks")),
+                    It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = "svc", RestartAttempts = stored, RestartAttemptsUpdatedAtTicks = ticks });
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.GetRestartAttemptsAsync("svc", TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.NotNull(result);
+            Assert.Equal(expectedAttempts, result!.Attempts);
+            Assert.Equal(expectTime, result.UpdatedAtUtc.HasValue);
+            if (expectTime)
+            {
+                Assert.Equal(ticks!.Value, result.UpdatedAtUtc!.Value.Ticks);
+                Assert.Equal(DateTimeKind.Utc, result.UpdatedAtUtc.Value.Kind);
+            }
+        }
+
+        #endregion
 
         [Fact]
         public async Task GetServicePidAsync_ServiceIsRunning_ReturnsPid()
@@ -783,7 +949,7 @@ namespace Servy.Infrastructure.UnitTests.Data
                     sql.Contains($"FROM {SqlConstants.ServicesTableName}") &&
                     sql.Contains("WHERE Name = @Name") &&
                     sql.Contains("LIMIT 1")),
-                It.Is<object>(p => p.GetType().GetProperty("Name") != null!),
+                It.Is<object>(p => (string?)p.GetType().GetProperty("Name")!.GetValue(p) == serviceName),
                 It.IsAny<IDbTransaction>(),
                 It.IsAny<CancellationToken>()),
                 Times.Once);
@@ -837,7 +1003,85 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task Search_DecryptsPasswords()
+        public async Task GetAllAsync_DecryptFalse_ReturnsCiphertextAndNeverCallsDecrypt()
+        {
+            // Arrange - the exact negative control of GetAllAsync_DecryptsAll
+            var service1 = new ServiceDto { Id = 1 };
+            var type = typeof(ServiceDto);
+
+            foreach (var field in SensitiveFields)
+            {
+                type.GetProperty(field.Key)?.SetValue(service1, $"{field.Value}1_enc");
+            }
+
+            SetupDecryptPassthrough();
+
+            _mockDapper
+                .Setup(d => d.QueryAsync<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new List<ServiceDto> { service1 });
+
+            var repo = CreateRepository();
+
+            // Act
+            var result = (await repo.GetAllAsync(false, TestContext.Current.CancellationToken)).ToList();
+
+            // Assert
+            var single = Assert.Single(result);
+            foreach (var field in SensitiveFields)
+            {
+                Assert.Equal($"{field.Value}1_enc", type.GetProperty(field.Key)?.GetValue(single));
+            }
+            _mockSecureData.Verify(s => s.Decrypt(It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task SearchAsync_MatchingKeyword_DecryptFalse_ForwardsFlagToFilteredPath()
+        {
+            // Arrange
+            var list = new List<ServiceDto> { new ServiceDto { Name = "A", Password = "enc1" } };
+            _mockDapper
+                .Setup(d => d.QueryAsync<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(list);
+            SetupDecryptPassthrough();
+
+            var repo = CreateRepository();
+
+            // Act
+            var result = (await repo.SearchAsync("A", false, TestContext.Current.CancellationToken)).ToList();
+
+            // Assert
+            Assert.Single(result);
+            Assert.Equal("enc1", result[0].Password);
+            _mockSecureData.Verify(s => s.Decrypt(It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task SearchAsync_NullKeyword_DecryptFalse_ForwardsFlagToShortCircuit()
+        {
+            // Arrange
+            var list = new List<ServiceDto> { CreateEncryptedServiceDto() };
+            _mockDapper
+                .Setup(d => d.QueryAsync<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(list);
+            SetupDecryptPassthrough();
+
+            var repo = CreateRepository();
+
+            // Act
+            var result = (await repo.SearchAsync(null!, false, TestContext.Current.CancellationToken)).ToList();
+
+            // Assert
+            var single = Assert.Single(result);
+            var type = typeof(ServiceDto);
+            foreach (var field in SensitiveFields)
+            {
+                Assert.Equal($"{field.Value}_enc", type.GetProperty(field.Key)?.GetValue(single));
+            }
+            _mockSecureData.Verify(s => s.Decrypt(It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task SearchAsync_MatchingKeyword_DecryptsPasswords()
         {
             // Arrange
             var list = new List<ServiceDto> { new ServiceDto { Name = "A", Password = "enc1" } };
@@ -857,7 +1101,32 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task Search_NullKeyword_ShortCircuitsToGetAll()
+        public async Task SearchAsync_Keyword_ReturnsOnlyRowsWhoseNameOrDescriptionContainsIt()
+        {
+            // Arrange
+            _mockDapper
+                .Setup(d => d.QueryAsync<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new List<ServiceDto>
+                {
+                    new ServiceDto { Name = "Alpha", Description = "web frontend" },
+                    new ServiceDto { Name = "Beta", Description = "Nightly BACKUP job" },
+                    new ServiceDto { Name = "Gamma", Description = null },
+                });
+            var repo = CreateRepository();
+
+            // Act
+            var byPaddedName = (await repo.SearchAsync("  ALPHA ", false, TestContext.Current.CancellationToken)).Select(s => s.Name).ToList();
+            var byDescription = (await repo.SearchAsync("backup", false, TestContext.Current.CancellationToken)).Select(s => s.Name).ToList();
+            var noMatch = (await repo.SearchAsync("zzz", false, TestContext.Current.CancellationToken)).ToList();
+
+            // Assert
+            Assert.Equal(new[] { "Alpha" }, byPaddedName);
+            Assert.Equal(new[] { "Beta" }, byDescription);
+            Assert.Empty(noMatch);
+        }
+
+        [Fact]
+        public async Task SearchAsync_NullKeyword_ShortCircuitsToGetAll()
         {
             // Arrange
             var list = new List<ServiceDto> { CreateEncryptedServiceDto() };
@@ -897,8 +1166,54 @@ namespace Servy.Infrastructure.UnitTests.Data
 
         #region Import/Export Tests
 
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task ExportXmlAsync_BlankName_ReturnsEmptyStringWithoutQuerying(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.ExportXmlAsync(name, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Empty(result);
+            _mockDapper.Verify(d => d.QuerySingleOrDefaultAsync<ServiceDto>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()),
+                Times.Never);
+            _mockXmlServiceSerializer.Verify(s => s.Serialize(It.IsAny<ServiceDto>()), Times.Never);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("   ")]
+        public async Task ExportJsonAsync_BlankName_ReturnsEmptyStringWithoutQuerying(string? name)
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act
+            var result = await repo.ExportJsonAsync(name, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Empty(result);
+            _mockDapper.Verify(d => d.QuerySingleOrDefaultAsync<ServiceDto>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()),
+                Times.Never);
+            _mockJsonServiceSerializer.Verify(s => s.Serialize(It.IsAny<ServiceDto>()), Times.Never);
+        }
+
         [Fact]
-        public async Task ExportXML_ReturnsEmptyString()
+        public async Task ExportXmlAsync_ServiceMissing_ReturnsEmptyString()
         {
             // Arrange
             _mockDapper.Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto>(
@@ -915,7 +1230,7 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task ExportXML_ReturnsSerializedService()
+        public async Task ExportXmlAsync_ServiceFound_ReturnsSerializedService()
         {
             // Arrange
             var dto = new ServiceDto { Name = "A", Password = "pwd1" };
@@ -944,73 +1259,7 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task ImportXML_ValidXml_ReturnsSuccess()
-        {
-            // Arrange
-            var dto = new ServiceDto { Name = "A" };
-            var repo = CreateRepository();
-            var xml = $"<ServiceDto><Name>{dto.Name}</Name></ServiceDto>";
-
-            _mockXmlServiceSerializer.Setup(d => d.Deserialize(It.IsAny<string>())).Returns(dto);
-            _mockDapper.Setup(d => d.ExecuteScalarAsync<int>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>())).ReturnsAsync(1);
-
-            // Act
-            var result = await repo.ImportXmlAsync(xml, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.True(result.IsSuccess);
-        }
-
-        [Fact]
-        public async Task ImportXML_EmptyXml_ReturnsFailure()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var xml = string.Empty;
-
-            // Act
-            var result = await repo.ImportXmlAsync(xml, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(Strings.Msg_ImportXmlNullOrEmpty, result.ErrorMessage);
-        }
-
-        [Fact]
-        public async Task ImportXML_InvalidXml_ReturnsFailure()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var xml = "<ServiceDto><Name></Invalid></ServiceDto>";
-            _mockXmlServiceSerializer.Setup(d => d.Deserialize(It.IsAny<string>())).Throws(new Exception("Parsing error"));
-
-            // Act
-            var result = await repo.ImportXmlAsync(xml, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(string.Format(Strings.Msg_ImportXmlFailed, "Parsing error"), result.ErrorMessage);
-        }
-
-        [Fact]
-        public async Task ImportXML_ServiceNull_ReturnsFailure()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var xml = "<ServiceDto></ServiceDto>";
-
-            _mockXmlServiceSerializer.Setup(d => d.Deserialize(It.IsAny<string>())).Returns((ServiceDto)null!);
-
-            // Act
-            var result = await repo.ImportXmlAsync(xml, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(Strings.Msg_ImportXmlDeserializationFailed, result.ErrorMessage);
-        }
-
-        [Fact]
-        public async Task ExportJSON_ReturnsEmptyString()
+        public async Task ExportJsonAsync_ServiceMissing_ReturnsEmptyString()
         {
             // Arrange
             _mockDapper.Setup(d => d.QuerySingleOrDefaultAsync<ServiceDto>(
@@ -1027,7 +1276,7 @@ namespace Servy.Infrastructure.UnitTests.Data
         }
 
         [Fact]
-        public async Task ExportJSON_ReturnsSerializedService()
+        public async Task ExportJsonAsync_ServiceFound_ReturnsSerializedService()
         {
             // Arrange
             var name = "A";
@@ -1051,83 +1300,155 @@ namespace Servy.Infrastructure.UnitTests.Data
             Assert.Equal(expectedJson, json);
         }
 
-        [Fact]
-        public async Task ImportJSON_ValidJson_ReturnsSuccess()
-        {
-            // Arrange
-            var dto = new ServiceDto { Name = "A" };
-            var repo = CreateRepository();
-            var json = "{\"Name\":\"A\"}";
-
-            _mockJsonServiceSerializer.Setup(d => d.Deserialize(It.IsAny<string>())).Returns(dto);
-            _mockDapper.Setup(d => d.ExecuteScalarAsync<int>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>())).ReturnsAsync(1);
-
-            // Act
-            var result = await repo.ImportJsonAsync(json, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.True(result.IsSuccess);
-        }
-
-        [Fact]
-        public async Task ImportJSON_EmptyJson_ReturnsFailure()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var json = string.Empty;
-
-            // Act
-            var result = await repo.ImportJsonAsync(json, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(Strings.Msg_ImportJsonNullOrEmpty, result.ErrorMessage);
-        }
-
-        [Fact]
-        public async Task ImportJsonAsync_DeserializerReturnsNull_ReturnsFailure()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var jsonPayload = "{}";
-
-            // Explicitly set up the serializer layer to simulate a null! payload translation result
-            _mockJsonServiceSerializer
-                .Setup(s => s.Deserialize(jsonPayload))
-                .Returns((ServiceDto?)null);
-
-            // Act
-            var result = await repo.ImportJsonAsync(jsonPayload, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(Strings.Msg_ImportJsonDeserializationFailed, result.ErrorMessage);
-
-            // Verify that execution short-circuited cleanly without touching the database infrastructure
-            _mockDapper.Verify(
-                e => e.ExecuteScalarAsync<int>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()),
-                Times.Never);
-        }
-
-        [Fact]
-        public async Task ImportJSON_Throws_ReturnsFailure()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var json = "{ invalid json }";
-            _mockJsonServiceSerializer.Setup(d => d.Deserialize(It.IsAny<string>())).Throws(new Exception("Syntax error"));
-
-            // Act
-            var result = await repo.ImportJsonAsync(json, TestContext.Current.CancellationToken);
-
-            // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(string.Format(Strings.Msg_ImportJsonFailed, "Syntax error"), result.ErrorMessage);
-        }
-
         #endregion
 
         #region Private Helper Branch Coverage Tests
+
+        [Fact]
+        public async Task CreateEncryptedClone_StripsDecryptionFailureMarkerFromDescription()
+        {
+            // Arrange
+            var repo = CreateRepository();
+            const string originalDescription = "This is the real service description.";
+            const string markedDescription = "[DECRYPTION FAILED: SecureDataIntegrityException] The record's key or payload is corrupt. Original Description: " + originalDescription;
+
+            var dto = new ServiceDto
+            {
+                Name = "TestService",
+                Description = markedDescription,
+                Password = "plain_password"
+            };
+
+            ServiceDto? capturedEncryptedClone = null;
+            _mockDapper.Setup(d => d.ExecuteScalarAsync<int>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((sql, param, _, token) => capturedEncryptedClone = param as ServiceDto)
+                .ReturnsAsync(1);
+
+            // Act
+            await repo.UpsertAsync(dto, preserveExistingRuntimeState: false, preserveExistingCredentials: false, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.NotNull(capturedEncryptedClone);
+            Assert.Equal(originalDescription, capturedEncryptedClone.Description);
+            Assert.Equal(markedDescription, dto.Description);
+        }
+
+        [Fact]
+        public async Task CreateEncryptedClone_StripsStackedDecryptionFailureMarkersFromDescription()
+        {
+            // Arrange
+            var repo = CreateRepository();
+            const string originalDescription = "Original clean description.";
+            const string stackedMarkedDescription =
+                "[DECRYPTION FAILED: SecureDataIntegrityException] The record's key or payload is corrupt. Original Description: " +
+                "[DECRYPTION FAILED: CryptographicException] The record's key or payload is corrupt. Original Description: " +
+                originalDescription;
+
+            var dto = new ServiceDto
+            {
+                Name = "TestServiceStacked",
+                Description = stackedMarkedDescription,
+                Password = "plain_password"
+            };
+
+            ServiceDto? capturedEncryptedClone = null;
+            _mockDapper.Setup(d => d.ExecuteScalarAsync<int>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((sql, param, _, token) => capturedEncryptedClone = param as ServiceDto)
+                .ReturnsAsync(1);
+
+            // Act
+            await repo.UpsertAsync(dto, preserveExistingRuntimeState: false, preserveExistingCredentials: false, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.NotNull(capturedEncryptedClone);
+            Assert.Equal(originalDescription, capturedEncryptedClone.Description);
+        }
+
+        [Fact]
+        public async Task CreateEncryptedClone_StripsTheCorruptMarkerAsHandleCorruptServiceDecryptionActuallyWritesIt()
+        {
+            // Arrange
+            // The marker is built by the real producer rather than transcribed here, so a reword of
+            // its text no longer passes unnoticed: the strip regex is the only other copy, and if the
+            // two drift apart this assertion fails instead of the marker reaching the Description column.
+            var repo = CreateRepository();
+            const string originalDescription = "This is the real service description.";
+
+            var dto = new ServiceDto
+            {
+                Name = "TestService",
+                Description = originalDescription,
+                Password = "plain_password"
+            };
+
+            TestReflection.InvokeNonPublic(repo, "HandleCorruptServiceDecryption", dto,
+                new InvalidOperationException("decryption failed", new CryptographicException("bad key")));
+
+            // Guard the guard: a producer that stopped marking would make the round-trip below vacuous.
+            Assert.NotEqual(originalDescription, dto.Description);
+
+            ServiceDto? capturedEncryptedClone = null;
+            _mockDapper.Setup(d => d.ExecuteScalarAsync<int>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((sql, param, _, token) => capturedEncryptedClone = param as ServiceDto)
+                .ReturnsAsync(1);
+
+            // Act
+            await repo.UpsertAsync(dto, preserveExistingRuntimeState: false, preserveExistingCredentials: false, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.NotNull(capturedEncryptedClone);
+            Assert.Equal(originalDescription, capturedEncryptedClone.Description);
+        }
+
+        [Fact]
+        public async Task CreateEncryptedClone_StripsTheLegacyMarkerAsHandleLegacyBlockedDecryptionActuallyWritesIt()
+        {
+            // Arrange
+            // Same round-trip for the second producer: its message is the longer of the two branches
+            // in the strip pattern and the one most likely to be reworded.
+            var repo = CreateRepository();
+            const string originalDescription = "Original clean description.";
+
+            var dto = new ServiceDto
+            {
+                Name = "LegacyRow",
+                Description = originalDescription,
+                Password = "plain_password"
+            };
+
+            TestReflection.InvokeNonPublic(repo, "HandleLegacyBlockedDecryption", dto,
+                new SecureDataLegacyBlockedException("v1 payload refused by policy"));
+
+            Assert.NotEqual(originalDescription, dto.Description);
+
+            ServiceDto? capturedEncryptedClone = null;
+            _mockDapper.Setup(d => d.ExecuteScalarAsync<int>(
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<IDbTransaction>(),
+                It.IsAny<CancellationToken>()))
+                .Callback<string, object, IDbTransaction, CancellationToken>((sql, param, _, token) => capturedEncryptedClone = param as ServiceDto)
+                .ReturnsAsync(1);
+
+            // Act
+            await repo.UpsertAsync(dto, preserveExistingRuntimeState: false, preserveExistingCredentials: false, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.NotNull(capturedEncryptedClone);
+            Assert.Equal(originalDescription, capturedEncryptedClone.Description);
+        }
 
         [Fact]
         public async Task PatchRuntimeStateAsync_ExistingNotNull_ExecutesApplyRuntimeState()
@@ -1142,28 +1463,10 @@ namespace Servy.Infrastructure.UnitTests.Data
                 .ReturnsAsync(databaseMatch);
 
             // Act
-            await repo.UpdateAsync(incoming, preserveExistingRuntimeState: true, preserveExistingCredentials: false, TestContext.Current.CancellationToken);
+            await repo.UpsertAsync(incoming, preserveExistingRuntimeState: true, preserveExistingCredentials: false, TestContext.Current.CancellationToken);
 
             // Assert
-            _mockDapper.Verify(d => d.ExecuteAsync(It.IsAny<string>(), It.Is<ServiceDto>(s => s.Pid == 9999 && s.ActiveStdoutPath == "db.log"), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Once);
-        }
-
-        [Fact]
-        public void PatchRuntimeState_ExistingNotNull_ExecutesApplyRuntimeState()
-        {
-            // Arrange
-            var repo = CreateRepository();
-            var incoming = new ServiceDto { Name = "TargetSyncService", Pid = 0 };
-            var databaseMatch = new ServiceDto { Name = "TargetSyncService", Pid = 8888, ActiveStderrPath = "err.log" };
-
-            _mockDapper.Setup(d => d.QuerySingleOrDefault<ServiceDto>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>()))
-                       .Returns(databaseMatch);
-
-            // Act
-            repo.Update(incoming, preserveExistingRuntimeState: true, preserveExistingCredentials: false);
-
-            // Assert
-            _mockDapper.Verify(d => d.Execute(It.IsAny<string>(), It.Is<ServiceDto>(s => s.Pid == 8888 && s.ActiveStderrPath == "err.log"), It.IsAny<IDbTransaction>()), Times.Once);
+            _mockDapper.Verify(d => d.ExecuteScalarAsync<int>(It.IsAny<string>(), It.Is<ServiceDto>(s => s.Pid == 9999 && s.ActiveStdoutPath == "db.log"), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()), Times.Once);
         }
 
         [Theory]
@@ -1181,6 +1484,8 @@ namespace Servy.Infrastructure.UnitTests.Data
                 ActiveStdoutPath = "inc_out.log",
                 ActiveStderrPath = "inc_err.log",
                 PreviousStopTimeout = 10,
+                RestartAttempts = 1,
+                RestartAttemptsUpdatedAtTicks = 100,
                 RunAsLocalSystem = true,
                 UserAccount = "inc_user",
                 Password = "new_password"
@@ -1193,6 +1498,8 @@ namespace Servy.Infrastructure.UnitTests.Data
                 ActiveStdoutPath = "active_stdout.log",
                 ActiveStderrPath = "active_stderr.log",
                 PreviousStopTimeout = 30,
+                RestartAttempts = 4,
+                RestartAttemptsUpdatedAtTicks = 400,
                 RunAsLocalSystem = false,
                 UserAccount = "old_user",
                 Password = "old_password"
@@ -1214,6 +1521,10 @@ namespace Servy.Infrastructure.UnitTests.Data
                 Assert.Equal("active_stdout.log", incoming.ActiveStdoutPath);
                 Assert.Equal("active_stderr.log", incoming.ActiveStderrPath);
                 Assert.Equal(30, incoming.PreviousStopTimeout);
+
+                // The restart attempts counter is runtime state too: editing a service never resets its quota
+                Assert.Equal(4, incoming.RestartAttempts);
+                Assert.Equal(400, incoming.RestartAttemptsUpdatedAtTicks);
             }
             else
             {
@@ -1221,6 +1532,8 @@ namespace Servy.Infrastructure.UnitTests.Data
                 Assert.Equal("inc_out.log", incoming.ActiveStdoutPath);
                 Assert.Equal("inc_err.log", incoming.ActiveStderrPath);
                 Assert.Equal(10, incoming.PreviousStopTimeout);
+                Assert.Equal(1, incoming.RestartAttempts);
+                Assert.Equal(100, incoming.RestartAttemptsUpdatedAtTicks);
             }
 
             if (preserveCredentials)
@@ -1237,6 +1550,149 @@ namespace Servy.Infrastructure.UnitTests.Data
             }
         }
 
+        [Theory]
+        [InlineData(@"NT SERVICE\Test")]
+        [InlineData(@"NT AUTHORITY\NetworkService")]
+        [InlineData(@"DOMAIN\svc_gmsa$")]
+        [InlineData(@".\blank_svc")] // a local account the import kept after a blank-password logon
+        public void ApplyRuntimeState_PreserveCredentialsWithIncomingPasswordlessAccount_KeepsTheIncomingAccount(string account)
+        {
+            // Arrange: an import that named a passwordless account, over a stored row with a password account
+            var incoming = new ServiceDto { Name = "Test", RunAsLocalSystem = false, UserAccount = account, Password = null };
+            var existing = new ServiceDto { Name = "Test", RunAsLocalSystem = false, UserAccount = "old_user", Password = "old_password" };
+
+            // Act
+            TestReflection.InvokeNonPublicStatic(
+                typeof(ServiceRepository),
+                "ApplyRuntimeState",
+                incoming,
+                existing,
+                false,
+                true);
+
+            // Assert
+            Assert.False(incoming.RunAsLocalSystem);
+            Assert.Equal(account, incoming.UserAccount);
+            Assert.Null(incoming.Password);
+        }
+
+        [Fact]
+        public void ApplyRuntimeState_PreserveCredentialsWithIncomingLocalAccountAndPassword_DoesNotApplyIt()
+        {
+            // Arrange: a local account with a password is never kept by an import, so it is not applied here either;
+            // the stored passwordless account was not named by the file, so the service goes back to LocalSystem (#8050)
+            var incoming = new ServiceDto { Name = "Test", RunAsLocalSystem = false, UserAccount = @".\inc_user", Password = "new_password" };
+            var existing = new ServiceDto { Name = "Test", RunAsLocalSystem = false, UserAccount = @"NT SERVICE\Test", Password = null };
+
+            // Act
+            TestReflection.InvokeNonPublicStatic(
+                typeof(ServiceRepository),
+                "ApplyRuntimeState",
+                incoming,
+                existing,
+                false,
+                true);
+
+            // Assert
+            Assert.True(incoming.RunAsLocalSystem);
+            Assert.Null(incoming.UserAccount);
+            Assert.Null(incoming.Password);
+        }
+
+        [Theory]
+        [InlineData(@"NT SERVICE\Test")]
+        [InlineData(@".\test_svc")] // a local account stored with no password, configured with a blank one (#8050)
+        public void ApplyRuntimeState_PreserveCredentialsWithIncomingLocalSystemBaselineOverStoredPasswordlessAccount_ResetsToLocalSystem(string account)
+        {
+            // Arrange: an import that named no account comes in as the LocalSystem baseline, over a stored account
+            // that every export writes, so the file it came from had that account removed
+            var incoming = new ServiceDto { Name = "Test", RunAsLocalSystem = true, UserAccount = null, Password = null };
+            var existing = new ServiceDto { Name = "Test", RunAsLocalSystem = false, UserAccount = account, Password = null };
+
+            // Act
+            TestReflection.InvokeNonPublicStatic(
+                typeof(ServiceRepository),
+                "ApplyRuntimeState",
+                incoming,
+                existing,
+                false,
+                true);
+
+            // Assert
+            Assert.True(incoming.RunAsLocalSystem);
+            Assert.Null(incoming.UserAccount);
+            Assert.Null(incoming.Password);
+        }
+
+        [Fact]
+        public void ApplyRuntimeState_PreserveCredentialsWithIncomingLocalSystemBaselineOverStoredPasswordAccount_KeepsTheStoredAccount()
+        {
+            // Arrange: an account with a password is never exported, so its absence from the file says nothing and it is kept
+            var incoming = new ServiceDto { Name = "Test", RunAsLocalSystem = true, UserAccount = null, Password = null };
+            var existing = new ServiceDto { Name = "Test", RunAsLocalSystem = false, UserAccount = @".\test_svc", Password = "stored_password" };
+
+            // Act
+            TestReflection.InvokeNonPublicStatic(
+                typeof(ServiceRepository),
+                "ApplyRuntimeState",
+                incoming,
+                existing,
+                false,
+                true);
+
+            // Assert
+            Assert.False(incoming.RunAsLocalSystem);
+            Assert.Equal(@".\test_svc", incoming.UserAccount);
+            Assert.Equal("stored_password", incoming.Password);
+        }
+
+        [Fact]
+        public void ApplyRuntimeState_PreserveCredentialsOverStoredPasswordAccount_LogsThatTheStoredAccountIsKept()
+        {
+            // Arrange: the import notice only describes the file, so the kept account must be reported here (#8054)
+            var incoming = new ServiceDto { Name = "Test", RunAsLocalSystem = true, UserAccount = null, Password = null };
+            var existing = new ServiceDto { Name = "Test", RunAsLocalSystem = false, UserAccount = @"DOMAIN\svc", Password = "stored_password" };
+
+            // Act
+            var (_, log) = LogCapture.Run(() => TestReflection.InvokeNonPublicStatic(
+                typeof(ServiceRepository),
+                "ApplyRuntimeState",
+                incoming,
+                existing,
+                false,
+                true));
+
+            // Assert
+            Assert.Contains(@"Import: Service 'Test' already exists with the logon account 'DOMAIN\svc', which has a stored password.", log);
+            Assert.Contains("the stored account and its password are kept.", log);
+            Assert.DoesNotContain("stored_password", log);
+        }
+
+        [Theory]
+        [InlineData(false, @"NT SERVICE\Test", null)] // a stored passwordless account the file no longer names is reset (#8050)
+        [InlineData(false, @".\test_svc", null)]      // a local account stored with no password is reset too (#8050)
+        [InlineData(true, null, null)]                // a stored LocalSystem row
+        [InlineData(true, @"DOMAIN\svc", "stored_password")] // a stored LocalSystem row with a leftover account
+        [InlineData(false, @"DOMAIN\svc", null)]      // a kept account with no stored password
+        public void ApplyRuntimeState_PreserveCredentialsWithoutAStoredPasswordAccount_DoesNotLogAKeptAccount(bool storedRunAsLocalSystem, string? storedAccount, string? storedPassword)
+        {
+            // Arrange: only a stored account that has a password is kept by name, so nothing else may be reported as kept
+            var incoming = new ServiceDto { Name = "Test", RunAsLocalSystem = true, UserAccount = null, Password = null };
+            var existing = new ServiceDto { Name = "Test", RunAsLocalSystem = storedRunAsLocalSystem, UserAccount = storedAccount, Password = storedPassword };
+
+            // Act
+            var (_, log) = LogCapture.Run(() => TestReflection.InvokeNonPublicStatic(
+                typeof(ServiceRepository),
+                "ApplyRuntimeState",
+                incoming,
+                existing,
+                false,
+                true));
+
+            // Assert
+            Assert.DoesNotContain("already exists with the logon account", log);
+        }
+
         [Fact]
         public async Task CreateEncryptedClone_CatchBlock_ThrowsInvalidOperationException()
         {
@@ -1249,11 +1705,30 @@ namespace Servy.Infrastructure.UnitTests.Data
 
             // Act & Assert
             var wrapperEx = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                 repo.AddAsync(dto, TestContext.Current.CancellationToken));
+                 repo.UpsertAsync(dto, preserveExistingRuntimeState: false, preserveExistingCredentials: false, TestContext.Current.CancellationToken));
 
             Assert.Contains("Encryption failed for field", wrapperEx.Message);
             Assert.NotNull(wrapperEx.InnerException);
             Assert.IsType<CryptographicException>(wrapperEx.InnerException);
+        }
+
+        [Fact]
+        public async Task UpsertAsync_NullService_ThrowsArgumentNullExceptionFromCreateEncryptedClone()
+        {
+            // Arrange
+            var repo = CreateRepository();
+
+            // Act & Assert
+            // UpsertAsync has no null check of its own; the guard under test is the one
+            // CreateEncryptedClone applies before anything is written.
+            var ex = await Assert.ThrowsAsync<ArgumentNullException>(() =>
+                repo.UpsertAsync(null!, preserveExistingRuntimeState: false, preserveExistingCredentials: false, TestContext.Current.CancellationToken));
+
+            Assert.Equal("source", ex.ParamName);
+
+            _mockDapper.Verify(
+                e => e.ExecuteScalarAsync<int>(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<IDbTransaction>(), It.IsAny<CancellationToken>()),
+                Times.Never);
         }
 
         [Fact]
@@ -1293,7 +1768,7 @@ namespace Servy.Infrastructure.UnitTests.Data
                            .Throws(new TimeoutException("Cryptographic subsystem timed out."));
 
             // Act
-            var result = await repo.GetByIdAsync(77, decrypt: true, TestContext.Current.CancellationToken);
+            var result = await repo.GetByNameAsync("PoisonRow", decrypt: true, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.NotNull(result);
@@ -1339,6 +1814,51 @@ namespace Servy.Infrastructure.UnitTests.Data
             {
                 Assert.Null(type.GetProperty(field.Key)?.GetValue(freshDto));
             }
+        }
+
+        [Fact]
+        public void HandleLegacyBlockedDecryption_AllBranchesAndNullGuards_Covered()
+        {
+            // Arrange
+            var repo = CreateRepository();
+            var dto = new ServiceDto { Name = "LegacyRow", Description = "KeepMe", Password = "XYZ" };
+            var ex = new SecureDataLegacyBlockedException("v1 payload refused by policy");
+            Assert.False(dto.DecryptionFailed);
+
+            // Act & Assert
+            // 1. Branch path verification: Guard tracking on null DTO elements
+            TestReflection.InvokeNonPublic(repo, "HandleLegacyBlockedDecryption", null, ex);
+
+            // 2. The description is flagged and, unlike the corrupt-record handler above, the sensitive
+            // fields are deliberately left as stored ciphertext - the record is intact, not corrupt.
+            TestReflection.InvokeNonPublic(repo, "HandleLegacyBlockedDecryption", dto, ex);
+
+            Assert.Contains("[LEGACY ENCRYPTION BLOCKED]", dto.Description);
+            Assert.Contains("KeepMe", dto.Description);
+            Assert.Equal("XYZ", dto.Password);
+            Assert.True(dto.DecryptionFailed);
+        }
+
+        [Fact]
+        public void SafeDecrypt_LegacyBlockedException_RoutesToLegacyHandlerNotCorruptHandler()
+        {
+            // Arrange
+            _mockSecureData.Setup(s => s.Decrypt(It.IsAny<string>()))
+                           .Throws(new SecureDataLegacyBlockedException("v1 payload refused by policy"));
+
+            var repo = CreateRepository();
+            var dto = new ServiceDto { Name = "LegacyRow", Description = "KeepMe", Password = "XYZ" };
+
+            // Act
+            TestReflection.InvokeNonPublic(repo, "SafeDecrypt", dto);
+
+            // Assert: flagged as policy-refused, not scrubbed as corrupt, and refused for saving by the
+            // flag every save-side check reads (#7348), not by the description text
+            Assert.Contains("[LEGACY ENCRYPTION BLOCKED]", dto.Description);
+            Assert.DoesNotContain("[DECRYPTION FAILED", dto.Description);
+            Assert.Equal("XYZ", dto.Password);
+            Assert.True(dto.DecryptionFailed);
+            Assert.True(DecryptionFailureMarker.HasDecryptionFailure(dto));
         }
 
         #endregion

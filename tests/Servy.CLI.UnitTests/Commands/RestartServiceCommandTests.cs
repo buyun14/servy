@@ -7,6 +7,7 @@ using Servy.Core.Services;
 
 namespace Servy.CLI.UnitTests.Commands
 {
+    [Collection(ElevationTestCollection.Name)]
     public class RestartServiceCommandTests : ServiceCommandTestsBase<RestartServiceCommand, RestartServiceOptions>
     {
         protected override RestartServiceCommand CreateCommandInstance() => new RestartServiceCommand(MockServiceManager.Object);
@@ -19,6 +20,10 @@ namespace Servy.CLI.UnitTests.Commands
         protected override string ExpectedSuccessMessage(string serviceName) => string.Format(Strings.Msg_RestartSuccess, serviceName);
 
         protected override string ExpectedGenericActionMessage(string serviceName) => string.Format(Strings.Msg_RestartServiceAction, serviceName);
+
+        protected override string ExpectedSuggestion => Strings.Msg_RestartServiceSuggestion;
+
+        protected override string ExpectedCommandName => "restart";
 
         protected override void SetupServiceManagerSuccess(Mock<IServiceManager> mockManager, string serviceName)
         {
@@ -42,20 +47,28 @@ namespace Servy.CLI.UnitTests.Commands
         }
 
         [Fact]
-        public async Task Execute_ServiceIsDisabled_ReturnsServiceDisabledError()
+        public Task Execute_ServiceIsDisabled_ReturnsServiceDisabledError() => AssertDisabledStartupTypeIsRefusedAsync();
+
+        [Fact]
+        public async Task Execute_ValidOptions_AsksTheManagerToLogTheSuccessfulRestart()
         {
             // Arrange
-            const string serviceName = "DisabledService";
-            var options = CreateValidOptions(serviceName);
-            MockServiceManager.Setup(sm => sm.IsServiceInstalled(serviceName, It.IsAny<CancellationToken>())).Returns(true);
-            MockServiceManager.Setup(sm => sm.GetServiceStartupType(serviceName, It.IsAny<CancellationToken>())).Returns(Core.Enums.ServiceStartType.Disabled);
+            const string serviceName = "TestService";
+            SetupServiceManagerSuccess(MockServiceManager, serviceName);
 
             // Act
-            var result = await ExecuteCommandAsync(Command, options);
+            var result = await ExecuteCommandAsync(Command, CreateValidOptions(serviceName));
 
             // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(Strings.Msg_ServiceDisabledError, result.Message);
+            Assert.True(result.IsSuccess);
+            MockServiceManager.Verify(
+                sm => sm.RestartServiceAsync(serviceName, true, It.IsAny<CancellationToken>()),
+                Times.Once);
+
+            // Exact token, not It.IsAny: a hand-over that passes default matches nothing.
+            MockServiceManager.Verify(
+                sm => sm.RestartServiceAsync(serviceName, true, TestContext.Current.CancellationToken),
+                Times.Once);
         }
     }
 }

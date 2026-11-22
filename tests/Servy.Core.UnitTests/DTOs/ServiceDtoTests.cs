@@ -16,11 +16,17 @@ namespace Servy.Core.UnitTests.DTOs
         [Fact]
         public void Clone_AllProperties_MatchSourceValues()
         {
-            // 1. Arrange: Create a source with non-default values for ALL properties
+            // 1. Arrange: Create a source with non-default values for ALL properties.
+            // ServiceDto.Clone() is MemberwiseClone(), which cannot omit or transpose a member, so
+            // this test is a tripwire for a future hand-written Clone(): closed #1290 was exactly
+            // that defect (a dropped EnableConsoleUI), which is why every property is compared
+            // reflectively rather than by hand.
             var sourcePass1 = CreateFullyPopulatedServiceDto();
             var sourcePass2 = CreateFullyPopulatedServiceDto();
 
-            // Invert boolean properties on pass 2 to ensure two-pass complete boolean swap detection
+            // Pass 2 flips every bool so each one is compared in both states. Note this does NOT
+            // detect a swap between two bools whose ordinal indices share a parity: they are seeded
+            // equal and inverted together, so they are equal in both passes.
             InvertAllBooleanProperties(sourcePass2);
 
             var testPasses = new[] { sourcePass1, sourcePass2 };
@@ -55,27 +61,45 @@ namespace Servy.Core.UnitTests.DTOs
         public void SensitiveProperties_MustCarryIgnoreSerializationAttributes()
         {
             // Arrange
-            var sensitiveProperties = new List<string>
+            var expected = new List<string>
             {
-                "Id", "Pid", "RunAsLocalSystem", "UserAccount", "Password",
-                "PreviousStopTimeout", "ActiveStdoutPath", "ActiveStderrPath"
-            };
+                // UserAccount is deliberately absent: it is written for a passwordless account only, which
+                // ServiceDto.ShouldSerializeUserAccount decides (see UserAccount_IsSerializedOnlyForAPasswordlessAccount).
+                "Id", "Pid", "RunAsLocalSystem", "Password",
+                "PreviousStopTimeout", "ActiveStdoutPath", "ActiveStderrPath",
+                "RestartAttempts", "RestartAttemptsUpdatedAtTicks",
+                // Not a secret and not a column: one read's decryption outcome, which must never be
+                // exported or imported, or a marker in an export's description would travel as a verdict.
+                // LegacyEncryptionBlocked says which kind of failure that read was (#7816), for the same reason.
+                "DecryptionFailed", "LegacyEncryptionBlocked"
+            }.OrderBy(n => n, StringComparer.Ordinal).ToList();
 
-            // Act & Assert
-            foreach (string propName in sensitiveProperties)
-            {
-                // Safely extract property data via the target public type reflection framework
-                var prop = typeof(ServiceDto).GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
+            var props = typeof(ServiceDto).GetProperties(BindingFlags.Public | BindingFlags.Instance);
 
-                Assert.NotNull(prop);
+            // Act
+            // Enumerate by attribute rather than by name, the shape ServicePathAttributeAntiDriftTests
+            // uses: walking the hand-maintained list could only catch an attribute removed from a
+            // listed property, never one of ServiceDto's other 57 properties - or a newly added
+            // secret - that should be ignored and is not.
+            var jsonIgnored = props.Where(p => p.GetCustomAttribute<JsonIgnoreAttribute>() != null)
+                .Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToList();
+            var xmlIgnored = props.Where(p => p.GetCustomAttribute<XmlIgnoreAttribute>() != null)
+                .Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToList();
 
-                // Actively assert protection attributes are registered to enforce security constraints
-                bool hasJsonIgnore = prop.GetCustomAttribute<JsonIgnoreAttribute>() != null;
-                bool hasXmlIgnore = prop.GetCustomAttribute<XmlIgnoreAttribute>() != null;
+            // Assert
+            // Tripwire: ServiceDto has 68 public instance properties today. A property that is new
+            // AND carries neither attribute is absent from BOTH sides of the comparisons below, so
+            // they can never see it - the direction closed #5705 named and its fix did not close.
+            // A new property changes this count and fails here first, which forces `expected` above
+            // to be reconsidered; update the count alongside it whenever the DTO grows.
+            Assert.Equal(68, props.Length);
 
-                Assert.True(hasJsonIgnore, $"Security Regression: Property '{propName}' is missing [JsonIgnore].");
-                Assert.True(hasXmlIgnore, $"Security Regression: Property '{propName}' is missing [XmlIgnore].");
-            }
+            // Security Regression: the ignored set must be exactly the set listed above, so adding
+            // or removing either attribute has to be a deliberate edit of this test. Comparing both
+            // attributes against the same list also pins that they never diverge - a value hidden
+            // from JSON but present in the XML export still reaches disk.
+            Assert.Equal(expected, jsonIgnored);
+            Assert.Equal(expected, xmlIgnored);
         }
 
         [Fact]
@@ -98,6 +122,10 @@ namespace Servy.Core.UnitTests.DTOs
                 var prop = typeof(ServiceDto).GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
 
                 Assert.NotNull(prop); // Ensure matching target tracking property exists
+
+                // UserAccount has its own rule (passwordless accounts only), covered by
+                // UserAccount_IsSerializedOnlyForAPasswordlessAccount below.
+                if (propName == nameof(ServiceDto.UserAccount)) continue;
 
                 // Case 1: String properties (Serialize only if not null or whitespace)
                 if (prop.PropertyType == typeof(string))
@@ -126,6 +154,36 @@ namespace Servy.Core.UnitTests.DTOs
             }
         }
 
+        [Theory]
+        [InlineData(@"NT SERVICE\MyService", null, null, true)]
+        [InlineData(@"NT SERVICE\MyService", false, "", true)]
+        [InlineData(@"NT AUTHORITY\NetworkService", false, null, true)]
+        [InlineData(@"DOMAIN\svc_gmsa$", false, null, true)]
+        // A local account is stored with no password only when it was configured with a blank one
+        [InlineData(@".\test_svc", false, null, true)]
+        [InlineData(@".\test_svc", false, "secret", false)]
+        // An account that needs a password is never written
+        [InlineData(@"DOMAIN\User", false, null, false)]
+        [InlineData(@".\svc-account", false, "secret", false)]
+        // A passwordless name with a password set, or a service running as LocalSystem, is not written
+        [InlineData(@"NT SERVICE\MyService", false, "secret", false)]
+        [InlineData(@"NT SERVICE\MyService", true, null, false)]
+        // LocalSystem is expressed by RunAsLocalSystem, never by an account name
+        [InlineData("LocalSystem", false, null, false)]
+        [InlineData(null, false, null, false)]
+        [InlineData("   ", false, null, false)]
+        public void UserAccount_IsSerializedOnlyForAPasswordlessAccount(string? account, bool? runAsLocalSystem, string? password, bool expected)
+        {
+            // Arrange
+            var dto = new ServiceDto { UserAccount = account, RunAsLocalSystem = runAsLocalSystem, Password = password };
+
+            // Act
+            bool result = dto.ShouldSerializeUserAccount();
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
         #endregion
 
         /// <summary>
@@ -148,8 +206,8 @@ namespace Servy.Core.UnitTests.DTOs
         }
 
         /// <summary>
-        /// Inverts all boolean property values on the target <see cref="ServiceDto"/> instance.
-        /// Enables complete mapping swap detection across boolean fields.
+        /// Inverts all boolean property values on the target <see cref="ServiceDto"/> instance,
+        /// so the second clone pass compares every boolean in its other state.
         /// </summary>
         private static void InvertAllBooleanProperties(ServiceDto dto)
         {
@@ -198,9 +256,9 @@ namespace Servy.Core.UnitTests.DTOs
             }
             else if (targetType == typeof(bool))
             {
-                // NOTE: bool? has only two non-null values, so same-typed swap detection is not
-                // achievable in a single pass - alternating keeps the pattern reproducible while
-                // dual-pass cloning validates all boolean states.
+                // NOTE: bool? has only two non-null values, so alternating on the ordinal index
+                // gives a reproducible pattern in which each boolean is populated non-default in
+                // one of the two passes. It does not separate two booleans of the same parity.
                 p.SetValue(dto, (seed & 1) == 0);
             }
             else if (targetType == typeof(double))

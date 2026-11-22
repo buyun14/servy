@@ -7,6 +7,7 @@ using Servy.Core.Services;
 
 namespace Servy.CLI.UnitTests.Commands
 {
+    [Collection(ElevationTestCollection.Name)]
     public class StartServiceCommandTests : ServiceCommandTestsBase<StartServiceCommand, StartServiceOptions>
     {
         protected override StartServiceCommand CreateCommandInstance() => new StartServiceCommand(MockServiceManager.Object);
@@ -20,6 +21,10 @@ namespace Servy.CLI.UnitTests.Commands
         protected override string ExpectedSuccessMessage(string serviceName) => string.Format(Strings.Msg_StartSuccess, serviceName);
 
         protected override string ExpectedGenericActionMessage(string serviceName) => string.Format(Strings.Msg_StartServiceAction, serviceName);
+
+        protected override string ExpectedSuggestion => Strings.Msg_StartServiceSuggestion;
+
+        protected override string ExpectedCommandName => "start";
 
         protected override void SetupServiceManagerSuccess(Mock<IServiceManager> mockManager, string serviceName)
         {
@@ -43,20 +48,30 @@ namespace Servy.CLI.UnitTests.Commands
         }
 
         [Fact]
-        public async Task Execute_ServiceIsDisabled_ReturnsServiceDisabledError()
+        public Task Execute_ServiceIsDisabled_ReturnsServiceDisabledError() => AssertDisabledStartupTypeIsRefusedAsync();
+
+        [Fact]
+        public async Task Execute_ValidOptions_AsksTheManagerToLogTheSuccessfulStart()
         {
             // Arrange
-            const string serviceName = "DisabledService";
-            var options = CreateValidOptions(serviceName);
-            MockServiceManager.Setup(sm => sm.IsServiceInstalled(serviceName, It.IsAny<CancellationToken>())).Returns(true);
-            MockServiceManager.Setup(sm => sm.GetServiceStartupType(serviceName, It.IsAny<CancellationToken>())).Returns(Core.Enums.ServiceStartType.Disabled);
+            const string serviceName = "TestService";
+            SetupServiceManagerSuccess(MockServiceManager, serviceName);
 
             // Act
-            var result = await ExecuteCommandAsync(Command, options);
+            var result = await ExecuteCommandAsync(Command, CreateValidOptions(serviceName));
 
             // Assert
-            Assert.False(result.IsSuccess);
-            Assert.Equal(Strings.Msg_ServiceDisabledError, result.Message);
+            Assert.True(result.IsSuccess);
+            MockServiceManager.Verify(
+                sm => sm.StartServiceAsync(serviceName, true, It.IsAny<CancellationToken>()),
+                Times.Once);
+
+            // Exact token, not It.IsAny: a hand-over that passes default matches nothing. The installed check
+            // and the disabled pre-check are BaseCommand's, shared by every lifecycle verb, so they are pinned here once.
+            var token = TestContext.Current.CancellationToken;
+            MockServiceManager.Verify(sm => sm.IsServiceInstalled(serviceName, token), Times.Once);
+            MockServiceManager.Verify(sm => sm.GetServiceStartupType(serviceName, token), Times.Once);
+            MockServiceManager.Verify(sm => sm.StartServiceAsync(serviceName, true, token), Times.Once);
         }
     }
 }

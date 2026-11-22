@@ -18,6 +18,11 @@ namespace Servy.Manager.Converters
     public abstract class ProcessMetricConverter<TValue> : IValueConverter where TValue : struct
     {
         /// <summary>
+        /// Seam for unit testing. Production code defaults to the real WPF designer-mode check.
+        /// </summary>
+        internal static Func<bool> IsInDesignModeCheck = () => DesignerProperties.GetIsInDesignMode(new DependencyObject());
+
+        /// <summary>
         /// The process formatting helper dependency.
         /// </summary>
         protected readonly IProcessHelper ProcessHelper;
@@ -34,7 +39,7 @@ namespace Servy.Manager.Converters
         protected ProcessMetricConverter()
         {
             // Check for design mode before accessing App.Services
-            if (DesignerProperties.GetIsInDesignMode(new DependencyObject()))
+            if (IsInDesignModeCheck())
             {
                 ProcessHelper = new DesignTimeProcessHelper();
                 return;
@@ -43,7 +48,7 @@ namespace Servy.Manager.Converters
             var helper = App.Services?.GetService<IProcessHelper>();
             if (helper == null)
             {
-                Logger.Warn($"{GetType().Name}: IProcessHelper could not be resolved from DI; using design-time fallback. Metric values will be placeholders.");
+                Logger.Warn($"{GetType().Name}: IProcessHelper could not be resolved from DI; falling back to a default ProcessHelper instance. Formatting still works, but the configured helper registration is missing.");
                 helper = new DesignTimeProcessHelper();
             }
             ProcessHelper = helper;
@@ -68,11 +73,10 @@ namespace Servy.Manager.Converters
         /// or the <see cref="UnknownMetricUsage"/> placeholder if the value is null or an incompatible type.
         /// </returns>
         /// <remarks>
-        /// This implementation utilizes C# pattern matching to provide a "fail-silent" guard.
-        /// If the bound property is a null nullable structure, the pattern match fails,
-        /// safely returning the unknown placeholder instead of throwing a <see cref="NullReferenceException"/>.
+        /// The type pattern is deliberate: it folds the null check and the unboxing into one test,
+        /// where a direct cast of a null box would throw.
         /// </remarks>
-        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
         {
             // Pattern matching handles the null check and unboxing in one go.
             // If the bound property is nullable and is null, the pattern match fails
@@ -88,7 +92,7 @@ namespace Servy.Manager.Converters
         /// <summary>
         /// Not implemented (one-way binding only).
         /// </summary>
-        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
         {
             return Binding.DoNothing;
         }

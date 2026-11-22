@@ -1,18 +1,281 @@
 using Servy.Core.Config;
 using Servy.Core.DTOs;
 using Servy.Core.Helpers;
+using System.Reflection;
 
 namespace Servy.Core.UnitTests.Helpers
 {
     public class ServiceDtoHelperTests
     {
         [Fact]
-        public void ApplyDefaults_WhenAllPropertiesAreNull_PopulatesEveryDefault()
+        public void Clone_WhenDtoIsNull_ThrowsArgumentNullException()
         {
-            // Arrange: Create a DTO where all nullable properties are null
-            // Note: ServiceDto has field initializers, so explicitly null
-            // every nullable property to exercise ApplyDefaults on an incomplete import.
+            // Arrange
+            ServiceDto? dto = null;
+
+            // Act & Assert
+            var exception = Assert.Throws<ArgumentNullException>(() => ServiceDtoHelper.Clone(dto!));
+            Assert.Equal("dto", exception.ParamName);
+        }
+
+        [Fact]
+        public void Clone_ReturnsIndependentCopy()
+        {
+            // Arrange: CreateFull leaves the [JsonIgnore]/[XmlIgnore] identity fields at their defaults,
+            // so set them here - the wrapper has to carry them across too
+            var original = ServiceDtoFactory.CreateFull();
+            original.Id = 42;
+            original.Pid = 4242;
+
+            // Act
+            var clone = ServiceDtoHelper.Clone(original);
+
+            // Assert: a distinct instance carrying every property value
+            Assert.NotSame(original, clone);
+            foreach (var prop in typeof(ServiceDto).GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (!prop.CanRead || !prop.CanWrite) continue;
+                Assert.Equal(prop.GetValue(original), prop.GetValue(clone));
+            }
+
+            // Assert: Verify mutating the clone does not affect the original object
+            var originalName = original.Name;
+            var originalStartTimeout = original.StartTimeout;
+
+            clone.Name = "MutatedName";
+            clone.StartTimeout = 999;
+
+            Assert.Equal(originalName, original.Name);
+            Assert.Equal(originalStartTimeout, original.StartTimeout);
+        }
+
+        [Fact]
+        public void HydrateDefaults_WhenDtoIsNull_ShouldNotThrow()
+        {
+            // Arrange
+            ServiceDto? dto = null;
+
+            // Act & Assert
+            var exception = Record.Exception(() => ServiceDtoHelper.HydrateDefaults(dto));
+            Assert.Null(exception);
+        }
+
+        [Fact]
+        public void HydrateDefaults_WhenStructuralPropertiesAreNull_PopulatesDefaultsWithoutResettingIdentity()
+        {
+            // Arrange: Null every structural property, but give the identity trio explicit values so the no-reset guarantee is observable
+            var dto = CreateAllNullDto();
+            dto.RunAsLocalSystem = false;
+            dto.UserAccount = "CustomUser";
+            dto.Password = "CustomPassword";
+
+            // Act
+            ServiceDtoHelper.HydrateDefaults(dto);
+
+            // Assert: Structural defaults populated
+            AssertAllStructuralDefaults(dto);
+
+            // Assert: Identity properties remain untouched
+            Assert.False(dto.RunAsLocalSystem);
+            Assert.Equal("CustomUser", dto.UserAccount);
+            Assert.Equal("CustomPassword", dto.Password);
+        }
+
+        /// <summary>
+        /// Covers the hydration of RunAsLocalSystem by HydrateDefaults itself. The structural-default
+        /// helper cannot carry this one: the sibling no-reset test gives the field an explicit value so
+        /// the identity guarantee stays observable, and ApplyDefaultsAndResetIdentity overwrites it
+        /// unconditionally, so only this test fails when the hydration line is removed or its value drifts.
+        /// </summary>
+        [Fact]
+        public void HydrateDefaults_WhenRunAsLocalSystemIsNull_AppliesTheAppConfigDefault()
+        {
+            // Arrange: leave the identity flag unset, which is the only state the hydration line reads
+            var dto = new ServiceDto { RunAsLocalSystem = null };
+
+            // Act
+            ServiceDtoHelper.HydrateDefaults(dto);
+
+            // Assert
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, dto.RunAsLocalSystem);
+        }
+
+        [Fact]
+        public void HydrateDefaults_WhenUserAccountHasSurroundingWhitespace_TrimsIt()
+        {
+            // Arrange: Pad the account on both sides so the identity normalization step is observable
+            var dto = new ServiceDto { UserAccount = "  Domain\\User  " };
+
+            // Act
+            ServiceDtoHelper.HydrateDefaults(dto);
+
+            // Assert
+            Assert.Equal("Domain\\User", dto.UserAccount);
+        }
+
+        [Fact]
+        public void HydrateDefaults_NormalizesEnvironmentVariablesAndDependencies()
+        {
+            // Arrange: Provide multi-line inputs requiring normalization
             var dto = new ServiceDto
+            {
+                EnvironmentVariables = "VAR1=VAL1\r\nVAR2=VAL2\\",
+                ServiceDependencies = "Dep1\r\nDep2",
+                PreLaunchEnvironmentVariables = "PRE1=VAL1\nPRE2=VAL2"
+            };
+
+            // Act
+            ServiceDtoHelper.HydrateDefaults(dto);
+
+            // Assert: Strings should be normalized into single-line semicolon-delimited forms
+            Assert.Equal("VAR1=VAL1;VAR2=VAL2\\\\", dto.EnvironmentVariables);
+            Assert.Equal("Dep1;Dep2", dto.ServiceDependencies);
+            Assert.Equal("PRE1=VAL1;PRE2=VAL2", dto.PreLaunchEnvironmentVariables);
+        }
+
+        [Fact]
+        public void ApplyDefaultsAndResetIdentity_WhenAllPropertiesAreNull_PopulatesEveryDefault()
+        {
+            // Arrange: Explicitly null every nullable property defensively to exercise ApplyDefaultsAndResetIdentity on an incomplete import
+            var dto = CreateAllNullDto();
+
+            // Act
+            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
+
+            // Assert
+            AssertAllStructuralDefaults(dto);
+            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, dto.RunAsLocalSystem);
+        }
+
+        [Fact]
+        public void ApplyDefaultsAndResetIdentity_WhenPropertiesAlreadyHaveValues_PreservesExplicitNonIdentityValues()
+        {
+            // Arrange: Assign explicit custom configurations that deviate from system defaults
+            const int customTimeout = 999;
+            bool customToggle = !AppConfig.DefaultEnableSizeRotation;
+
+            var dto = new ServiceDto
+            {
+                Name = "TestService",
+                StartTimeout = customTimeout,
+                EnableSizeRotation = customToggle
+            };
+
+            // Precondition: StopTimeout is left unset, so hydration is the only thing that can fill it
+            Assert.Null(dto.StopTimeout);
+
+            // Act
+            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
+
+            // Assert
+            // 1. Verify custom parameter value allocations remain perfectly intact
+            Assert.Equal(customTimeout, dto.StartTimeout);
+            Assert.Equal(customToggle, dto.EnableSizeRotation);
+
+            // 2. Verify unmatched null variables still pull successfully from base fallback policies
+            Assert.Equal(AppConfig.DefaultStopTimeout, dto.StopTimeout);
+        }
+
+        [Fact]
+        public void ApplyDefaultsAndResetIdentity_WithAccountThatNeedsAPassword_ResetsToLocalSystemBaseline()
+        {
+            // Arrange: Populate an explicit custom user account layout configuration
+            var dto = new ServiceDto
+            {
+                Name = "IdentitySecurityService",
+                RunAsLocalSystem = false,
+                UserAccount = @".\test_svc",
+                Password = "secret"
+            };
+
+            // Act
+            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
+
+            // Assert
+            // Verify that the Global Identity Reset on Import policy overwrites and purges an account that needs a password
+            Assert.True(dto.RunAsLocalSystem, "The identity was not securely reset to follow the password-less LocalSystem default state.");
+            Assert.Null(dto.UserAccount);
+            Assert.Null(dto.Password);
+        }
+
+        [Theory]
+        [InlineData(@"NT SERVICE\IdentitySecurityService")]
+        [InlineData(@"NT AUTHORITY\LocalService")]
+        [InlineData(@"NT AUTHORITY\NetworkService")]
+        [InlineData(@"IIS APPPOOL\DefaultAppPool")]
+        [InlineData(@"DOMAIN\svc_gmsa$")]
+        public void ApplyDefaultsAndResetIdentity_WithPasswordlessAccount_KeepsTheAccount(string account)
+        {
+            // Arrange
+            var dto = new ServiceDto
+            {
+                Name = "IdentitySecurityService",
+                RunAsLocalSystem = true,
+                UserAccount = account,
+                Password = "ignored"
+            };
+
+            // Act
+            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
+
+            // Assert
+            Assert.False(dto.RunAsLocalSystem, "A passwordless account was not kept as the service identity.");
+            Assert.Equal(account, dto.UserAccount);
+            Assert.Null(dto.Password);
+        }
+
+        [Fact]
+        public void ApplyDefaultsAndResetIdentity_WithPasswordlessAccountAndSurroundingWhitespace_KeepsTheTrimmedAccount()
+        {
+            // Arrange
+            var dto = new ServiceDto { Name = "TrimmedAccountService", UserAccount = @"  NT SERVICE\TrimmedAccountService  " };
+
+            // Act
+            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
+
+            // Assert
+            Assert.False(dto.RunAsLocalSystem);
+            Assert.Equal(@"NT SERVICE\TrimmedAccountService", dto.UserAccount);
+        }
+
+        [Theory]
+        [InlineData("LocalSystem")]
+        [InlineData(@"NT AUTHORITY\SYSTEM")]
+        [InlineData(@"DOMAIN\User")]
+        [InlineData(@"NT SERVICE\")]
+        public void ApplyDefaultsAndResetIdentity_WithAccountThatIsNotPasswordless_ResetsToLocalSystemBaseline(string account)
+        {
+            // Arrange
+            var dto = new ServiceDto { Name = "ResetService", RunAsLocalSystem = false, UserAccount = account };
+
+            // Act
+            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
+
+            // Assert
+            Assert.True(dto.RunAsLocalSystem);
+            Assert.Null(dto.UserAccount);
+            Assert.Null(dto.Password);
+        }
+
+        [Fact]
+        public void ApplyDefaultsAndResetIdentity_WhenDtoIsNull_ShouldNotThrow()
+        {
+            // Arrange
+            ServiceDto? dto = null;
+
+            // Act & Assert
+            // ApplyDefaultsAndResetIdentity returns immediately on null (see ServiceDtoHelper)
+            var exception = Record.Exception(() => ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto));
+            Assert.Null(exception);
+        }
+
+        /// <summary>
+        /// Builds the shared null-out fixture both hydration tests arrange, so a new nullable
+        /// property is nulled once rather than in two hand-maintained initializers.
+        /// </summary>
+        private static ServiceDto CreateAllNullDto()
+        {
+            return new ServiceDto
             {
                 StartupType = null,
                 Priority = null,
@@ -30,6 +293,8 @@ namespace Servy.Core.UnitTests.Helpers
                 HeartbeatInterval = null,
                 MaxFailedChecks = null,
                 MaxRestartAttempts = null,
+                HeartbeatUrlTimeoutSeconds = null,
+                EnableHeartbeatUrlFlags = null,
                 PreLaunchTimeoutSeconds = null,
                 PreLaunchRetryAttempts = null,
                 PreLaunchIgnoreFailure = null,
@@ -39,14 +304,17 @@ namespace Servy.Core.UnitTests.Helpers
                 RecoveryAction = null,
                 RecoveryOnCleanExit = null
             };
+        }
 
-            // Act
-            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
-
-            // Assert
+        /// <summary>
+        /// Asserts the 26 structural defaults HydrateDefaults populates. ApplyDefaultsAndResetIdentity
+        /// delegates to HydrateDefaults for all of them, so both tests share one list and default
+        /// number 27 is added in a single place.
+        /// </summary>
+        private static void AssertAllStructuralDefaults(ServiceDto dto)
+        {
             Assert.Equal((int)AppConfig.DefaultStartupType, dto.StartupType);
             Assert.Equal((int)AppConfig.DefaultProcessPriority, dto.Priority);
-            Assert.Equal(AppConfig.DefaultRunAsLocalSystem, dto.RunAsLocalSystem);
             Assert.Equal(AppConfig.DefaultEnableDebugLogs, dto.EnableDebugLogs);
             Assert.Equal(AppConfig.DefaultStartTimeout, dto.StartTimeout);
             Assert.Equal(AppConfig.DefaultStopTimeout, dto.StopTimeout);
@@ -60,6 +328,7 @@ namespace Servy.Core.UnitTests.Helpers
             Assert.Equal(AppConfig.DefaultHeartbeatInterval, dto.HeartbeatInterval);
             Assert.Equal(AppConfig.DefaultMaxFailedChecks, dto.MaxFailedChecks);
             Assert.Equal(AppConfig.DefaultMaxRestartAttempts, dto.MaxRestartAttempts);
+            Assert.Equal(AppConfig.DefaultAllowOverriddenRuntimeVars, dto.AllowOverriddenRuntimeVars);
             Assert.Equal(AppConfig.DefaultPreLaunchTimeoutSeconds, dto.PreLaunchTimeoutSeconds);
             Assert.Equal(AppConfig.DefaultPreLaunchRetryAttempts, dto.PreLaunchRetryAttempts);
             Assert.Equal(AppConfig.DefaultPreLaunchIgnoreFailure, dto.PreLaunchIgnoreFailure);
@@ -68,68 +337,8 @@ namespace Servy.Core.UnitTests.Helpers
             Assert.Equal(AppConfig.DefaultEnableConsoleUI, dto.EnableConsoleUI);
             Assert.Equal((int)AppConfig.DefaultRecoveryAction, dto.RecoveryAction);
             Assert.Equal(AppConfig.DefaultRecoveryOnCleanExit, dto.RecoveryOnCleanExit);
-        }
-
-        [Fact]
-        public void ApplyDefaultsAndResetIdentity_WhenPropertiesAlreadyHaveValues_PreservesExplicitNonIdentityValues()
-        {
-            // Arrange: Assign explicit custom configurations that deviate from system defaults
-            const int customTimeout = 999;
-            bool customToggle = !AppConfig.DefaultEnableSizeRotation;
-
-            var dto = new ServiceDto
-            {
-                Name = "TestService",
-                StartTimeout = customTimeout,
-                EnableSizeRotation = customToggle,
-                // Populate arbitrary properties as null to ensure hydration still executes as a sibling track
-                StopTimeout = null
-            };
-
-            // Act
-            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
-
-            // Assert
-            // 1. Verify custom parameter value allocations remain perfectly intact
-            Assert.Equal(customTimeout, dto.StartTimeout);
-            Assert.Equal(customToggle, dto.EnableSizeRotation);
-
-            // 2. Verify unmatched null variables still pull successfully from base fallback policies
-            Assert.Equal(AppConfig.DefaultStopTimeout, dto.StopTimeout);
-        }
-
-        [Fact]
-        public void ApplyDefaultsAndResetIdentity_WithCustomIdentityPopulated_UnconditionallyResetsToLocalSystemBaseline()
-        {
-            // Arrange: Populate an explicit custom user account layout configuration
-            var dto = new ServiceDto
-            {
-                Name = "IdentitySecurityService",
-                RunAsLocalSystem = false,
-                UserAccount = @".\test_svc",
-                Password = "secret"
-            };
-
-            // Act
-            ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto);
-
-            // Assert
-            // Verify that the Global Identity Reset on Import policy strictly overwrites and purges the account context
-            Assert.True(dto.RunAsLocalSystem, "The identity was not securely reset to follow the password-less LocalSystem default state.");
-            Assert.Null(dto.UserAccount);
-            Assert.Null(dto.Password);
-        }
-
-        [Fact]
-        public void ApplyDefaults_WhenDtoIsNull_ShouldNotThrow()
-        {
-            // Arrange
-            ServiceDto? dto = null;
-
-            // Act & Assert
-            // ApplyDefaultsAndResetIdentity returns immediately on null (see ServiceDtoHelper)
-            var exception = Record.Exception(() => ServiceDtoHelper.ApplyDefaultsAndResetIdentity(dto!));
-            Assert.Null(exception);
+            Assert.Equal(AppConfig.DefaultHeartbeatUrlTimeoutSeconds, dto.HeartbeatUrlTimeoutSeconds);
+            Assert.Equal(AppConfig.DefaultEnableHeartbeatUrlFlags, dto.EnableHeartbeatUrlFlags);
         }
     }
 }

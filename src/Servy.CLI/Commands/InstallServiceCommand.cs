@@ -46,7 +46,7 @@ namespace Servy.CLI.Commands
             return await ExecuteWithHandlingAsync("install", action, suggestion, async () =>
             {
                 // Install cannot go through ExecuteServiceOperationAsync (the service does not exist yet),
-                // so it performs the elevation pre-flight check itself; this is the only elevation check on this path.
+                // so it performs the elevation pre-flight check itself; this is the only check inside the command (Program.cs also checks before the bootstrap).
                 if (!BypassElevationCheck)
                 {
                     SecurityHelper.EnsureAdministrator();
@@ -63,6 +63,7 @@ namespace Servy.CLI.Commands
                 opts.PostLaunchParameters = GetSecureValue(opts.PostLaunchParameters, AppConfig.PostLaunchParametersEnvVarName);
                 opts.PreStopParameters = GetSecureValue(opts.PreStopParameters, AppConfig.PreStopParametersEnvVarName);
                 opts.PostStopParameters = GetSecureValue(opts.PostStopParameters, AppConfig.PostStopParametersEnvVarName);
+                opts.HeartbeatUrl = GetSecureValue(opts.HeartbeatUrl, AppConfig.HeartbeatUrlEnvVarName);
 
                 // Validate options
                 var validation = _validator.Validate(opts);
@@ -121,9 +122,10 @@ namespace Servy.CLI.Commands
                     HeartbeatUrlTimeoutSeconds = heartbeatUrlTimeout,
                     EnableHeartbeatUrlFlags = opts.EnableHeartbeatUrlFlags,
                     EnvironmentVariables = opts.EnvironmentVariables,
+                    AllowOverriddenRuntimeVars = opts.AllowOverriddenRuntimeVars,
                     ServiceDependencies = opts.ServiceDependencies,
 
-                    Username = opts.User,
+                    Username = opts.User?.Trim(),
                     Password = opts.Password,
 
                     // Pre-Launch
@@ -140,7 +142,7 @@ namespace Servy.CLI.Commands
                     // Failure program
                     FailureProgramPath = opts.FailureProgramPath,
                     FailureProgramStartupDirectory = opts.FailureProgramStartupDir,
-                    FailureProgramArgs = opts.FailureProgramParameters,
+                    FailureProgramExecutableArgs = opts.FailureProgramParameters,
 
                     // Post-Launch
                     PostLaunchExePath = opts.PostLaunchPath,
@@ -209,25 +211,24 @@ namespace Servy.CLI.Commands
         {
             var envValue = Environment.GetEnvironmentVariable(envVarName);
 
-            // If the environment variable exists but is only whitespace, warn and ignore it
-            if (envValue != null && string.IsNullOrWhiteSpace(envValue))
+            if (envValue == null)
+                return optionValue;
+
+            // Set but blank: warn and fall back to the command line rather than silently
+            // installing an empty password or parameter string.
+            if (string.IsNullOrWhiteSpace(envValue))
             {
                 Logger.Warn($"Environment variable '{envVarName}' contains only whitespace and will be ignored.");
                 return optionValue;
             }
 
-            if (!string.IsNullOrEmpty(envValue))
+            if (!string.IsNullOrEmpty(optionValue) && !string.Equals(envValue, optionValue, StringComparison.Ordinal))
             {
-                if (!string.IsNullOrEmpty(optionValue) && !string.Equals(envValue, optionValue, StringComparison.Ordinal))
-                {
-                    Logger.Warn($"Environment variable '{envVarName}' is overriding the explicitly provided command-line option.");
-                }
-
-                Logger.Info($"Using value from environment variable '{envVarName}'.");
-                return envValue;
+                Logger.Warn($"Environment variable '{envVarName}' is overriding the explicitly provided command-line option.");
             }
 
-            return optionValue;
+            Logger.Info($"Using value from environment variable '{envVarName}'.");
+            return envValue;
         }
     }
 }

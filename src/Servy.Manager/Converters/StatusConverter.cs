@@ -5,7 +5,7 @@ namespace Servy.Manager.Converters
 {
     /// <summary>
     /// Converts between <see cref="ServiceStatus"/> values and their localized string
-    /// representations defined in <see cref="Strings.resx"/>.
+    /// representations defined in <see cref="Strings"/>.
     /// </summary>
     public class StatusConverter : EnumLocalizedConverter<ServiceStatus>
     {
@@ -20,6 +20,7 @@ namespace Servy.Manager.Converters
             [ServiceStatus.ContinuePending] = () => Strings.Status_ContinuePending,
             [ServiceStatus.PausePending] = () => Strings.Status_PausePending,
             [ServiceStatus.Paused] = () => Strings.Status_Paused,
+            [ServiceStatus.Unknown] = () => Strings.Status_Unknown,
         };
 
         /// <summary>
@@ -30,11 +31,11 @@ namespace Servy.Manager.Converters
         }
 
         /// <summary>
-        /// Provides a fallback string value when the binding resolution pass breaks.
+        /// Returns a fallback string when the bound value is not a mapped <see cref="ServiceStatus"/>.
         /// </summary>
-        /// <param name="value">The raw unmapped source value.</param>
-        /// <returns>The string representation or an empty string indicator.</returns>
-        protected override string GetFallbackValue(object value)
+        /// <param name="value">The unmapped source value.</param>
+        /// <returns>The value's string representation, or an empty string when null.</returns>
+        protected override string GetFallbackValue(object? value)
         {
             // Return the raw value or empty string to surface binding errors
             // rather than masquerading as 'Not Installed'.

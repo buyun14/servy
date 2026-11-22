@@ -7,7 +7,7 @@ namespace Servy.CLI.Options
     /// </summary>
     [Verb(
         "status",
-        HelpText = "获取 Windows 服务的当前状态。可能的结果：NotInstalled、Stopped、StartPending、StopPending、Running、ContinuePending、PausePending、Paused。"
+        HelpText = "Get the current status of a Windows service. Possible results: NotInstalled, Stopped, StartPending, StopPending, Running, ContinuePending, PausePending, Paused, Unknown."
     )]
     public class ServiceStatusOptions : GlobalOptionsBase
     {
@@ -15,7 +15,7 @@ namespace Servy.CLI.Options
         /// Gets or sets the name of the Windows service to check.
         /// This option is required.
         /// </summary>
-        [Option('n', "name", Required = true, HelpText = "要检查的服务名称。")]
+        [Option('n', "name", Required = true, HelpText = "Name of the service to check.")]
         public string? ServiceName { get; set; }
     }
 }

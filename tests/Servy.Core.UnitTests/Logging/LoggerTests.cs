@@ -8,9 +8,12 @@ using System.Text.RegularExpressions;
 
 namespace Servy.Core.UnitTests.Logging
 {
-    [CollectionDefinition("LoggerSequential", DisableParallelization = true)]
+    [CollectionDefinition(Name, DisableParallelization = true)]
     public class LoggerCollection
     {
+        /// <summary>Collection name; reference this instead of repeating the string literal.</summary>
+        public const string Name = "LoggerSequential";
+
         // Enforces strict sequential isolation across the execution suite
     }
 
@@ -18,7 +21,7 @@ namespace Servy.Core.UnitTests.Logging
     /// Comprehensive unit tests for the Logger class, executed sequentially
     /// due to the static nature of the target class to avoid file lock contention.
     /// </summary>
-    [Collection("LoggerSequential")] // Ensures tests don't run in parallel and fight over the static _writer
+    [Collection(LoggerCollection.Name)] // Ensures tests don't run in parallel and fight over the static _writer
     public class LoggerTests : IDisposable
     {
         private readonly string _testFileName;
@@ -34,9 +37,9 @@ namespace Servy.Core.UnitTests.Logging
             ResetFallbackCounters();
 
             _testFileName = $"TestLog_{Guid.NewGuid():N}.log";
-            _fullLogPath = Path.Combine(Logger.LogsPath, _testFileName);
-            _initFallbackPath = Path.Combine(Logger.LogsPath, "LoggerInitializationErrors.log");
-            _writeFallbackPath = Path.Combine(Logger.LogsPath, "LoggerWriteErrors.log");
+            _fullLogPath = Path.Combine(AppConfig.LogsFolderPath, _testFileName);
+            _initFallbackPath = Path.Combine(AppConfig.LogsFolderPath, "LoggerInitializationErrors.log");
+            _writeFallbackPath = Path.Combine(AppConfig.LogsFolderPath, "LoggerWriteErrors.log");
 
             CleanupFiles();
         }
@@ -61,6 +64,30 @@ namespace Servy.Core.UnitTests.Logging
             TestReflection.SetFieldStatic(typeof(Logger), "_logFallbackWriteCount", 0);
         }
 
+        /// <summary>
+        /// Isolates the formatted exception block that follows <paramref name="logMessage"/>
+        /// in the log file, failing with a clear message if the entry is absent.
+        /// </summary>
+        private static string IsolateExceptionSegment(string content, string logMessage)
+        {
+            int index = content.IndexOf(logMessage, StringComparison.Ordinal);
+
+            Assert.True(index >= 0, $"Log entry '{logMessage}' was not found in the log file.");
+
+            return content.Substring(index).TrimEnd();
+        }
+
+        /// <summary>
+        /// Counts only the structural closing brackets that terminate the segment,
+        /// ignoring any ']' embedded in exception messages or stack traces.
+        /// </summary>
+        private static int CountStructuralClosingBrackets(string exceptionSegment)
+        {
+            var matches = Regex.Matches(exceptionSegment, @"\]+$");
+
+            return matches.Count > 0 ? matches[0].Value.Length : 0;
+        }
+
         #region Initialization & Core Logic Tests
 
         [Fact]
@@ -81,11 +108,11 @@ namespace Servy.Core.UnitTests.Logging
         public void Initialize_WithNullFileName_GracefullySkipsInitialization()
         {
             // Arrange
-            // Ensure the static logger infrastructure is perfectly flushed and reset before testing bounds
+            // Ensure the static logger infrastructure is flushed and reset before testing bounds
             Logger.Shutdown();
 
             // Capture a directory listing snapshot to verify no file system leaks occur
-            var logDirectory = new DirectoryInfo(Logger.LogsPath);
+            var logDirectory = new DirectoryInfo(AppConfig.LogsFolderPath);
             int initialLogFileCount = logDirectory.Exists ? logDirectory.GetFiles("*.log").Length : 0;
 
             // Act
@@ -93,7 +120,7 @@ namespace Servy.Core.UnitTests.Logging
             Logger.Info("Should drop silently and never instantiate a stream handle.");
 
             // Assert
-            // 1. Structural State Check: route explicitly through the static field extraction engine targeting '_writer'
+            // 1. Structural State Check: verify '_writer' is null
             var internalWriter = TestReflection.GetFieldStatic<RotatingStreamWriter?>(typeof(Logger), "_writer");
             Assert.Null(internalWriter);
 
@@ -106,12 +133,30 @@ namespace Servy.Core.UnitTests.Logging
         }
 
         [Fact]
+        public void Initialize_WithNullFileName_OnALiveLogger_ShutsTheWriterDown()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+            Logger.Info("Before the reset");
+
+            // Act
+            Logger.Initialize((string)null);
+            Logger.Info("After the reset");
+
+            // Assert
+            Assert.Null(TestReflection.GetFieldStatic<RotatingStreamWriter>(typeof(Logger), "_writer"));
+            string content = File.ReadAllText(_fullLogPath);
+            Assert.Contains("Before the reset", content);
+            Assert.DoesNotContain("After the reset", content);
+        }
+
+        [Fact]
         public void Initialize_WhenFileNameIsInvalid_FailsSilentlyAndWritesToFallback()
         {
             // Arrange
-            // Passing an invalid character like a null terminator character sequence
-            // forces Path.Combine to pass validation but crashes the underlying Win32
-            // CreateFile handle allocation with an ArgumentException.
+            // A NUL character passes Path.Combine, which does not validate characters, and is
+            // then rejected with an ArgumentException by the managed path check in the writer's
+            // new FileInfo(path), before any Win32 CreateFile call is made.
             string illegalFileName = "Invalid\0Char.log";
 
             // Act
@@ -121,6 +166,21 @@ namespace Servy.Core.UnitTests.Logging
             Assert.True(File.Exists(_initFallbackPath), "Initialization fallback log should have been created.");
             string fallbackContent = File.ReadAllText(_initFallbackPath);
             Assert.Contains("Failed to initialize logger", fallbackContent);
+        }
+
+        [Theory]
+        [InlineData(AppConfig.LoggerMaxFallbackWrites - 1, true)]  // the last write the budget allows
+        [InlineData(AppConfig.LoggerMaxFallbackWrites, false)]     // budget spent
+        public void Initialize_FailureFallback_StopsWritingOnceTheBudgetIsSpent(int writesAlreadyMade, bool expectWritten)
+        {
+            // Arrange
+            TestReflection.SetFieldStatic(typeof(Logger), "_initFallbackWriteCount", writesAlreadyMade);
+
+            // Act
+            Logger.Initialize("Invalid\0Char.log");
+
+            // Assert
+            Assert.Equal(expectWritten, File.Exists(_initFallbackPath));
         }
 
         [Fact]
@@ -147,6 +207,53 @@ namespace Servy.Core.UnitTests.Logging
             Assert.True(File.Exists(_writeFallbackPath), "Write fallback log should have been created.");
             string fallbackContent = File.ReadAllText(_writeFallbackPath);
             Assert.Contains("Failed to write log entry", fallbackContent);
+        }
+
+        [Theory]
+        [InlineData(AppConfig.LoggerMaxFallbackWrites - 1, true)]  // the last write the budget allows
+        [InlineData(AppConfig.LoggerMaxFallbackWrites, false)]     // budget spent
+        public void Log_ReentrantFallback_StopsWritingOnceTheBudgetIsSpent(int writesAlreadyMade, bool expectWritten)
+        {
+            // Arrange
+            Logger.Initialize(_testFileName); // resets both counters, so the sentinel is set afterwards
+            TestReflection.SetFieldStatic(typeof(Logger), "_logFallbackWriteCount", writesAlreadyMade);
+
+            try
+            {
+                TestReflection.SetFieldStatic(typeof(Logger), "_isLogging", true);
+
+                // Act
+                Logger.Warn("Fallback budget probe");
+            }
+            finally
+            {
+                TestReflection.SetFieldStatic(typeof(Logger), "_isLogging", false);
+            }
+
+            // Assert
+            Assert.Equal(expectWritten, File.Exists(_writeFallbackPath));
+        }
+
+        [Theory]
+        [InlineData(AppConfig.LoggerMaxFallbackWrites - 1, true)]  // the last write the budget allows
+        [InlineData(AppConfig.LoggerMaxFallbackWrites, false)]     // budget spent
+        public void Log_WriteFailureFallback_StopsWritingOnceTheBudgetIsSpent(int writesAlreadyMade, bool expectWritten)
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+            Logger.Info("Establishing file context on disk");
+            Logger.Shutdown(); // Flush and release the handle so the test can lock it
+            Logger.Initialize(_testFileName); // resets both counters, so the sentinel is set afterwards
+            TestReflection.SetFieldStatic(typeof(Logger), "_logFallbackWriteCount", writesAlreadyMade);
+
+            // Act
+            using (var lockStream = new FileStream(_fullLogPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                Logger.Info("This write should fail on the lock.");
+            }
+
+            // Assert
+            Assert.Equal(expectWritten, File.Exists(_writeFallbackPath));
         }
 
         #endregion
@@ -207,8 +314,6 @@ namespace Servy.Core.UnitTests.Logging
         public void Log_SanitizesMessage_MaintainsSingleLineContract(string rawMessage, string expectedFragment)
         {
             // Arrange
-            // Pure instance isolation is guaranteed cleanly via sequential collection serialization constraints
-            // and the distinct constructor allocation mappings.
             Logger.Initialize(_testFileName);
 
             // Act
@@ -216,15 +321,152 @@ namespace Servy.Core.UnitTests.Logging
             Logger.Shutdown();
 
             // Assert
-            string[] lines = File.ReadAllLines(_fullLogPath);
+            // Read the raw text: File.ReadAllLines strips every terminator it splits on, so a
+            // CR or LF assertion made against one of its elements is true by construction.
+            string content = File.ReadAllText(_fullLogPath);
 
-            // Trace target element dynamically to insulate the assertion loop from background thread telemetry noise
-            int matchingIndex = Array.FindIndex(lines, l => l.Contains(expectedFragment));
-            Assert.True(matchingIndex >= 0, $"Expected log entry containing fragment '{expectedFragment}' was not found.");
+            // The constructor gives every test a fresh, uniquely named log file, so this entry is the
+            // file's only content - which is what lets the whole file be treated as one entry below.
+            Assert.Contains(expectedFragment, content);
 
-            string targetLine = lines[matchingIndex];
-            Assert.DoesNotContain("\n", targetLine);
-            Assert.DoesNotContain("\r", targetLine);
+            // The entry must occupy exactly one physical line: the only newline in the file
+            // is the terminator the writer appends.
+            string entry = content.TrimEnd('\r', '\n');
+            Assert.DoesNotContain("\n", entry);
+            Assert.DoesNotContain("\r", entry);
+
+            // The vertical separators ReadLine does not split on, and which the sanitizer
+            // is specifically there to collapse.
+            foreach (char forbidden in new[] { '\u2028', '\u2029', '\u0085', '\v', '\f' })
+            {
+                Assert.DoesNotContain(forbidden.ToString(), entry);
+            }
+        }
+
+        #endregion
+
+        #region Report Tests
+
+        [Theory]
+        [InlineData("- alpha: 1\n- beta: 2")]
+        [InlineData("- alpha: 1\r\n- beta: 2")]
+        public void Report_WritesTitleAndEveryBodyLineAsItsOwnEntry(string body)
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+
+            // Act
+            Logger.Report(LogLevel.Info, "[Startup Parameters]", body);
+            Logger.Shutdown();
+
+            // Assert
+            string content = File.ReadAllText(_fullLogPath);
+            string[] entries = ReadEntries(content);
+
+            Assert.Equal(3, entries.Length);
+            Assert.EndsWith("| [Startup Parameters]", entries[0]);
+            Assert.EndsWith("| - alpha: 1", entries[1]);
+            Assert.EndsWith("| - beta: 2", entries[2]);
+
+            // The flattened rendering the single-line contract used to produce is what this replaces.
+            Assert.DoesNotContain("- alpha: 1 ; - beta: 2", content);
+        }
+
+        [Fact]
+        public void Report_PreservesBlankLinesAsTheirOwnEntries()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+
+            // Act
+            Logger.Report(LogLevel.Info, "[Report]", "first section\n\nsecond section");
+            Logger.Shutdown();
+
+            // Assert
+            // The blank line between the two sections is a line of the composed layout, so it
+            // survives as an entry of its own rather than as a doubled " ; ; " separator.
+            string[] entries = ReadEntries(File.ReadAllText(_fullLogPath));
+            Assert.Equal(4, entries.Length);
+            Assert.EndsWith("| first section", entries[1]);
+            Assert.EndsWith("|", entries[2].TrimEnd());
+            Assert.EndsWith("| second section", entries[3]);
+        }
+
+        [Fact]
+        public void Report_BelowConfiguredLogLevel_WritesNothing()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName, LogLevel.Warn);
+
+            // Act
+            Logger.Report(LogLevel.Info, "[Hidden Report]", "hidden body line");
+            Logger.Shutdown();
+
+            // Assert
+            string content = File.Exists(_fullLogPath) ? File.ReadAllText(_fullLogPath) : string.Empty;
+            Assert.DoesNotContain("[Hidden Report]", content);
+            Assert.DoesNotContain("hidden body line", content);
+        }
+
+        [Fact]
+        public void Report_EmptyTitleAndBody_WritesNothing()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+
+            // Act
+            Logger.Report(LogLevel.Info, string.Empty, string.Empty);
+            Logger.Shutdown();
+
+            // Assert
+            string content = File.Exists(_fullLogPath) ? File.ReadAllText(_fullLogPath) : string.Empty;
+            Assert.Empty(ReadEntries(content));
+        }
+
+        [Fact]
+        public void Report_TitleWithEmptyBody_WritesOnlyTheTitleEntry()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+
+            // Act
+            Logger.Report(LogLevel.Info, "[Only Title]", string.Empty);
+            Logger.Shutdown();
+
+            // Assert
+            string[] entries = ReadEntries(File.ReadAllText(_fullLogPath));
+            Assert.Single(entries);
+            Assert.EndsWith("| [Only Title]", entries[0]);
+        }
+
+        [Fact]
+        public void Report_EmptyTitleWithBody_WritesOnlyTheBodyLines()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+
+            // Act
+            Logger.Report(LogLevel.Info, string.Empty, "alpha\nbeta");
+            Logger.Shutdown();
+
+            // Assert
+            string[] entries = ReadEntries(File.ReadAllText(_fullLogPath));
+            Assert.Equal(2, entries.Length);
+            Assert.EndsWith("| alpha", entries[0]);
+            Assert.EndsWith("| beta", entries[1]);
+        }
+
+        /// <summary>
+        /// Splits the captured log text into entries without depending on the host's line
+        /// terminator, so the assertions read the same on the Windows runner and here.
+        /// </summary>
+        private static string[] ReadEntries(string content)
+        {
+            return content
+                .Split('\n')
+                .Select(line => line.TrimEnd('\r'))
+                .Where(line => line.Length > 0)
+                .ToArray();
         }
 
         #endregion
@@ -266,9 +508,7 @@ namespace Servy.Core.UnitTests.Logging
             Assert.Contains(" [Inner -> InvalidOperationException: Inner fail", content);
 
             // 2. Isolate the exact formatted exception segment text block
-            Assert.Contains("Exception test", content);
-            int exceptionMessageIndex = content.IndexOf("Exception test", StringComparison.Ordinal);
-            string exceptionSegment = content.Substring(exceptionMessageIndex).TrimEnd();
+            string exceptionSegment = IsolateExceptionSegment(content, "Exception test");
 
             // Verify bracket matching directly on the isolated exception block.
             // Since there is one level of inner exceptions nested here, the segment must end
@@ -280,15 +520,22 @@ namespace Servy.Core.UnitTests.Logging
             Assert.DoesNotContain("\n", exceptionSegment);
         }
 
-        [Fact]
-        public void FormatException_HardTruncatesMassiveExceptions_AvoidsSurrogatePairSplitting()
+        [Theory]
+        [InlineData("")]  // Cut position at even offset into the payload.
+        [InlineData("x")] // Odd offset: this is the row whose cut lands between the two halves of a pair.
+        public void FormatException_HardTruncatesMassiveExceptions_AvoidsSurrogatePairSplitting(string parityPrefix)
         {
             // Arrange
             // DYNAMIC CAP BOUNDING: Derive payload constraints directly from AppConfig to prevent
             // regression breaks if exception truncation configuration thresholds fluctuate.
-            // A heart emoji with variation selectors forms a valid multi-code-unit surrogate pair sequence.
+            // U+1F60A is a supplementary-plane code point, so UTF-16 encodes it as the surrogate pair
+            // U+D83D U+DE0A - the two code units the truncation guard must not separate. A BMP
+            // character such as a heart plus a variation selector would contain no surrogate at all.
+            // The payload is run at both parities because the cut is derived from a fixed character cap:
+            // only one of the two offsets puts the cut inside a pair and exercises the guard.
+            string surrogatePair = char.ConvertFromUtf32(0x1F60A);
             int charCount = (AppConfig.LoggerMaxFormattedExceptionLength / 2) + 1024;
-            string hugeSurrogateString = string.Concat(Enumerable.Repeat("❤️", charCount));
+            string hugeSurrogateString = parityPrefix + string.Concat(Enumerable.Repeat(surrogatePair, charCount));
             var ex = new Exception(hugeSurrogateString);
 
             Logger.Initialize(_testFileName);
@@ -307,13 +554,58 @@ namespace Servy.Core.UnitTests.Logging
             int cutIndex = content.IndexOf(truncationMarker, StringComparison.Ordinal);
             string truncatedHead = content.Substring(0, cutIndex);
 
-            // Validate that the very last character before the truncation marker is NOT a high surrogate.
-            // In UTF-16 (C# strings), a high surrogate must always be followed by a low surrogate.
-            // If it's at the end of the string, it is unpaired and corrupted.
+            // The log is written through a UTF8Encoding with the default replacement fallback, so an
+            // orphaned high surrogate never survives the round trip to disk: it is encoded as EF BF BD
+            // and reads back as U+FFFD. Asserting that the boundary is NOT a high surrogate therefore
+            // cannot fail, whatever the truncation does. Assert the positive shape instead - the cut must
+            // land after a complete pair, so the last character before the marker is the LOW surrogate of
+            // one - and assert that no replacement character reached the file at all.
+            Assert.DoesNotContain("\uFFFD", truncatedHead, StringComparison.Ordinal);
+
             char boundaryChar = truncatedHead[truncatedHead.Length - 1];
 
-            Assert.False(char.IsHighSurrogate(boundaryChar),
-                "Regression: Truncation logic split a UTF-16 surrogate pair, leaving an orphaned high surrogate at the boundary.");
+            Assert.True(char.IsLowSurrogate(boundaryChar),
+                "Regression: Truncation logic split a UTF-16 surrogate pair, so the character before the marker is not the end of a pair.");
+
+            // Pin the guard across the whole truncated segment rather than sampling it at one position.
+            for (int i = 0; i < truncatedHead.Length; i++)
+            {
+                if (!char.IsHighSurrogate(truncatedHead[i])) continue;
+
+                Assert.True(i + 1 < truncatedHead.Length && char.IsLowSurrogate(truncatedHead[i + 1]),
+                    $"Unpaired high surrogate at index {i} of the truncated segment.");
+            }
+        }
+
+        [Fact]
+        public void FormatException_TruncatesInsideNestedInnerException_ClosesEveryOpenContextWithinTheCap()
+        {
+            // Arrange
+            // Two open "[Inner -> " contexts are outstanding when the cap is hit: Middle (depth 1)
+            // and the huge leaf (depth 2). The only other truncation test puts its payload on a flat
+            // exception, so the cut always lands at depth 0 where there is nothing to close.
+            int cap = AppConfig.LoggerMaxFormattedExceptionLength;
+            var leaf = new Exception(new string('x', cap + 1024));
+            var ex = new Exception("Root", new Exception("Middle", leaf));
+
+            Logger.Initialize(_testFileName);
+
+            // Act
+            Logger.Error("Nested truncation", ex);
+            Logger.Shutdown();
+
+            // Assert
+            string segment = IsolateExceptionSegment(File.ReadAllText(_fullLogPath), "Nested truncation");
+            const string exceptionPrefix = "Nested truncation | Exception: ";
+            Assert.StartsWith(exceptionPrefix, segment);
+            string formatted = segment.Substring(exceptionPrefix.Length);
+
+            // Both open contexts are closed after the marker, so the segment stays scannable.
+            Assert.Equal(2, Regex.Matches(formatted, Regex.Escape("[Inner -> ")).Count);
+            Assert.EndsWith("... [truncated]]]", formatted);
+
+            // The closing brackets are reserved inside the cap, not appended past it.
+            Assert.Equal(cap, formatted.Length);
         }
 
         [Fact]
@@ -343,8 +635,8 @@ namespace Servy.Core.UnitTests.Logging
             Assert.Contains("[Inner -> InvalidOperationException: Task B state invalid]", content);
 
             // 3. Verify chronological order: Task A (left sibling) must be logged BEFORE Task B (right sibling)
-            int indexA = content.IndexOf("Task A timed out");
-            int indexB = content.IndexOf("Task B state invalid");
+            int indexA = content.IndexOf("Task A timed out", StringComparison.Ordinal);
+            int indexB = content.IndexOf("Task B state invalid", StringComparison.Ordinal);
 
             Assert.True(indexA < indexB, "AggregateException siblings were not preserved in their chronological declaration order.");
         }
@@ -380,9 +672,7 @@ namespace Servy.Core.UnitTests.Logging
 
             // 3. Structural validation - Verify bracket balancing on the isolated exception block.
             // Isolate the formatted exception text block after our log message
-            Assert.Contains("Reflection execution pass", content);
-            int exceptionMessageIndex = content.IndexOf("Reflection execution pass", StringComparison.Ordinal);
-            string exceptionSegment = content.Substring(exceptionMessageIndex).TrimEnd();
+            string exceptionSegment = IsolateExceptionSegment(content, "Reflection execution pass");
 
             // Since there is exactly one level of nested loader exceptions, the segment must
             // end with a single closed bracket matching the "[Inner -> " opening context block.
@@ -440,13 +730,11 @@ namespace Servy.Core.UnitTests.Logging
             Assert.Contains("[Inner -> TimeoutException: Third inner level fault", content);
 
             // Isolate the exception text block to run structural calculations
-            Assert.Contains("Nested chain execution pass", content);
-            int msgIndex = content.IndexOf("Nested chain execution pass", StringComparison.Ordinal);
-            string exceptionSegment = content.Substring(msgIndex).TrimEnd();
+            string exceptionSegment = IsolateExceptionSegment(content, "Nested chain execution pass");
 
-            // Calculate bracket balance
+            // Calculate bracket balance via structural closing brackets at the tail end
             var openTokensCount = Regex.Matches(exceptionSegment, Regex.Escape("[Inner -> ")).Count;
-            var closeBracketsCount = exceptionSegment.Split(']').Length - 1;
+            var closeBracketsCount = CountStructuralClosingBrackets(exceptionSegment);
 
             // ASSERTIONS:
             // 1. There must be exactly 3 "[Inner -> " opened tokens.
@@ -489,24 +777,29 @@ namespace Servy.Core.UnitTests.Logging
             Assert.Contains($"Exception: Depth level {targetOverflow} wrapper", content);
 
             // 2. Verify that the deepest "Root" text was dropped because it exceeded the depth safety cutoff
-            // Re-verify string parsing matches depth cutoff expectation boundary context parameters
             Assert.DoesNotContain("Root Exception Context", content);
 
-            // 3. Isolate the exact formatted exception text segment to avoid picking up layout brackets
-            Assert.Contains("Deeply nested exception test", content);
-            int exceptionMessageIndex = content.IndexOf("Deeply nested exception test", StringComparison.Ordinal);
-            string exceptionSegment = content.Substring(exceptionMessageIndex).TrimEnd();
+            // 3. Verify that the depth truncation marker is emitted explicitly
+            Assert.Contains("[Inner -> ... depth limit reached]", content);
 
-            // 4. Calculate depth by counting structural depth tracking brackets inside the exception block
+            // 4. Isolate the exact formatted exception text segment to avoid picking up layout brackets
+            string exceptionSegment = IsolateExceptionSegment(content, "Deeply nested exception test");
+
+            // 5. Calculate depth by counting structural depth tracking brackets inside the exception block
             int innerBracketCount = exceptionSegment.Split(new[] { "[Inner -> " }, StringSplitOptions.None).Length - 1;
-            // NAIVE BRACKET COUNT: Instead of counting every ']' raw character via Split,
-            // target only the structural closing brackets that terminate the inner exception blocks at the tail end.
-            var structuralCloseMatches = Regex.Matches(exceptionSegment, @"\]+$");
-            int closingBracketCount = structuralCloseMatches.Count > 0 ? structuralCloseMatches[0].Value.Length : 0;
+            int closingBracketCount = CountStructuralClosingBrackets(exceptionSegment);
 
-            // The formatted string should never unroll more blocks than the max depth allowed
-            Assert.True(innerBracketCount < AppConfig.LoggerMaxInnerExceptionDepth,
-                $"Exception unroller processed more inner loops than allowed. Counted: {innerBracketCount}");
+            // Exactly the configured number of levels is unrolled: MaxDepth - 1 real inner contexts plus
+            // the single depth-limit marker, which also opens an "[Inner -> " token. An upper bound alone
+            // would also accept a cap that fires too early and silently drops levels the limit promises.
+            Assert.Equal(AppConfig.LoggerMaxInnerExceptionDepth, innerBracketCount);
+
+            // The deepest level kept is MaxDepth - 1 below the outermost wrapper, and the next one down is
+            // the first dropped. "Depth level 5 wrapper" is not a substring of "Depth level 15 wrapper",
+            // because the character after "level " differs, so the negative check cannot match a kept level.
+            int deepestKept = targetOverflow - (AppConfig.LoggerMaxInnerExceptionDepth - 1);
+            Assert.Contains($"Exception: Depth level {deepestKept} wrapper", exceptionSegment);
+            Assert.DoesNotContain($"Depth level {deepestKept - 1} wrapper", exceptionSegment);
 
             // The closing brackets will be exactly innerBracketCount because the
             // structural depth 0 root exception correctly skips closing tags.
@@ -524,8 +817,7 @@ namespace Servy.Core.UnitTests.Logging
             Logger.Initialize(_testFileName);
             Logger.Info("First writer");
 
-            // Behavioral Setup: Leverage centralized test infrastructure reflection engine
-            // to inject a non-zero sentinel into the private static fallback tracking variable slot.
+            // Inject a non-zero sentinel into _initFallbackWriteCount.
             // On a successful reconfiguration run, InternalInitialize() will reset this back to 0.
             const string targetCounterFieldName = "_initFallbackWriteCount";
             TestReflection.SetFieldStatic(typeof(Logger), targetCounterFieldName, 99);
@@ -547,6 +839,60 @@ namespace Servy.Core.UnitTests.Logging
             // 2. Behavioral Verification: Prove that re-initialization actually executed by checking the sentinel reset
             int finalCounterValue = TestReflection.GetFieldStatic<int>(typeof(Logger), targetCounterFieldName);
             Assert.Equal(0, finalCounterValue);
+        }
+
+        /// <summary>
+        /// Pins the "value changed and a writer is live, so recreate it" arm of EACH runtime setter
+        /// on its own. <see cref="Setters_WhenCalledWithNewValues_ReinitializesWriter"/> calls three
+        /// setters in a row against a single sentinel, so the first call already resets it and only
+        /// <see cref="Logger.SetLogRotationSize"/> is actually pinned there.
+        /// </summary>
+        [Theory]
+        [InlineData(nameof(Logger.SetLogRotationSize))]
+        [InlineData(nameof(Logger.SetMaxBackupLogFiles))]
+        [InlineData(nameof(Logger.SetDateRotationType))]
+        [InlineData(nameof(Logger.SetUseLocalTimeForRotation))]
+        public void Setter_WhenCalledAloneWithNewValue_ReinitializesWriter(string setter)
+        {
+            // Arrange
+            Logger.Initialize(
+                _testFileName,
+                logRotationSizeMB: 10,
+                maxBackupLogFiles: 10,
+                dateRotationType: DateRotationType.None,
+                useLocalTimeForRotation: false);
+            Logger.Info("Live writer");
+
+            // InternalInitialize resets this counter, so 0 afterwards means this one setter recreated the writer.
+            TestReflection.SetFieldStatic(typeof(Logger), "_initFallbackWriteCount", 99);
+
+            // Act
+            switch (setter)
+            {
+                case nameof(Logger.SetLogRotationSize): Logger.SetLogRotationSize(20); break;
+                case nameof(Logger.SetMaxBackupLogFiles): Logger.SetMaxBackupLogFiles(5); break;
+                case nameof(Logger.SetDateRotationType): Logger.SetDateRotationType(DateRotationType.Daily); break;
+                case nameof(Logger.SetUseLocalTimeForRotation): Logger.SetUseLocalTimeForRotation(true); break;
+                default: throw new ArgumentOutOfRangeException(nameof(setter), setter, "No arrangement for this setter.");
+            }
+
+            // Assert
+            Assert.Equal(0, TestReflection.GetFieldStatic<int>(typeof(Logger), "_initFallbackWriteCount"));
+        }
+
+        [Fact]
+        public void Reinitialization_GrantsANewWriteFallbackBudget()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName);
+            Logger.Info("Live writer");
+            TestReflection.SetFieldStatic(typeof(Logger), "_logFallbackWriteCount", 99);
+
+            // Act
+            Logger.SetLogRotationSize(20); // a new value on a live writer recreates it
+
+            // Assert
+            Assert.Equal(0, TestReflection.GetFieldStatic<int>(typeof(Logger), "_logFallbackWriteCount"));
         }
 
         [Fact]
@@ -571,15 +917,59 @@ namespace Servy.Core.UnitTests.Logging
             Logger.SetUseLocalTimeForRotation(true);           // Unchanged
 
             // Assert
-            int count = TestReflection.GetFieldStatic<int>(typeof(Logger), "_initFallbackWriteCount")!;
+            int count = TestReflection.GetFieldStatic<int>(typeof(Logger), "_initFallbackWriteCount");
             Assert.Equal(99, count); // Proves InternalInitialize was bypassed
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(-5)]
+        public void Initialize_NonPositiveRotationSize_FallsBackToTheDefault(int sizeMB)
+        {
+            // Arrange
+            // (the fixture has already reset the static logger)
+
+            // Act
+            Logger.Initialize(_testFileName, logRotationSizeMB: sizeMB);
+
+            // Assert
+            Assert.Equal(AppConfig.DefaultRotationSizeMB, TestReflection.GetFieldStatic<int>(typeof(Logger), "_logRotationSizeMB"));
+        }
+
+        [Theory]
+        [InlineData(-1, AppConfig.LoggerDefaultMaxBackupLogFiles)]
+        [InlineData(0, 0)] // 0 means unlimited backups and must be kept, not replaced by the default
+        public void Initialize_BackupCount_NegativeFallsBackToTheDefaultAndZeroIsKept(int requested, int expected)
+        {
+            // Arrange
+            // (the fixture has already reset the static logger)
+
+            // Act
+            Logger.Initialize(_testFileName, maxBackupLogFiles: requested);
+
+            // Assert
+            Assert.Equal(expected, TestReflection.GetFieldStatic<int>(typeof(Logger), "_maxBackupLogFiles"));
+        }
+
+        [Fact]
+        public void Setters_RejectNonPositiveSizeAndNegativeBackupCount_AndKeepTheCurrentValues()
+        {
+            // Arrange
+            Logger.Initialize(_testFileName, logRotationSizeMB: 20, maxBackupLogFiles: 5);
+
+            // Act
+            Logger.SetLogRotationSize(0);
+            Logger.SetMaxBackupLogFiles(-1);
+
+            // Assert
+            Assert.Equal(20, TestReflection.GetFieldStatic<int>(typeof(Logger), "_logRotationSizeMB"));
+            Assert.Equal(5, TestReflection.GetFieldStatic<int>(typeof(Logger), "_maxBackupLogFiles"));
         }
 
         [Fact]
         public void SetUseLocalTimeForRotation_UpdatesTimestampTimezoneFormat()
         {
             // Arrange
-            // Absolute test boundaries are governed securely via strict sequential test serialization rules.
             Logger.Initialize(_testFileName, useLocalTimeForRotation: false);
 
             // Act
@@ -591,8 +981,7 @@ namespace Servy.Core.UnitTests.Logging
             // Assert
             string[] lines = File.ReadAllLines(_fullLogPath);
 
-            // Extract the targeted indices explicitly using their message payloads
-            // so background threads firing logs into the static entity won't disrupt verification.
+            // Extract the targeted indices explicitly using their message payloads.
             int utcIndex = Array.FindIndex(lines, l => l.Contains("Message UTC"));
             int localIndex = Array.FindIndex(lines, l => l.Contains("Message Local"));
 
@@ -625,6 +1014,26 @@ namespace Servy.Core.UnitTests.Logging
             Assert.False(File.Exists(_fullLogPath), "Log file should not be created for empty or null messages.");
         }
 
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        public void Error_WithNullOrEmptyMessageAndException_LogsTheFormattedExceptionAlone(string? message)
+        {
+            // Arrange: an exception that was never thrown has no stack trace, so the entry is fully predictable
+            Logger.Initialize(_testFileName);
+            var ex = new InvalidOperationException("boom");
+
+            // Act
+            Logger.Error(message, ex);
+            Logger.Shutdown();
+
+            // Assert: the exception is logged on its own, with no empty message and no " | Exception: " separator
+            Assert.True(File.Exists(_fullLogPath), "Log file should be created when an exception accompanies a null or empty message.");
+            string content = File.ReadAllText(_fullLogPath);
+            Assert.Contains("[ERROR] | InvalidOperationException: boom", content);
+            Assert.DoesNotContain("| Exception:", content);
+        }
+
         [Fact]
         public void Log_WhenReentrantLoggingDetected_WritesToFallbackLogAndShortCircuits()
         {
@@ -648,12 +1057,9 @@ namespace Servy.Core.UnitTests.Logging
             Logger.Shutdown();
 
             // Assert
-            // 1. Verify main log file does not contain the re-entrant message
-            if (File.Exists(_fullLogPath))
-            {
-                string mainContent = File.ReadAllText(_fullLogPath);
-                Assert.DoesNotContain("Reentrant warning message", mainContent);
-            }
+            // 1. The guard must short-circuit before the writer is ever touched, so the
+            //    main log file is never created at all.
+            Assert.False(File.Exists(_fullLogPath), "Re-entrant logging must short-circuit before writing; the main log file should not exist.");
 
             // 2. Verify fallback error log received the re-entrant warning message
             Assert.True(File.Exists(_writeFallbackPath), "Write fallback log should have been created for re-entrant logging.");

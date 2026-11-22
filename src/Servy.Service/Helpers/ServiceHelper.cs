@@ -1,8 +1,8 @@
 using Servy.Core.Config;
-using Servy.Core.Data;
 using Servy.Core.EnvironmentVariables;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using Servy.Core.Validation;
 using Servy.Service.CommandLine;
 using Servy.Service.ProcessManagement;
@@ -17,41 +17,62 @@ namespace Servy.Service.Helpers
     {
         #region Logging Security
 
+        // Entries are matched with '_' as a word boundary on both sides, so a broad keyword
+        // (SECRET, TOKEN, PASSWORD, API) already covers PREFIX_KEYWORD and KEYWORD_SUFFIX
+        // (e.g. CLIENT_SECRET, APP_SECRET, SECRET_KEY, DATABASE_PASSWORD, API_KEY, TELEGRAM_TOKEN, DISCORD_TOKEN).
+        // Only add a compound entry when neither of its constituent parts is listed (e.g. PRIVATE_KEY, SSH_KEY).
+
         /// <summary>
-        /// A collection of keywords used to identify potentially sensitive information
-        /// in configuration keys or environment variable names.
-        /// SYNC WITH: setup/taskschd/ServySecurity.ps1 ($sensitiveKeys)
+        /// Long or unambiguous sensitive keywords where letter/digit prefixes are permitted
+        /// (e.g., PGPASSWORD, DBPASSWORD, APITOKEN, APIKEY, MY_PASSWORD).
         /// </summary>
-        private static readonly HashSet<string> SensitiveKeyWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        private static readonly string[] LooseKeyWords = new string[]
         {
             // --- Core Credentials ---
-            "PASSWORD", "PWD", "PASSPHRASE", "PIN", "USERPWD",
+            "PASSWORD", "PASSPHRASE", "USERPWD",
 
-            // --- Web & Mobile Auth (JWT/OAuth) ---
-            "TOKEN", "AUTH", "CREDENTIAL", "BEARER", "JWT",
-            "SESSION", "COOKIE", "CLIENT_SECRET", "PAT",
+            // --- Web & Mobile Auth (JWT/OAuth/Personal Tokens) ---
+            "TOKEN", "CREDENTIAL",
 
             // --- Cloud & Infrastructure (AWS/Azure/GCP) ---
-            "SECRET", "SAS", "ACCOUNTKEY", "ACCESSKEY", "SKEY",
-            "SIGNATURE", "TENANT_ID", // Often sensitive when paired with secrets
+            "SECRET", "ACCOUNTKEY", "ACCESSKEY", "SIGNATURE",
 
             // --- Databases & Storage ---
-            "CONNECTIONSTRING", "CONNSTR", "DSN", "DATABASE_URL",
-            "PROVIDER_CONNECTION_STRING", "DATABASE_PASSWORD",
+            "CONNECTIONSTRING", "CONNSTR", "DATABASE_URL",
+            "PROVIDER_CONNECTION_STRING",
+
+            // --- Cryptography & Identity (Specific KEY variants) ---
+            "PRIVATE_KEY", "SSH_KEY", "APIKEY",
+            "CERTIFICATE", "THUMBPRINT",
+
+            // --- API & Integration Tokens ---
+            "BROWSER_KEY", "WEBHOOK_URL",
+            "KUBE_CONFIG"
+        };
+
+        /// <summary>
+        /// Short or ambiguous sensitive keywords that require a strict leading word boundary
+        /// to prevent false positives (e.g., COMPAT, CONCERT, ARKANSAS).
+        /// </summary>
+        private static readonly string[] StrictKeyWords = new string[]
+        {
+            // --- Short Core Credentials ---
+            "PWD", "PIN",
+
+            // --- Web & Mobile Auth ---
+            "AUTH", "BEARER", "JWT", "SESSION", "COOKIE", "PAT",
+
+            // --- Cloud & Infrastructure ---
+            "SAS", "SKEY", "TENANT_ID",
+
+            // --- Databases & Storage ---
+            "DSN",
 
             // --- Cryptography & Identity ---
-            // Explicitly replaced broad "KEY" with target variants
-            "PRIVATE_KEY", "SSH_KEY", "SECRET_KEY", "API_KEY",
-            "CERTIFICATE", "CERT", "THUMBPRINT", "PFX", "PEM", "SALT", "PEPPER",
+            "CERT", "PFX", "PEM", "SALT", "PEPPER",
 
             // --- API Service Identifiers ---
-            "API",          // Catches API_KEY, API_SECRET, etc.
-            "APP_SECRET",
-            "BROWSER_KEY",
-            "WEBHOOK_URL",   // These often contain embedded tokens
-            "KUBE_CONFIG",
-            "TELEGRAM_TOKEN",
-            "DISCORD_TOKEN"
+            "API"
         };
 
         /// <summary>
@@ -59,13 +80,15 @@ namespace Servy.Service.Helpers
         /// word boundaries and alternation maps for sensitive credential keys.
         /// </summary>
         private static readonly string KeywordBoundaryPattern =
-            // Keyword: Negative lookarounds allow _, ., and - as valid boundaries without consuming them.
-            // Suffix group pulled inside the 'key' named capture parenthesis to safeguard composite descriptors.
-            @"(?i)(?<![a-zA-Z0-9])(?<key>(?:" + string.Join("|", SensitiveKeyWords.Select(Regex.Escape)) + @")(?:_[A-Za-z0-9]+)*)(?![a-zA-Z0-9])";
+            @"(?i)(?:" +
+                @"(?<![a-zA-Z0-9])(?<key>[A-Za-z0-9]*(?:" + string.Join("|", LooseKeyWords.Select(Regex.Escape)) + @")S?[0-9]*(?:_[A-Za-z0-9]+)*)(?![a-zA-Z0-9])" +
+                @"|" +
+                @"(?<![a-zA-Z0-9])(?<key>(?:" + string.Join("|", StrictKeyWords.Select(Regex.Escape)) + @")S?(?:_[A-Za-z0-9]+)*)(?![a-zA-Z0-9])" +
+            @")";
 
         /// <summary>
         /// A specialized regex for matching sensitive keys.
-        /// Uses the same boundary logic as MaskingRegex to avoid false positives like 'MONKEY_TYPE'.
+        /// Uses the same boundary logic as MaskingRegex to avoid false positives like 'APIPATH' or 'PRIVATELY'.
         /// </summary>
         private static readonly Regex KeyMatcherRegex = new Regex(
             KeywordBoundaryPattern,
@@ -90,7 +113,6 @@ namespace Servy.Service.Helpers
                  // BRANCH A: Explicit Separators (:, =, /)
                  // Aggressively consumes spaces for unquoted strings (e.g., "KEY=---BEGIN RSA---")
                  // as long as the next word isn't another CLI flag.
-                 // Entire choice block is wrapped in an atomic group (?>...) to prevent catastrophic backtracking.
                  @"(?<sep>\s*[:=]\s*|/)" +
                  @"(?>(?:" +
                      @"(?<val>""[^""]*"")|" +            // Double quoted: captures quotes so the whole string gets masked cleanly
@@ -101,7 +123,6 @@ namespace Servy.Service.Helpers
                  // BRANCH B: Space Separator
                  // Consumes unquoted strings, supporting multi-word values (e.g., "my secret pass")
                  // but stops consuming if it detects a subsequent CLI flag.
-                 // Entire choice block is wrapped in an atomic group (?>...) to prevent catastrophic backtracking.
                  @"(?<sep>\s+)(?![\-/]+[a-zA-Z])" +
                  @"(?>(?:" +
                      @"(?<val>""[^""]*"")|" +            // Double quoted: captures quotes so the whole string gets masked cleanly
@@ -147,15 +168,14 @@ namespace Servy.Service.Helpers
         /// <inheritdoc />
         public void LogStartupArguments(StartOptions options, IServyLogger? logger)
         {
-            if (options == null)
-            {
-                logger?.Error("StartOptions is null.");
-                return;
-            }
+            if (options == null) throw new ArgumentNullException(nameof(options));
 
             // 1. PUBLIC DATA: Logged to both Local Log and Windows Event Log (logger?.Info)
-            logger?.Info(
-                  $"[Startup Parameters]\n" +
+            logger?.Report(
+                  LogLevel.Info,
+                  "[Startup Parameters]",
+                  $"Servy version: {AppConfig.Version}\n\n" +
+
                   "--------Main-------------------\n" +
                   $"- serviceName: {options.ServiceName}\n" +
                   $"- realExePath: {options.ExecutablePath}\n" +
@@ -174,7 +194,8 @@ namespace Servy.Service.Helpers
                   $"- enableDateRotation: {options.EnableDateRotation}\n" +
                   $"- dateRotationType: {options.DateRotationType}\n" +
                   $"- maxRotations: {options.MaxRotations}\n" +
-                  $"- useLocalTimeForRotation: {options.UseLocalTimeForRotation}\n\n" +
+                  $"- useLocalTimeForRotation: {options.UseLocalTimeForRotation}\n" +
+                  $"- enableDebugLogs: {options.EnableDebugLogs}\n\n" +
 
                   "--------Recovery---------------\n" +
                   $"- enableHealthMonitoring: {options.EnableHealthMonitoring}\n" +
@@ -189,6 +210,9 @@ namespace Servy.Service.Helpers
                   $"- failureProgramPath: {options.FailureProgramPath}\n" +
                   $"- failureProgramStartupDirectory: {options.FailureProgramStartupDirectory}\n\n" +
 
+                  "--------Advanced---------------\n" +
+                  $"- allowOverriddenRuntimeVars: {options.AllowOverriddenRuntimeVars}\n\n" +
+
                   "--------Pre-Launch-------------\n" +
                   $"- preLaunchExecutablePath: {options.PreLaunchExecutablePath}\n" +
                   $"- preLaunchStartupDirectory: {options.PreLaunchStartupDirectory}\n" +
@@ -202,13 +226,13 @@ namespace Servy.Service.Helpers
                   $"- postLaunchExecutablePath: {options.PostLaunchExecutablePath}\n" +
                   $"- postLaunchStartupDirectory: {options.PostLaunchStartupDirectory}\n\n" +
 
-                  "--------Pre-Stop-------------\n" +
+                  "--------Pre-Stop---------------\n" +
                   $"- preStopExecutablePath: {options.PreStopExecutablePath}\n" +
                   $"- preStopStartupDirectory: {options.PreStopStartupDirectory}\n" +
                   $"- preStopTimeout: {options.PreStopTimeoutInSeconds}\n" +
                   $"- preStopLogAsError: {options.PreStopLogAsError}\n\n" +
 
-                  "--------Post-Stop-------------\n" +
+                  "--------Post-Stop--------------\n" +
                   $"- postStopExecutablePath: {options.PostStopExecutablePath}\n" +
                   $"- postStopStartupDirectory: {options.PostStopStartupDirectory}\n"
             );
@@ -220,14 +244,15 @@ namespace Servy.Service.Helpers
                 string envVarsFormatted = EnvironmentVariablesToString(options.EnvironmentVariables);
                 string preLaunchEnvVarsFormatted = EnvironmentVariablesToString(options.PreLaunchEnvironmentVariables);
 
-                Logger.Info(
-                    $"[Startup Parameters - SENSITIVE DATA]\n" +
+                Logger.Report(
+                    LogLevel.Info,
+                    "[Startup Parameters - SENSITIVE DATA]",
                     "NOTE: This section contains sensitive parameters including executable arguments and environment variables.\n" +
                     "--------Main (Sensitive)-------\n" +
                     $"- realArgs: {MaskRawArguments(options.ExecutableArgs)}\n\n" +
 
                     "--------Recovery (Sensitive)---\n" +
-                    $"- failureProgramArgs: {MaskRawArguments(options.FailureProgramArgs)}\n\n" +
+                    $"- failureProgramArgs: {MaskRawArguments(options.FailureProgramExecutableArgs)}\n\n" +
 
                     "--------Advanced (Sensitive)---\n" +
                     $"- environmentVariables: {envVarsFormatted}\n\n" +
@@ -264,14 +289,15 @@ namespace Servy.Service.Helpers
                 // 2. Establish the absolute floor (System32)
                 string system32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
 
-                // 3. derive fallback from ExecutablePath with explicit guards
-                // This avoids ArgumentNullException on older runtimes and handles malformed roots
+                // 3. Derive the fallback from ExecutablePath.
+                // Path.GetDirectoryName returns null for null or empty input and for a bare root ("C:\"),
+                // so the IsNullOrEmpty check on its result below covers every case.
                 string? exeDir = string.IsNullOrEmpty(options.ExecutablePath)
                     ? null
                     : Path.GetDirectoryName(options.ExecutablePath);
 
                 // 4. Final safety check: if GetDirectoryName returned null or empty, use System32
-                options.StartupDirectory = string.IsNullOrEmpty(exeDir) ? system32 : exeDir!;
+                options.StartupDirectory = string.IsNullOrEmpty(exeDir) ? system32 : exeDir;
 
                 // 5. Diagnostic logging with full context
                 logger?.Warn($"Working directory '{originalValue}' is invalid or inaccessible. Falling back to '{options.StartupDirectory}'.");
@@ -283,12 +309,14 @@ namespace Servy.Service.Helpers
             => _commandLineProvider.GetArgs();
 
         /// <inheritdoc />
-        public StartOptions? ParseOptions(IServiceRepository serviceRepository, string[] fullArgs)
-            => StartOptionsParser.Parse(serviceRepository, _processHelper, fullArgs);
+        public StartOptions? ParseOptions(INamedPipesService namedPipesService, string[] fullArgs)
+            => StartOptionsParser.Parse(namedPipesService, _processHelper, fullArgs);
 
         /// <inheritdoc />
         public bool ValidateAndLog(StartOptions options, IServyLogger? logger)
         {
+            if (options == null) throw new ArgumentNullException(nameof(options));
+
             LogStartupArguments(options, logger);
 
             if (!ValidateStartupOptions(logger, options))
@@ -301,12 +329,13 @@ namespace Servy.Service.Helpers
 
         /// <inheritdoc />
         public void RestartProcess(
-                    IProcessWrapper process,
+                    IProcessWrapper? process,
                     StartProcessCallback startProcess,
                     string realExePath,
                     string realArgs,
                     string workingDir,
                     List<EnvironmentVariable> environmentVariables,
+                    bool allowOverriddenRuntimeVars,
                     IServyLogger? logger,
                     int stopTimeoutMs,
                     CancellationToken cancellationToken = default)
@@ -331,7 +360,6 @@ namespace Servy.Service.Helpers
                         }
                         catch (Exception ex)
                         {
-                            /* Process already dead, can't get children anyway */
                             logger?.Warn($"RestartProcess error while getting process PID and StartTime: {ex.Message}");
                         }
 
@@ -356,13 +384,14 @@ namespace Servy.Service.Helpers
                     }
                 }
 
-                startProcess.Invoke(realExePath, realArgs, workingDir, environmentVariables, cancellationToken);
-
-                logger?.Info("Process restarted.");
+                if (startProcess.Invoke(realExePath, realArgs, workingDir, environmentVariables, allowOverriddenRuntimeVars, cancellationToken))
+                {
+                    logger?.Info("Process restarted.");
+                }
             }
             catch (Exception ex)
             {
-                logger?.Error($"Failed to restart process.", ex);
+                logger?.Error("Failed to restart process.", ex);
             }
             finally
             {
@@ -377,30 +406,22 @@ namespace Servy.Service.Helpers
         {
             try
             {
-#if DEBUG
-                var dir = AppFoldersHelper.GetAppDirectory();
-#else
-                var dir = AppConfig.ProgramDataPath;
-#endif
-
-                if (string.IsNullOrWhiteSpace(dir))
-                {
-                    logger?.Error("Execution Aborted: The directory path for the restarter is invalid.");
-                    return;
-                }
-
-                var restarter = Path.Combine(dir, "Servy.Restarter.exe");
+                // Same resolution rules as the other shipped executables: AppConfig owns the
+                // DEBUG/RELEASE split for all three, so the validation and the launch cannot drift.
+                var restarter = AppConfig.GetServyRestarterPath();
 
                 if (!File.Exists(restarter))
                 {
-                    logger?.Error("Servy.Restarter.exe not found.");
+                    logger?.Error($"{AppConfig.ServyRestarterExe} not found.");
                     return;
                 }
 
+                // The restarter runs under this service account, so it logs in the service's own log folder, the only
+                // one the account can write
                 var psi = new ProcessStartInfo
                 {
                     FileName = restarter,
-                    Arguments = Helper.Quote(serviceName),
+                    Arguments = Helper.Quote(serviceName) + " " + Helper.Quote(ServiceLogPaths.GetFolderPath(serviceName)),
                     CreateNoWindow = true,
                     UseShellExecute = false
                 };
@@ -413,20 +434,23 @@ namespace Servy.Service.Helpers
                         return;
                     }
 
+                    int restarterExeMaxWaitMs = GetRestarterExeMaxWaitMs();
+                    int restarterKillGracePeriodMs = GetRestarterKillGracePeriodMs();
+
                     // 1. Wait for the restarter to complete the Stop/Start cycle
-                    if (!process.WaitForExit(AppConfig.RestarterExeMaxWaitMs))
+                    if (!WaitForProcessExit(process, restarterExeMaxWaitMs))
                     {
-                        logger?.Error($"Servy.Restarter.exe timed out after {AppConfig.RestarterExeMaxWaitMs / (double)AppConfig.MillisecondsPerMinute} minutes. Forcing termination to prevent orphan conflicts.");
+                        logger?.Error($"Servy.Restarter.exe timed out after {restarterExeMaxWaitMs / (double)AppConfig.MillisecondsPerMinute} minutes. Forcing termination to prevent orphan conflicts.");
 
                         try
                         {
                             // 2. Kill the orphaned restarter
-                            process.Kill();
+                            KillProcess(process);
 
                             // 3. Brief wait to ensure kernel cleanup is complete before we return control
-                            if (!process.WaitForExit(AppConfig.RestarterKillGracePeriodMs))
+                            if (!WaitForProcessExit(process, restarterKillGracePeriodMs))
                             {
-                                logger?.Warn($"Restarter killed, but kernel cleanup is taking longer than {AppConfig.RestarterKillGracePeriodMs / (double)AppConfig.MillisecondsPerSecond} seconds.");
+                                logger?.Warn($"Restarter killed, but kernel cleanup is taking longer than {restarterKillGracePeriodMs / (double)AppConfig.MillisecondsPerSecond} seconds.");
                             }
                         }
                         catch (Exception killEx)
@@ -437,7 +461,14 @@ namespace Servy.Service.Helpers
                         return;
                     }
 
-                    logger?.Info($"Servy.Restarter.exe exited with code {process.ExitCode}.");
+                    if (process.ExitCode == 0)
+                    {
+                        logger?.Info($"Servy.Restarter.exe exited with code {process.ExitCode}.");
+                    }
+                    else
+                    {
+                        logger?.Error($"Servy.Restarter.exe exited with non-zero code {process.ExitCode}; the service restart likely failed.");
+                    }
                 }
             }
             catch (Exception ex)
@@ -445,6 +476,30 @@ namespace Servy.Service.Helpers
                 logger?.Error("Failed to launch restarter.", ex);
             }
         }
+
+        /// <summary>
+        /// Seam to retrieve the maximum wait time for the restarter process exit.
+        /// </summary>
+        protected virtual int GetRestarterExeMaxWaitMs()
+            => AppConfig.RestarterExeMaxWaitMs;
+
+        /// <summary>
+        /// Seam to retrieve the grace period wait time after killing the restarter process.
+        /// </summary>
+        protected virtual int GetRestarterKillGracePeriodMs()
+            => AppConfig.RestarterKillGracePeriodMs;
+
+        /// <summary>
+        /// Seam to wrap <see cref="Process.WaitForExit(int)"/> for unit testing.
+        /// </summary>
+        protected virtual bool WaitForProcessExit(Process process, int milliseconds)
+            => process.WaitForExit(milliseconds);
+
+        /// <summary>
+        /// Seam to wrap <see cref="Process.Kill()"/> for unit testing.
+        /// </summary>
+        protected virtual void KillProcess(Process process)
+            => process.Kill();
 
         /// <inheritdoc />
         public void RestartComputer(IServyLogger? logger)
@@ -474,7 +529,7 @@ namespace Servy.Service.Helpers
             }
             catch (Exception ex)
             {
-                logger?.Error($"Failed to restart computer.", ex);
+                logger?.Error("Failed to restart computer.", ex);
             }
         }
 
@@ -485,8 +540,8 @@ namespace Servy.Service.Helpers
 
             try
             {
-                service.RequestAdditionalTime(milliseconds);
-                logger?.Info($"Requested additional {milliseconds} ms for service operation.");
+                RequestAdditionalTimeCore(service, milliseconds);
+                logger?.Debug($"Requested additional {milliseconds} ms for service operation.");
             }
             catch (InvalidOperationException)
             {
@@ -495,8 +550,23 @@ namespace Servy.Service.Helpers
             catch (Exception ex)
             {
                 // Last-resort safety: never let SCM signaling crash the service
-                logger?.Error($"RequestAdditionalTime failed.", ex);
+                logger?.Error("RequestAdditionalTime failed.", ex);
             }
+        }
+
+        /// <summary>
+        /// Forwards the wait hint to <see cref="ServiceBase.RequestAdditionalTime(int)"/>.
+        /// </summary>
+        /// <remarks>
+        /// Seam only. <see cref="ServiceBase.RequestAdditionalTime(int)"/> succeeds solely for a
+        /// service actually running under the SCM, so a test subclass overrides this to reach the
+        /// success path and the last-resort catch of <see cref="RequestAdditionalTime"/>.
+        /// </remarks>
+        /// <param name="service">The service hosting the operation that needs more time.</param>
+        /// <param name="milliseconds">The additional time to request, in milliseconds.</param>
+        protected virtual void RequestAdditionalTimeCore(ServiceBase service, int milliseconds)
+        {
+            service.RequestAdditionalTime(milliseconds);
         }
 
         #endregion
@@ -511,7 +581,7 @@ namespace Servy.Service.Helpers
         /// <returns>A semicolon-separated string of key-value pairs, or "None" if the collection is null.</returns>
         private static string EnvironmentVariablesToString(IEnumerable<EnvironmentVariable> vars)
         {
-            if (vars == null) return "None";
+            if (vars == null || !vars.Any()) return "None";
 
             return string.Join("; ", vars.Select(v =>
                 $"{v.Name}={MaskSensitiveValue(v.Name, v.Value)}"));
@@ -560,23 +630,8 @@ namespace Servy.Service.Helpers
                 {
                     string key = m.Groups["key"].Value;
                     string sep = m.Groups["sep"].Value;
-                    string val = m.Groups["val"].Value;
 
-                    // Cleanly catch encapsulated quoted string allocations first to block space-splitting leaks
-                    if ((val.StartsWith("\"", StringComparison.Ordinal) && val.EndsWith("\"", StringComparison.Ordinal)) ||
-                        (val.StartsWith("'", StringComparison.Ordinal) && val.EndsWith("'", StringComparison.Ordinal)))
-                    {
-                        return $"{key}{sep}********";
-                    }
-
-                    // Branch B unquoted fallback: isolate and mask only the final whitespace-delimited argument token
-                    int lastSpaceInValue = val.LastIndexOf(' ');
-                    if (lastSpaceInValue >= 0)
-                    {
-                        string intermediateText = val.Substring(0, lastSpaceInValue + 1);
-                        return $"{key}{sep}{intermediateText}********";
-                    }
-
+                    // Redact the entire captured value regardless of quotes or spaces to guarantee no credential leaks.
                     return $"{key}{sep}********";
                 });
             }
@@ -588,8 +643,9 @@ namespace Servy.Service.Helpers
         }
 
         /// <summary>
-        /// Masks the dynamic segments of a URL for logging purposes, preserving only the scheme and host.
-        /// Explicitly strips out embedded credentials (UserInfo), query parameters, and down-path segments.
+        /// Masks the dynamic segments of a URL for logging purposes, preserving the scheme, the host and the first
+        /// 5 characters of the path as a hint. Explicitly strips out embedded credentials (UserInfo), query parameters,
+        /// the fragment and the rest of the path.
         /// </summary>
         /// <param name="url">The URL to mask.</param>
         /// <returns>The fully scrubbed and masked URL.</returns>
@@ -605,7 +661,7 @@ namespace Servy.Service.Helpers
                 return "[INVALID URL]";
             }
 
-            // Capture solely the scheme and host boundary to strip user:pass, query string strings, and precise routing hashes
+            // Keep only scheme://host plus a 5-character path hint; strips user:pass, the query string, and the fragment
             string baseSecuredUri = $"{uri.Scheme}://{uri.Host}";
             string localPath = uri.LocalPath;
 
@@ -627,7 +683,7 @@ namespace Servy.Service.Helpers
         /// This method performs a series of integrity checks on:
         /// <list type="bullet">
         /// <item><description>Required fields (Service Name and Main Executable Path).</description></item>
-        /// <item><description>The existence and validity of primary, failure, pre-launch, and post-launch executable paths.</description></item>
+        /// <item><description>The existence and validity of primary, failure, pre-launch, post-launch, pre-stop, and post-stop executable paths.</description></item>
         /// <item><description>The validity of associated working directories for all configured processes.</description></item>
         /// </list>
         /// Any validation failure is logged as an error to the provided <paramref name="logger"/>.

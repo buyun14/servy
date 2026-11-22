@@ -57,6 +57,21 @@ namespace Servy.Service.UnitTests.StreamWriters
             }
         }
 
+        [Fact]
+        public void Constructor_InnerWriterRefusesReparsePoints()
+        {
+            // Arrange
+            using (var adapter = CreateAdapter())
+            {
+                // Act
+                var inner = TestReflection.GetField<RotatingStreamWriter>(adapter, "_inner");
+                var ancestorCheck = TestReflection.GetField<Func<string, bool>?>(inner, "_hasAncestorReparsePoint");
+
+                // Assert: the stdout/stderr writer must run the reparse-point and final-path checks (#7527)
+                Assert.NotNull(ancestorCheck);
+            }
+        }
+
         #endregion
 
         #region Disposal & Guard Clause Tests
@@ -86,17 +101,6 @@ namespace Servy.Service.UnitTests.StreamWriters
             Assert.Throws<ObjectDisposedException>(() => adapter.WriteLine("Test line"));
         }
 
-        [Fact]
-        public void Write_AfterDispose_ThrowsObjectDisposedException()
-        {
-            // Arrange
-            var adapter = CreateAdapter();
-            adapter.Dispose();
-
-            // Act & Assert
-            Assert.Throws<ObjectDisposedException>(() => adapter.Write("Test text"));
-        }
-
         #endregion
 
         #region Functional Delegation Tests
@@ -117,24 +121,6 @@ namespace Servy.Service.UnitTests.StreamWriters
             Assert.True(File.Exists(_tempPath));
             string content = File.ReadAllText(_tempPath);
             Assert.Contains(testLine, content);
-        }
-
-        [Fact]
-        public void Write_WritesToStreamSuccessfully()
-        {
-            // Arrange
-            string testText = "Partial text";
-
-            // Act
-            using (var adapter = CreateAdapter())
-            {
-                adapter.Write(testText);
-            }
-
-            // Assert
-            Assert.True(File.Exists(_tempPath));
-            string content = File.ReadAllText(_tempPath);
-            Assert.Equal(testText, content);
         }
 
         #endregion

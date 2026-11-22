@@ -22,8 +22,9 @@ namespace Servy.Manager.ViewModels
 
         /// <summary>
         /// The number of data points maintained in the performance history buffers.
-        /// A value of 101 ensures the graph line spans the entire horizontal width
-        /// of the UI control (0 to 100 on the X-axis) immediately upon initialization.
+        /// A value of 101 yields 100 intervals across <see cref="GraphWidth"/>, so that the first
+        /// rendered tick already spans the full width of the graph rather than growing in from the
+        /// left over the following 100 ticks.
         /// </summary>
         private const int PerformanceHistoryCapacity = 101;
 
@@ -36,12 +37,25 @@ namespace Servy.Manager.ViewModels
         /// </remarks>
         private const double GraphScaleHeadroom = 1.2;
 
+        /// <summary>
+        /// Minimum CPU scale (%) so that the axis always spans the full normalised CPU range.
+        /// </summary>
+        /// <remarks>
+        /// CPU usage is normalised to 0-100% of whole-machine capacity before it reaches the graph,
+        /// so the axis never needs to be shorter than the metric's own range.
+        /// </remarks>
+        private const double MinCpuAxisMaximumPercent = 100.0;
+
+        /// <summary>
+        /// Minimum RAM scale (MB) to avoid flat graphs for small processes.
+        /// </summary>
+        private const double MinRamAxisMaximumMb = 10;
+
         #endregion
 
         #region Fields
 
         private readonly IServiceRepository _serviceRepository;
-        private readonly double _ramDisplayMax = 10; // Minimum RAM scale (MB) to avoid flat graphs for small processes
 
         private readonly IAppConfiguration _appConfig;
         private readonly IProcessHelper _processHelper;
@@ -77,9 +91,9 @@ namespace Servy.Manager.ViewModels
                 _selectedService = value;
                 OnPropertyChanged(nameof(SelectedService));
 
-                CopyPidCommand?.RaiseCanExecuteChanged();
+                CopyPidCommand.RaiseCanExecuteChanged();
 
-                ResetGraphs();
+                ResetGraphsAndResynchronizePid();
 
                 StopMonitoring();
                 StartMonitoring();
@@ -169,7 +183,7 @@ namespace Servy.Manager.ViewModels
         /// <param name="serviceCommands">Commands for service operations.</param>
         /// <param name="appConfig">Application configuration settings.</param>
         /// <param name="cursorService">Service used to control the cursor state.</param>
-        /// <param name="processHelper">The process helper used to format process commands.</param>
+        /// <param name="processHelper">The process helper used to collect process-tree CPU/RAM metrics and format them for display.</param>
         /// <param name="uiDispatcher">Dispatcher for UI thread operations.</param>
         public PerformanceViewModel(
             IServiceRepository serviceRepository,
@@ -208,7 +222,7 @@ namespace Servy.Manager.ViewModels
         protected override ServiceItemBase? SelectedServiceItem => SelectedService;
 
         /// <inheritdoc />
-        protected override int RefreshIntervalMs => _appConfig.PerformanceRefreshIntervalInMs;
+        protected override int RefreshIntervalMs => _appConfig.PerformanceRefreshIntervalMs;
 
         /// <inheritdoc />
         protected override ServiceItemBase CreateServiceItem(Service? service)
@@ -219,7 +233,7 @@ namespace Servy.Manager.ViewModels
         /// <inheritdoc />
         protected override void ResetMonitoringState()
         {
-            ResetGraphs();
+            ResetGraphsAndResynchronizePid();
         }
 
         /// <inheritdoc />
@@ -236,8 +250,8 @@ namespace Servy.Manager.ViewModels
                 if (currentSelection.Pid != null)      // only act on the running -> stopped transition
                 {
                     currentSelection.Pid = null;
-                    ResetGraphs();
-                    CopyPidCommand?.RaiseCanExecuteChanged();
+                    ResetGraphsAndResynchronizePid();
+                    CopyPidCommand.RaiseCanExecuteChanged();
                 }
                 return;
             }
@@ -245,8 +259,8 @@ namespace Servy.Manager.ViewModels
             if (currentSelection.Pid != currentPid)
             {
                 currentSelection.Pid = currentPid;
-                ResetGraphs();
-                CopyPidCommand?.RaiseCanExecuteChanged();
+                ResetGraphsAndResynchronizePid();
+                CopyPidCommand.RaiseCanExecuteChanged();
             }
 
             int pid = currentSelection.Pid.Value;
@@ -274,11 +288,12 @@ namespace Servy.Manager.ViewModels
         #region Private Methods - Logic & Calculation
 
         /// <summary>
-        /// Resets all graph-related display values and data collections to their initial state.
+        /// Resets the graph display values and data collections to their initial state,
+        /// and re-synchronises the PID label with the current selection.
         /// </summary>
         /// <remarks>Call this method to clear existing CPU and RAM usage data and prepare the graphs for
         /// fresh input. This is typically used when reinitializing the display or after a data source change.</remarks>
-        private void ResetGraphs()
+        private void ResetGraphsAndResynchronizePid()
         {
             // 1. Reset display values
             CpuUsage = UiConstants.NotAvailable;
@@ -335,11 +350,11 @@ namespace Servy.Manager.ViewModels
                 }
             }
 
-            // Grow the axis with the observed peak (plus headroom), but never below the fixed floor
-            // (100% for CPU, _ramDisplayMax MB for RAM) so small processes don't fill the graph.
+            // Grow the axis with the observed peak (plus headroom), but never below the fixed
+            // per-metric floor, so small processes don't fill the graph.
             double displayMax = isCpu
-                ? Math.Max(currentMax * GraphScaleHeadroom, 100.0)
-                : Math.Max(currentMax * GraphScaleHeadroom, _ramDisplayMax);
+                ? Math.Max(currentMax * GraphScaleHeadroom, MinCpuAxisMaximumPercent)
+                : Math.Max(currentMax * GraphScaleHeadroom, MinRamAxisMaximumMb);
 
             var lineBuffer = isCpu ? _cpuBuffer : _ramBuffer;
             var fillBuffer = isCpu ? _cpuFillBuffer : _ramFillBuffer;
@@ -353,7 +368,7 @@ namespace Servy.Manager.ViewModels
             foreach (var val in valueHistory)
             {
                 double x = i * stepX;
-                double ratio = Math.Min(Math.Max(val / displayMax, 0), 1);
+                double ratio = val / displayMax;
                 double y = GraphHeight - (ratio * GraphHeight);
 
                 var point = new Point(x, y);

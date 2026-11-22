@@ -48,6 +48,14 @@ namespace Servy.Manager.UnitTests.Views
             }
 
             /// <summary>
+            /// Test seam allowing unit tests to directly set the <see cref="SearchableViewModelBase.HasSearched"/> state.
+            /// </summary>
+            public void SetHasSearched(bool value)
+            {
+                HasSearched = value;
+            }
+
+            /// <summary>
             /// Simple mock implementation of the required abstract base map routine.
             /// </summary>
             protected override ServiceItemBase CreateServiceItem(Service? service)
@@ -68,19 +76,6 @@ namespace Servy.Manager.UnitTests.Views
                 _mockServiceCommands.Object);
         }
 
-        /// <summary>
-        /// Centralized, non-blocking polling primitive helper to track asynchronous fire-and-forget processing blocks safely.
-        /// </summary>
-        private static async Task PollUntilTrueAsync(Func<bool> condition, int maxRetries = 25, int delayMs = 20)
-        {
-            int retries = 0;
-            while (!condition() && retries < maxRetries)
-            {
-                await Task.Delay(delayMs);
-                retries++;
-            }
-        }
-
         [Fact]
         public async Task UserControl_Loaded_WhenDataContextIsNull_DoesNotThrowAndCompletesSilently()
         {
@@ -95,7 +90,15 @@ namespace Servy.Manager.UnitTests.Views
                     control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent)));
 
                 Assert.Null(exception);
-                await Task.CompletedTask;
+
+                // Record.Exception only observes a synchronous throw. The "CompletesSilently" half of
+                // the name lives in the task UiTaskRunner started, so await the seam and pin its
+                // terminal state, exactly as the two exception-path tests below do.
+                var task = control.LastLoadedTask;
+                Assert.NotNull(task);
+                await task;
+
+                Assert.Equal(TaskStatus.RanToCompletion, task.Status);
             }, createApp: true);
         }
 
@@ -108,14 +111,58 @@ namespace Servy.Manager.UnitTests.Views
                 var control = new TestServiceSearchUserControl();
                 var viewModel = CreateIsolatedViewModel();
 
-                // Add a dummy entry directly to the read-only bulk collection properties block
+                // Add a dummy entry and mark HasSearched = true to represent an already-populated, searched view model
                 viewModel.Services.Add(new DependencyService { Name = "ExistingService" });
+                viewModel.SetHasSearched(true); // HasSearched has a protected setter, so the test double exposes it
+
                 control.DataContext = viewModel;
 
                 // Act
                 control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
 
+                // The Loaded handler assigns LastLoadedTask unconditionally and synchronously, so the
+                // seam is always available once RaiseEvent returns. Pin its terminal state instead of
+                // guarding the await, exactly as the other Loaded tests in this file do.
+                var task = control.LastLoadedTask;
+                Assert.NotNull(task);
+                await task;
+
                 // Assert
+                Assert.Equal(TaskStatus.RanToCompletion, task.Status);
+                Assert.False(viewModel.ExecuteAsyncWasCalled);
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task UserControl_Loaded_WhenPreviousSearchMatchedNothing_DoesNotSearchAgain()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                // The case #6029 was about: a completed search that matched nothing leaves Services
+                // empty while HasSearched is true. The sibling above sets both, so only this
+                // arrangement can tell the HasSearched gate from the emptiness check it replaced.
+                var control = new TestServiceSearchUserControl();
+                var viewModel = CreateIsolatedViewModel();
+
+                viewModel.SetHasSearched(true);
+                control.DataContext = viewModel;
+
+                // Complete the test command's gate up front. The gate under test should never run it,
+                // but a regression that does would otherwise leave LastLoadedTask awaiting this source
+                // forever, so the test would hang instead of reporting the redundant search.
+                viewModel.CommandTcs.SetResult(null);
+
+                // Act
+                control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+
+                var task = control.LastLoadedTask;
+                Assert.NotNull(task);
+                await task;
+
+                // Assert
+                Assert.Empty(viewModel.Services);
+                Assert.Equal(TaskStatus.RanToCompletion, task.Status);
                 Assert.False(viewModel.ExecuteAsyncWasCalled);
             }, createApp: true);
         }
@@ -129,18 +176,23 @@ namespace Servy.Manager.UnitTests.Views
                 var control = new TestServiceSearchUserControl();
                 var viewModel = CreateIsolatedViewModel();
 
-                viewModel.Services.Clear(); // Collection state evaluates to !Any()
+                viewModel.Services.Clear(); // No-op (already empty); the real gate is HasSearched, which this view model leaves at its default false
                 control.DataContext = viewModel;
 
                 // Act
                 control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
                 viewModel.CommandTcs.SetResult(null);
 
-                // Centralized poll tracking handles asynchronous execution window
-                await PollUntilTrueAsync(() => viewModel.ExecuteAsyncWasCalled);
+                // ExecuteAsyncWasCalled is set on the synchronous portion of the call chain, so it is
+                // already true when RaiseEvent returns and proves only that the delegate was entered.
+                // Await the seam for the "Successfully" half.
+                var task = control.LastLoadedTask;
+                Assert.NotNull(task);
+                await task;
 
                 // Assert
                 Assert.True(viewModel.ExecuteAsyncWasCalled);
+                Assert.Equal(TaskStatus.RanToCompletion, task.Status);
             }, createApp: true);
         }
 
@@ -190,6 +242,29 @@ namespace Servy.Manager.UnitTests.Views
                 Assert.Equal(TaskStatus.RanToCompletion, task.Status);
                 Assert.True(viewModel.ExecuteAsyncWasCalled);
             }, createApp: true);
+        }
+
+        [Fact]
+        public async Task UserControl_Loaded_WhenGenericExceptionIsThrown_LogsTheFailureUnderTheViewName()
+        {
+            // Arrange & Act
+            var log = await LogCapture.RunAsync(() => Helper.RunOnSTA(async () =>
+            {
+                var control = new TestServiceSearchUserControl();
+                var viewModel = CreateIsolatedViewModel();
+                control.DataContext = viewModel;
+
+                control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+                viewModel.CommandTcs.SetException(new InvalidOperationException("SCM Connection Refused"));
+
+                var task = control.LastLoadedTask;
+                Assert.NotNull(task);
+                await task;
+            }, createApp: true));
+
+            // Assert - the failure is logged under the name the view declares, not under the type name
+            Assert.Contains($"Async UI handler failed in {TestServiceSearchUserControl.ExpectedViewName}.", log);
+            Assert.Contains("SCM Connection Refused", log);
         }
     }
 }

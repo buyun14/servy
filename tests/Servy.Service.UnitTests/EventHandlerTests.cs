@@ -1,4 +1,5 @@
 using Moq;
+using Servy.Core.EnvironmentVariables;
 using Servy.Core.Enums;
 using Servy.Core.Logging;
 using Servy.Service.ProcessManagement;
@@ -11,29 +12,27 @@ namespace Servy.Service.UnitTests
 {
     public class EventHandlerTests : IDisposable
     {
-        private readonly List<IDisposable> _disposableServices = new List<IDisposable>();
+        private readonly ServiceTestContext _ctx = new ServiceTestContext();
 
         [Fact]
-        public void OnOutputDataReceived_WritesToRotatingWriters_IgnoresNullOrEmpty()
+        public void OnOutputDataReceived_WritesLinesIncludingEmptyOnes_IgnoresTheNullEndOfStreamSentinel()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
-            var service = ctx.Build();
-            _disposableServices.Add(service); // Track SUT instance for teardown disposal
+            var service = _ctx.Build();
 
             var mockStdoutWriter = new Mock<IStreamWriter>();
             var mockStderrWriter = new Mock<IStreamWriter>();
 
-            ctx.StreamWriterFactory
+            _ctx.StreamWriterFactory
                .Setup(f => f.Create("valid-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
                .Returns(mockStdoutWriter.Object);
 
-            ctx.StreamWriterFactory
+            _ctx.StreamWriterFactory
                .Setup(f => f.Create("error-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
                .Returns(mockStderrWriter.Object);
 
             var nonEmptyArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs("output line");
-            var emptyArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs(null!);
+            var endOfStreamArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs(null);
             var emptyStringArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs(string.Empty);
 
             var startOptions = ServiceTestContext.CreateDefaultStartOptions();
@@ -49,7 +48,7 @@ namespace Servy.Service.UnitTests
 
             // Act
             service.InvokeOnOutputDataReceived(null, nonEmptyArgs);
-            service.InvokeOnOutputDataReceived(null, emptyArgs);
+            service.InvokeOnOutputDataReceived(null, endOfStreamArgs);
             service.InvokeOnOutputDataReceived(null, emptyStringArgs);
 
             // Assert
@@ -67,26 +66,24 @@ namespace Servy.Service.UnitTests
         }
 
         [Fact]
-        public void OnErrorDataReceived_WritesToRotatingWriters_IgnoresNullOrEmpty()
+        public void OnErrorDataReceived_WritesLinesIncludingEmptyOnes_IgnoresTheNullEndOfStreamSentinel()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
-            var service = ctx.Build();
-            _disposableServices.Add(service);
+            var service = _ctx.Build();
 
             var mockStdoutWriter = new Mock<IStreamWriter>();
             var mockStderrWriter = new Mock<IStreamWriter>();
 
-            ctx.StreamWriterFactory
+            _ctx.StreamWriterFactory
                .Setup(f => f.Create("valid-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
                .Returns(mockStdoutWriter.Object);
 
-            ctx.StreamWriterFactory
+            _ctx.StreamWriterFactory
                .Setup(f => f.Create("error-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
                .Returns(mockStderrWriter.Object);
 
             var nonEmptyArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs("error line");
-            var emptyArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs(null!);
+            var endOfStreamArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs(null);
             var emptyStringArgs = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs(string.Empty);
 
             var startOptions = ServiceTestContext.CreateDefaultStartOptions();
@@ -103,7 +100,7 @@ namespace Servy.Service.UnitTests
 
             // Act
             service.InvokeOnErrorDataReceived(null, nonEmptyArgs);
-            service.InvokeOnErrorDataReceived(null, emptyArgs);
+            service.InvokeOnErrorDataReceived(null, endOfStreamArgs);
             service.InvokeOnErrorDataReceived(null, emptyStringArgs);
 
             // Assert
@@ -124,19 +121,19 @@ namespace Servy.Service.UnitTests
         public void HandleLogWriters_SameStdoutAndStderrPath_MultiplexesToSingleWriter()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
-            var service = ctx.Build();
-            _disposableServices.Add(service);
+            var service = _ctx.Build();
 
             var mockSharedWriter = new Mock<IStreamWriter>();
 
-            ctx.StreamWriterFactory
+            _ctx.StreamWriterFactory
                .Setup(f => f.Create("shared-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
                .Returns(mockSharedWriter.Object);
 
             var startOptions = ServiceTestContext.CreateDefaultStartOptions();
             startOptions.StdoutPath = "shared-path.log";
-            startOptions.StderrPath = "shared-path.log";
+            // A different spelling of the same file, in a different case: the multiplex decision is made on the
+            // canonicalized paths (Helper.NormalizePath) and ignores case, as Windows paths do.
+            startOptions.StderrPath = Path.Combine(".", "SHARED-PATH.LOG");
 
             // Act
             service.InvokeHandleLogWriters(startOptions);
@@ -150,7 +147,7 @@ namespace Servy.Service.UnitTests
             Assert.Same(stdoutWriterValue, stderrWriterValue);
 
             // Verify Create was invoked only once for the shared multiplexed stream
-            ctx.StreamWriterFactory.Verify(
+            _ctx.StreamWriterFactory.Verify(
                 f => f.Create("shared-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()),
                 Times.Once);
         }
@@ -159,9 +156,7 @@ namespace Servy.Service.UnitTests
         public void OnProcessExited_LogsExitInfo()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
-            var service = ctx.Build();
-            _disposableServices.Add(service);
+            var service = _ctx.Build();
 
             var options = ServiceTestContext.CreateDefaultStartOptions();
             options.FailureProgramPath = @"C:\App\alert.exe";
@@ -175,10 +170,10 @@ namespace Servy.Service.UnitTests
             service.InvokeOnProcessExited(null, EventArgs.Empty);
 
             // Assert
-            ctx.Logger.Verify(l => l.Info(It.Is<string>(s => s.Contains("Child process exited successfully (Code 0).")), It.IsAny<Exception>()), Times.Once);
+            _ctx.Logger.Verify(l => l.Info(It.Is<string>(s => s.Contains("Child process exited successfully (Code 0).")), It.IsAny<Exception>()), Times.Once);
 
             // Verify clean exit does not launch failure program
-            ctx.ProcessFactory.Verify(f => f.Create(
+            _ctx.ProcessFactory.Verify(f => f.Create(
                 It.Is<ProcessStartInfo>(psi => psi.FileName == @"C:\App\alert.exe"), It.IsAny<IServyLogger>()), Times.Never);
         }
 
@@ -186,38 +181,71 @@ namespace Servy.Service.UnitTests
         public void OnProcessExited_ExitCodeNonZero_LogsErrorAndLaunchesFailureProgram()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
-            var service = ctx.Build();
-            _disposableServices.Add(service);
+            var service = _ctx.Build();
 
             var options = ServiceTestContext.CreateDefaultStartOptions();
             options.FailureProgramPath = @"C:\App\alert.exe";
+            // Every directory is different, so the hook cannot be handed another hook's directory unnoticed.
+            options.StartupDirectory = @"C:\svc";
+            options.PreLaunchStartupDirectory = @"C:\hooks\prelaunch";
+            options.PostLaunchStartupDirectory = @"C:\hooks\postlaunch";
+            options.FailureProgramStartupDirectory = @"C:\hooks\failure";
+            options.PreStopStartupDirectory = @"C:\hooks\prestop";
+            options.PostStopStartupDirectory = @"C:\hooks\poststop";
+            // Every argument string is different, so the hook cannot be handed another program's arguments unnoticed.
+            options.ExecutableArgs = "--main-arg";
+            options.PreLaunchExecutableArgs = "--pre-launch-arg";
+            options.PostLaunchExecutableArgs = "--post-launch-arg";
+            options.FailureProgramExecutableArgs = "--failure-arg";
+            options.PreStopExecutableArgs = "--pre-stop-arg";
+            options.PostStopExecutableArgs = "--post-stop-arg";
+            // The same name carries a different value in each list, so a program handed the wrong list is noticed.
+            options.EnvironmentVariables = new List<EnvironmentVariable> { new EnvironmentVariable { Name = "SERVY_TEST_SCOPE", Value = "main" } };
+            options.PreLaunchEnvironmentVariables = new List<EnvironmentVariable> { new EnvironmentVariable { Name = "SERVY_TEST_SCOPE", Value = "pre-launch" } };
             TestReflection.SetField(service, "_options", options);
 
             var mockProcess = new Mock<IProcessWrapper>();
             mockProcess.Setup(p => p.ExitCode).Returns(42);
             service.SetChildProcess(mockProcess.Object);
 
+            ProcessStartInfo? failurePsi = null;
+            var failureProgram = new Mock<IProcessWrapper>();
+            failureProgram.Setup(p => p.Start()).Returns(true);
+            _ctx.ProcessFactory
+                .Setup(f => f.Create(It.Is<ProcessStartInfo>(psi => psi.FileName == @"C:\App\alert.exe"), It.IsAny<IServyLogger>()))
+                .Callback<ProcessStartInfo, IServyLogger>((psi, _) => failurePsi = psi)
+                .Returns(failureProgram.Object);
+
             // Act
             service.InvokeOnProcessExited(null, EventArgs.Empty);
 
             // Assert
-            ctx.Logger.Verify(l => l.Error("Process exited with code 42 and recovery is disabled.", It.IsAny<Exception>()), Times.Once);
+            _ctx.Logger.Verify(l => l.Error(
+                    "[OnProcessExited] Process exited with code 42 (0x0000002A) and recovery is disabled.",
+                    It.IsAny<Exception>()), Times.Once);
 
             // Verify non-zero exit code launches configured failure program
-            ctx.ProcessFactory.Verify(f => f.Create(
+            _ctx.ProcessFactory.Verify(f => f.Create(
                 It.Is<ProcessStartInfo>(psi => psi.FileName == @"C:\App\alert.exe"), It.IsAny<IServyLogger>()), Times.Once);
+
+            // The failure program carries its own arguments, not another program's
+            Assert.NotNull(failurePsi);
+            Assert.Equal("--failure-arg", failurePsi.Arguments);
+            // ... and starts in its own directory, not another hook's
+            Assert.Equal(@"C:\hooks\failure", failurePsi.WorkingDirectory);
+            // ... and receives the main variables, not the pre-launch hook's own
+            Assert.Equal("main", failurePsi.Environment["SERVY_TEST_SCOPE"]);
         }
 
         [Fact]
         public void OnProcessExited_ExitCodeThrowsException_LogsWarning()
         {
             // Arrange
-            var ctx = new ServiceTestContext();
-            var service = ctx.Build();
-            _disposableServices.Add(service);
+            var service = _ctx.Build();
 
-            TestReflection.SetField(service, "_options", ServiceTestContext.CreateDefaultStartOptions());
+            var options = ServiceTestContext.CreateDefaultStartOptions();
+            options.FailureProgramPath = @"C:\App\alert.exe";
+            TestReflection.SetField(service, "_options", options);
 
             var mockProcess = new Mock<IProcessWrapper>();
             mockProcess.Setup(p => p.ExitCode).Throws(new InvalidOperationException("boom"));
@@ -227,16 +255,141 @@ namespace Servy.Service.UnitTests
             service.InvokeOnProcessExited(null, EventArgs.Empty);
 
             // Assert
-            ctx.Logger.Verify(l => l.Warn(It.Is<string>(s => s.Contains("Failed to get exit code")), It.IsAny<Exception>()), Times.Once);
+            _ctx.Logger.Verify(l => l.Warn(It.Is<string>(s => s.Contains("Failed to get exit code")), It.IsAny<Exception>()), Times.Once);
+
+            // An unreadable exit code falls through as -1, so the recovery-disabled error carries that fallback value
+            _ctx.Logger.Verify(l => l.Error(
+                    "[OnProcessExited] Process exited with code -1 (0xFFFFFFFF) and recovery is disabled.",
+                    It.IsAny<Exception>()), Times.Once);
+
+            // Verify the same -1 drives the stop sequence, which launches the configured failure program
+            _ctx.ProcessFactory.Verify(f => f.Create(
+                It.Is<ProcessStartInfo>(psi => psi.FileName == @"C:\App\alert.exe"), It.IsAny<IServyLogger>()), Times.Once);
         }
 
-        public void Dispose()
+        [Fact]
+        public void HandleLogWriters_StdoutFactoryThrows_LogsErrorAndStillCreatesTheStderrWriter()
         {
-            // Unified Cleanup: Iterate and safely drop transient test services to avoid CTS leaks
-            foreach (var service in _disposableServices)
-            {
-                service?.Dispose();
-            }
+            // Arrange
+            var service = _ctx.Build();
+
+            var ioFailure = new IOException("The network path was not found.");
+            var mockStderrWriter = new Mock<IStreamWriter>();
+
+            _ctx.StreamWriterFactory
+               .Setup(f => f.Create("valid-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
+               .Throws(ioFailure);
+
+            _ctx.StreamWriterFactory
+               .Setup(f => f.Create("error-path.log", It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
+               .Returns(mockStderrWriter.Object);
+
+            var startOptions = ServiceTestContext.CreateDefaultStartOptions();
+
+            // Act
+            service.InvokeHandleLogWriters(startOptions);
+
+            // Assert
+            // The failing stream is logged with its path and the original exception, then dropped.
+            _ctx.Logger.Verify(l => l.Error(
+                "Could not open log file 'valid-path.log'; continuing without redirection for this stream.",
+                ioFailure), Times.Once);
+            Assert.Null(TestReflection.GetField<object>(service, "_stdoutWriter"));
+
+            // A redirection failure on one stream never stops the service: stderr still gets its own writer.
+            Assert.Same(mockStderrWriter.Object, TestReflection.GetField<object>(service, "_stderrWriter"));
         }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public void OnDataReceived_WriterThrowsIOException_LogsWarningAndDoesNotThrow(bool stdout)
+        {
+            // Arrange
+            var service = _ctx.Build();
+
+            var mockWriter = new Mock<IStreamWriter>();
+            mockWriter.Setup(w => w.WriteLine(It.IsAny<string>())).Throws(new IOException("disk full"));
+
+            _ctx.StreamWriterFactory
+               .Setup(f => f.Create(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
+               .Returns(mockWriter.Object);
+
+            service.InvokeHandleLogWriters(ServiceTestContext.CreateDefaultStartOptions());
+
+            var args = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs("line");
+
+            // Act
+            var ex = Record.Exception(() =>
+            {
+                if (stdout) service.InvokeOnOutputDataReceived(null, args);
+                else service.InvokeOnErrorDataReceived(null, args);
+            });
+
+            // Assert
+            // The output pump threads must never let a write failure escape; it is logged and swallowed.
+            Assert.Null(ex);
+            _ctx.Logger.Verify(l => l.Warn(
+                stdout ? "Failed to write stdout line: disk full" : "Failed to write stderr line: disk full",
+                It.IsAny<Exception>()), Times.Once);
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public void OnDataReceived_WriterAlreadyDisposed_IsSilent(bool stdout)
+        {
+            // Arrange
+            var service = _ctx.Build();
+
+            var mockWriter = new Mock<IStreamWriter>();
+            mockWriter.Setup(w => w.WriteLine(It.IsAny<string>())).Throws(new ObjectDisposedException("writer"));
+
+            _ctx.StreamWriterFactory
+               .Setup(f => f.Create(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<long>(), It.IsAny<bool>(), It.IsAny<DateRotationType>(), It.IsAny<int>(), It.IsAny<bool>()))
+               .Returns(mockWriter.Object);
+
+            service.InvokeHandleLogWriters(ServiceTestContext.CreateDefaultStartOptions());
+
+            var args = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs("line");
+
+            // Act
+            var ex = Record.Exception(() =>
+            {
+                if (stdout) service.InvokeOnOutputDataReceived(null, args);
+                else service.InvokeOnErrorDataReceived(null, args);
+            });
+
+            // Assert
+            // Shutting down: the dedicated ObjectDisposedException arm must not fall through to the Warn arm.
+            Assert.Null(ex);
+            mockWriter.Verify(w => w.WriteLine("line"), Times.Once);
+            _ctx.Logger.Verify(l => l.Warn(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public void OnDataReceived_NoWriterConfigured_DropsTheLineSilently(bool stdout)
+        {
+            // Arrange
+            // HandleLogWriters is not called, so neither stream has a writer: the state of a service
+            // that configures no stdout or stderr path.
+            var service = _ctx.Build();
+            var args = DataReceivedEventArgsFactory.CreateDataReceivedEventArgs("line");
+
+            // Act
+            var ex = Record.Exception(() =>
+            {
+                if (stdout) service.InvokeOnOutputDataReceived(null, args);
+                else service.InvokeOnErrorDataReceived(null, args);
+            });
+
+            // Assert
+            Assert.Null(ex);
+            _ctx.Logger.Verify(l => l.Warn(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+        }
+
+        public void Dispose() => _ctx.Dispose();
     }
 }

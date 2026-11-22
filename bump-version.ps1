@@ -1,13 +1,15 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
-    Updates the version of Servy across scripts, AppConfig, and Directory.Build.props.
+    Updates the version and copyright notice of Servy across build-config.ps1, Directory.Build.props, and Servy.psd1.
 
 .DESCRIPTION
-    This script updates the version of Servy in multiple locations:
+    This script updates the version and copyright year of Servy in multiple locations:
     - setup\build-config.ps1    (Version hashtable key)
-    - Directory.Build.props     (<Version>, <FileVersion>, <AssemblyVersion>)
-    - src\Servy.CLI\Servy.psd1  (ModuleVersion)
+    - Directory.Build.props     (<Version>, <FileVersion>, <AssemblyVersion>, <Copyright>)
+    - src\Servy.CLI\Servy.psd1  (ModuleVersion, Copyright)
+    The copyright year written is the current year at run time; it is not a parameter.
 
 .PARAMETER Version
     The new version to apply in 'Major.Minor' format (e.g., "8.0").
@@ -27,7 +29,7 @@ Updates all relevant files to version 4.0.
 Previews all version modifications that would be applied for version 4.0 without writing changes to disk.
 
 .NOTES
-    - The script overwrites files in-place.
+    - The script overwrites files in-place unless -DryRun is used.
     - Ensure you have backups or version control before running.
 #>
 
@@ -39,6 +41,7 @@ param(
     [switch]$DryRun
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:HadFailure      = $false
 
@@ -51,7 +54,7 @@ $baseDir = $PSScriptRoot
 $helperFile = "Update-FileHelpers.ps1"
 $helperPath = Join-Path $baseDir $helperFile
 
-if (Test-Path $helperPath) {
+if (Test-Path -LiteralPath $helperPath) {
     . $helperPath
 } else {
     throw "Critical dependency missing: '$helperFile' was not found at '$helperPath'. Ensure the helper is in the same directory as this script."
@@ -63,10 +66,14 @@ $script:filesModified     = 0
 $script:totalReplacements = 0
 
 # -----------------------------
-# Convert short version to full versions
+# Convert short version to full versions and current year
 # -----------------------------
 $fullVersion = "$Version.0"
 $fileVersion = "$Version.0.0"
+$currentYear = (Get-Date).Year
+
+# Hoist shared copyright holder pattern string
+$copyrightHolderPattern = 'Akram\s+El\s+Assas\.\s+All\s+rights\s+reserved\.'
 
 if ($DryRun) {
     Write-Host "DRY-RUN: Previewing Servy version update to $Version..." -ForegroundColor Yellow
@@ -80,9 +87,10 @@ if ($DryRun) {
 $buildConfigPath = Join-Path $baseDir 'setup\build-config.ps1'
 Update-FilesContent `
     -Files @($buildConfigPath) `
-    -Pattern '(Version\s*=\s*")[^"]*(")' `
+    -Pattern '(?m)(^\s*Version\s*=\s*")[^"]*(")' `
     -Replacement { param($m) "$($m.Groups[1].Value)$Version$($m.Groups[2].Value)" } `
     -ExpectMatch `
+    -ExpectMatchCount 1 `
     -DryRun:$DryRun
 
 # -----------------------------
@@ -91,9 +99,10 @@ Update-FilesContent `
 $propsPath = Join-Path $baseDir "Directory.Build.props"
 
 $propsEdits = @(
-    @{ Pattern = '(<Version(?:\s+[^>]*)?>)[^<]*(</Version>)';         Replacement = { param($m) "$($m.Groups[1].Value)$fullVersion$($m.Groups[2].Value)" } },
-    @{ Pattern = '(<FileVersion(?:\s+[^>]*)?>)[^<]*(</FileVersion>)';     Replacement = { param($m) "$($m.Groups[1].Value)$fileVersion$($m.Groups[2].Value)" } },
-    @{ Pattern = '(<AssemblyVersion(?:\s+[^>]*)?>)[^<]*(</AssemblyVersion>)'; Replacement = { param($m) "$($m.Groups[1].Value)$fileVersion$($m.Groups[2].Value)" } }
+    @{ Pattern = '(<Version(?:\s+[^>]*)?>)[^<]*(</Version>)';         Replacement = { param($m) "$($m.Groups[1].Value)$fullVersion$($m.Groups[2].Value)" }; ExpectedCount = 1 },
+    @{ Pattern = '(<FileVersion(?:\s+[^>]*)?>)[^<]*(</FileVersion>)';     Replacement = { param($m) "$($m.Groups[1].Value)$fileVersion$($m.Groups[2].Value)" }; ExpectedCount = 1 },
+    @{ Pattern = '(<AssemblyVersion(?:\s+[^>]*)?>)[^<]*(</AssemblyVersion>)'; Replacement = { param($m) "$($m.Groups[1].Value)$fileVersion$($m.Groups[2].Value)" }; ExpectedCount = 1 },
+    @{ Pattern = "(<Copyright(?:\s+[^>]*)?>Copyright\s+[^\d]+?\s+)\d{4}(\s+$copyrightHolderPattern</Copyright>)"; Replacement = { param($m) "$($m.Groups[1].Value)$currentYear$($m.Groups[2].Value)" }; ExpectedCount = 1 }
 )
 
 Update-FilesContent `
@@ -107,20 +116,38 @@ Update-FilesContent `
 # -----------------------------
 $psd1Path = Join-Path $baseDir "src\Servy.CLI\Servy.psd1"
 
+$psd1Edits = @(
+    @{ Pattern = "(?<![A-Za-z0-9])(ModuleVersion\s*=\s*')[^']*(')"; Replacement = { param($m) "$($m.Groups[1].Value)$fullVersion$($m.Groups[2].Value)" }; ExpectedCount = 1 },
+    @{ Pattern = "(Copyright\s*=\s*'Copyright\s+[^\d]+?\s+)\d{4}(\s+$copyrightHolderPattern')"; Replacement = { param($m) "$($m.Groups[1].Value)$currentYear$($m.Groups[2].Value)" }; ExpectedCount = 1 }
+)
+
 Update-FilesContent `
     -Files @($psd1Path) `
-    -Pattern "(ModuleVersion\s*=\s*')[^']*(')" `
-    -Replacement { param($m) "$($m.Groups[1].Value)$fullVersion$($m.Groups[2].Value)" } `
+    -Edits $psd1Edits `
     -ExpectMatch `
     -DryRun:$DryRun
 
-if ($script:HadFailure) {
-    Write-Host "Version update process completed with errors." -ForegroundColor Red
-    exit 1
+# -----------------------------
+# Summary Report
+# -----------------------------
+Write-Host "`n========================================="
+Write-Host "                SUMMARY"
+Write-Host "========================================="
+if ($DryRun) {
+    Write-Host "Files scanned:                   $script:totalFilesScanned"
+    Write-Host "Files that would be modified:    $script:filesModified"
+    Write-Host "Replacements that would be made: $script:totalReplacements"
+} else {
+    Write-Host "Files scanned:                    $script:totalFilesScanned"
+    Write-Host "Files modified:                   $script:filesModified"
+    Write-Host "Total replacements:               $script:totalReplacements"
 }
 
-if ($DryRun) {
-    Write-Host "DRY-RUN: Version update preview completed successfully." -ForegroundColor Yellow
-} else {
-    Write-Host "All version updates completed successfully." -ForegroundColor Green
+if ($script:HadFailure) {
+    if ($DryRun) {
+        Write-Host "`nDRY-RUN: Version update preview completed with errors. No files were modified." -ForegroundColor Yellow
+    } else {
+        Write-Host "Version update process completed with errors." -ForegroundColor Red
+    }
+    exit 1
 }

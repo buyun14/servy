@@ -1,4 +1,5 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Displays Windows toast notifications for the latest Servy error events.
@@ -8,10 +9,13 @@
     interactive desktop alerts for service failures.
 
     This script:
-      1. Filters the Windows Application event log for errors related to 'Servy'.
+      1. Filters the Windows Application event log for errors related to 'Servy', keeping
+         only the Servy error event IDs (3000-3199).
       2. Retrieves all new errors since the last execution using a timestamp file.
       3. Parses the error messages to extract service names and log text.
-      4. Shows individual Windows toast notifications for each failure.
+      4. Shows individual Windows toast notifications for each failure, at most 10 per run:
+         when more errors arrived, the newest 10 are shown and the older ones are skipped and
+         recorded in ServyWatermarkErrors.log.
 
 .NOTES
     Author      : Akram El Assas
@@ -26,7 +30,8 @@
 
 .EXAMPLE
     .\ServyFailureNotification.ps1
-    Displays a toast notification for the latest Servy error event.
+    Displays a toast notification for each new Servy error event: only the latest one on a
+    first run, at most 10 per run afterwards.
 #>
 
 # -------------------------------
@@ -70,11 +75,17 @@ function Show-Notification {
 
     $ToastTitle = "Servy - $ServiceName"
 
+    # Load WinRT assemblies before entering delivery trial block; if unavailable on this host,
+    # classify as a permanent failure so the watermark advances rather than looping indefinitely.
     try {
-        # Load WinRT assemblies
         [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
         [void][Windows.UI.Notifications.NotificationSetting, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    } catch {
+        Write-FallbackError -Message "ServyToast: WinRT notification types are unavailable on this host ($($_.Exception.Message)). Toast delivery is not possible here; advancing the watermark." -ScriptDir $ScriptDir -FallbackFileName $FallbackLogFile
+        return 'PermanentFailure'
+    }
 
+    try {
         $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
             [Windows.UI.Notifications.ToastTemplateType]::ToastText02
         )
@@ -134,7 +145,7 @@ function Show-Notification {
             # Setting probe restricted; proceed with delivery anyway.
         }
 
-        # Track synchronous platform failures safely via local reference tracking blocks.
+        # Track asynchronous platform failures safely via local reference tracking blocks.
         $failedRef = [ref]$false
         $failCode  = [ref]([int]0)
 
@@ -145,12 +156,14 @@ function Show-Notification {
         $null = $toast.add_Failed({
             param($evtSender, $evtArgs)
             $failedRef.Value = $true
-            $failCode.Value  = [int]$evtArgs.ErrorCode
+            $ex = $evtArgs.ErrorCode
+            # ErrorCode is projected as System.Exception; its HResult carries the numeric code.
+            $failCode.Value  = if ($ex -is [System.Exception]) { [int]$ex.HResult } else { [int]$ex }
         })
 
         $notifier.Show($toast)
 
-        # ROBUSTNESS: Block execution and loop to await synchronous platform failures.
+        # ROBUSTNESS: Block execution and loop to await asynchronous platform failures.
         # WinRT reports delivery failure asynchronously; poll up to 2s for the add_Failed
         # callback so a late-firing failure is captured before the watermark advances.
         $deadline = [DateTime]::UtcNow.AddMilliseconds(2000)

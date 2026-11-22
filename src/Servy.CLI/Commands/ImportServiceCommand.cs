@@ -1,4 +1,5 @@
 using Servy.CLI.Enums;
+using Servy.CLI.Helpers;
 using Servy.CLI.Models;
 using Servy.CLI.Options;
 using Servy.CLI.Resources;
@@ -20,8 +21,6 @@ namespace Servy.CLI.Commands
     public class ImportServiceCommand : BaseCommand
     {
         private readonly IServiceRepository _serviceRepository;
-        private readonly IXmlServiceSerializer _xmlServiceSerializer;
-        private readonly IJsonServiceSerializer _jsonServiceSerializer;
         private readonly IServiceManager _serviceManager;
         private readonly IXmlServiceValidator _xmlServiceValidator;
         private readonly IJsonServiceValidator _jsonServiceValidator;
@@ -31,22 +30,17 @@ namespace Servy.CLI.Commands
         /// Initializes a new instance of the <see cref="ImportServiceCommand"/> class.
         /// </summary>
         /// <param name="serviceRepository">The service repository for persisting configurations.</param>
-        /// <param name="xmlServiceSerializer">Serializer for XML service configurations.</param>
-        /// <param name="jsonServiceSerializer">Serializer for JSON service configurations.</param>
         /// <param name="serviceManager">Manager to control Windows services.</param>
         /// <param name="xmlServiceValidator">Validator for XML service configurations.</param>
         /// <param name="jsonServiceValidator">Validator for JSON service configurations.</param>
         /// <param name="processHelper">Helper for process related formatting and parsing.</param>
         /// <exception cref="ArgumentNullException">
-        /// Thrown when <paramref name="serviceRepository"/>, <paramref name="xmlServiceSerializer"/>,
-        /// <paramref name="jsonServiceSerializer"/>, <paramref name="serviceManager"/>,
+        /// Thrown when <paramref name="serviceRepository"/>, <paramref name="serviceManager"/>,
         /// <paramref name="xmlServiceValidator"/>, <paramref name="jsonServiceValidator"/>, or
         /// <paramref name="processHelper"/> is <c>null</c>.
         /// </exception>
         public ImportServiceCommand(
             IServiceRepository serviceRepository,
-            IXmlServiceSerializer xmlServiceSerializer,
-            IJsonServiceSerializer jsonServiceSerializer,
             IServiceManager serviceManager,
             IXmlServiceValidator xmlServiceValidator,
             IJsonServiceValidator jsonServiceValidator,
@@ -56,8 +50,6 @@ namespace Servy.CLI.Commands
             _xmlServiceValidator = xmlServiceValidator ?? throw new ArgumentNullException(nameof(xmlServiceValidator));
             _jsonServiceValidator = jsonServiceValidator ?? throw new ArgumentNullException(nameof(jsonServiceValidator));
             _serviceManager = serviceManager ?? throw new ArgumentNullException(nameof(serviceManager));
-            _xmlServiceSerializer = xmlServiceSerializer ?? throw new ArgumentNullException(nameof(xmlServiceSerializer));
-            _jsonServiceSerializer = jsonServiceSerializer ?? throw new ArgumentNullException(nameof(jsonServiceSerializer));
             _processHelper = processHelper ?? throw new ArgumentNullException(nameof(processHelper));
         }
 
@@ -85,7 +77,10 @@ namespace Servy.CLI.Commands
                     return CommandResult.Fail(Strings.Msg_PathRequired);
 
                 // Pre-flight elevation check
-                SecurityHelper.EnsureAdministrator();
+                if (!BypassElevationCheck)
+                {
+                    SecurityHelper.EnsureAdministrator();
+                }
 
                 // ROBUSTNESS: Delegate the complex path canonicalization, UNC blocking, and
                 // defense-in-depth symlink/junction guard checks to the centralized ImportGuard.
@@ -140,14 +135,13 @@ namespace Servy.CLI.Commands
                 opts,
                 content,
                 "XML",
-                xmlContent => _xmlServiceValidator.TryValidate(xmlContent, out var err) ? (true, null) : (false, err),
+                xmlContent => _xmlServiceValidator.TryValidate(xmlContent, out var err, out var dto) ? (true, null, dto) : (false, err, null),
                 dto => _serviceRepository.UpsertAsync(
                         dto,
                         preserveExistingRuntimeState: true,
                         preserveExistingCredentials: true,
                         cancellationToken: cancellationToken
                         ),
-                _xmlServiceSerializer.Deserialize,
                 cancellationToken: cancellationToken);
         }
 
@@ -165,46 +159,59 @@ namespace Servy.CLI.Commands
                 opts,
                 content,
                 "JSON",
-                jsonContent => _jsonServiceValidator.TryValidate(jsonContent, out var err) ? (true, null) : (false, err),
+                jsonContent => _jsonServiceValidator.TryValidate(jsonContent, out var err, out var dto) ? (true, null, dto) : (false, err, null),
                 dto => _serviceRepository.UpsertAsync(
                         dto,
                         preserveExistingRuntimeState: true,
                         preserveExistingCredentials: true,
                         cancellationToken: cancellationToken
                         ),
-                _jsonServiceSerializer.Deserialize,
                 cancellationToken: cancellationToken);
         }
 
         /// <summary>
         /// Core logic for processing service imports across different formats.
         /// </summary>
+        /// <param name="opts">Import service options; <see cref="ImportServiceOptions.InstallService"/> decides whether step 4 runs.</param>
+        /// <param name="content">The raw configuration file content, already read and size-checked by the caller.</param>
+        /// <param name="formatName">The format label used in messages ("XML" or "JSON").</param>
+        /// <param name="validator">Format-specific validation; parses <paramref name="content"/> once and returns
+        /// whether it is valid, the error text when it is not, and the parsed definition when it is.</param>
+        /// <param name="repoImporter">Persists the deserialized DTO and returns the number of affected rows.</param>
+        /// <param name="cancellationToken">Optional cancellation token.</param>
+        /// <returns>A <see cref="CommandResult"/> indicating success or the first failing step.</returns>
         private async Task<CommandResult> ProcessImportInternalAsync(
              ImportServiceOptions opts,
              string content,
              string formatName,
-             Func<string, (bool Valid, string? Error)> validator,
+             Func<string, (bool Valid, string? Error, ServiceDto? Dto)> validator,
              Func<ServiceDto, Task<int>> repoImporter,
-             Func<string, ServiceDto?> deserializer,
              CancellationToken cancellationToken = default)
         {
-            // 1. Format Validation
-            var (isValid, error) = validator(content);
+            // 1. Format Validation, which also materializes the definition (one parse per import)
+            var (isValid, error, dto) = validator(content);
             if (!isValid)
                 return CommandResult.Fail(string.Format(Strings.Msg_ImportFormatInvalid, formatName, error));
 
-            // 2. Deserialization
-            var dto = deserializer(content);
             if (dto == null)
                 return CommandResult.Fail(Strings.Msg_ImportDeserializationFailure);
 
-            // 3. Path validation
+            // 2. Path validation
             var pathValidation = ValidateServicePaths(dto);
             if (!pathValidation.IsSuccess)
                 return pathValidation;
 
-            // 4. Repository Import (only after validation passes)
-            var affected = await repoImporter(dto);
+            // 3. Repository Import (only after validation passes). A stored row that no longer decrypts is never
+            // overwritten; say why, with what to do, rather than a generic failure.
+            int affected;
+            try
+            {
+                affected = await repoImporter(dto);
+            }
+            catch (ServiceDecryptionFailedException ex)
+            {
+                return CommandResult.Fail(ex.Message);
+            }
             if (affected <= 0)
             {
                 Logger.Error($"Repository upsert for service '{dto.Name}' reported 0 affected rows.");
@@ -214,7 +221,7 @@ namespace Servy.CLI.Commands
             if (!opts.InstallService)
                 return CommandResult.Ok(string.Format(Strings.Msg_ImportSuccessNoInstall, formatName));
 
-            // 5. Installation
+            // 4. Installation
             return await TryInstallServiceAsync(dto.Name ?? string.Empty, formatName, cancellationToken);
         }
 
@@ -228,6 +235,7 @@ namespace Servy.CLI.Commands
             var violation = ServicePathValidator.FindFirstViolation(service, _processHelper.ValidatePath);
             if (violation != null)
             {
+                // ExecutablePath keeps the CLI-specific message because it interpolates the offending value.
                 if (violation.Property.Name == nameof(ServiceDto.ExecutablePath))
                 {
                     return CommandResult.Fail(string.Format(
@@ -235,9 +243,7 @@ namespace Servy.CLI.Commands
                         violation.Value ?? string.Empty));
                 }
 
-                return CommandResult.Fail(string.Format(
-                    Core.Resources.Strings.Msg_InvalidPathInConfig,
-                    violation.Attribute.Label));
+                return CommandResult.Fail(violation.ResolveErrorMessage());
             }
 
             return CommandResult.Ok();
@@ -253,7 +259,7 @@ namespace Servy.CLI.Commands
         private async Task<CommandResult> TryInstallServiceAsync(string serviceName, string format, CancellationToken cancellationToken = default)
         {
             // 1. Retrieve the service domain object
-            var serviceDto = await _serviceRepository.GetByNameAsync(serviceName, cancellationToken: cancellationToken);
+            var serviceDto = await _serviceRepository.GetByNameAsync(serviceName, decrypt: true, cancellationToken: cancellationToken);
 
             if (serviceDto == null)
             {
@@ -261,10 +267,10 @@ namespace Servy.CLI.Commands
                 return CommandResult.Fail(string.Format(Strings.Msg_ImportInstallLookupFailure, serviceName));
             }
 
-            var serviceDomain = ServiceMapper.ToDomain(_serviceManager, serviceDto);
+            var serviceDomain = ServiceDtoMapper.ToDomain(_serviceManager, serviceDto);
 
             // 2. Attempt service installation
-            var res = await serviceDomain.Install(isCLI: true, cancellationToken: cancellationToken);
+            var res = await serviceDomain.InstallAsync(isCLI: true, cancellationToken: cancellationToken);
 
             if (res.IsSuccess)
             {
@@ -272,11 +278,8 @@ namespace Servy.CLI.Commands
                 return CommandResult.Ok(string.Format(Strings.Msg_ImportInstallSuccess, format, serviceName));
             }
 
-            // Log the domain-specific error message
             Logger.Error($"Installation failed for {serviceName}: {res.ErrorMessage}");
-
-            // Return the specific error from the domain logic, or a localized general failure
-            return CommandResult.Fail(res.ErrorMessage ?? string.Format(Strings.Msg_ImportInstallGeneralFailure, serviceName));
+            return res.ToFailure();
         }
 
     }

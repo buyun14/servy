@@ -6,7 +6,7 @@ using System.Data.SQLite;
 
 namespace Servy.Infrastructure.IntegrationTests.Data
 {
-    [Collection("SequentialDatabaseTests")]
+    [Collection(DatabaseTestCollection.Name)]
     public class SQLiteDbInitializerIntegrationTests
     {
         /// <summary>
@@ -39,17 +39,17 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             using (var conn = CreateConnection())
             {
                 // Act
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
                 Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion, version);
 
                 var tables = conn.Query<string>("SELECT name FROM sqlite_master WHERE type='table';").ToList();
-                Assert.Contains("Services", tables);
+                Assert.Contains(SqlConstants.ServicesTableName, tables);
                 Assert.Contains("SchemaInfo", tables);
 
-                var columns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
                 Assert.Contains("EnableSizeRotation", columns); // Applied by V2
                 Assert.Contains("EnableConsoleUI", columns); // Applied by V3
                 Assert.Contains("RecoveryOnCleanExit", columns); // Applied by V5
@@ -63,7 +63,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 Assert.Contains("CpuAffinity", columns);
 
                 // Verify the structural index details map directly to the modern COLLATE UNICODE_NOCASE layout rules (Applied by V6)
-                var indexList = conn.Query("PRAGMA index_list('Services');")
+                var indexList = conn.Query($"PRAGMA index_list('{SqlConstants.ServicesTableName}');")
                                     .Select(x => (IDictionary<string, object>)x)
                                     .ToList();
 
@@ -89,17 +89,37 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             // By creating 'Services' as a VIEW, the subsequent 'CREATE UNIQUE INDEX' on it will throw a SQLiteException.
             using (var conn = CreateConnection())
             {
-                // Act
                 SeedSchemaInfo(conn, 0);
                 conn.Execute($"CREATE VIEW {SqlConstants.ServicesTableName} AS SELECT 1 AS Id;");
 
                 // Act & Assert
-                Assert.Throws<SQLiteException>(() => SQLiteDbInitializer.Initialize(conn));
+                Assert.Throws<SQLiteException>(() => SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null));
 
                 // Assert
                 // Verify the transaction was successfully rolled back
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
                 Assert.Equal(0, version); // Version should NOT have incremented to 1 due to rollback
+            }
+        }
+
+        [Fact]
+        public void Initialize_DatabaseNewerThanLatestSchemaVersion_RefusesAndThrows()
+        {
+            // Arrange: a database written by a newer Servy than this build supports.
+            using (var conn = CreateConnection())
+            {
+                SeedSchemaInfo(conn, SQLiteDbInitializer.LatestSchemaVersion + 1);
+
+                // Act & Assert
+                // Reconciliation must be refused outright: it would ADD COLUMN for anything the
+                // newer version renamed.
+                var ex = Assert.Throws<InvalidOperationException>(() => SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null));
+                Assert.Contains($"schema version {SQLiteDbInitializer.LatestSchemaVersion + 1}", ex.Message);
+                Assert.Contains("newer version of Servy", ex.Message);
+
+                // The refusal leaves the database exactly as it was found.
+                var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
+                Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion + 1, version);
             }
         }
 
@@ -136,7 +156,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
 
                 // Act
                 // Trigger migration, executing MIN(Id) evaluation to clean up duplicates deterministically
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
@@ -148,14 +168,64 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 Assert.Equal(1L, (long)services[0].Id);
 
                 // Verify the old index was dropped and replaced with a UNIQUE index
-                var indexInfo = conn.QuerySingle("PRAGMA index_list('Services');");
+                var indexInfo = conn.QuerySingle($"PRAGMA index_list('{SqlConstants.ServicesTableName}');");
                 Assert.Equal("idx_services_name_unique", (string)indexInfo.name);
                 Assert.Equal(1L, (long)indexInfo.unique);
 
                 // Verify 'EnableRotation' was renamed to 'EnableSizeRotation'
-                var columns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
                 Assert.DoesNotContain("EnableRotation", columns);
                 Assert.Contains("EnableSizeRotation", columns);
+            }
+        }
+
+        [Theory]
+        [InlineData(false)] // only the new column: both terms are false, so this row pins the kept value, not a term
+        [InlineData(true)]  // both columns: the second term decides
+        public void Initialize_LegacyUnversionedDatabaseThatAlreadyHasEnableSizeRotation_SkipsTheRenameAndKeepsTheValue(bool alsoHasOldColumn)
+        {
+            using (var conn = CreateConnection())
+            {
+                // Arrange: a Services table and no SchemaInfo row, so Initialize takes the unversioned path
+                var baseColumns = new List<string> { "Id INTEGER PRIMARY KEY AUTOINCREMENT", "Name TEXT", "EnableSizeRotation INTEGER" };
+                var seedData = new Dictionary<string, string> { { "Name", "'LegacyV0'" }, { "EnableSizeRotation", "1" } };
+                if (alsoHasOldColumn)
+                {
+                    baseColumns.Add("EnableRotation INTEGER");
+                    seedData.Add("EnableRotation", "0");
+                }
+                CreateLegacyServicesTable(conn, baseColumns, seedData, "Name", "EnableRotation", "EnableSizeRotation");
+
+                // Act
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
+
+                // Assert: the upgrade completed and the value in the new column is the one that was stored
+                Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion, conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;"));
+                Assert.Equal(1L, conn.QuerySingle<long>($"SELECT EnableSizeRotation FROM {SqlConstants.ServicesTableName} WHERE Name = 'LegacyV0';"));
+            }
+        }
+
+        [Fact]
+        public void Initialize_LegacyUnversionedDatabaseWithNeitherRotationColumn_SkipsTheRenameAndAddsTheNewColumn()
+        {
+            using (var conn = CreateConnection())
+            {
+                // Arrange: a Services table with neither rotation column and no SchemaInfo row. The row with only
+                // EnableSizeRotation cannot tell the guard's first term from its second (both are false there), so
+                // this layout is the one where only the first term keeps the rename from running.
+                var baseColumns = new List<string> { "Id INTEGER PRIMARY KEY AUTOINCREMENT", "Name TEXT" };
+                var seedData = new Dictionary<string, string> { { "Name", "'LegacyV0'" } };
+                CreateLegacyServicesTable(conn, baseColumns, seedData, "Name", "EnableRotation", "EnableSizeRotation");
+
+                // Act
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
+
+                // Assert: the upgrade completed, the missing column was added rather than renamed into, and the row survived
+                Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion, conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;"));
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
+                Assert.DoesNotContain("EnableRotation", columns);
+                Assert.Contains("EnableSizeRotation", columns);
+                Assert.Equal(1L, conn.QuerySingle<long>($"SELECT COUNT(*) FROM {SqlConstants.ServicesTableName} WHERE Name = 'LegacyV0';"));
             }
         }
 
@@ -183,24 +253,66 @@ namespace Servy.Infrastructure.IntegrationTests.Data
 
                 // Act
                 // Triggers ApplyVersion4 table-rebuild execution path
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
                 Assert.True(version >= 4);
 
                 // 1. Verify the active production table was rebuilt clean without the orphan column
-                var columns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
                 Assert.DoesNotContain("OldOrphanData", columns);
 
                 // 2. Confirms backup side-table exists and retains original structure
                 var tables = conn.Query<string>("SELECT name FROM sqlite_master WHERE type='table';").ToList();
-                Assert.Contains("Services_orphans_v4", tables);
+                Assert.Contains($"{SqlConstants.ServicesTableName}_orphans_v4", tables);
 
                 // 3. Confirm exact values and binding Id keys survived the drop sequence completely
                 var orphanData = conn.QuerySingle($"SELECT Id, OldOrphanData FROM {SqlConstants.ServicesTableName}_orphans_v4;");
                 Assert.Equal(1L, (long)orphanData.Id);
                 Assert.Equal("CriticalConfigToken_XYZ", (string)orphanData.OldOrphanData);
+            }
+        }
+
+        [Fact]
+        public void Initialize_Version3Database_WithIndexOnOrphanColumn_LogsTheFailedRestoreAndRollsBack()
+        {
+            // Arrange: a V3 table whose user index sits on a column ApplyVersion4 treats as an orphan,
+            // so the index cannot be re-created on the rebuilt table.
+            using (var conn = CreateConnection())
+            {
+                SeedSchemaInfo(conn, 3);
+
+                var baseColumns = new List<string> { "Id INTEGER PRIMARY KEY AUTOINCREMENT", "Name TEXT NOT NULL", "OldOrphanData TEXT" };
+                var seedData = new Dictionary<string, string>
+                {
+                    { "Name", "'LegacyAgent'" },
+                    { "OldOrphanData", "'CriticalConfigToken_XYZ'" }
+                };
+                CreateLegacyServicesTable(conn, baseColumns, seedData, "Name");
+                conn.Execute($"CREATE INDEX idx_custom_orphan ON {SqlConstants.ServicesTableName}(OldOrphanData);");
+
+                // Act
+                SQLiteException? thrown = null;
+                var log = LogCapture.Run(() =>
+                {
+                    thrown = Assert.Throws<SQLiteException>(() => SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null));
+                });
+
+                // Assert: the original SQLite error surfaces and the whole migration is rolled back
+                Assert.Contains("OldOrphanData", thrown!.Message);
+                Assert.Equal(3, conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;"));
+
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
+                Assert.Contains("OldOrphanData", columns);
+
+                var objects = conn.Query<string>("SELECT name FROM sqlite_master;").ToList();
+                Assert.Contains("idx_custom_orphan", objects);
+                Assert.DoesNotContain("Services_v4", objects);
+                Assert.DoesNotContain($"{SqlConstants.ServicesTableName}_orphans_v4", objects);
+
+                // Assert: the failure arm names the index it could not restore
+                Assert.Contains("Failed to restore dependent index 'idx_custom_orphan'", log);
             }
         }
 
@@ -231,10 +343,10 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                     END;");
 
                 // Act
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
-                var dependents = conn.Query<(string Type, string Name)>("SELECT type, name FROM sqlite_master WHERE tbl_name='Services' AND type IN ('index', 'trigger');").ToList();
+                var dependents = conn.Query<(string Type, string Name)>($"SELECT type, name FROM sqlite_master WHERE tbl_name='{SqlConstants.ServicesTableName}' AND type IN ('index', 'trigger');").ToList();
 
                 Assert.Contains(dependents, d => d.Type == "index" && d.Name == "idx_custom_displayname");
                 Assert.Contains(dependents, d => d.Type == "trigger" && d.Name == "trg_custom_after_update");
@@ -250,8 +362,10 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 SeedSchemaInfo(conn, 1);
 
                 // Create table with 'EnableSizeRotation' already existing (triggers Rename skip existing branch)
-                // Lacks 'EnableRotation' (triggers Rename source missing branch)
-                // Has 'RecoveryOnCleanExit' already (triggers AddColumn skip branch)
+                // Also lacks 'EnableRotation', but RenameColumnIfExists tests the target column first,
+                // so this fixture does NOT reach the Rename source missing branch
+                // 'RecoveryOnCleanExit' is pre-seeded, but the V4 rebuild recreates every expected column
+                // before V5 runs, so V5's AddColumn skip branch is reached with or without it
                 conn.Execute($@"
                     CREATE TABLE {SqlConstants.ServicesTableName} (
                         Id INTEGER PRIMARY KEY,
@@ -261,7 +375,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 ");
 
                 // Act
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert: The skips should allow the initialization to complete cleanly without throwing SQL syntax errors
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
@@ -285,16 +399,75 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                     tx.Commit();
 
                     // Assert
-                    var columns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                    var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
                     Assert.Contains("EnableRotation", columns); // Left alone
                     Assert.Contains("EnableSizeRotation", columns); // Left alone
                 }
             }
         }
 
+        [Fact]
+        public void ApplyVersion2_NeitherRotationColumnExists_SkipsRenameAndLogsMissingSource()
+        {
+            using (var conn = CreateConnection())
+            {
+                // Arrange: a Services table with neither the old nor the new column, so RenameColumnIfExists
+                // reaches its "source column not found" arm. The log line is the arm's only observable output.
+                SeedSchemaInfo(conn, 1);
+                conn.Execute($"CREATE TABLE {SqlConstants.ServicesTableName} (Id INTEGER PRIMARY KEY, Name TEXT);");
+
+                // Act: invoke the migration directly, as the sibling test does, to bypass V4's rebuild
+                var log = LogCapture.Run(() =>
+                {
+                    using (var tx = conn.BeginTransaction())
+                    {
+                        TestReflection.InvokeNonPublicStatic(typeof(SQLiteDbInitializer), "ApplyVersion2", conn, tx);
+                        tx.Commit();
+                    }
+                });
+
+                // Assert: no rename was attempted, no column appeared, and the skip names the missing source column
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
+                Assert.DoesNotContain("EnableRotation", columns);
+                Assert.DoesNotContain("EnableSizeRotation", columns);
+                Assert.Contains(
+                    "Migration to Version 2 skipped: Source column 'EnableRotation' was not found in the 'Services' table layout.",
+                    log);
+            }
+        }
+
+        [Fact]
+        public void Initialize_Version1DatabaseWithLegacyEnableRotation_RenamesColumnAndKeepsValue()
+        {
+            // Arrange: a database already cleanly tracking schema Version 1 that still carries the
+            // pre-V2 column name, which is the only fixture that reaches ApplyVersion2's rename arm
+            using (var conn = CreateConnection())
+            {
+                SeedSchemaInfo(conn, 1);
+                // ExecutablePath is seeded because it and Name are the two NOT NULL columns the V4
+                // rebuild recreates, and the row has to survive that copy for the assertions below
+                conn.Execute($"CREATE TABLE {SqlConstants.ServicesTableName} (Id INTEGER PRIMARY KEY, Name TEXT NOT NULL, ExecutablePath TEXT NOT NULL, EnableRotation INTEGER);");
+                conn.Execute($"INSERT INTO {SqlConstants.ServicesTableName} (Id, Name, ExecutablePath, EnableRotation) VALUES (1, 'LegacyV1', 'C:\\LegacyV1.exe', 1);");
+
+                // Act
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
+
+                // Assert: V2 renamed the column in place, so the V1 user's setting survived the chain
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
+                Assert.DoesNotContain("EnableRotation", columns);
+                Assert.Contains("EnableSizeRotation", columns);
+                Assert.Equal(1L, conn.QuerySingle<long>($"SELECT EnableSizeRotation FROM {SqlConstants.ServicesTableName} WHERE Id = 1;"));
+
+                // Without the V2 rename, EnableRotation would be an orphan column by the time
+                // ApplyVersion4 rebuilds the table, and the setting would be reset to its default
+                var tables = conn.Query<string>("SELECT name FROM sqlite_master WHERE type='table';").ToList();
+                Assert.DoesNotContain("Services_orphans_v4", tables);
+            }
+        }
+
         #endregion
 
-        #region V6
+        #region V6 Explicit collation index (Name COLLATE UNICODE_NOCASE)
 
         [Fact]
         public void ApplyVersion6_AsciiCasingDuplicates_DeduplicatesAndAppliesNoCaseIndex()
@@ -313,12 +486,13 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 // Setup the old functional index as NON-UNIQUE so it permits the insert of casing variations on legacy systems.
                 conn.Execute($"CREATE INDEX idx_services_name_lower ON {SqlConstants.ServicesTableName}(LOWER(Name));");
 
-                // Seed duplicate rows out of chronological order to check oldest historical match selection (MIN(Id) resolution)
+                // Seed one case-duplicate after the baseline row (Ids 1 then 2); dedup must keep MIN(Id)=1,
+                // so a last-write-wins/MAX(Id) implementation would fail the assertion below.
                 var duplicateSeed = new Dictionary<string, string>(seedData) { ["Name"] = "'alpha-service'" };
                 InsertLegacyRow(conn, context, duplicateSeed);
 
                 // Act: Trigger initialization to catch version 5 -> 6 transition pipeline branch
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
@@ -331,7 +505,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 Assert.Equal("Alpha-Service", (string)remainingServices[0].Name);
 
                 // Verify the structural index details map directly to the modern COLLATE UNICODE_NOCASE layout rules
-                var indexList = conn.Query("PRAGMA index_list('Services');")
+                var indexList = conn.Query($"PRAGMA index_list('{SqlConstants.ServicesTableName}');")
                                     .Select(x => (IDictionary<string, object>)x)
                                     .ToList();
 
@@ -347,6 +521,48 @@ namespace Servy.Infrastructure.IntegrationTests.Data
 
                 Assert.Single(indexInfo);
                 Assert.Equal("Name", indexInfo[0]["name"]?.ToString());
+            }
+        }
+
+        [Fact]
+        public void ApplyVersion6_CasingDuplicates_LogsEachGroupNamingServiceKeptIdAndRemovedCount()
+        {
+            // Register the collation before the connection opens: Initialize is called from inside the
+            // LogCapture lambda, which is compiled only when it runs, so nothing in this method body would
+            // otherwise have loaded Servy.Infrastructure before a connection without UNICODE_NOCASE is opened.
+            SQLiteFunction.RegisterFunction(typeof(UnicodeNoCaseCollation));
+
+            using (var conn = CreateConnection())
+            {
+                // Arrange: the deleted rows are whole service configurations and the transaction commits them
+                // away, so the per-group log line is the only record of what was removed. The sibling dedup
+                // tests above assert the surviving row only, so they stay green with that line deleted.
+                // The static logger is redirected to a private directory to read the lines back.
+                SeedSchemaInfo(conn, 5);
+
+                var baseColumns = new List<string> { "Id INTEGER PRIMARY KEY AUTOINCREMENT", "Name TEXT" };
+                var seedData = new Dictionary<string, string> { { "Name", "'Beta-Service'" } };
+
+                var context = CreateLegacyServicesTable(conn, baseColumns, seedData, "Name");
+
+                // Non-unique legacy index, so casing variants can be inserted the way a real pre-v6 database holds them
+                conn.Execute($"CREATE INDEX idx_services_name_lower ON {SqlConstants.ServicesTableName}(LOWER(Name));");
+
+                // Two variants of the kept row (Ids 2 and 3), so the removed count is 2 rather than 1
+                // and a line that hardcodes 1, or reports the group count, fails the assertion below.
+                InsertLegacyRow(conn, context, new Dictionary<string, string>(seedData) { ["Name"] = "'beta-service'" });
+                InsertLegacyRow(conn, context, new Dictionary<string, string>(seedData) { ["Name"] = "'BETA-SERVICE'" });
+
+                // Act: run the version 5 -> 6 transition, which performs the dedup pass
+                var log = LogCapture.Run(() => SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null));
+
+                // Assert: the dedup really ran and kept the oldest row
+                var remainingServices = conn.Query($"SELECT Id, Name FROM {SqlConstants.ServicesTableName};").ToList();
+                Assert.Single(remainingServices);
+                Assert.Equal(1L, (long)remainingServices[0].Id);
+
+                // Assert: the log names the service, the kept ID and how many rows that group lost
+                Assert.Contains("Version 6 Remediation: kept ID 1 for service name 'Beta-Service' and removed 2 case-variant row(s).", log);
             }
         }
 
@@ -369,7 +585,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 InsertLegacyRow(conn, context, duplicateSeed);
 
                 // Act
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert: Verify UNICODE_NOCASE successfully group-collapsed and purged the duplicate non-ASCII character entries
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
@@ -406,7 +622,7 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             // Arrange: Execute complete initialization runner to build schema and spin custom collations up
             using (var conn = CreateConnection())
             {
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Access internal definition engines seamlessly via centralized test reflection helper
                 var expectedCols = (IEnumerable<string>)TestReflection.InvokeNonPublicStatic(typeof(SQLiteDbInitializer), "GetExpectedColumns")!;
@@ -473,13 +689,13 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 CreateLegacyServicesTable(conn, baseColumns, seedData, "Name");
 
                 // Act: Run full initialization loop to trigger the V6 -> V7 ApplyVersion7 schema migration pipeline
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
                 Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion, version);
 
-                var columns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
 
                 // Confirm the structural migration successfully appended the specific external heartbeat properties
                 Assert.Contains("HeartbeatUrl", columns);
@@ -513,13 +729,13 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 CreateLegacyServicesTable(conn, baseColumns, seedData, "Name");
 
                 // Act: Run full initialization loop to trigger the V7 -> V8 ApplyVersion8 schema migration pipeline
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
                 var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
                 Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion, version);
 
-                var columns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
 
                 // Confirm the structural migration successfully appended the CpuAffinity property
                 Assert.Contains("CpuAffinity", columns);
@@ -527,6 +743,92 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 // Verify that default values for the fresh migration column resolve safely to NULL for historical records
                 var migratedRow = conn.QuerySingle($"SELECT CpuAffinity FROM {SqlConstants.ServicesTableName} WHERE Id = 1;");
                 Assert.Null(migratedRow.CpuAffinity);
+            }
+        }
+
+        #endregion
+
+        #region V9 UserAccount Normalization Migration Branches
+
+        [Fact]
+        public void ApplyVersion9_UpgradesFromVersion8_TrimsPaddedUserAccountsAndLeavesCleanValuesIntact()
+        {
+            // Arrange: Establish schema explicitly at Version 8 configuration checkpoint
+            using (var conn = CreateConnection())
+            {
+                SeedSchemaInfo(conn, 8);
+
+                var baseColumns = new List<string> { "Id INTEGER PRIMARY KEY AUTOINCREMENT", "Name TEXT COLLATE UNICODE_NOCASE NOT NULL", "UserAccount TEXT" };
+                var seedData = new Dictionary<string, string> { { "Name", "'AppWithPaddedAccount'" }, { "UserAccount", "'  domain\\svc_account  '" } };
+
+                var context = CreateLegacyServicesTable(conn, baseColumns, seedData, "Name", "UserAccount");
+
+                // Seed row 2 with clean UserAccount value
+                InsertLegacyRow(conn, context, new Dictionary<string, string> { { "Name", "'AppWithCleanAccount'" }, { "UserAccount", "'domain\\clean_svc'" } });
+
+                // Seed row 3 with NULL UserAccount value
+                InsertLegacyRow(conn, context, new Dictionary<string, string> { { "Name", "'AppWithNullAccount'" }, { "UserAccount", "NULL" } });
+
+                // Seed row 4 with tab-padded UserAccount value
+                InsertLegacyRow(conn, context, new Dictionary<string, string> { { "Name", "'AppWithTabPaddedAccount'" }, { "UserAccount", "'\tdomain\\tab_svc\t'" } });
+
+                // Act: Run initialization to trigger V8 -> V9 migration
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
+
+                // Assert
+                var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
+                Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion, version);
+
+                var rows = conn.Query($"SELECT Id, Name, UserAccount FROM {SqlConstants.ServicesTableName} ORDER BY Id;").ToList();
+                Assert.Equal(4, rows.Count);
+
+                // Row 1: Space-padded UserAccount should be normalized/trimmed
+                Assert.Equal(@"domain\svc_account", (string)rows[0].UserAccount);
+
+                // Row 2: Clean UserAccount remains unchanged
+                Assert.Equal(@"domain\clean_svc", (string)rows[1].UserAccount);
+
+                // Row 3: NULL UserAccount remains NULL
+                Assert.Null(rows[2].UserAccount);
+
+                // Row 4: Tab-padded UserAccount should be normalized/trimmed
+                Assert.Equal(@"domain\tab_svc", (string)rows[3].UserAccount);
+            }
+        }
+
+        #endregion
+
+        #region V11 AllowOverriddenRuntimeVars Migration Branches
+
+        [Fact]
+        public void ApplyVersion11_UpgradesFromVersion10_AppendsAllowOverriddenRuntimeVarsColumnCleanly()
+        {
+            // Arrange: Establish schema explicitly at target Version 10 configuration checkpoint
+            using (var conn = CreateConnection())
+            {
+                SeedSchemaInfo(conn, 10);
+
+                // Build a pristine pre-v11 database using modern collation logic
+                var baseColumns = new List<string> { "Id INTEGER PRIMARY KEY AUTOINCREMENT", "Name TEXT COLLATE UNICODE_NOCASE NOT NULL" };
+                var seedData = new Dictionary<string, string> { { "Name", "'OverriddenRuntimeVarsApp'" } };
+
+                CreateLegacyServicesTable(conn, baseColumns, seedData, "Name");
+
+                // Act: Run full initialization loop to trigger the V10 -> V11 ApplyVersion11 schema migration pipeline
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
+
+                // Assert
+                var version = conn.QuerySingle<int>("SELECT Version FROM SchemaInfo WHERE Id = 1;");
+                Assert.Equal(SQLiteDbInitializer.LatestSchemaVersion, version);
+
+                var columns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
+
+                // Confirm the structural migration successfully appended the AllowOverriddenRuntimeVars property
+                Assert.Contains("AllowOverriddenRuntimeVars", columns);
+
+                // Verify that default values for the fresh migration column resolve safely to 0 / NULL for historical records
+                var migratedRow = conn.QuerySingle($"SELECT AllowOverriddenRuntimeVars FROM {SqlConstants.ServicesTableName} WHERE Id = 1;");
+                Assert.True(migratedRow.AllowOverriddenRuntimeVars == null || migratedRow.AllowOverriddenRuntimeVars == 0L);
             }
         }
 
@@ -540,14 +842,14 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             // Arrange: Initialize schema to latest version and seed both clean and padded rows directly
             using (var conn = CreateConnection())
             {
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Insert clean row 'zombietest' and whitespace-padded row ' zombietest ' with required NOT NULL columns
                 conn.Execute($"INSERT INTO {SqlConstants.ServicesTableName} (Name, ExecutablePath) VALUES ('zombietest', 'C:\\path\\exe');");
                 conn.Execute($"INSERT INTO {SqlConstants.ServicesTableName} (Name, ExecutablePath) VALUES (' zombietest ', 'C:\\path\\exe');");
 
                 // Act: Re-run Initialize on an existing database containing padded zombie collisions
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert: Verify detector scan leaves both records intact and unharmed in the database
                 var names = conn.Query<string>($"SELECT Name FROM {SqlConstants.ServicesTableName} WHERE Name LIKE '%zombietest%';").ToList();
@@ -555,6 +857,35 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 Assert.Equal(2, names.Count);
                 Assert.Contains("zombietest", names);
                 Assert.Contains(" zombietest ", names);
+            }
+        }
+
+        [Fact]
+        public void Initialize_WhitespacePaddedZombieAndTwin_LogsCriticalAnomalyNamingBothRows()
+        {
+            using (var conn = CreateConnection())
+            {
+                // Arrange: the detector is read-only and its only observable output is a Logger.Warn line,
+                // so the sibling test above (which asserts the rows survive) stays green with the whole
+                // detector deleted. The static logger is redirected to a private directory to read that line back.
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
+
+                // Seed the clean row and its whitespace-padded twin; the unique index tolerates both
+                // because ' zombielog ' and 'zombielog' differ outside of casing.
+                conn.Execute($"INSERT INTO {SqlConstants.ServicesTableName} (Name, ExecutablePath) VALUES ('zombielog', 'C:\\path\\exe');");
+                conn.Execute($"INSERT INTO {SqlConstants.ServicesTableName} (Name, ExecutablePath) VALUES (' zombielog ', 'C:\\path\\exe');");
+                conn.Execute($"INSERT INTO {SqlConstants.ServicesTableName} (Name, ExecutablePath) VALUES ('\tzombietablog\t', 'C:\\path\\exe');");
+                conn.Execute($"INSERT INTO {SqlConstants.ServicesTableName} (Name, ExecutablePath) VALUES ('zombietablog', 'C:\\path\\exe');");
+
+                // Act: re-run Initialize so the detector scans a database that already holds a collision
+                var log = LogCapture.Run(() => SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null));
+
+                // Assert: the detector ran and reported the collision, naming the padded row and its clean twin
+                Assert.Contains("CRITICAL DATA LIFECYCLE ANOMALY", log);
+                Assert.Contains("service record ' zombielog '", log);
+                Assert.Contains("clean twin 'zombielog'", log);
+                Assert.Contains("service record '\tzombietablog\t'", log);
+                Assert.Contains("clean twin 'zombietablog'", log);
             }
         }
 
@@ -569,8 +900,8 @@ namespace Servy.Infrastructure.IntegrationTests.Data
             using (var conn = CreateConnection())
             {
                 // Step 1: Perform a full baseline initialization to get the perfect expected schema.
-                SQLiteDbInitializer.Initialize(conn);
-                var expectedColumns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
+                var expectedColumns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
 
                 // Step 2: Sabotage the schema
                 conn.Execute($"DROP TABLE {SqlConstants.ServicesTableName};");
@@ -579,19 +910,28 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 const string missingColumn = "Name";
                 Assert.Contains(missingColumn, expectedColumns);
 
-                // Rebuild the table intentionally omitting 'Name', changing 'EnableSizeRotation' to TEXT (type mismatch),
+                // A second omitted column that is INTEGER, so the type reaching the ADD COLUMN arm is pinned for
+                // a non-TEXT affinity as well.
+                const string missingIntegerColumn = "PreviousStopTimeout";
+                Assert.Contains(missingIntegerColumn, expectedColumns);
+
+                // Rebuild the table intentionally omitting 'Name' and 'PreviousStopTimeout', changing 'EnableSizeRotation' to TEXT (type mismatch),
                 // and adding an 'OrphanColumn' (orphan branch).
                 var corruptedTableDef = new List<string> { "Id INTEGER PRIMARY KEY", "OrphanColumn TEXT" };
                 foreach (var col in expectedColumns)
                 {
-                    if (col == missingColumn) continue; // Force missing branch
+                    if (col == missingColumn || col == missingIntegerColumn) continue; // Force missing branch
                     if (col == "EnableSizeRotation")
                     {
                         corruptedTableDef.Add($"{col} TEXT"); // Force mismatch branch
                     }
                     else if (col != "Id")
                     {
-                        corruptedTableDef.Add($"{col} INTEGER");
+                        // Preserve each column's declared type so 'EnableSizeRotation' stays the ONLY mismatch
+                        // in this fixture. Declaring every remaining column INTEGER also turned the 33 columns
+                        // the DTO declares TEXT into mismatches, none of them intended or asserted.
+                        string sqlType = (string)TestReflection.InvokeNonPublicStatic(typeof(SQLiteDbInitializer), "GetSqlType", col)!;
+                        corruptedTableDef.Add($"{col} {sqlType}");
                     }
                 }
 
@@ -602,19 +942,37 @@ namespace Servy.Infrastructure.IntegrationTests.Data
                 conn.Execute($"UPDATE SchemaInfo SET Version = {SQLiteDbInitializer.LatestSchemaVersion} WHERE Id = 1;");
 
                 // Act - Run Initialize again
-                SQLiteDbInitializer.Initialize(conn);
+                SQLiteDbInitializer.Initialize(conn, legacyRecoveryFolderPath: null);
 
                 // Assert
-                var finalColumns = conn.Query("PRAGMA table_info(Services);").Select(r => (string)r.name).ToList();
+                var finalColumns = conn.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});").Select(r => (string)r.name).ToList();
 
                 // The missing column should have been successfully restored
                 Assert.Contains(missingColumn, finalColumns);
                 // The orphan remains (we just log it, we don't drop it automatically)
                 Assert.Contains("OrphanColumn", finalColumns);
 
+                // The restored columns must come back with the declared definition, not just the name:
+                // 'Name' is TEXT NOT NULL (EnsureAlterableDefinition adds the DEFAULT '') and
+                // 'PreviousStopTimeout' is INTEGER. ('isNotNull' is the alias because 'notNull' parses as SQLite's NOTNULL operator.)
+                Assert.Contains(missingIntegerColumn, finalColumns);
+                var restoredName = conn.QuerySingle($"SELECT type, \"notnull\" AS isNotNull, dflt_value AS dflt FROM pragma_table_info('{SqlConstants.ServicesTableName}') WHERE name = @Name;", new { Name = missingColumn });
+                Assert.Equal("TEXT", (string)restoredName.type);
+                Assert.Equal(1L, (long)restoredName.isNotNull);
+                Assert.Equal("''", (string)restoredName.dflt);
+
+                var restoredIntegerType = conn.QuerySingle<string>($"SELECT type FROM pragma_table_info('{SqlConstants.ServicesTableName}') WHERE name = @Name;", new { Name = missingIntegerColumn });
+                Assert.Equal("INTEGER", restoredIntegerType);
+
                 // Note: Mismatches are logged, not automatically altered, because SQLite doesn't support ALTER COLUMN type.
-                var typeMismatchType = conn.QuerySingle<string>("SELECT type FROM pragma_table_info('Services') WHERE name = 'EnableSizeRotation';");
+                var typeMismatchType = conn.QuerySingle<string>($"SELECT type FROM pragma_table_info('{SqlConstants.ServicesTableName}') WHERE name = 'EnableSizeRotation';");
                 Assert.Equal("TEXT", typeMismatchType); // Should still be TEXT as we sabotaged it
+
+                // 'EnableSizeRotation' is the only sabotaged type: every other column was rebuilt with the
+                // type the DTO declares, so a TEXT column must still read back as TEXT. This pins the
+                // fixture to the single documented mismatch instead of the ~33 accidental ones it used to carry.
+                var untouchedTextType = conn.QuerySingle<string>($"SELECT type FROM pragma_table_info('{SqlConstants.ServicesTableName}') WHERE name = 'ExecutablePath';");
+                Assert.Equal("TEXT", untouchedTextType);
             }
         }
 

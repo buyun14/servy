@@ -10,8 +10,9 @@ namespace Servy.UI.Helpers
     public static class Helper
     {
         /// <summary>
-        /// Recursively searches the WPF Visual Tree to find a child of a specific type.
-        /// Used here to extract the internal <see cref="ScrollViewer"/> from the <see cref="ListBox"/>.
+        /// Recursively searches the WPF visual tree below <paramref name="parent"/> for the first
+        /// descendant of type <typeparamref name="T"/>, depth-first in child order.
+        /// Typical use: locating the <see cref="ScrollViewer"/> inside a templated list control.
         /// </summary>
         /// <typeparam name="T">The type of the visual child to find.</typeparam>
         /// <param name="parent">The parent object to start the search from.</param>
@@ -34,15 +35,11 @@ namespace Servy.UI.Helpers
         /// </summary>
         /// <param name="duration">The duration to format.</param>
         /// <returns>
-        /// A formatted string such as <c>1h 5s</c>, <c>15s</c>, <c>-3m 10s</c>, or <c>0ms</c> if the duration is zero.
+        /// A formatted string such as <c>1h 5s</c>, <c>15s</c>, <c>-3m 10s</c>, or <c>0ms</c> when the
+        /// duration is zero or shorter than one millisecond in either direction.
         /// </returns>
         public static string FormatDuration(TimeSpan duration)
         {
-            if (duration == TimeSpan.Zero)
-            {
-                return "0ms";
-            }
-
             bool isNegative = duration < TimeSpan.Zero;
             TimeSpan absDuration = duration.Duration(); // Gets absolute value
 
@@ -99,8 +96,8 @@ namespace Servy.UI.Helpers
         /// </summary>
         /// <param name="count">The number of items processed.</param>
         /// <param name="duration">The time taken for the operation.</param>
-        /// <param name="noneFormat">Template for zero items (e.g. "No services loaded in {0}").</param>
-        /// <param name="oneFormat">Template for one item (e.g. "Loaded 1 service in {0}").</param>
+        /// <param name="noneFormat">Template for zero items (e.g. "No services loaded in {1}").</param>
+        /// <param name="oneFormat">Template for one item (e.g. "Loaded 1 service in {1}").</param>
         /// <param name="manyFormat">Template for multiple items (e.g. "Loaded {0} services in {1}").</param>
         /// <returns>
         /// A string such as:
@@ -131,6 +128,5 @@ namespace Servy.UI.Helpers
             // Pass the formatted count and the duration to the plural template
             return string.Format(manyFormat, countText, durationText);
         }
-
     }
 }

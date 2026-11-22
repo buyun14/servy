@@ -13,6 +13,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      upload_coverage:
+        description: 'Upload coverage metrics to Codecov and Coveralls'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,12 +42,10 @@ jobs:
     timeout-minutes: 30
 
     env:
-      REPORTGENERATOR_VERSION: "5.5.10"
-      # Centralized source of truth for coverage exclusions
-      VSTEST_EXCLUSIONS: "[*.UnitTests]*,[*.IntegrationTests]*,[Servy.Testing]*,**/*.xaml,**/*.xaml.cs,**/*.g.cs,**/*.Designer.cs,**/obj/**/*"
-      REPORTGENERATOR_ASSEMBLIES: "-*.UnitTests;-*.IntegrationTests;-Servy.Testing"
-      REPORTGENERATOR_FILES: "-**/*.xaml;-**/*.xaml.cs;-**/*.g.cs;-**/*.Designer.cs;-**/obj/**/*"
       MAX_RETRIES: 5 # Maximum retry attempts for resilient network down-stream downloads
+      # One gate for every coverage step below: only the matrix leg that uploads, and on a manual
+      # workflow_dispatch only when the upload_coverage input opted in (it defaults to false)
+      UPLOAD_COVERAGE: ${{ matrix.upload_coverage == true && (github.event_name != 'workflow_dispatch' || inputs.upload_coverage) }}
 
     steps:
       - name: Checkout repository
@@ -53,10 +57,16 @@ jobs:
           max_retries: ${{ env.MAX_RETRIES }}
 
       - name: Restore dependencies
-        run: dotnet restore Servy.sln
+        shell: pwsh
+        run: |
+          dotnet restore Servy.sln
+          if ($LASTEXITCODE -ne 0) { throw "Restore failed for Servy.sln (exit $LASTEXITCODE)" }
 
       - name: Build solution (Debug)
-        run: dotnet build Servy.sln --configuration Debug --no-restore
+        shell: pwsh
+        run: |
+          dotnet build Servy.sln --configuration Debug --no-restore
+          if ($LASTEXITCODE -ne 0) { throw "Debug build failed for Servy.sln (exit $LASTEXITCODE)" }
 
       - name: Run all tests with coverage (Debug)
         shell: pwsh
@@ -75,22 +85,17 @@ jobs:
 
               Write-Host "Running tests for $projName..." -ForegroundColor Cyan
 
+              # .NET MTP CLI syntax
               $dotnetArgs = @(
                   'test', $projPath,
                   '--configuration', 'Debug',
                   '--no-build',
-                  '--blame',
-                  '--blame-crash',
-                  '--blame-crash-dump-type', 'full',
-                  '--collect', 'XPlat Code Coverage',
-                  '--results-directory', "./TestResults/$subDirName/$projName"
-              )
-
-              $dotnetArgs += @(
+                  '--filter', 'Category!=Stress',
+                  '--results-directory', "$env:GITHUB_WORKSPACE/TestResults/$subDirName/$projName",
                   '--',
-                  'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura',
-                  "DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude=$($env:VSTEST_EXCLUSIONS)",
-                  'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeProperties="True"'
+                  '--coverage',
+                  '--coverage-output-format', 'cobertura',
+                  '--coverage-output', 'coverage.cobertura.xml'
               )
 
               & dotnet @dotnetArgs
@@ -106,10 +111,54 @@ jobs:
           }
 
       - name: Build solution (Release)
-        run: dotnet build Servy.sln --configuration Release --no-restore
+        shell: pwsh
+        run: |
+          dotnet build Servy.sln --configuration Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw "Release build failed for Servy.sln (exit $LASTEXITCODE)" }
 
       - name: Run all tests (Release)
-        run: dotnet test Servy.sln --configuration Release --no-build --blame --blame-crash --blame-crash-dump-type full
+        shell: pwsh
+        run: |
+          dotnet test Servy.sln --configuration Release --no-build `
+            --filter "Category!=Stress" `
+            --results-directory "$env:GITHUB_WORKSPACE/TestResults/Release"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Release test run failed"
+              Write-Error "Release test run failed."
+          }
+
+      - name: Run PowerShell verification and test scripts
+        shell: pwsh
+        run: |
+          $workspace = $env:GITHUB_WORKSPACE
+          $testScripts = @(Get-ChildItem -Path $workspace -Recurse -Filter '*.test.ps1' | Select-Object -ExpandProperty FullName)
+
+          $extraScripts = @(
+              Join-Path $workspace "setup\Verify-PublishExclusions.ps1"
+          )
+
+          foreach ($extra in $extraScripts) {
+              if (Test-Path $extra) {
+                  $testScripts += (Get-Item $extra).FullName
+              }
+          }
+
+          $testScripts = $testScripts | Select-Object -Unique
+          $failed = $false
+
+          foreach ($script in $testScripts) {
+              $relativePath = $script.Substring($workspace.Length).TrimStart('\', '/')
+              Write-Host "Running PowerShell test script: $relativePath..." -ForegroundColor Cyan
+              & pwsh -File $script
+              if ($LASTEXITCODE -ne 0) {
+                  $failed = $true
+                  Write-Host "::error::PowerShell test script failed: $relativePath"
+              }
+          }
+
+          if ($failed) {
+              Write-Error "One or more PowerShell test scripts failed."
+          }
 
       - name: Upload Test Diagnostics & Crash Dumps on Failure
         if: ${{ failure() || cancelled() }}
@@ -127,9 +176,11 @@ jobs:
       # -----------------------------------------------------
       - name: Merge and normalize coverage paths (PowerShell)
         shell: pwsh
-        if: ${{ matrix.upload_coverage == true }}
+        if: ${{ env.UPLOAD_COVERAGE == 'true' }}
         run: |
           $workspace = $env:GITHUB_WORKSPACE
+          $filters = . (Join-Path $workspace "tests/coverage-filters.ps1")
+
           $fixedDir = Join-Path $workspace "TestResults\fixed"
           if (-Not (Test-Path $fixedDir)) { New-Item -ItemType Directory -Path $fixedDir | Out-Null }
 
@@ -140,9 +191,10 @@ jobs:
           if (-Not (Test-Path $localTools)) { New-Item -ItemType Directory -Path $localTools | Out-Null }
 
           & dotnet new tool-manifest --force --output $localTools
+          if ($LASTEXITCODE -ne 0) { Write-Error "dotnet new tool-manifest failed (exit $LASTEXITCODE)" }
 
           Push-Location $localTools
-          & dotnet tool install dotnet-reportgenerator-globaltool --version $env:REPORTGENERATOR_VERSION
+          & dotnet tool install dotnet-reportgenerator-globaltool --version $filters.Version
           if ($LASTEXITCODE -ne 0) { Write-Error "dotnet tool install failed (exit $LASTEXITCODE)" }
 
           $joinedReports = $coverageFiles.FullName -join ';'
@@ -150,8 +202,8 @@ jobs:
               "-reports:$joinedReports" `
               "-targetdir:$fixedDir" `
               "-reporttypes:Cobertura" `
-              "-assemblyfilters:$($env:REPORTGENERATOR_ASSEMBLIES)" `
-              "-filefilters:$($env:REPORTGENERATOR_FILES)"
+              "-assemblyfilters:$($filters.Assemblies)" `
+              "-filefilters:$($filters.Files)"
           if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Error "reportgenerator failed (exit $LASTEXITCODE)" }
           Pop-Location
 
@@ -177,24 +229,64 @@ jobs:
       # Third-Party Metrics Tracking Uploads (x64 Only Context)
       # -----------------------------------------------------
       - name: Import Codecov Public GPG Key
-        if: ${{ matrix.upload_coverage == true }}
+        if: ${{ env.UPLOAD_COVERAGE == 'true' }}
         continue-on-error: true
-        shell: bash
+        shell: pwsh
         run: |
-          # Create the directory just in case
-          mkdir -p ~/.gnupg
+          $env:PATH += ";C:\Program Files\Git\usr\bin"
 
-          # Use gpg --batch to skip interactive prompts, and try a secondary, robust keyserver
-          gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 27034E7FDB850E0BBC2C62FF806BB28AED779869
+          $gnupgDir = Join-Path $env:USERPROFILE ".gnupg"
+          if (-not (Test-Path $gnupgDir)) { New-Item -ItemType Directory -Path $gnupgDir | Out-Null }
 
-          # Verify the import
-          gpg --list-keys 27034E7FDB850E0BBC2C62FF806BB28AED779869
+          $expected = '27034E7FDB850E0BBC2C62FF806BB28AED779869'
+          $imported = $false
+
+          $keyUrls = @(
+              "https://keybase.io/codecovsecops/pgp_keys.asc",
+              "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x27034E7FDB850E0BBC2C62FF806BB28AED779869"
+          )
+
+          $keyPath = Join-Path $env:RUNNER_TEMP "codecov.asc"
+          $headers = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+          foreach ($url in $keyUrls) {
+              try {
+                  Invoke-WebRequest -Uri $url -Headers $headers -OutFile $keyPath -UseBasicParsing
+                  $content = Get-Content $keyPath -Raw
+                  if ($content -notmatch "BEGIN PGP PUBLIC KEY BLOCK") { Write-Warning "No armored key at ${url}"; continue }
+
+                  # The first fpr record after pub is the primary key fingerprint
+                  $primary = @(& gpg --batch --show-keys --with-colons $keyPath 2>$null | Where-Object { $_ -like 'fpr:*' })[0]
+                  if (-not $primary -or ($primary -split ':')[9] -ne $expected) {
+                      Write-Warning "Key from ${url} is not $expected - not imported"
+                      continue
+                  }
+
+                  & gpg --batch --import $keyPath
+
+                  # Set ultimate trust for the imported key to suppress the uncertified signature warning
+                  "${expected}:6:" | & gpg --batch --import-ownertrust
+
+                  & gpg --list-keys $expected
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Key $expected is not in the keyring after importing ${url}"; continue }
+
+                  $imported = $true
+                  Write-Host "Codecov GPG key $expected imported and verified successfully from ${url}." -ForegroundColor Green
+                  break
+              } catch {
+                  Write-Warning "Could not import Codecov GPG key from ${url}: ${_}"
+              }
+          }
+
+          if (-not $imported) { Write-Warning "Codecov GPG key $expected was not imported from any source" }
 
       - name: Upload coverage to Codecov
         id: codecov
         continue-on-error: true
         uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe #v5.5.4
-        if: ${{ matrix.upload_coverage == true }}
+        if: ${{ env.UPLOAD_COVERAGE == 'true' }}
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: TestResults/fixed/coverage.cobertura.xml
@@ -208,7 +300,7 @@ jobs:
         id: coveralls
         continue-on-error: true
         uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b #v2.36
-        if: ${{ matrix.upload_coverage == true }}
+        if: ${{ env.UPLOAD_COVERAGE == 'true' }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           base-path: ${{ github.workspace }}
@@ -220,8 +312,8 @@ jobs:
           COVERALLS_GIT_BRANCH: ${{ github.ref_name }}
 
       - name: Notify Metrics Platform Status in case of failure
-        if: ${{ matrix.upload_coverage == true && (steps.codecov.outcome == 'failure' || steps.coveralls.outcome == 'failure') }}
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd #v8.0.0
+        if: ${{ env.UPLOAD_COVERAGE == 'true' && (steps.codecov.outcome == 'failure' || steps.coveralls.outcome == 'failure') }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9.0.0
         with:
           script: |
             const failureTargets = [

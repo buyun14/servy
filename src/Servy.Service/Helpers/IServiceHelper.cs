@@ -1,6 +1,6 @@
-using Servy.Core.Data;
 using Servy.Core.EnvironmentVariables;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using Servy.Service.CommandLine;
 using Servy.Service.ProcessManagement;
 using System.ServiceProcess;
@@ -12,12 +12,15 @@ namespace Servy.Service.Helpers
     /// <param name="arguments">Command-line arguments for the child.</param>
     /// <param name="workingDirectory">Working directory the child is started in.</param>
     /// <param name="environmentVariables">Environment block to inject.</param>
+    /// <param name="allowOverriddenRuntimeVars">If set to <c>true</c>, allows runtime environment variables to be overridden; if <c>false</c>, preserves existing runtime variables.</param>
     /// <param name="cancellationToken">Token observed while starting.</param>
-    public delegate void StartProcessCallback(
+    /// <returns><c>true</c> when the child was launched; <c>false</c> when the launch was skipped.</returns>
+    public delegate bool StartProcessCallback(
         string exePath,
         string arguments,
         string workingDirectory,
         List<EnvironmentVariable> environmentVariables,
+        bool allowOverriddenRuntimeVars,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -27,16 +30,26 @@ namespace Servy.Service.Helpers
     public interface IServiceHelper
     {
         /// <summary>
-        /// Retrieves the full command-line arguments for the current process.
+        /// Retrieves the full command-line arguments for the current process, in
+        /// <see cref="Environment.GetCommandLineArgs"/> layout: index 0 is the executable path
+        /// and the caller-supplied arguments start at index 1.
         /// </summary>
-        /// <returns>An array of strings containing the command-line arguments.</returns>
+        /// <returns>
+        /// An array of strings containing the command-line arguments, executable path first.
+        /// See <see cref="ICommandLineProvider.GetArgs"/> for why the layout must be preserved -
+        /// an array taken from <c>Main(string[] args)</c> is offset by one and shifts every
+        /// consumer's indices.
+        /// </returns>
         string[] GetArgs();
 
         /// <summary>
-        /// Parses the command-line arguments and loads the service configuration from the repository.
+        /// Parses the command-line arguments and fetches the service configuration from the Servy host service over its named pipe.
         /// </summary>
-        /// <param name="serviceRepository">The repository used to fetch service-specific configurations.</param>
-        /// <param name="fullArgs">The full set of command-line arguments to parse.</param>
+        /// <param name="namedPipesService">The named pipes service used to fetch service-specific configurations.</param>
+        /// <param name="fullArgs">
+        /// The full set of command-line arguments to parse, as returned by <see cref="GetArgs"/>:
+        /// index 0 is the executable path and index 1 is the service name.
+        /// </param>
         /// <returns>
         /// Returns a populated <see cref="StartOptions"/>.
         /// </returns>
@@ -44,9 +57,9 @@ namespace Servy.Service.Helpers
         /// Thrown when the command-line arguments are invalid.
         /// </exception>
         /// <exception cref="InvalidOperationException">
-        /// Thrown when the service configuration is missing.
+        /// Thrown when the Servy host service has no configuration for the service, or when the host refuses or fails the request.
         /// </exception>
-        StartOptions? ParseOptions(IServiceRepository serviceRepository, string[] fullArgs);
+        StartOptions? ParseOptions(INamedPipesService namedPipesService, string[] fullArgs);
 
         /// <summary>
         /// Records the full initialization context, including raw command-line arguments and resolved
@@ -57,19 +70,23 @@ namespace Servy.Service.Helpers
         /// and environment variables.
         /// </param>
         /// <param name="logger">
-        /// The scoped logger instance used for output. If <see langword="null"/>, diagnostic
+        /// The scoped logger instance used for public output. If <see langword="null"/>, public diagnostic
         /// information will not be recorded.
         /// </param>
+        /// <exception cref="ArgumentNullException">
+        /// Thrown if <paramref name="options"/> is null.
+        /// </exception>
         /// <remarks>
         /// <para>
-        /// This method acts as the "black box" recorder for the service startup. It logs the
-        /// transition from raw CLI input to the internal state used by the process launcher.
+        /// This method acts as the "black box" recorder for the service startup. Public parameter metadata is logged
+        /// to both local file logs and the Windows Event Log using <paramref name="logger"/>.
         /// </para>
         /// <para>
-        /// <b>Security Note:</b> Sensitive properties within <paramref name="options"/> (such as
-        /// passwords or encrypted environment variables) are expected to be obfuscated or
-        /// handled securely by the <paramref name="logger"/> implementation to prevent
-        /// plaintext exposure in log files.
+        /// <b>Security Note:</b> Sensitive fields (such as environment variable values and raw executable arguments) are
+        /// only recorded when <see cref="StartOptions.EnableDebugLogs"/> is <see langword="true"/>. Prior to output,
+        /// all sensitive values are redacted directly by this method using <c>ServiceHelper.MaskSensitiveValue</c> and
+        /// <c>ServiceHelper.MaskRawArguments</c>. Sensitive blocks are written exclusively to the local file log
+        /// (<c>Servy.Service.log</c>) via the static logger and are never emitted to the Windows Event Log.
         /// </para>
         /// </remarks>
         void LogStartupArguments(StartOptions options, IServyLogger? logger);
@@ -86,6 +103,9 @@ namespace Servy.Service.Helpers
         /// <returns>
         /// <c>true</c> if the options are valid and the service can proceed; otherwise, <c>false</c>.
         /// </returns>
+        /// <exception cref="ArgumentNullException">
+        /// Thrown if <paramref name="options"/> is null.
+        /// </exception>
         bool ValidateAndLog(StartOptions options, IServyLogger? logger);
 
         /// <summary>
@@ -110,16 +130,21 @@ namespace Servy.Service.Helpers
         /// <param name="realArgs">Command-line arguments.</param>
         /// <param name="workingDir">Working directory for the process.</param>
         /// <param name="environmentVariables">Environment variables.</param>
+        /// <param name="allowOverriddenRuntimeVars">If set to <c>true</c>, allows runtime environment variables to be overridden; if <c>false</c>, preserves existing runtime variables.</param>
         /// <param name="logger">Logger instance.</param>
         /// <param name="stopTimeoutMs">Timeout in milliseconds to wait for the process to stop.</param>
         /// <param name="cancellationToken">Cancellation token.</param>
+        /// <exception cref="ArgumentNullException">
+        /// Thrown if <paramref name="startProcess"/> is null.
+        /// </exception>
         void RestartProcess(
-            IProcessWrapper process,
+            IProcessWrapper? process,
             StartProcessCallback startProcess,
             string realExePath,
             string realArgs,
             string workingDir,
             List<EnvironmentVariable> environmentVariables,
+            bool allowOverriddenRuntimeVars,
             IServyLogger? logger,
             int stopTimeoutMs,
             CancellationToken cancellationToken = default);
@@ -127,8 +152,8 @@ namespace Servy.Service.Helpers
         /// <summary>
         /// Attempts to restart the Windows service associated with the current process.
         /// </summary>
-        /// <param name="logger">The logger instance used to report progress and errors.</param>
         /// <param name="serviceName">The name of the Windows service to restart.</param>
+        /// <param name="logger">The logger instance used to report progress and errors.</param>
         /// <remarks>
         /// This should be used when the service is registered with the Service Control Manager.
         /// </remarks>

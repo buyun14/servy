@@ -1,4 +1,5 @@
 using Servy.Core.Native;
+using System.ComponentModel;
 using static Servy.Core.Native.NativeMethods;
 
 namespace Servy.Core.Services
@@ -6,6 +7,22 @@ namespace Servy.Core.Services
     /// <summary>
     /// Provides an abstraction for invoking native Windows Service API functions.
     /// </summary>
+    /// <remarks>
+    /// Apart from <see cref="EnsureLogOnAsServiceRight"/>, <see cref="GrantServiceControlRights"/>,
+    /// <see cref="RevokeServiceControlRights"/>, <see cref="GetServices"/> and <see cref="GetServiceProcessId"/>, the members mirror the Win32
+    /// service control manager functions and do not throw on failure: a <see langword="bool"/>-returning member
+    /// returns <see langword="false"/>, and a handle-returning member returns a handle whose <c>IsInvalid</c> is
+    /// <see langword="true"/>. The reason is available only from <see cref="IWin32ErrorProvider.GetLastWin32Error"/>,
+    /// which must be called immediately after the failing call, before any other managed call (a property read, a
+    /// null test or a log statement included), because any intervening P/Invoke overwrites the thread's last-error
+    /// slot. <see cref="GetServices"/> does not follow this convention: it can propagate an exception (for example a
+    /// <see cref="System.ComponentModel.Win32Exception"/>) from the underlying service enumeration instead of
+    /// returning an empty sequence or an invalid handle. <see cref="GrantServiceControlRights"/> and
+    /// <see cref="RevokeServiceControlRights"/> return nothing: each throws an <see cref="ArgumentException"/> for an
+    /// unusable handle and logs every later failure without surfacing it. <see cref="GetServiceProcessId"/> mirrors no
+    /// single Win32 function either: it opens the service by name and returns 0 on every failure, a blank name, a
+    /// stopped service and a missing one alike, so <see cref="IWin32ErrorProvider.GetLastWin32Error"/> does not explain a 0.
+    /// </remarks>
     public interface IWindowsServiceApi
     {
         /// <summary>
@@ -35,9 +52,45 @@ namespace Servy.Core.Services
         void EnsureLogOnAsServiceRight(string accountName);
 
         /// <summary>
+        /// Grants the specified user or service account the discretionary access control list (DACL) permissions
+        /// required to query status and restart the service via ServiceControl mechanisms without requiring full administration rights.
+        /// </summary>
+        /// <param name="serviceHandle">A valid handle to the target service opened with <c>SERVICE_READ_CONTROL</c> and <c>SERVICE_WRITE_DAC</c> rights.</param>
+        /// <param name="accountName">The account name (e.g. <c>DOMAIN\user</c>, <c>.\user</c>, or machine account) to grant permissions to.</param>
+        /// <remarks>
+        /// A null, empty or whitespace <paramref name="accountName"/>, or an account that is not eligible for an explicit grant
+        /// (<see cref="Servy.Core.Config.ServiceAccounts.IsEligibleForServiceControlGrant"/>: LocalSystem, the
+        /// shared LocalService and NetworkService identities, and IIS AppPool identities), is skipped and
+        /// nothing is granted. A virtual account (<c>NT SERVICE\...</c>) IS granted: its per-service SID belongs
+        /// to this service alone, so the grant cannot reach any other service. Every failure after the handle check (the account not resolving to a SID, or a
+        /// <see cref="Win32Exception"/> from querying or setting the service security descriptor) is logged and not
+        /// rethrown, so the caller cannot tell a grant that failed from one that succeeded.
+        /// </remarks>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="serviceHandle"/> is null, invalid, or closed.</exception>
+        void GrantServiceControlRights(SafeServiceHandle? serviceHandle, string accountName);
+
+        /// <summary>
+        /// Removes the explicit Allow entries that <see cref="GrantServiceControlRights"/> wrote for an account that
+        /// no longer runs the service, so it can no longer query, start, stop or pause it.
+        /// </summary>
+        /// <param name="serviceHandle">A valid handle to the target service opened with <c>SERVICE_READ_CONTROL</c> and <c>SERVICE_WRITE_DAC</c> rights.</param>
+        /// <param name="accountName">The account name (e.g. <c>DOMAIN\user</c>, <c>.\user</c>, or machine account) whose grant is taken back.</param>
+        /// <remarks>
+        /// A null, empty or whitespace <paramref name="accountName"/>, or an account that is not eligible for an explicit grant
+        /// (<see cref="Servy.Core.Config.ServiceAccounts.IsEligibleForServiceControlGrant"/>: LocalSystem, the
+        /// shared LocalService and NetworkService identities, and IIS AppPool identities), is skipped and
+        /// nothing is revoked. A virtual account (<c>NT SERVICE\...</c>) IS revoked, symmetrically with the grant. Only the account's Allow entries are removed; a Deny entry an administrator added is
+        /// left in place. Every failure after the handle check (the account not resolving to a SID, or a
+        /// <see cref="Win32Exception"/> from querying or setting the service security descriptor) is logged and not
+        /// rethrown, so the caller cannot tell a revocation that failed from one that succeeded.
+        /// </remarks>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="serviceHandle"/> is null, invalid, or closed.</exception>
+        void RevokeServiceControlRights(SafeServiceHandle? serviceHandle, string accountName);
+
+        /// <summary>
         /// Creates a service object and adds it to the specified service control manager database.
         /// </summary>
-        /// <param name="hSCManager">Handle to the service control manager.</param>
+        /// <param name="hSCManager">A handle to the service control manager.</param>
         /// <param name="lpServiceName">The name of the service.</param>
         /// <param name="lpDisplayName">The display name of the service.</param>
         /// <param name="dwDesiredAccess">The desired access rights for the service.</param>
@@ -70,7 +123,7 @@ namespace Servy.Core.Services
         /// <summary>
         /// Opens an existing service.
         /// </summary>
-        /// <param name="hSCManager">Handle to the service control manager.</param>
+        /// <param name="hSCManager">A handle to the service control manager.</param>
         /// <param name="lpServiceName">The name of the service to open.</param>
         /// <param name="dwDesiredAccess">The access to the service.</param>
         /// <returns>A handle to the service.</returns>
@@ -79,14 +132,14 @@ namespace Servy.Core.Services
         /// <summary>
         /// Marks the specified service for deletion from the service control manager database.
         /// </summary>
-        /// <param name="hService">Handle to the service.</param>
+        /// <param name="hService">A handle to the service.</param>
         /// <returns><see langword="true"/> if the operation succeeds; otherwise, <see langword="false"/>.</returns>
         bool DeleteService(SafeServiceHandle hService);
 
         /// <summary>
         /// Sends a control code to a service.
         /// </summary>
-        /// <param name="hService">Handle to the service.</param>
+        /// <param name="hService">A handle to the service.</param>
         /// <param name="dwControl">The control code to send.</param>
         /// <param name="lpServiceStatus">Receives the latest status information about the service.</param>
         /// <returns><see langword="true"/> if the operation succeeds; otherwise, <see langword="false"/>.</returns>
@@ -95,7 +148,7 @@ namespace Servy.Core.Services
         /// <summary>
         /// Changes the configuration parameters of a service.
         /// </summary>
-        /// <param name="hService">Handle to the service.</param>
+        /// <param name="hService">A handle to the service.</param>
         /// <param name="dwServiceType">The new service type.</param>
         /// <param name="dwStartType">The new start type.</param>
         /// <param name="dwErrorControl">The severity of the error if the service fails to start.</param>
@@ -124,7 +177,7 @@ namespace Servy.Core.Services
         /// <summary>
         /// Changes the optional configuration parameters of a service using a description structure.
         /// </summary>
-        /// <param name="hService">Handle to the service.</param>
+        /// <param name="hService">A handle to the service.</param>
         /// <param name="dwInfoLevel">The configuration information level to be set.</param>
         /// <param name="lpInfo">A reference to the new configuration information.</param>
         /// <returns><see langword="true"/> if the configuration is successfully changed; otherwise, <see langword="false"/>.</returns>
@@ -211,5 +264,15 @@ namespace Servy.Core.Services
         /// </summary>
         /// <returns>An enumerable of <see cref="WindowsServiceInfo"/> representing installed services.</returns>
         IEnumerable<WindowsServiceInfo> GetServices();
+
+        /// <summary>
+        /// Gets the identifier of the process a service runs in.
+        /// </summary>
+        /// <param name="serviceName">The name of the service.</param>
+        /// <returns>
+        /// The process identifier the Service Control Manager reports for the service, including while it is starting
+        /// or stopping; 0 when the service is stopped, is not installed, or its status cannot be queried.
+        /// </returns>
+        int GetServiceProcessId(string serviceName);
     }
 }

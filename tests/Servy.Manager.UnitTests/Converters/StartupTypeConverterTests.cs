@@ -1,6 +1,7 @@
 using Servy.Core.Enums;
 using Servy.Manager.Converters;
 using Servy.Manager.Resources;
+using Servy.Testing;
 using System.Globalization;
 using System.Windows.Data;
 
@@ -17,11 +18,11 @@ namespace Servy.Manager.UnitTests.Converters
         /// </summary>
         public static TheoryData<ServiceStartType, string> StartupTypeMappings => new TheoryData<ServiceStartType, string>()
         {
-            { ServiceStartType.Automatic,             nameof(Strings.StartupType_Automatic) },
+            { ServiceStartType.Automatic,            nameof(Strings.StartupType_Automatic) },
             { ServiceStartType.AutomaticDelayedStart, nameof(Strings.StartupType_AutomaticDelayedStart) },
-            { ServiceStartType.Manual,                nameof(Strings.StartupType_Manual) },
-            { ServiceStartType.Disabled,              nameof(Strings.StartupType_Disabled) },
-            { ServiceStartType.Unknown,               nameof(Strings.StartupType_Unknown) },
+            { ServiceStartType.Manual,               nameof(Strings.StartupType_Manual) },
+            { ServiceStartType.Disabled,             nameof(Strings.StartupType_Disabled) },
+            { ServiceStartType.Unknown,              nameof(Strings.StartupType_Unknown) },
         };
 
         #endregion
@@ -54,11 +55,23 @@ namespace Servy.Manager.UnitTests.Converters
         }
 
         [Fact]
-        public void Convert_NullReturnsFetching_InvalidEchoesInput()
+        public void Convert_NullValue_ReturnsFetchingPlaceholder()
         {
-            // Act & Assert
-            Assert.Equal(Strings.Label_Fetching, _converter.Convert(null!, typeof(string), null!, CultureInfo.InvariantCulture));
-            Assert.Equal("Invalid", _converter.Convert("Invalid", typeof(string), null!, CultureInfo.InvariantCulture));
+            // Act
+            var result = _converter.Convert(null!, typeof(string), null!, CultureInfo.InvariantCulture);
+
+            // Assert
+            Assert.Equal(Strings.Label_Fetching, result);
+        }
+
+        [Fact]
+        public void Convert_IncompatibleValue_EchoesInput()
+        {
+            // Act
+            var result = _converter.Convert("Invalid", typeof(string), null!, CultureInfo.InvariantCulture);
+
+            // Assert: GetFallbackValue surfaces the raw value rather than masquerading as a mapped start type
+            Assert.Equal("Invalid", result);
         }
 
         #endregion
@@ -66,31 +79,12 @@ namespace Servy.Manager.UnitTests.Converters
         #region ConvertBack Tests
 
         [Theory]
-        [MemberData(nameof(StartupTypeMappings))]
-        public void ConvertBack_ValidString_ReturnsEnum(ServiceStartType expected, string resourceName)
-        {
-            // Arrange
-            var input = typeof(Strings).GetProperty(resourceName)?.GetValue(null!) as string;
-
-            // Act
-            var result = _converter.ConvertBack(input!, typeof(ServiceStartType), null!, CultureInfo.InvariantCulture);
-
-            // Assert
-            Assert.Equal(expected, result);
-        }
-
-        [Fact]
-        public void ConvertBack_NullInput_ReturnsDoNothing()
-        {
-            // Act & Assert
-            Assert.Equal(Binding.DoNothing, _converter.ConvertBack(null!, typeof(string), null!, CultureInfo.InvariantCulture));
-        }
-
-        [Fact]
-        public void ConvertBack_InvalidString_ReturnsDoNothing()
+        [InlineData(null)]
+        [InlineData("Any UI value")]
+        public void ConvertBack_ReturnsDoNothing(object? value)
         {
             // Act
-            var result = _converter.ConvertBack("Invalid String", typeof(ServiceStartType), null!, CultureInfo.InvariantCulture);
+            var result = _converter.ConvertBack(value!, typeof(ServiceStartType), null!, CultureInfo.InvariantCulture);
 
             // Assert
             Assert.Equal(Binding.DoNothing, result);
@@ -99,6 +93,24 @@ namespace Servy.Manager.UnitTests.Converters
         #endregion
 
         #region Completeness Guard Tests
+
+        [Fact]
+        public void StartupMap_CoversEveryDeclaredServiceStartType()
+        {
+            // Arrange: Extract the private static StartupMap directly from StartupTypeConverter
+            var map = TestReflection.GetFieldStatic<Dictionary<ServiceStartType, Func<string>>>(typeof(StartupTypeConverter), "StartupMap");
+
+            // Act
+            var declared = Enum.GetValues(typeof(ServiceStartType)).Cast<ServiceStartType>().ToHashSet();
+            var mapKeys = map.Keys.ToHashSet();
+
+            // Assert: Ensure bidirectional completeness between StartupMap keys and ServiceStartType enum values
+            var unmappedValues = declared.Except(mapKeys).ToList();
+            var extraValues = mapKeys.Except(declared).ToList();
+
+            Assert.Empty(unmappedValues);
+            Assert.Empty(extraValues);
+        }
 
         [Fact]
         public void ServiceStartTypeEnum_AllValuesAreMappedAndAccountedFor()

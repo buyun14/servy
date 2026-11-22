@@ -3,6 +3,7 @@ using Servy.Manager.Models;
 using Servy.Manager.Resources;
 using Servy.Manager.Services;
 using Servy.Manager.ViewModels;
+using Servy.Testing;
 using Servy.UI.Services;
 
 namespace Servy.Manager.UnitTests.ViewModels
@@ -20,7 +21,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             _uiDispatcherMock = new Mock<IUiDispatcher>();
             _serviceCommandsMock = new Mock<IServiceCommands>();
 
-            // Ensure the dispatcher doesn't hang the async state machine during tests
+            // Explicit for readability; Moq already returns Task.CompletedTask for unstubbed Task members.
             _uiDispatcherMock.Setup(d => d.YieldAsync()).Returns(Task.CompletedTask);
 
             // Initialize centralized SUT instance to establish a single cleanup vector
@@ -42,6 +43,11 @@ namespace Servy.Manager.UnitTests.ViewModels
         {
             public Func<Service?, ServiceItemBase>? CustomCreateServiceItem { get; set; }
 
+            // Records every exception the pipeline surfaced through HandleSearchExceptionAsync. That
+            // call is the only effect the general catch arm has which the cancellation arm deliberately
+            // does not, so the recording is the only thing that tells the two arms apart.
+            public List<Exception> HandledExceptions { get; } = new List<Exception>();
+
             public TestServiceSearchViewModel(
                 ICursorService cursorService,
                 IUiDispatcher uiDispatcher,
@@ -58,8 +64,21 @@ namespace Servy.Manager.UnitTests.ViewModels
                 return new Mock<ServiceItemBase>().Object;
             }
 
-            public CancellationTokenSource? GetCancellationTokenSource() => _serviceSearchCts;
-            public void SetCancellationTokenSource(CancellationTokenSource cts) => _serviceSearchCts = cts;
+            public CancellationTokenSource? GetCancellationTokenSource()
+            {
+                return TestReflection.GetField<CancellationTokenSource?>(this, "_searchCts");
+            }
+
+            public void SetCancellationTokenSource(CancellationTokenSource cts)
+            {
+                TestReflection.SetField(this, "_searchCts", cts);
+            }
+
+            protected override Task HandleSearchExceptionAsync(Exception ex)
+            {
+                HandledExceptions.Add(ex);
+                return Task.CompletedTask;
+            }
         }
 
         #endregion
@@ -161,6 +180,33 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task SearchServicesAsync_HandsThePipelineTokenToTheFetch()
+        {
+            // Arrange
+            // Capture, during the fetch, both the token the search received and the token of the
+            // source the pipeline swapped in. A delegate that passes CancellationToken.None or
+            // default gets a token that cannot be canceled and is not equal to the source's token.
+            CancellationToken received = default;
+            CancellationToken expected = default;
+            _serviceCommandsMock
+                .Setup(s => s.SearchServicesAsync("Servy", false, It.IsAny<CancellationToken>()))
+                .Callback<string, bool, CancellationToken>((query, calculatePerf, token) =>
+                {
+                    received = token;
+                    expected = _sut.GetCancellationTokenSource()!.Token;
+                })
+                .ReturnsAsync(new List<Service>());
+            _sut.SearchText = "Servy";
+
+            // Act
+            await _sut.SearchCommand.ExecuteAsync(null);
+
+            // Assert
+            Assert.True(received.CanBeCanceled);
+            Assert.Equal(expected, received);
+        }
+
+        [Fact]
         public async Task SearchServicesAsync_NullServiceCommands_AbortsGracefully()
         {
             // Arrange
@@ -189,15 +235,22 @@ namespace Servy.Manager.UnitTests.ViewModels
             Assert.Null(exception);
             Assert.False(_sut.IsBusy);
             _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
+            // Cancellation is the normal path - every superseding search and every tab-switch Dispose
+            // cancels the running one - so it must never reach the handler the Main and Logs overrides
+            // turn into a modal error dialog. Everything above is done by the Step 7 finally on both
+            // paths, so this is the only assertion the cancellation arm's deletion fails.
+            Assert.Empty(_sut.HandledExceptions);
         }
 
         [Fact]
         public async Task SearchServicesAsync_GenericExceptionThrown_CleansUpState()
         {
             // Arrange
+            var failure = new InvalidOperationException("Database/SCM connection lost");
+
             _serviceCommandsMock
                 .Setup(s => s.SearchServicesAsync(It.IsAny<string>(), false, It.IsAny<CancellationToken>()))
-                .ThrowsAsync(new InvalidOperationException("Database/SCM connection lost"));
+                .ThrowsAsync(failure);
 
             // Act
             await _sut.SearchCommand.ExecuteAsync(null);
@@ -205,6 +258,9 @@ namespace Servy.Manager.UnitTests.ViewModels
             // Assert - Should reach finally block cleanly despite crash
             Assert.False(_sut.IsBusy);
             _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
+            // The mirror of the cancellation test: a genuine failure does reach the handler, and it is
+            // the same instance the pipeline caught.
+            Assert.Same(failure, Assert.Single(_sut.HandledExceptions));
         }
 
         [Fact]
@@ -216,6 +272,11 @@ namespace Servy.Manager.UnitTests.ViewModels
             _serviceCommandsMock
                 .Setup(s => s.SearchServicesAsync(It.IsAny<string>(), false, It.IsAny<CancellationToken>()))
                 .Returns(tcs.Task);
+
+            // Stands in for the rows the newer search owns. Services is the UI state the #1796 guard
+            // protects, so the stale search must leave this exact row in place.
+            var currentRow = new Mock<ServiceItemBase>().Object;
+            _sut.Services.Add(currentRow);
 
             var executionTask = _sut.SearchCommand.ExecuteAsync(null);
             var executionTokenSource = _sut.GetCancellationTokenSource();
@@ -235,6 +296,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             Assert.True(_sut.IsBusy);
             _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Never);
             Assert.Equal(Strings.Button_Searching, _sut.SearchButtonText);
+            Assert.Same(currentRow, Assert.Single(_sut.Services));
 
             // Clean up global mock allocations
             racingCts.Dispose();

@@ -3,6 +3,10 @@ using Servy.Core.Helpers;
 using Servy.Core.Logging;
 using Servy.Core.Native;
 using Servy.Core.Resources;
+using Servy.Core.Security;
+using Microsoft.Win32.SafeHandles;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 
 namespace Servy.Core.Validation
@@ -16,19 +20,50 @@ namespace Servy.Core.Validation
         private const string ExtendedPrefix = @"\\?\";
         private const string ExtendedUncPrefix = @"\\?\UNC\";
 
+        /// <summary><c>FILE_NAME_OPENED</c>: <c>GetFinalPathNameByHandle</c> returns the name the handle was opened by, not normalized.</summary>
+        private const uint FileNameOpened = 0x8;
+
         /// <summary>
-        /// Enforces unified validation layers shared across both input and output operations.
-        /// Guarantees that any defensive hardening immediately benefits both import and export workflows.
+        /// The protected system directories no imported or exported configuration file may live under.
+        /// Both validation stages match against this one set, so a root added here hardens the pre-handle
+        /// audit and the post-resolution re-check together. The special-folder paths are process-constant,
+        /// so resolving them once is safe.
+        /// </summary>
+        private static readonly string[] ProtectedFolders =
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)
+        };
+
+        /// <summary>
+        /// Returns the protected system directory <paramref name="candidate"/> sits under, or <c>null</c> when it sits under none.
+        /// </summary>
+        /// <param name="candidate">An absolute path to match against <see cref="ProtectedFolders"/>.</param>
+        /// <returns>The matched protected folder, or <c>null</c>.</returns>
+        private static string? FindProtectedFolderViolation(string candidate) =>
+            ProtectedFolders.FirstOrDefault(folder =>
+                !string.IsNullOrEmpty(folder) &&
+                candidate.StartsWith(
+                    folder.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>
+        /// Audits a path before any handle is opened: no <see cref="FileStream"/> is created and nothing is created on disk.
+        /// Read-only filesystem metadata is queried where a check requires it (volume type, ancestor reparse points, target existence and attributes).
+        /// Covers UNC path blocking, network drive detection, reparse points, reserved device names, protected system directories, and allowed file extensions.
         /// </summary>
         /// <param name="path">The unverified relative or absolute file path to audit.</param>
         /// <param name="mode">The <see cref="FileMode"/> configuration tracking contextual intent (e.g., import vs. export semantics).</param>
-        /// <param name="access">The <see cref="FileAccess"/> permissions required for the resolved target stream.</param>
-        /// <param name="share">The <see cref="FileShare"/> rule limits mapping concurrent thread constraints.</param>
-        /// <param name="stream">When this method returns, contains an opened, active <see cref="FileStream"/> instance pointing to the verified file layout if validation succeeded; otherwise, <c>null</c>. <b>On successful validation, the caller assumes absolute ownership of this instance and is responsible for its disposal.</b></param>
-        /// <returns>A <see cref="PathSecurityResult"/> indicating whether the validation pipeline passed or failed, along with outcome tokens.</returns>
-        public static PathSecurityResult ValidatePath(string path, FileMode mode, FileAccess access, FileShare share, out FileStream? stream)
+        /// <returns>A <see cref="PathSecurityResult"/> indicating whether pre-handle validation passed or failed.</returns>
+        public static PathSecurityResult ValidatePathOnly(string path, FileMode mode)
         {
-            stream = null;
+            bool isImport = mode == FileMode.Open;
+
+            // Helper local function to pick between import-flavored and export-flavored message strings.
+            string Pick(string importMsg, string exportMsg) => isImport ? importMsg : exportMsg;
+
             string fullPath;
             try
             {
@@ -45,7 +80,7 @@ namespace Servy.Core.Validation
             bool isUncUri = Uri.TryCreate(fullPath, UriKind.Absolute, out var uri) && uri.IsUnc;
             if (fullPath.StartsWith(@"\\", StringComparison.Ordinal) || isUncUri)
             {
-                var errorMsg = mode == FileMode.Open ? Strings.Msg_SecurityUncPathProhibited : Strings.Msg_SecurityUncPathExportProhibited;
+                var errorMsg = Pick(Strings.Msg_SecurityUncPathProhibited, Strings.Msg_SecurityUncPathExportProhibited);
                 Logger.Error(errorMsg);
                 return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
             }
@@ -59,7 +94,7 @@ namespace Servy.Core.Validation
                     var drive = new DriveInfo(root);
                     if (drive.DriveType == DriveType.Network)
                     {
-                        var errorMsg = mode == FileMode.Open ? Strings.Msg_SecurityNetworkDriveProhibited : Strings.Msg_SecurityNetworkDriveExportProhibited;
+                        var errorMsg = Pick(Strings.Msg_SecurityNetworkDriveProhibited, Strings.Msg_SecurityNetworkDriveExportProhibited);
                         Logger.Error(errorMsg);
                         return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
                     }
@@ -73,7 +108,7 @@ namespace Servy.Core.Validation
             // Reparse Point Guard (Directory and File Level)
             if (Helper.HasAncestorReparsePoint(fullPath))
             {
-                var errorMsg = mode == FileMode.Open ? Strings.Msg_SecurityDirReparsePointProhibited : Strings.Msg_SecurityDirReparsePointExportProhibited;
+                var errorMsg = Pick(Strings.Msg_SecurityDirReparsePointProhibited, Strings.Msg_SecurityDirReparsePointExportProhibited);
                 Logger.Error(errorMsg);
                 return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
             }
@@ -83,7 +118,7 @@ namespace Servy.Core.Validation
             fileLinkInfo.Refresh();
             if (!string.IsNullOrEmpty(fileLinkInfo.LinkTarget) || (fileLinkInfo.Exists && (fileLinkInfo.Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint))
             {
-                var errorMsg = mode == FileMode.Open ? Strings.Msg_SecurityFileReparsePointProhibited : Strings.Msg_SecurityFileReparsePointExportProhibited;
+                var errorMsg = Pick(Strings.Msg_SecurityFileReparsePointProhibited, Strings.Msg_SecurityFileReparsePointExportProhibited);
                 Logger.Error(errorMsg);
                 return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
             }
@@ -93,10 +128,13 @@ namespace Servy.Core.Validation
             int firstDotIndex = fileName.IndexOf('.');
             string firstSegment = firstDotIndex >= 0 ? fileName.Substring(0, firstDotIndex) : fileName;
 
-            // Strip trailing spaces, periods, and tabs to match Win32's internal behavior
+            // Display only. The trailing space/period/tab stripping Win32 performs before resolving a
+            // device name is applied by ReservedNames.IsReservedDeviceName, which decides the block
+            // below from the raw segment; this copy exists so the message names the device the kernel
+            // would resolve to ("CON", not "CON ").
             string normalizedSegment = firstSegment.TrimEnd(' ', '.', '\t');
 
-            if (ReservedNames.ReservedDeviceNames.Contains(normalizedSegment))
+            if (ReservedNames.IsReservedDeviceName(firstSegment))
             {
                 var errorMsg = string.Format(Strings.Msg_SecurityReservedDeviceName, normalizedSegment);
                 Logger.Error(errorMsg);
@@ -104,27 +142,11 @@ namespace Servy.Core.Validation
             }
 
             // System Protection Guard
-            string[] protectedFolders =
-            {
-                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                Environment.GetFolderPath(Environment.SpecialFolder.System),
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)
-            };
-
-            // Centralized Protected Directory Matcher Local Function
-            string? FindProtectedFolderViolation(string candidate) =>
-                protectedFolders.FirstOrDefault(folder =>
-                    !string.IsNullOrEmpty(folder) &&
-                    candidate.StartsWith(
-                        folder.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
-                        StringComparison.OrdinalIgnoreCase));
-
             var violatedFolder = FindProtectedFolderViolation(fullPath);
 
             if (violatedFolder != null)
             {
-                var errorMsg = string.Format(mode == FileMode.Open ? Strings.Msg_SecurityProtectedDirectory : Strings.Msg_SecurityProtectedDirectoryExport, violatedFolder);
+                var errorMsg = string.Format(Pick(Strings.Msg_SecurityProtectedDirectory, Strings.Msg_SecurityProtectedDirectoryExport), violatedFolder);
                 Logger.Error(errorMsg);
                 return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
             }
@@ -140,16 +162,45 @@ namespace Servy.Core.Validation
             }
 
             // Existence Check (Only required for Input/Import modes)
-            if (mode == FileMode.Open && !fileLinkInfo.Exists)
+            if (isImport && !fileLinkInfo.Exists)
             {
                 var errorMsg = string.Format(Strings.Msg_ImportFileNotFound, fullPath);
                 Logger.Error(errorMsg);
                 return PathSecurityResult.Fail(PathSecurityFailureKind.InvalidArgument, errorMsg);
             }
 
+            return PathSecurityResult.Success(fullPath);
+        }
+
+        /// <summary>
+        /// Enforces unified validation layers shared across both input and output operations.
+        /// Guarantees that any defensive hardening immediately benefits both import and export workflows.
+        /// </summary>
+        /// <param name="path">The unverified relative or absolute file path to audit.</param>
+        /// <param name="mode">The <see cref="FileMode"/> configuration tracking contextual intent (e.g., import vs. export semantics).</param>
+        /// <param name="access">The <see cref="FileAccess"/> permissions required for the resolved target stream.</param>
+        /// <param name="share">The <see cref="FileShare"/> level granted to other handles while the returned stream is open.</param>
+        /// <param name="stream">When this method returns, contains an opened, active <see cref="FileStream"/> instance pointing to the verified file layout if validation succeeded; otherwise, <c>null</c>. <b>On successful validation, the caller assumes absolute ownership of this instance and is responsible for its disposal.</b></param>
+        /// <returns>A <see cref="PathSecurityResult"/> indicating whether the validation pipeline passed or failed, along with outcome tokens.</returns>
+        public static PathSecurityResult ValidatePath(string path, FileMode mode, FileAccess access, FileShare share, out FileStream? stream)
+        {
+            stream = null;
+            bool isImport = mode == FileMode.Open;
+
+            // Helper local function to pick between import-flavored and export-flavored message strings.
+            string Pick(string importMsg, string exportMsg) => isImport ? importMsg : exportMsg;
+
+            // Run pure path-only preflight checks upfront
+            var pathOnlyResult = ValidatePathOnly(path, mode);
+            if (!pathOnlyResult.IsValid)
+            {
+                return pathOnlyResult;
+            }
+
+            string fullPath = pathOnlyResult.ValidPath.ResolvedPath;
+
             // Handle Resolution (Final Target Verification)
-            bool existedBefore = File.Exists(fullPath);
-            bool createdByUs = !existedBefore;
+            bool createdByUs = !File.Exists(fullPath);
             FileStream? fileStream = null;
             bool success = false;
 
@@ -158,52 +209,31 @@ namespace Servy.Core.Validation
                 fileStream = new FileStream(fullPath, mode, access, share);
                 var safeHandle = fileStream.SafeFileHandle;
 
+                // Note on Native Fail-Closed Guards:
+                // The two handle checks below (IsInvalid, and TryGetFinalPathByHandle returning false when
+                // its native size probe or path query fails) are defensive native fallbacks. They ensure
+                // that kernel-level handle failures fail closed rather than bypassing path checks, and
+                // cannot be reached through managed FileStream APIs in unit tests without mocking native
+                // P/Invoke calls. The catch block below is not one of them: a FileStream that cannot be
+                // opened (a sharing violation, access denied) lands there.
                 if (safeHandle.IsInvalid)
                 {
                     return PathSecurityResult.Fail(PathSecurityFailureKind.Security, Strings.Msg_SecurityHandleInvalid);
                 }
 
-                uint requiredSize = NativeMethods.GetFinalPathNameByHandle(safeHandle, null!, 0, NativeMethods.VOLUME_NAME_DOS);
-
-                // Fail closed if the win32 character size probe returns 0 or exceeds maximum integer string buffer capacity.
-                // This prevents resolution errors and uint overflow from silently bypassing target checks.
-                if (requiredSize == 0 || requiredSize > int.MaxValue)
+                if (!TryGetFinalPathByHandle(safeHandle, out string finalPathName))
                 {
                     var errorMsg = Strings.Msg_SecurityHandleSizeProbeFailed;
                     Logger.Error(errorMsg);
                     return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
                 }
 
-                var pathBuilder = new StringBuilder((int)requiredSize);
-                uint resultSize = NativeMethods.GetFinalPathNameByHandle(safeHandle, pathBuilder, requiredSize, NativeMethods.VOLUME_NAME_DOS);
-
-                // Fail closed if the string serialization pass returns 0.
-                if (resultSize == 0)
-                {
-                    var errorMsg = Strings.Msg_SecurityHandleSerializationFailed;
-                    Logger.Error(errorMsg);
-                    return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
-                }
-
-                string finalPathName = pathBuilder.ToString();
                 string normalizedPath = finalPathName;
-                bool unwrappedUnc = false;
-
-                if (normalizedPath.StartsWith(ExtendedUncPrefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    normalizedPath = @"\\" + normalizedPath.Substring(ExtendedUncPrefix.Length);
-                    unwrappedUnc = true;
-                }
-                else if (normalizedPath.StartsWith(ExtendedPrefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    normalizedPath = normalizedPath.Substring(ExtendedPrefix.Length);
-                }
-
-                bool finalIsUnc = unwrappedUnc || (Uri.TryCreate(normalizedPath, UriKind.Absolute, out var finalUri) && finalUri.IsUnc);
+                bool finalIsUnc = Uri.TryCreate(normalizedPath, UriKind.Absolute, out var finalUri) && finalUri.IsUnc;
 
                 if (normalizedPath.StartsWith(@"\\", StringComparison.Ordinal) || finalIsUnc)
                 {
-                    var errorMsg = mode == FileMode.Open ? Strings.Msg_SecurityResolvedUncDestination : Strings.Msg_SecurityResolvedUncDestinationExport;
+                    var errorMsg = Pick(Strings.Msg_SecurityResolvedUncDestination, Strings.Msg_SecurityResolvedUncDestinationExport);
                     Logger.Error(errorMsg);
                     return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
                 }
@@ -213,7 +243,27 @@ namespace Servy.Core.Validation
 
                 if (resolvedViolation != null)
                 {
-                    var errorMsg = string.Format(mode == FileMode.Open ? Strings.Msg_SecurityProtectedDirectory : Strings.Msg_SecurityProtectedDirectoryExport, resolvedViolation);
+                    var errorMsg = string.Format(Pick(Strings.Msg_SecurityProtectedDirectory, Strings.Msg_SecurityProtectedDirectoryExport), resolvedViolation);
+                    Logger.Error(errorMsg);
+                    return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
+                }
+
+                // The checks above ran on the path string and the FileStream open resolved it again, so an ancestor
+                // junction or symlink swapped in between (or a subst drive) can land the handle on another file.
+                // Require the handle to name the very path that was validated.
+                if (!HandleNamesValidatedPath(safeHandle, normalizedPath, fullPath))
+                {
+                    var errorMsg = Pick(Strings.Msg_SecurityDirReparsePointProhibited, Strings.Msg_SecurityDirReparsePointExportProhibited);
+                    Logger.Error($"{errorMsg} Validated '{fullPath}', opened '{normalizedPath}'.");
+                    return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
+                }
+
+                // A hard link is a second name for a file that can live anywhere on the volume, protected folders
+                // included, and the final path reports the name it was opened by. Require exactly one link; a
+                // failed information query fails closed like the native guards above.
+                if (!NativeMethods.GetFileInformationByHandle(safeHandle, out var handleInfo) || handleInfo.NumberOfLinks != 1)
+                {
+                    var errorMsg = string.Format(Strings.Msg_SecurityHandleValidationFailed, "the target file must have exactly one hard link");
                     Logger.Error(errorMsg);
                     return PathSecurityResult.Fail(PathSecurityFailureKind.Security, errorMsg);
                 }
@@ -237,6 +287,221 @@ namespace Servy.Core.Validation
                 {
                     try { File.Delete(fullPath); } catch { /* Best-effort cleanup of stub files created by OpenOrCreate */ }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Resolves an open file handle to its final DOS path, failing closed if the path cannot be determined.
+        /// </summary>
+        /// <param name="handle">The open file handle to resolve.</param>
+        /// <param name="finalPath">When this method returns <c>true</c>, the normalized final path for <paramref name="handle"/>.</param>
+        /// <returns><c>true</c> when the handle path was resolved; otherwise, <c>false</c>.</returns>
+        public static bool TryGetFinalPathByHandle(SafeFileHandle handle, out string finalPath)
+            => TryGetFinalPathByHandle(handle, NativeMethods.VOLUME_NAME_DOS, out finalPath);
+
+        /// <summary>
+        /// Returns whether an opened handle names <paramref name="validatedPath"/>. The normalized final path
+        /// expands 8.3 components the caller may have passed (such as <c>C:\Users\RUNNER~1</c>), so when it
+        /// differs, the opened (non-normalized) name of the same handle, which keeps them, is compared as well.
+        /// Both names come from the handle, so a redirection through a junction, symlink or subst drive fails both.
+        /// </summary>
+        /// <param name="handle">The open file handle.</param>
+        /// <param name="normalizedPath">The normalized final path already resolved for <paramref name="handle"/>.</param>
+        /// <param name="validatedPath">The full path the pre-handle checks validated.</param>
+        /// <returns><c>true</c> when either name equals <paramref name="validatedPath"/>, ignoring case; otherwise, <c>false</c>.</returns>
+        internal static bool HandleNamesValidatedPath(SafeFileHandle handle, string normalizedPath, string validatedPath)
+        {
+            if (string.Equals(normalizedPath, validatedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return TryGetFinalPathByHandle(handle, FileNameOpened | NativeMethods.VOLUME_NAME_DOS, out string openedPath)
+                && string.Equals(openedPath, validatedPath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Resolves an open file handle to a DOS path with the given <c>GetFinalPathNameByHandle</c> flags,
+        /// failing closed if the path cannot be determined.
+        /// </summary>
+        /// <param name="handle">The open file handle to resolve.</param>
+        /// <param name="flags">The <c>GetFinalPathNameByHandle</c> flags.</param>
+        /// <param name="finalPath">When this method returns <c>true</c>, the path for <paramref name="handle"/> without its extended-length prefix.</param>
+        /// <returns><c>true</c> when the handle path was resolved; otherwise, <c>false</c>.</returns>
+        private static bool TryGetFinalPathByHandle(SafeFileHandle handle, uint flags, out string finalPath)
+        {
+            finalPath = string.Empty;
+
+            if (handle == null || handle.IsInvalid || handle.IsClosed)
+            {
+                return false;
+            }
+
+            uint requiredSize = NativeMethods.GetFinalPathNameByHandle(handle, null!, 0, flags);
+            if (requiredSize == 0 || requiredSize > int.MaxValue)
+            {
+                return false;
+            }
+
+            var pathBuilder = new StringBuilder((int)requiredSize);
+            uint resultSize = NativeMethods.GetFinalPathNameByHandle(handle, pathBuilder, requiredSize, flags);
+            if (resultSize == 0 || resultSize >= requiredSize)
+            {
+                return false;
+            }
+
+            string path = pathBuilder.ToString();
+            if (path.StartsWith(ExtendedUncPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                finalPath = @"\\" + path.Substring(ExtendedUncPrefix.Length);
+            }
+            else if (path.StartsWith(ExtendedPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                finalPath = path.Substring(ExtendedPrefix.Length);
+            }
+            else
+            {
+                finalPath = path;
+            }
+
+            return !string.IsNullOrEmpty(finalPath);
+        }
+
+        /// <summary>
+        /// Validates that a target file path resolves strictly within the specified base directory,
+        /// rejecting UNC paths, rooted paths pointing outside the base, and reparse points, and
+        /// hands back the resolved path so callers use the very string that was validated.
+        /// </summary>
+        /// <param name="targetPath">The path to validate.</param>
+        /// <param name="baseDirectory">The trusted application directory.</param>
+        /// <param name="resolvedPath">
+        /// When this method returns <c>true</c>, the fully resolved target path; otherwise <see cref="string.Empty"/>.
+        /// </param>
+        /// <returns><c>true</c> if the path is safely contained within the base directory; otherwise, <c>false</c>.</returns>
+        public static bool TryResolveWithinAppDirectory(string targetPath, string baseDirectory, out string resolvedPath)
+        {
+            resolvedPath = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(targetPath) || string.IsNullOrWhiteSpace(baseDirectory))
+            {
+                Logger.Warn("Path security validation failed: Target path or base directory is empty.");
+                return false;
+            }
+
+            try
+            {
+                // Reject UNC paths immediately
+                if (targetPath.StartsWith(@"\\", StringComparison.Ordinal) || targetPath.StartsWith("//", StringComparison.Ordinal))
+                {
+                    Logger.Warn($"Security refusal: Path '{targetPath}' is a UNC path.");
+                    return false;
+                }
+
+                string fullBaseDir = Path.GetFullPath(baseDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+                string fullTargetPath = Helper.IsAbsolute(targetPath)
+                    ? Path.GetFullPath(targetPath)
+                    : Path.GetFullPath(Path.Combine(fullBaseDir, targetPath));
+
+                // Reject if path traverses outside application directory
+                if (!fullTargetPath.StartsWith(fullBaseDir, StringComparison.OrdinalIgnoreCase))
+                {
+                    Logger.Warn($"Security refusal: Path '{fullTargetPath}' resolves outside application directory '{fullBaseDir}'.");
+                    return false;
+                }
+
+                // Reject reparse points (junctions/symlinks)
+                if (Helper.HasAncestorReparsePoint(fullTargetPath))
+                {
+                    Logger.Warn($"Security refusal: Path '{fullTargetPath}' traverses a junction or symbolic link.");
+                    return false;
+                }
+
+                var fileLinkInfo = new FileInfo(fullTargetPath);
+                fileLinkInfo.Refresh();
+                if (!string.IsNullOrEmpty(fileLinkInfo.LinkTarget) ||
+                    (fileLinkInfo.Exists && (fileLinkInfo.Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint))
+                {
+                    Logger.Warn($"Security refusal: Path '{fullTargetPath}' is a symbolic link.");
+                    return false;
+                }
+
+                resolvedPath = fullTargetPath;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Exception during path containment validation for '{targetPath}': {ex.Message}", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Validates that a target file path resolves strictly within the specified base directory,
+        /// rejecting UNC paths, rooted paths pointing outside the base, and reparse points.
+        /// </summary>
+        /// <param name="targetPath">The path to validate.</param>
+        /// <param name="baseDirectory">The trusted application directory.</param>
+        /// <returns><c>true</c> if the path is safely contained within the base directory; otherwise, <c>false</c>.</returns>
+        /// <remarks>
+        /// Thin wrapper over <see cref="TryResolveWithinAppDirectory"/> for callers that only need the verdict.
+        /// </remarks>
+        public static bool IsSafelyContainedWithinAppDirectory(string targetPath, string baseDirectory)
+            => TryResolveWithinAppDirectory(targetPath, baseDirectory, out _);
+
+        /// <summary>
+        /// Inspects the target file or directory ACL and logs a security notice when standard
+        /// non-admin users possess write or modify rights.
+        /// </summary>
+        /// <param name="path">The directory or file path to evaluate.</param>
+        /// <remarks>
+        /// Diagnostic only: the check produces a log entry, not a verdict, so there is no value for a
+        /// caller to act on and no case in which an ACL that could not be inspected is reported as hardened.
+        /// </remarks>
+        public static void WarnIfDirectoryAclNotHardened(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return;
+
+            try
+            {
+                string targetDir = File.Exists(path) ? Path.GetDirectoryName(path)! : path;
+                if (!Directory.Exists(targetDir))
+                    return;
+
+                var dirInfo = new DirectoryInfo(targetDir);
+                DirectorySecurity security = dirInfo.GetAccessControl(AccessControlSections.Access);
+                AuthorizationRuleCollection rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier));
+
+                const FileSystemRights WriteClass =
+                    FileSystemRights.WriteData |
+                    FileSystemRights.AppendData |
+                    FileSystemRights.WriteAttributes |
+                    FileSystemRights.WriteExtendedAttributes |
+                    FileSystemRights.Delete |
+                    FileSystemRights.DeleteSubdirectoriesAndFiles |
+                    FileSystemRights.ChangePermissions |
+                    FileSystemRights.TakeOwnership;
+
+                foreach (FileSystemAccessRule rule in rules)
+                {
+                    if (rule.IdentityReference is SecurityIdentifier ruleSid && SecurityHelper.IsBroadUnprivilegedSid(ruleSid))
+                    {
+                        if (rule.AccessControlType == AccessControlType.Allow)
+                        {
+                            bool hasWriteModify = (rule.FileSystemRights & WriteClass) != 0;
+                            if (hasWriteModify)
+                            {
+                                Logger.Warn($"ACL Security Notice: Directory '{targetDir}' grants Write/Modify access to standard users ({rule.IdentityReference.Value}).");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"ACL security check notice for '{path}': {ex.Message}");
             }
         }
     }

@@ -8,7 +8,7 @@ namespace Servy.Service.StreamWriters
     public interface IStreamWriterFactory
     {
         /// <summary>
-        /// Creates a new <see cref="IStreamWriter"/> for the specified file path and rotation size.
+        /// Creates a new <see cref="IStreamWriter"/> for the specified file path and rotation settings.
         /// </summary>
         /// <param name="path">The path to the log file.</param>
         /// <param name="enableSizeRotation">
@@ -20,16 +20,12 @@ namespace Servy.Service.StreamWriters
         /// Enables rotation based on the date interval specified by <paramref name="dateRotationType"/>.
         /// </param>
         /// <param name="dateRotationType">
-        /// Defines the date-based rotation schedule (daily, weekly, or monthly).
-        /// Ignored when <paramref name="enableDateRotation"/> is <c>false</c>.
+        /// Defines the date-based rotation schedule (daily, weekly, monthly, or none).
+        /// <see cref="DateRotationType.None"/> disables date-based rotation even when
+        /// <paramref name="enableDateRotation"/> is <c>true</c>.
         /// </param>
         /// <param name="maxRotations">The maximum number of rotated log files to keep. Set to 0 for unlimited.</param>
         /// <param name="useLocalTimeForRotation">Indicates whether to use local system time for log rotation (Default: false (UTC)).</param>
-        /// <remarks>
-        /// When both size-based and date-based rotation are enabled,
-        /// size rotation takes precedence. If a size-based rotation occurs,
-        /// date-based rotation is skipped for that write.
-        /// </remarks>
         /// <returns>An <see cref="IStreamWriter"/> instance.</returns>
         IStreamWriter? Create(
             string path,

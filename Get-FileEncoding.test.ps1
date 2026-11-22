@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Unit tests for Get-FileEncoding.ps1.
@@ -18,6 +19,7 @@ $ScriptDir = $PSScriptRoot
 $TestDir = Join-Path ([System.IO.Path]::GetTempPath()) "ServyEncodingTests_$([Guid]::NewGuid().ToString('N'))"
 [void](New-Item -ItemType Directory -Path $TestDir -Force)
 
+$TotalCount = 0
 $PassCount = 0
 $FailCount = 0
 
@@ -47,7 +49,7 @@ function Assert-Encoding {
 
         # 3. Check endianness if applicable (UTF16 / UTF32)
         if ($encoding -is [System.Text.UnicodeEncoding] -or $encoding -is [System.Text.UTF32Encoding]) {
-            $isBigEndian = [bool](Test-ReflectionField -Object $encoding -FieldName "bigEndian")
+            $isBigEndian = [bool](Get-ReflectionFieldValue -Object $encoding -FieldName "bigEndian")
             if ($isBigEndian -ne $ExpectedBigEndian) {
                 throw "Endianness mismatch: Expected BigEndian=$ExpectedBigEndian, got BigEndian=$isBigEndian"
             }
@@ -76,25 +78,41 @@ function Assert-Encoding {
 
         Write-Host "  [PASS] $TestName" -ForegroundColor Green
         $script:PassCount++
+        $script:TotalCount++
     }
     catch {
         Write-Host "  [FAIL] $TestName - $_" -ForegroundColor Red
         $script:FailCount++
+        $script:TotalCount++
     }
 }
 
-# Helper to inspect non-public fields for strict object property assertions
-function Test-ReflectionField {
+# Helper to inspect non-public field values for strict object property assertions across .NET Framework and .NET Core/5+
+function Get-ReflectionFieldValue {
     param([object]$Object, [string]$FieldName)
     $flags = [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic
-    $field = $Object.GetType().GetField($FieldName, $flags)
-    if ($null -eq $field) {
-        throw "Reflection seam broken: '$($Object.GetType().FullName)' has no non-public field '$FieldName' on this runtime."
+
+    # Try the exact field name first, then the leading-underscore and boolean 'is' backing-field
+    # conventions. GetField is case-sensitive without BindingFlags.IgnoreCase, so the 'is' forms
+    # must capitalise the field name the way .NET does ('_isBigEndian', not '_isbigEndian').
+    $capitalized = $FieldName.Substring(0, 1).ToUpperInvariant() + $FieldName.Substring(1)
+    $candidateNames = @($FieldName, "_$FieldName", "_is$capitalized", "is$capitalized", "Is$capitalized")
+    $type = $Object.GetType()
+
+    foreach ($name in $candidateNames) {
+        $field = $type.GetField($name, $flags)
+        if ($null -ne $field) {
+            return $field.GetValue($Object)
+        }
     }
-    return $field.GetValue($Object)
+
+    throw "Reflection seam broken: '$($type.FullName)' has no non-public field matching '$FieldName' on this runtime."
 }
 
-Write-Host "=== Running Get-FileEncoding.ps1 Tests ===" -ForegroundColor Cyan
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host " Running Get-FileEncoding.ps1 Tests                 " -ForegroundColor Cyan
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host ""
 
 try {
     # -----------------------------------------------------
@@ -168,6 +186,67 @@ try {
     [System.IO.File]::WriteAllBytes($fileBareUtf8Bom, [byte[]]@(0xEF, 0xBB, 0xBF))
     Assert-Encoding -TestName "3-byte file with UTF-8 BOM" -FilePath $fileBareUtf8Bom -ExpectedType ([System.Text.UTF8Encoding]) -ExpectedEmitBom $true
 
+    # Bare UTF-16 BE BOM (2 bytes) -> UnicodeEncoding BE
+    $fileBareUtf16Be = Join-Path $TestDir "bare_utf16_be.txt"
+    [System.IO.File]::WriteAllBytes($fileBareUtf16Be, [byte[]]@(0xFE, 0xFF))
+    Assert-Encoding -TestName "2-byte file with UTF-16 BE BOM" -FilePath $fileBareUtf16Be -ExpectedType ([System.Text.UnicodeEncoding]) -ExpectedEmitBom $true -ExpectedBigEndian $true
+
+    # Bare UTF-32 LE BOM (4 bytes) -> UTF32Encoding LE.
+    # This is the three-way overlap: the same bytes are also a UTF-16 LE BOM followed by two NULs,
+    # so it pins the branch order as well as the readCount guard.
+    $fileBareUtf32Le = Join-Path $TestDir "bare_utf32_le.txt"
+    [System.IO.File]::WriteAllBytes($fileBareUtf32Le, [byte[]]@(0xFF, 0xFE, 0x00, 0x00))
+    Assert-Encoding -TestName "4-byte file with UTF-32 LE BOM" -FilePath $fileBareUtf32Le -ExpectedType ([System.Text.UTF32Encoding]) -ExpectedEmitBom $true -ExpectedBigEndian $false
+
+    # Bare UTF-32 BE BOM (4 bytes) -> UTF32Encoding BE
+    $fileBareUtf32Be = Join-Path $TestDir "bare_utf32_be.txt"
+    [System.IO.File]::WriteAllBytes($fileBareUtf32Be, [byte[]]@(0x00, 0x00, 0xFE, 0xFF))
+    Assert-Encoding -TestName "4-byte file with UTF-32 BE BOM" -FilePath $fileBareUtf32Be -ExpectedType ([System.Text.UTF32Encoding]) -ExpectedEmitBom $true -ExpectedBigEndian $true
+
+    # Truncated UTF-32 LE BOM (3 bytes: FF FE 00) -> UTF-16 LE.
+    # The buffer is zero-filled, so bytes 2 and 3 look like a UTF-32 LE BOM to a byte comparison;
+    # only the readCount -ge 4 guard keeps this file on the UTF-16 LE branch.
+    $fileTruncUtf32Le = Join-Path $TestDir "trunc_utf32_le.txt"
+    [System.IO.File]::WriteAllBytes($fileTruncUtf32Le, [byte[]]@(0xFF, 0xFE, 0x00))
+    Assert-Encoding -TestName "3-byte truncated UTF-32 LE BOM falls back to UTF-16 LE" -FilePath $fileTruncUtf32Le -ExpectedType ([System.Text.UnicodeEncoding]) -ExpectedEmitBom $true -ExpectedBigEndian $false
+
+    # -----------------------------------------------------
+    # Near-miss prefixes: one byte away from a BOM
+    # -----------------------------------------------------
+    # Arrange: each prefix differs from one BOM by exactly one byte, so it must fall through to the
+    # branch named in Expect. Every byte comparison in Get-FileEncoding.ps1 is the only thing that
+    # keeps one of these files off the wrong branch.
+    $nearMisses = @(
+        @{ Name = 'FF FE 00 4E (UTF-16 LE text starting with U+4E00)'; Bytes = [byte[]]@(0xFF, 0xFE, 0x00, 0x4E); Expect = 'Utf16Le' },
+        @{ Name = '00 FE 00 00'; Bytes = [byte[]]@(0x00, 0xFE, 0x00, 0x00); Expect = 'Utf8' },
+        @{ Name = 'FF 00 00 00'; Bytes = [byte[]]@(0xFF, 0x00, 0x00, 0x00); Expect = 'Utf8' },
+        @{ Name = '01 00 FE FF'; Bytes = [byte[]]@(0x01, 0x00, 0xFE, 0xFF); Expect = 'Utf8' },
+        @{ Name = '00 01 FE FF'; Bytes = [byte[]]@(0x00, 0x01, 0xFE, 0xFF); Expect = 'Utf8' },
+        @{ Name = '00 00 00 FF'; Bytes = [byte[]]@(0x00, 0x00, 0x00, 0xFF); Expect = 'Utf8' },
+        @{ Name = '00 00 FE 00'; Bytes = [byte[]]@(0x00, 0x00, 0xFE, 0x00); Expect = 'Utf8' },
+        @{ Name = '00 BB BF';    Bytes = [byte[]]@(0x00, 0xBB, 0xBF);       Expect = 'Utf8' },
+        @{ Name = 'EF 00 BF';    Bytes = [byte[]]@(0xEF, 0x00, 0xBF);       Expect = 'Utf8' },
+        @{ Name = 'EF BB 00';    Bytes = [byte[]]@(0xEF, 0xBB, 0x00);       Expect = 'Utf8' },
+        @{ Name = '00 FE';       Bytes = [byte[]]@(0x00, 0xFE);             Expect = 'Utf8' },
+        @{ Name = 'FF 00';       Bytes = [byte[]]@(0xFF, 0x00);             Expect = 'Utf8' },
+        @{ Name = '00 FF';       Bytes = [byte[]]@(0x00, 0xFF);             Expect = 'Utf8' },
+        @{ Name = 'FE 00';       Bytes = [byte[]]@(0xFE, 0x00);             Expect = 'Utf8' }
+    )
+
+    $i = 0
+    foreach ($case in $nearMisses) {
+        $i++
+        $path = Join-Path $TestDir "near_miss_$i.bin"
+        [System.IO.File]::WriteAllBytes($path, $case.Bytes)
+
+        # Act & Assert: Assert-Encoding reads the file through Get-FileEncoding and checks type, BOM and endianness
+        if ($case.Expect -eq 'Utf16Le') {
+            Assert-Encoding -TestName "Near miss $($case.Name) stays UTF-16 LE" -FilePath $path -ExpectedType ([System.Text.UnicodeEncoding]) -ExpectedEmitBom $true -ExpectedBigEndian $false
+        } else {
+            Assert-Encoding -TestName "Near miss $($case.Name) falls back to UTF-8 without BOM" -FilePath $path -ExpectedType ([System.Text.UTF8Encoding]) -ExpectedEmitBom $false
+        }
+    }
+
 }
 finally {
     # Cleanup workspace
@@ -176,10 +255,19 @@ finally {
     }
 }
 
-Write-Host "`n=== Test Summary ===" -ForegroundColor Cyan
-Write-Host "Passed: $PassCount" -ForegroundColor Green
-Write-Host "Failed: $FailCount" -ForegroundColor $(if ($FailCount -gt 0) { "Red" } else { "Gray" })
-
-if ($FailCount -gt 0) {
+# ----------------------------------------------------------------
+# Summary Output
+# ----------------------------------------------------------------
+Write-Host "`n====================================================" -ForegroundColor Cyan
+Write-Host " Test Summary" -ForegroundColor Cyan
+Write-Host " Total   : $script:TotalCount" -ForegroundColor Gray
+Write-Host " Passed  : $script:PassCount" -ForegroundColor Green
+if ($script:FailCount -gt 0) {
+    Write-Host " Failed  : $script:FailCount" -ForegroundColor Red
+    Write-Host "====================================================" -ForegroundColor Cyan
     exit 1
+} else {
+    Write-Host " Failed  : 0" -ForegroundColor Green
+    Write-Host "====================================================" -ForegroundColor Cyan
+    exit 0
 }

@@ -2,20 +2,15 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
 
     <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>false</SelfContained>
     <PublishTrimmed>false</PublishTrimmed>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <IncludeAllContentForSelfExtract>false</IncludeAllContentForSelfExtract>
     <InvariantGlobalization>false</InvariantGlobalization>
-    <StripSymbols>true</StripSymbols>
 
     <ApplicationIcon>servy.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -25,13 +20,17 @@
 
   <PropertyGroup>
     <AssemblyTitle>Servy.Manager</AssemblyTitle>
-    <AssemblyDescription>A tool to manage services installed by Servy</AssemblyDescription>
+    <Description>A tool to manage services installed by Servy</Description>
     <Product>Servy.Manager</Product>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="Resources\handle64.exe" />
-    <None Remove="Resources\handle64a.exe" />
+    <None Remove="Resources\Servy.Host.exe" />
+    <None Remove="Resources\Servy.Host.pdb" />
+    <None Remove="Resources\Servy.Service.exe" />
+    <None Remove="Resources\Servy.Service.pdb" />
+    <None Remove="Resources\Servy.Restarter.exe" />
+    <None Remove="Resources\Servy.Restarter.pdb" />
     <None Remove="Resources\Icons\Error.png" />
     <None Remove="Resources\Icons\Info.png" />
     <None Remove="Resources\Icons\Warning.png" />
@@ -45,10 +44,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="Resources\handle64.exe" />
-    <EmbeddedResource Include="Resources\handle64a.exe" />
+    <EmbeddedResource Include="Resources\Servy.Host.exe" />
+    <EmbeddedResource Include="Resources\Servy.Host.pdb" />
     <EmbeddedResource Include="Resources\Servy.Service.exe" />
     <EmbeddedResource Include="Resources\Servy.Service.pdb" />
+    <EmbeddedResource Include="Resources\Servy.Restarter.exe" />
+    <EmbeddedResource Include="Resources\Servy.Restarter.pdb" />
   </ItemGroup>
 
   <ItemGroup>
@@ -58,32 +59,17 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Update="Views\Controls\PidBadgeControl.xaml.cs">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Update="Views\Controls\ServiceListControl.xaml.cs">
-      <SubType>Code</SubType>
-    </Compile>
     <Compile Update="Resources\Strings.Designer.cs">
       <DependentUpon>Strings.resx</DependentUpon>
       <DesignTime>True</DesignTime>
       <AutoGen>True</AutoGen>
     </Compile>
-    <Compile Update="Views\DependenciesView.xaml.cs">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Update="Views\ConsoleView.xaml.cs">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Update="Views\ServiceSearchUserControl.cs">
-      <SubType>Code</SubType>
-    </Compile>
   </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Update="Resources\Strings.resx">
-      <LastGenOutput>Strings.Designer.cs</LastGenOutput>
       <Generator>PublicResXFileCodeGenerator</Generator>
+      <LastGenOutput>Strings.Designer.cs</LastGenOutput>
     </EmbeddedResource>
   </ItemGroup>
 

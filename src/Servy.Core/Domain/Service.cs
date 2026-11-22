@@ -1,5 +1,6 @@
 using Servy.Core.Common;
 using Servy.Core.Config;
+using Servy.Core.DTOs;
 using Servy.Core.Enums;
 using Servy.Core.Services;
 using System.ComponentModel;
@@ -36,6 +37,21 @@ namespace Servy.Core.Domain
     /// <description>
     /// <b>Post-Launch (Asynchronous):</b> Always "Sidecars." These run in a fire-and-forget manner
     /// after the main process starts and do not support supervisor features.
+    /// </description>
+    /// </item>
+    /// <item>
+    /// <description>
+    /// <b>Pre-Stop (Synchronous, advisory):</b> Runs before the child process tree is terminated and is
+    /// bounded by <see cref="PreStopTimeoutSeconds"/>, but it is not a gatekeeper: a failure never cancels
+    /// the stop, and <see cref="PreStopLogAsError"/> only decides whether it is logged as an error or a
+    /// warning.
+    /// </description>
+    /// </item>
+    /// <item>
+    /// <description>
+    /// <b>Post-Stop (Asynchronous):</b> A "Sidecar" like Post-Launch. It runs fire-and-forget after the
+    /// process tree is gone, is not tracked, and supports no supervisor features - so it has no timeout
+    /// property of its own.
     /// </description>
     /// </item>
     /// </list>
@@ -225,7 +241,8 @@ namespace Servy.Core.Domain
 
         /// <summary>
         /// Gets or sets the maximum time in seconds allowed for the heartbeat URL request to complete before it is cancelled.
-        /// Value must be clamped between <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> and <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/>.
+        /// Value must be between <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> and <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/>;
+        /// values outside that range are rejected by <see cref="Servy.Core.Validation.IServiceValidationRules"/> at install time.
         /// Default is <see cref="AppConfig.DefaultHeartbeatUrlTimeoutSeconds"/>.
         /// </summary>
         public int HeartbeatUrlTimeoutSeconds { get; set; } = AppConfig.DefaultHeartbeatUrlTimeoutSeconds;
@@ -256,6 +273,11 @@ namespace Servy.Core.Domain
         /// Gets or sets environment variables for the service in the form "KEY=VALUE;KEY2=VALUE2".
         /// </summary>
         public string? EnvironmentVariables { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether to allow overriding of protected runtime variables (e.g., <c>JAVA_HOME</c>, <c>JAVA_OPTS</c>, <c>CATALINA_OPTS</c>) by the service's environment variables.
+        /// </summary>
+        public bool AllowOverriddenRuntimeVars { get; set; }
 
         /// <summary>
         /// Gets or sets a semicolon- or newline-separated list of dependent service names.
@@ -344,8 +366,9 @@ namespace Servy.Core.Domain
         /// <summary>
         /// Gets or sets a value indicating whether debug logs are enabled.
         /// When enabled, environment variables and process parameters are recorded in the local
-        /// log file at <c>%ProgramData%\Servy\logs\Servy.Service.log</c>. Sensitive data is
-        /// never written to the Windows Event Log or shown by the CLI / PowerShell module.
+        /// log file at <c>%ProgramData%\Servy\logs\services\&lt;ServiceName&gt;\Servy.Service.log</c>. Sensitive data is
+        /// never written to the Windows Event Log; the CLI <c>show</c> command and <c>Show-ServyService</c> mask it
+        /// unless <c>--decrypt</c> / <c>-Decrypt</c> is passed.
         /// Not recommended for production environments, as these logs may contain sensitive information.
         /// Default is <see cref="AppConfig.DefaultEnableDebugLogs"/>.
         /// </summary>
@@ -429,7 +452,7 @@ namespace Servy.Core.Domain
         /// An <see cref="OperationResult"/> describing whether the start succeeded
         /// (<see cref="OperationResult.Success"/>) along with any failure context.
         /// </returns>
-        public async Task<OperationResult> Start(CancellationToken cancellationToken = default)
+        public async Task<OperationResult> StartAsync(CancellationToken cancellationToken = default)
         {
             return await _serviceManager.StartServiceAsync(Name, logSuccessfulStart: true, cancellationToken);
         }
@@ -442,7 +465,7 @@ namespace Servy.Core.Domain
         /// An <see cref="OperationResult"/> describing whether the stop succeeded
         /// (<see cref="OperationResult.Success"/>) along with any failure context.
         /// </returns>
-        public async Task<OperationResult> Stop(CancellationToken cancellationToken = default)
+        public async Task<OperationResult> StopAsync(CancellationToken cancellationToken = default)
         {
             return await _serviceManager.StopServiceAsync(Name, logSuccessfulStop: true, cancellationToken);
         }
@@ -455,7 +478,7 @@ namespace Servy.Core.Domain
         /// An <see cref="OperationResult"/> describing whether the restart succeeded
         /// (<see cref="OperationResult.Success"/>) along with any failure context.
         /// </returns>
-        public async Task<OperationResult> Restart(CancellationToken cancellationToken = default)
+        public async Task<OperationResult> RestartAsync(CancellationToken cancellationToken = default)
         {
             return await _serviceManager.RestartServiceAsync(Name, logSuccessfulRestart: true, cancellationToken);
         }
@@ -466,12 +489,13 @@ namespace Servy.Core.Domain
         /// <param name="cancellationToken">Optional cancellation token.</param>
         /// <returns>
         /// A <see cref="ServiceControllerStatus"/> value representing the current service status,
-        /// or <c>null</c> if the service is not installed.
+        /// or <c>null</c> if the status could not be determined: the service is not installed, or it could not
+        /// be opened (for example access denied). A <c>null</c> is not proof of absence; use
+        /// <see cref="IsInstalled"/> to distinguish.
         /// </returns>
         public ServiceControllerStatus? GetStatus(CancellationToken cancellationToken = default)
         {
-            // Bypassed independent IsInstalled pre-check to resolve the TOCTOU window vulnerability.
-            // Delegate status resolution directly to a single-query path that returns null safely on missing services.
+            // Single-query path: returns null for missing services, avoiding a check-then-query TOCTOU window.
             return _serviceManager.GetServiceStatus(Name, cancellationToken);
         }
 
@@ -488,19 +512,6 @@ namespace Servy.Core.Domain
         }
 
         /// <summary>
-        /// Gets the configured startup type of the Windows service represented by this instance.
-        /// </summary>
-        /// <param name="cancellationToken">Optional cancellation token.</param>
-        /// <returns>
-        /// A <see cref="ServiceStartType"/> value representing the startup type,
-        /// or <c>null</c> if the service is not installed or the startup type cannot be determined.
-        /// </returns>
-        public ServiceStartType? GetServiceStartupType(CancellationToken cancellationToken = default)
-        {
-            return _serviceManager.GetServiceStartupType(Name, cancellationToken);
-        }
-
-        /// <summary>
         /// Installs the Windows service using the configured domain properties.
         /// </summary>
         /// <remarks>
@@ -513,6 +524,11 @@ namespace Servy.Core.Domain
         /// settings, monitoring options, recovery actions, etc.) to the underlying
         /// <see cref="IServiceManager"/> implementation.
         /// </para>
+        /// <para>
+        /// A <see cref="Win32Exception"/> raised while opening the Service Control Manager or creating/updating
+        /// the service is not thrown to the caller: the <see cref="ServiceManager"/> implementation catches it and
+        /// reports it as a failed <see cref="OperationResult"/>.
+        /// </para>
         /// </remarks>
         /// <returns>
         /// A task that represents the asynchronous install operation. The task result
@@ -522,15 +538,11 @@ namespace Servy.Core.Domain
         /// <param name="wrapperExeDir">Wrapper exe parent directory.</param>
         /// <param name="isCLI">Indicates if install is from the CLI.</param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
-        /// <exception cref="ArgumentNullException">
+        /// <exception cref="ArgumentException">
         /// Thrown if required properties such as <see cref="Name"/> or
-        /// <see cref="ExecutablePath"/> are null or empty.
+        /// <see cref="ExecutablePath"/> are null, empty, or whitespace.
         /// </exception>
-        /// <exception cref="Win32Exception">
-        /// Thrown if the Service Control Manager cannot be accessed or the service
-        /// cannot be created/updated.
-        /// </exception>
-        public async Task<OperationResult> Install(string? wrapperExeDir = null, bool isCLI = false, CancellationToken cancellationToken = default)
+        public async Task<OperationResult> InstallAsync(string? wrapperExeDir = null, bool isCLI = false, CancellationToken cancellationToken = default)
         {
             var servyServiceFilename = isCLI ? AppConfig.ServyServiceCLIExe : AppConfig.ServyServiceUIExe;
 #if DEBUG
@@ -574,6 +586,7 @@ namespace Servy.Core.Domain
                 HeartbeatUrlTimeoutSeconds = HeartbeatUrlTimeoutSeconds,
                 EnableHeartbeatUrlFlags = EnableHeartbeatUrlFlags,
                 EnvironmentVariables = EnvironmentVariables,
+                AllowOverriddenRuntimeVars = AllowOverriddenRuntimeVars,
                 ServiceDependencies = ServiceDependencies,
                 Username = RunAsLocalSystem ? null : UserAccount,
                 Password = RunAsLocalSystem ? null : Password,
@@ -590,7 +603,7 @@ namespace Servy.Core.Domain
 
                 FailureProgramPath = FailureProgramPath,
                 FailureProgramStartupDirectory = FailureProgramStartupDirectory,
-                FailureProgramArgs = FailureProgramParameters,
+                FailureProgramExecutableArgs = FailureProgramParameters,
 
                 PostLaunchExePath = PostLaunchExecutablePath,
                 PostLaunchStartupDirectory = PostLaunchStartupDirectory,
@@ -627,14 +640,15 @@ namespace Servy.Core.Domain
         /// is <see cref="OperationResult"/> describing whether the uninstall succeeded
         /// (<see cref="OperationResult.Success"/>) along with any failure context.
         /// </returns>
-        /// <exception cref="ArgumentNullException">
-        /// Thrown if <see cref="Name"/> is null or empty.
+        /// <exception cref="ArgumentException">
+        /// Thrown if <see cref="Name"/> is null, empty, or whitespace.
         /// </exception>
-        /// <exception cref="Win32Exception">
-        /// Thrown if the Service Control Manager cannot be accessed or the service
-        /// cannot be removed.
-        /// </exception>
-        public async Task<OperationResult> Uninstall(CancellationToken cancellationToken = default)
+        /// <remarks>
+        /// A <see cref="Win32Exception"/> raised while opening the Service Control Manager or removing the
+        /// service is not thrown to the caller: the <see cref="ServiceManager"/> implementation catches it and
+        /// reports it as a failed <see cref="OperationResult"/>.
+        /// </remarks>
+        public async Task<OperationResult> UninstallAsync(CancellationToken cancellationToken = default)
         {
             return await _serviceManager.UninstallServiceAsync(Name, cancellationToken);
         }

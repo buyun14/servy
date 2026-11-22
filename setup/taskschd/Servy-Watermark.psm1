@@ -1,4 +1,5 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Shared utility module for Servy notification systems.
@@ -20,19 +21,23 @@
 $getErrorsScript = Join-Path $PSScriptRoot "Get-ServyLastErrors.ps1"
 $writeLogScript = Join-Path $PSScriptRoot "Write-ServyLog.ps1"
 
-if ((Test-Path $getErrorsScript) -and (Test-Path $writeLogScript)) {
+if ((Test-Path -LiteralPath $getErrorsScript) -and (Test-Path -LiteralPath $writeLogScript)) {
     . $getErrorsScript
     . $writeLogScript
 } else {
     $missing = @()
-    if (-not (Test-Path $getErrorsScript)) { $missing += 'Get-ServyLastErrors.ps1' }
-    if (-not (Test-Path $writeLogScript))  { $missing += 'Write-ServyLog.ps1' }
+    if (-not (Test-Path -LiteralPath $getErrorsScript)) { $missing += 'Get-ServyLastErrors.ps1' }
+    if (-not (Test-Path -LiteralPath $writeLogScript))  { $missing += 'Write-ServyLog.ps1' }
     throw "Servy-Watermark Module: Required dependency missing in '$PSScriptRoot': $($missing -join ', ')"
 }
 
 # Event ID Taxonomy (Refer to src/Servy.Core/Logging/EventIds.cs for updates)
 # 3000-3099: Core Errors | 3100-3199: Script Errors
-$EVENT_ID_ERROR = 3103
+$EVENT_ID_ERROR = 3103 # mirrors EventIds.ScheduledTaskScriptError
+
+# Per-run notification cap (#7539): the most error events one run of ServyFailureEmail.ps1 or
+# ServyFailureNotification.ps1 delivers. Get-EventsToProcess keeps the newest ones and skips the rest.
+$MAX_EVENTS_PER_RUN = 10
 
 # -------------------------------
 # Helper: Fallback Logging
@@ -58,7 +63,9 @@ function Write-WatermarkLocalLog {
 function Write-FallbackError {
     <#
     .SYNOPSIS
-        Logs an error to the Windows Application Event Log, with a local file fallback.
+        Reports a notification-script error three ways: a console warning, the local fallback log file
+        (always written, and written first, as the primary record), then a best-effort Warning-level
+        entry in the Windows Application Event Log.
     #>
     param(
         [string]$Message,
@@ -101,9 +108,9 @@ function Read-Watermark {
     #>
     param([string]$TimestampFile)
     $lastProcessed = $null
-    if (Test-Path $TimestampFile) {
+    if (Test-Path -LiteralPath $TimestampFile) {
         try {
-            $raw = (Get-Content $TimestampFile -Raw -ErrorAction Stop)
+            $raw = (Get-Content -LiteralPath $TimestampFile -Raw -ErrorAction Stop)
             $lastProcessed = ConvertFrom-WatermarkString -Value $raw
         } catch {
             Write-Warning "Could not parse timestamp file; treating as first run - will only show the most recent event."
@@ -125,9 +132,10 @@ function Update-Watermark {
 
     if ($null -eq $TimeCreated) { return }
 
-    # --- CRITICAL: Always advance the watermark ---
-    # Update timestamp immediately for this specific event, regardless of email/toast success.
-    $newestTimestamp = $TimeCreated
+    # --- Advance the watermark to this event ---
+    # The callers decide when: after a delivered or permanently failed event, but not after a
+    # transient failure, so that event is retried on the next run.
+    $newestTimestamp = ([datetime]$TimeCreated).ToUniversalTime()
     $timestampString = $newestTimestamp.ToString("o")
 
     # Retry loop to gracefully handle concurrent FileShare.None lock collisions
@@ -149,7 +157,7 @@ function Update-Watermark {
             $shouldWrite = $true
 
             # 1. Atomic Read/Compare Phase: Safely evaluate if the watermark needs advancing
-            if (Test-Path $TimestampFile) {
+            if (Test-Path -LiteralPath $TimestampFile) {
                 $fs = [System.IO.File]::Open($TimestampFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
                 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
                 $reader = New-Object System.IO.StreamReader($fs, $utf8NoBom, $false, 1024, $true)
@@ -161,12 +169,16 @@ function Update-Watermark {
 
                 if (-not [string]::IsNullOrWhiteSpace($currentFileContent)) {
                     try {
+                        # ConvertFrom-WatermarkString never throws - unparseable content returns
+                        # $null here, and PowerShell then evaluates "-le $null" as False, so a
+                        # corrupt file still falls through to the write below and gets healed.
                         $fileTimestamp = ConvertFrom-WatermarkString -Value $currentFileContent
-                        if ($fileTimestamp -ne $null -and $newestTimestamp -le $fileTimestamp) {
+                        if ($newestTimestamp -le $fileTimestamp) {
                             $shouldWrite = $false
                         }
                     } catch {
-                        # If file is corrupt or unparseable, overwrite it to heal state boundary
+                        # Unreachable today (nothing above throws); kept as a defensive net in
+                        # case a future edit to this block introduces something that can.
                         Write-Warning "Could not parse current timestamp file during update check. Overwriting to heal file."
                     }
                 }
@@ -186,7 +198,7 @@ function Update-Watermark {
                 $fs = $null
 
                 # Commit changes atomically.
-                if (Test-Path $tempFile) {
+                if (Test-Path -LiteralPath $tempFile) {
                     # PATH CONFORMANCE: Convert all paths to explicit absolute forms.
                     # Instead of $null, we provide a valid, conforming backup path string ($absoluteBackup)
                     # to keep the underlying Win32 subsystem happy under .NET Framework 4.8 / PS 5.1.
@@ -194,7 +206,22 @@ function Update-Watermark {
                     $absoluteTimestamp = [System.IO.Path]::GetFullPath($TimestampFile)
                     $absoluteBackup    = [System.IO.Path]::GetFullPath($backupFile)
 
-                    if (Test-Path $absoluteTimestamp) {
+                    if (Test-Path -LiteralPath $absoluteTimestamp) {
+                        # Re-check target watermark state immediately before commit to prevent stale-write regressions
+                        $recheckContent = [System.IO.File]::ReadAllText($absoluteTimestamp).Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($recheckContent)) {
+                            try {
+                                $recheckTimestamp = ConvertFrom-WatermarkString -Value $recheckContent
+                                if ($null -ne $recheckTimestamp -and $newestTimestamp -le $recheckTimestamp) {
+                                    # Concurrent process advanced the watermark past us; discard staging and treat as completed
+                                    Remove-Item -LiteralPath $absoluteTemp -Force -ErrorAction SilentlyContinue
+                                    break
+                                }
+                            } catch {
+                                # Corrupt file will be overwritten below
+                            }
+                        }
+
                         [System.IO.File]::Replace($absoluteTemp, $absoluteTimestamp, $absoluteBackup)
                     } else {
                         # First run scenario: The target file doesn't exist yet, so a basic Move is safe and atomic.
@@ -234,8 +261,8 @@ function Update-Watermark {
             if ($null -ne $fs)     { try { $fs.Dispose() }     catch {} }
 
             # Post-swap cleanup: Scrub both transient staging and backup assets from disk
-            if (Test-Path $tempFile)   { try { Remove-Item $tempFile -Force }   catch {} }
-            if (Test-Path $backupFile) { try { Remove-Item $backupFile -Force } catch {} }
+            if (Test-Path -LiteralPath $tempFile)   { try { Remove-Item -LiteralPath $tempFile -Force }   catch {} }
+            if (Test-Path -LiteralPath $backupFile) { try { Remove-Item -LiteralPath $backupFile -Force } catch {} }
         }
     }
 }
@@ -244,10 +271,27 @@ function Get-EventsToProcess {
     <#
     .SYNOPSIS
         Fetches and sorts the new Servy errors based on the provided watermark.
+
+    .DESCRIPTION
+        Returns the newest valid event on a first run (no watermark), otherwise the new events in
+        chronological order, at most MaxEventsPerRun of them. When more arrived since the watermark,
+        the newest MaxEventsPerRun are returned and the older ones are skipped; the skip is written
+        as a warning and to the local ServyWatermarkErrors.log.
+
+    .PARAMETER ScriptDir
+        The calling script's directory, where the local log is written.
+
+    .PARAMETER LastProcessed
+        The watermark: the creation time of the last delivered event, or $null on a first run.
+
+    .PARAMETER MaxEventsPerRun
+        The per-run cap. Defaults to $MAX_EVENTS_PER_RUN (10).
     #>
     param(
         [string]$ScriptDir,
-        [System.Nullable[DateTime]]$LastProcessed = $null
+        [System.Nullable[DateTime]]$LastProcessed = $null,
+        [ValidateRange(1, 1000)]
+        [int]$MaxEventsPerRun = $MAX_EVENTS_PER_RUN
     )
 
     # Dot-sourced into module scope; pass the event ID explicitly rather than relying on scope inheritance.
@@ -258,8 +302,10 @@ function Get-EventsToProcess {
         return $null
     }
 
-    # PRE-FILTER: Prevent feedback loops *before* selecting the most recent event.
-    # This ensures a notification failure doesn't mask a genuine service crash during a first run.
+    # PRE-FILTER BACKSTOP: Secondary guard against feedback loops from legacy event entries (pre-#3160).
+    # Current notification scripts log script failures at Warning (Level 3), which Level = 2 query filters
+    # exclude upfront. This filter ensures remaining legacy feedback entries left by earlier versions on upgraded
+    # hosts do not mask a genuine service crash during a first run.
     $errors = @($rawErrors | Where-Object {
         $_.Message -notmatch "^ServyFailureEmail:" -and
         $_.Message -notmatch "^ServyToast:" -and
@@ -279,7 +325,21 @@ function Get-EventsToProcess {
     } else {
         # NORMAL RUN LOGIC: Chronological order
         # Explicitly cast to array to handle single-event scenarios
-        return @($errors | Sort-Object TimeCreated)
+        $sorted = @($errors | Sort-Object TimeCreated)
+
+        # PER-RUN CAP (#7539): a burst of error events must not become a burst of emails or toasts.
+        # Keep the newest $MaxEventsPerRun, still oldest first, and skip the older ones. Once the caller
+        # advances the watermark past the delivered events, the skipped ones are behind it and are never
+        # notified, so a flood costs one capped run instead of one email or toast per event.
+        if ($sorted.Count -gt $MaxEventsPerRun) {
+            $skipped = $sorted.Count - $MaxEventsPerRun
+            $capMessage = "Per-run cap reached: $($sorted.Count) new Servy error events, notifying the newest $MaxEventsPerRun and skipping the $skipped oldest (created $($sorted[0].TimeCreated.ToString('o')) to $($sorted[$skipped - 1].TimeCreated.ToString('o')))."
+            Write-Warning "ServyWatermark: $capMessage"
+            Write-WatermarkLocalLog -ScriptDir $ScriptDir -Message $capMessage
+            $sorted = @($sorted | Select-Object -Last $MaxEventsPerRun)
+        }
+
+        return $sorted
     }
 }
 
@@ -290,17 +350,14 @@ function ConvertFrom-ServyEventMessage {
     #>
     param([string]$Message)
 
-    # Parse raw message context
-    # Split the first line to safely extract the service prefix, preventing multi-line stack traces
-    # from forcing a fallback to an 'Unknown Service' state.
+    # Split first line to inspect header brackets safely
     $firstLine, $rest = $Message -split "\r?\n", 2
 
-    if ($firstLine -match '^\[(.+?)\]\s*(.*)$') {
+    # Match the primary service name in the first bracket [ServiceName]
+    if ($firstLine -match '^\[([^\]]+)\]\s*(.*)$') {
         return @{
             ServiceName = $matches[1]
-            LogText = if ($rest) {
-                if ([string]::IsNullOrEmpty($matches[2])) { $rest } else { "$($matches[2])`n$rest" }
-            } else { $matches[2] }
+            LogText     = $Message  # Retain the complete raw message including all brackets
         }
     } else {
         return @{

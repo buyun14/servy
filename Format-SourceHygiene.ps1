@@ -1,20 +1,24 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
-    Enforces whitespace hygiene (trailing whitespace removal and final newline insertion) across repository source files.
+    Enforces whitespace hygiene (trailing whitespace removal, final newline insertion, line-ending normalization, and UTF-8 BOM policy) across repository source files.
 
 .DESCRIPTION
     Scans source code, project configurations, PowerShell scripts, YAML workflows, and markdown files
     across the repository (excluding build outputs like bin/obj, version control folders, and generated files like *.g.cs, *.g.i.cs, *.Designer.cs),
-    enforcing two EditorConfig rules:
+    enforcing EditorConfig rules:
     1. Trims trailing whitespace from all lines (trim_trailing_whitespace = true).
     2. Ensures every file ends with a trailing newline (insert_final_newline = true).
+    3. Normalizes line endings to CRLF (end_of_line = crlf).
+    4. Enforces charset encoding policy (UTF-8 with BOM for .ps1, .psm1, .psd1, .xml, .config; UTF-8 without BOM for all others).
 
     Note: .resx files are explicitly excluded because trailing whitespace within XML <value> elements
-    can be meaningful string content.
+    can be meaningful string content. Additionally, trailing whitespace is preserved on .md files to respect
+    .editorconfig's [*.md] section where trim_trailing_whitespace = false (as two trailing spaces denote Markdown hard line breaks).
 
 .PARAMETER DryRun
-    If specified, previews the files that violate whitespace hygiene rules without modifying them on disk.
+    If specified, previews the files that violate whitespace hygiene or charset rules without modifying them on disk.
 
 .EXAMPLE
     .\Format-SourceHygiene.ps1
@@ -24,7 +28,7 @@ Formats all applicable repository files in-place.
 .EXAMPLE
     .\Format-SourceHygiene.ps1 -DryRun
 
-Previews files needing whitespace trimming or missing a final newline without writing changes to disk.
+Previews files needing formatting or encoding corrections without writing changes to disk.
 
 .NOTES
     File Name : Format-SourceHygiene.ps1
@@ -39,41 +43,46 @@ $ErrorActionPreference = "Stop"
 
 $baseDir = $PSScriptRoot
 
-# Dot-source Update-FileHelpers.ps1 for shared exclusion definitions if available
-$helperPath = Join-Path $PSScriptRoot "Update-FileHelpers.ps1"
-if (Test-Path $helperPath) {
-    . $helperPath
+# Dot-source Update-FileHelpers.ps1 for shared exclusion definitions
+$helperFile = "Update-FileHelpers.ps1"
+$helperPath = Join-Path $PSScriptRoot $helperFile
+if (-not (Test-Path -LiteralPath $helperPath)) {
+    throw "Critical dependency missing: '$helperFile' was not found at '$helperPath'. Ensure the helper is in the same directory as this script."
 }
+. $helperPath
 
-$exclusionRegex = if ($script:BuildArtifactExclusionRegex) {
-    $script:BuildArtifactExclusionRegex
-} else {
-    '[\\/](bin|obj|packages|\.git|\.vs|node_modules|coveragereport|TestResults)[\\/]'
-}
+$exclusionRegex = $script:BuildArtifactExclusionRegex
 
 if ($DryRun) {
-    Write-Host "DRY-RUN: Previewing files violating whitespace hygiene..." -ForegroundColor Yellow
+    Write-Host "DRY-RUN: Previewing files violating whitespace hygiene and charset rules..." -ForegroundColor Yellow
 } else {
-    Write-Host "Scanning and formatting files for whitespace hygiene..." -ForegroundColor Cyan
+    Write-Host "Scanning and formatting files for whitespace hygiene and charset rules..." -ForegroundColor Cyan
 }
 
 $scannedCount = 0
 $modifiedCount = 0
-$trimmedOnlyCount = 0
-$newlineOnlyCount = 0
-$bothCount = 0
+$failedCount = 0
+$trailingWhitespaceCount = 0
+$missingNewlineCount = 0
+$lfEndingCount = 0
+$bomCount = 0
 
-# Extensions governed by .editorconfig whitespace rules
+# File extensions requiring UTF-8 BOM encoding (.config kept for future App.config/Web.config support)
+$bomRequiredExtensions = $script:BomRequiredExtensions
+
+# Extensions governed by .editorconfig whitespace and charset rules (mirroring [*] scope).
 # NOTE: .resx files are deliberately omitted because trailing spaces inside XML <value> elements
 # represent localized string data rather than code formatting.
 $textExtensions = @(
     '.cs', '.yml', '.yaml', '.ps1', '.psm1', '.psd1',
     '.csproj', '.props', '.targets', '.xaml',
-    '.md', '.iss', '.manifest', '.json', '.sln'
+    '.md', '.iss', '.manifest', '.json', '.sln',
+    '.xml', '.config', '.js', '.py', '.vbs', '.toml',
+    '.ahk', '.nuspec', '.txt'
 )
 
 # Collect repository text files excluding build output, version control, and generated files
-$filesToScan = Get-ChildItem -Path $baseDir -Recurse -File -ErrorAction SilentlyContinue |
+$filesToScan = Get-ChildItem -LiteralPath $baseDir -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object {
         $relativePath = $_.FullName.Replace($baseDir, '')
 
@@ -89,53 +98,111 @@ $filesToScan = Get-ChildItem -Path $baseDir -Recurse -File -ErrorAction Silently
                    ($_.Name -notlike '*.g.i.cs')
         }
 
-        return $_.Extension -in $textExtensions
+        # Extensionless dotfiles (e.g. .editorconfig, .gitattributes, .gitignore, .gitleaksignore)
+        # where FileInfo.Extension equals the whole filename rather than a file extension.
+        $isDotFile = $_.Name.StartsWith('.') -and ($_.Name.IndexOf('.', 1) -lt 0)
+
+        return ($_.Extension -in $textExtensions) -or $isDotFile
     }
 
 foreach ($file in $filesToScan) {
     $scannedCount++
     $filePath = $file.FullName
-    $rawText = [System.IO.File]::ReadAllText($filePath)
+    $relativePath = $file.FullName.Replace($baseDir, '')
 
-    # Check 1: Missing final newline (CRLF)
-    $lacksFinalNewline = ($rawText.Length -gt 0) -and (-not $rawText.EndsWith("`r`n"))
+    try {
+        # Inspect encoding strictly; throw exception if file contains undecodable bytes
+        $sourceEncoding = Get-FileEncoding $filePath
+        $rawText = [System.IO.File]::ReadAllText($filePath, $sourceEncoding)
 
-    # Check 2: Trailing whitespace per line
-    $hasTrailingWhitespace = $false
-    $lines = Get-Content -Path $filePath -Encoding UTF8
-    $trimmedLines = foreach ($line in $lines) {
-        $t = $line.TrimEnd()
-        if ($t -ne $line) {
-            $hasTrailingWhitespace = $true
+        # Check Charset & BOM policy using single-pass Get-FileEncoding result (#6625)
+        $isUtf8   = $sourceEncoding -is [System.Text.UTF8Encoding]
+        $hasBom   = $isUtf8 -and ($sourceEncoding.GetPreamble().Length -eq 3)
+        $wantsBom = $file.Extension -in $bomRequiredExtensions
+        $bomWrong = (-not $isUtf8) -or ($hasBom -ne $wantsBom)
+
+        # .editorconfig [*.md] sets trim_trailing_whitespace = false: two trailing
+        # spaces are a Markdown hard line break, not stray whitespace.
+        $trimAllowed = $file.Extension -ne '.md'
+
+        # Check 1: Missing final newline (insert_final_newline = true) (#6612)
+        $lacksFinalNewline = ($rawText.Length -gt 0) -and (-not $rawText.EndsWith("`n"))
+
+        # Check 2: Non-CRLF line endings (end_of_line = crlf) (#6612)
+        $hasLfEndings = $rawText.Contains("`n") -and ($rawText -replace "`r`n", '').Contains("`n")
+
+        # Check 3: Trailing whitespace per line (derived from in-memory split)
+        $hasTrailingWhitespace = $false
+        $lines = $rawText -split "`r?`n"
+        $trimmedLines = foreach ($line in $lines) {
+            if ($trimAllowed) {
+                $t = $line.TrimEnd()
+                if ($t -ne $line) {
+                    $hasTrailingWhitespace = $true
+                }
+                $t
+            } else {
+                $line
+            }
         }
-        $t
+
+        if ($hasTrailingWhitespace -or $lacksFinalNewline -or $hasLfEndings -or $bomWrong) {
+            # Build precise issue categorization reasons for reporting
+            $reasons = @()
+            if ($hasTrailingWhitespace) {
+                $trailingWhitespaceCount++
+                $reasons += "trailing whitespace"
+            }
+            if ($lacksFinalNewline) {
+                $missingNewlineCount++
+                $reasons += "missing final newline"
+            }
+            if ($hasLfEndings) {
+                $lfEndingCount++
+                $reasons += "LF line endings"
+            }
+            if ($bomWrong) {
+                $bomCount++
+                if (-not $isUtf8) {
+                    $reasons += "not UTF-8 ($($sourceEncoding.EncodingName))"
+                } else {
+                    $reasons += if ($wantsBom) { "missing UTF-8 BOM" } else { "UTF-8 BOM detected" }
+                }
+            }
+            $reasonStr = $reasons -join " & "
+
+            if ($DryRun) {
+                $modifiedCount++
+                Write-Host "Would format ($reasonStr): $relativePath" -ForegroundColor Yellow
+            } else {
+                $targetEncoding = New-Object System.Text.UTF8Encoding($wantsBom)
+
+                # Drop trailing empty element produced by splitting text ending with a newline.
+                # Bounded at > 1 (not > 0): a single-element array here is $trimmedLines -eq @(''),
+                # and 0..($trimmedLines.Count - 2) would evaluate as the descending range 0..-1.
+                if ($trimmedLines.Count -gt 1 -and $trimmedLines[-1] -eq '') {
+                    $trimmedLines = $trimmedLines[0..($trimmedLines.Count - 2)]
+                }
+
+                $body = $trimmedLines -join "`r`n"
+
+                # A file that is empty, or becomes empty once trailing whitespace is trimmed, needs
+                # no final newline (Check 1 exempts it); rewriting must not add one.
+                $content = if ($body.Length -eq 0) { '' } else { $body + "`r`n" }
+
+                [System.IO.File]::WriteAllText($filePath, $content, $targetEncoding)
+                $modifiedCount++
+                Write-Host "Formatted ($reasonStr): $relativePath" -ForegroundColor Gray
+            }
+        }
     }
-
-    if ($hasTrailingWhitespace -or $lacksFinalNewline) {
-        $modifiedCount++
-        $relativePath = $file.FullName.Replace($baseDir, '')
-
-        # Detail categorization for progress output
-        $reason = if ($hasTrailingWhitespace -and $lacksFinalNewline) {
-            $bothCount++
-            "trailing whitespace & missing final newline"
-        } elseif ($hasTrailingWhitespace) {
-            $trimmedOnlyCount++
-            "trailing whitespace"
-        } else {
-            $newlineOnlyCount++
-            "missing final newline"
-        }
-
-        if ($DryRun) {
-            Write-Host "Would format ($reason): $relativePath" -ForegroundColor Yellow
-        } else {
-            # UTF8Encoding($false) = no BOM, on both Windows PowerShell 5.1 and PowerShell 7+
-            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-            $content   = ($trimmedLines -join "`r`n") + "`r`n"
-            [System.IO.File]::WriteAllText($filePath, $content, $utf8NoBom)
-            Write-Host "Formatted ($reason): $relativePath" -ForegroundColor Gray
-        }
+    catch [System.Text.DecoderFallbackException] {
+        Write-Warning "Skipped ${relativePath}: undecodable bytes for detected encoding ($($sourceEncoding.WebName)): $_"
+        $failedCount++
+    }
+    catch {
+        Write-Warning "Failed to process ${relativePath}: $_"
+        $failedCount++
     }
 }
 
@@ -143,8 +210,26 @@ if ($DryRun) {
     Write-Host "`nDRY-RUN: Scan Complete! (No files modified)" -ForegroundColor Yellow
     Write-Host "Files Scanned        : $scannedCount"
     Write-Host "Files Needing Format : $modifiedCount" -ForegroundColor Yellow
+    Write-Host "  trailing whitespace: $trailingWhitespaceCount"
+    Write-Host "  missing newline    : $missingNewlineCount"
+    Write-Host "  LF line endings    : $lfEndingCount"
+    Write-Host "  UTF-8 BOM / Charset: $bomCount"
+    if ($failedCount -gt 0) {
+        Write-Host "Files Skipped/Failed : $failedCount" -ForegroundColor Red
+    }
 } else {
     Write-Host "`nFormat Complete!" -ForegroundColor Green
     Write-Host "Files Scanned  : $scannedCount"
     Write-Host "Files Modified : $modifiedCount" -ForegroundColor Green
+    Write-Host "  trailing whitespace: $trailingWhitespaceCount"
+    Write-Host "  missing newline    : $missingNewlineCount"
+    Write-Host "  LF line endings    : $lfEndingCount"
+    Write-Host "  UTF-8 BOM / Charset: $bomCount"
+    if ($failedCount -gt 0) {
+        Write-Host "Files Skipped/Failed : $failedCount" -ForegroundColor Red
+    }
+}
+
+if ($failedCount -gt 0) {
+    exit 1
 }

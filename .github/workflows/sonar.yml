@@ -1,9 +1,9 @@
-# ===========================================
+# ==========================================================================================
 # GitHub Actions Workflow - Sonar
-# -------------------------------------------
+# ------------------------------------------------------------------------------------------
 # Performs SonarCloud static code analysis
 # and security scanning for the Servy solution.
-# ===========================================
+# ==========================================================================================
 
 name: sonar
 on:
@@ -52,7 +52,7 @@ jobs:
       - name: Cache SonarCloud packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
-          path: ~\sonar\cache
+          path: ~\.sonar\cache
           key: ${{ runner.os }}-sonar-analyzers-v1
           restore-keys: ${{ runner.os }}-sonar-analyzers-
 
@@ -74,6 +74,7 @@ jobs:
           if (-not (Test-Path $scannerDir)) { New-Item -Path $scannerDir -ItemType Directory | Out-Null }
           # Utilizing 'update' ensures version switches don't crash when versionless fallbacks populate the tool-path
           dotnet tool update dotnet-sonarscanner --version $env:SONAR_SCANNER_VERSION --tool-path $scannerDir
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool update dotnet-sonarscanner failed (exit $LASTEXITCODE)" }
 
       # 7. Build and Analyze
       - name: Build and analyze

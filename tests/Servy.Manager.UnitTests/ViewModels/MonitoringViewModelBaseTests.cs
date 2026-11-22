@@ -5,7 +5,6 @@ using Servy.Manager.ViewModels;
 using Servy.Testing;
 using Servy.UI.Constants;
 using Servy.UI.Services;
-using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Windows.Threading;
 
@@ -17,8 +16,8 @@ namespace Servy.Manager.UnitTests.ViewModels
         private readonly Mock<IUiDispatcher> _uiDispatcherMock;
         private readonly Mock<IServiceCommands> _serviceCommandsMock;
 
-        // Track generated SUT view model instances to enforce complete memory containment cleanup
-        private readonly ConcurrentBag<TestMonitoringViewModel> _allocatedViewModels = new ConcurrentBag<TestMonitoringViewModel>();
+        // Track created view models so the fixture can dispose them all
+        private readonly TrackedViewModels _allocatedViewModels = new TrackedViewModels();
 
         public MonitoringViewModelBaseTests()
         {
@@ -36,10 +35,13 @@ namespace Servy.Manager.UnitTests.ViewModels
 
             public bool IsOnMonitoringStoppedCalled { get; private set; }
 
-            // Backing property to verify hosted selection variants
+            // Value returned by the SelectedServiceItem override
             public ServiceItemBase? MockedSelectedService { get; set; }
 
-            public bool IsResetMonitoringStateCalled { get; private set; }
+            // A counter, not a one-way flag: only a count can tell one reset from several,
+            // which is what the _hadSelectedService latch in OnTickAsync exists to guarantee.
+            public int ResetMonitoringStateCallCount { get; private set; }
+            public bool IsResetMonitoringStateCalled => ResetMonitoringStateCallCount > 0;
             public ServiceItemBase? LastAppliedSelection { get; private set; }
 
             public TestMonitoringViewModel(
@@ -82,7 +84,7 @@ namespace Servy.Manager.UnitTests.ViewModels
 
             protected override void ResetMonitoringState()
             {
-                IsResetMonitoringStateCalled = true;
+                ResetMonitoringStateCallCount++;
             }
 
             protected override async Task ApplyTickAsync(ServiceItemBase selection, CancellationToken token)
@@ -121,9 +123,16 @@ namespace Servy.Manager.UnitTests.ViewModels
                 onTick ?? (_ => Task.CompletedTask)
             );
 
-            _allocatedViewModels.Add(vm);
+            _allocatedViewModels.Track(vm);
             return vm;
         }
+
+        /// <summary>
+        /// The single definition of "a valid selection" for the tick-path tests: a service item
+        /// whose <see cref="ServiceItemBase.Pid"/> passes the CopyPid CanExecute check.
+        /// </summary>
+        private static ConcreteServiceItem CreateLiveService() =>
+            new ConcreteServiceItem { Name = "LiveService", Pid = 9999 };
 
         #endregion
 
@@ -196,6 +205,51 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task StopMonitoring_DuringInFlightTick_DoesNotResurrectTheTimer()
+        {
+            // Arrange
+            var tcs = new TaskCompletionSource<object?>();
+            var vm = CreateViewModel(onTick: async _ => await tcs.Task);
+            vm.MockedSelectedService = CreateLiveService();
+            vm.StartMonitoring();
+
+            // Act - a tick is in flight (OnTick stopped the timer), then a stop is requested
+            vm.ExposeOnTick();
+            Assert.Equal(1, vm.ExposeIsTickRunningFlag);
+
+            vm.StopMonitoring();
+
+            // Act - let the in-flight tick complete so its finally block runs
+            tcs.SetResult(null);
+            await Helper.WaitUntilAsync(
+                () => vm.ExposeIsTickRunningFlag == 0,
+                TestTimeouts.CiGenerous,
+                cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert - the safety check must keep the timer stopped after the stop request
+            Assert.False(vm.ExposeTimer!.IsEnabled);
+            Assert.Equal(0, vm.ExposeIsMonitoringFlag);
+        }
+
+        [Fact]
+        public void StartMonitoring_CalledTwice_CancelsAndReplacesThePreviousSession()
+        {
+            // Arrange
+            var vm = CreateViewModel();
+            vm.StartMonitoring();
+            var firstCts = vm.ExposeCts;
+            var firstToken = vm.ExposeCurrentToken();
+
+            // Act
+            vm.StartMonitoring();
+
+            // Assert
+            Assert.NotSame(firstCts, vm.ExposeCts);
+            Assert.True(firstToken.IsCancellationRequested);
+            Assert.False(vm.ExposeCurrentToken().IsCancellationRequested);
+        }
+
+        [Fact]
         public void GetCurrentMonitoringToken_LifecycleStates_ReturnsExpectedTokens()
         {
             // Arrange
@@ -204,7 +258,6 @@ namespace Servy.Manager.UnitTests.ViewModels
             // Scenario 1: Not initialized yet -> Returns CancellationToken.None
             // Act & Assert
             Assert.Equal(CancellationToken.None, vm.ExposeCurrentToken());
-            Assert.False(vm.ExposeCurrentToken().IsCancellationRequested);
 
             // Scenario 2: Active monitoring session running -> Valid, live token
             // Act
@@ -229,7 +282,6 @@ namespace Servy.Manager.UnitTests.ViewModels
 
             // Assert
             Assert.Equal(CancellationToken.None, postDisposeToken);
-            Assert.False(postDisposeToken.IsCancellationRequested);
 
             // Scenario 5: Disposed CancellationTokenSource instance in _monitoringCts -> Catches ObjectDisposedException and returns canceled token
             // Act
@@ -254,7 +306,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             });
 
             // A valid selection: the ONLY thing that may block the payload is _isMonitoringFlag == 0.
-            vm.MockedSelectedService = new ConcreteServiceItem { Name = "LiveService", Pid = 9999 };
+            vm.MockedSelectedService = CreateLiveService();
             vm.ExposeInitTimer();          // timer exists, but StartMonitoring() was never called
 
             // Act
@@ -279,25 +331,62 @@ namespace Servy.Manager.UnitTests.ViewModels
                 await tcs.Task;
             });
 
-            // Active a valid service snapshot context to bypass the outer selection guard check inside OnTick logic
-            vm.MockedSelectedService = new ConcreteServiceItem { Name = "LiveService", Pid = 9999 };
+            // Set a valid selection so OnTickAsync forwards the tick to ApplyTickAsync
+            vm.MockedSelectedService = CreateLiveService();
             vm.StartMonitoring();
 
-            // Act - Trigger initial tick execution flow
-            vm.ExposeOnTick();
-            Assert.Equal(1, activeExecutionsCount);
-            Assert.Equal(1, vm.ExposeIsTickRunningFlag);
+            try
+            {
+                // Act - Trigger initial tick execution flow
+                vm.ExposeOnTick();
+                Assert.Equal(1, activeExecutionsCount);
+                Assert.Equal(1, vm.ExposeIsTickRunningFlag);
 
-            // Act - Concurrently trigger subsequent tick entry attempts while first loop is running
-            vm.ExposeOnTick();
+                // The tick must forward the current selection to ApplyTickAsync, not a stale or null one
+                Assert.Same(vm.MockedSelectedService, vm.LastAppliedSelection);
+
+                // Act - Concurrently trigger subsequent tick entry attempts while first loop is running
+                vm.ExposeOnTick();
+                vm.ExposeOnTick();
+
+                // Assert
+                Assert.Equal(1, activeExecutionsCount);
+                Assert.False(vm.ExposeTimer!.IsEnabled);
+            }
+            finally
+            {
+                // Teardown: release the in-flight tick even when an assert above fails,
+                // so no suspended async void operation survives the test.
+                tcs.TrySetResult(null);
+            }
+        }
+
+        [Fact]
+        public void OnTick_SelectionLostAfterBeingSet_ResetsMonitoringStateOnce()
+        {
+            // Arrange
+            var vm = CreateViewModel();
+            vm.MockedSelectedService = CreateLiveService();
+            vm.StartMonitoring();
+
+            // Act - a first tick with a selection latches _hadSelectedService
             vm.ExposeOnTick();
 
-            // Assert
-            Assert.Equal(1, activeExecutionsCount);
-            Assert.False(vm.ExposeTimer!.IsEnabled);
+            // Assert - the latching tick must not report a lost selection
+            Assert.False(vm.IsResetMonitoringStateCalled);
 
-            // Teardown
-            tcs.SetResult(null);
+            // Act - the selection is lost before the next tick
+            vm.MockedSelectedService = null;
+            vm.ExposeOnTick();
+
+            // Assert - exactly one reset, not merely "at least one"
+            Assert.Equal(1, vm.ResetMonitoringStateCallCount);
+
+            // Act - a further tick while the selection is still lost
+            vm.ExposeOnTick();
+
+            // Assert - the _hadSelectedService latch suppresses any further reset
+            Assert.Equal(1, vm.ResetMonitoringStateCallCount);
         }
 
         [Fact]
@@ -305,7 +394,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         {
             // Arrange
             var vm = CreateViewModel(onTick: _ => throw new OperationCanceledException());
-            vm.MockedSelectedService = new ConcreteServiceItem { Name = "LiveService", Pid = 9999 };
+            vm.MockedSelectedService = CreateLiveService();
             vm.StartMonitoring();
 
             // Pre-set error count to verify cancellation resets the consecutive error counter
@@ -325,7 +414,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         {
             // Arrange
             var vm = CreateViewModel(onTick: _ => throw new InvalidOperationException("SCM connection drop out panic."));
-            vm.MockedSelectedService = new ConcreteServiceItem { Name = "LiveService", Pid = 9999 };
+            vm.MockedSelectedService = CreateLiveService();
             vm.StartMonitoring();
 
             // Act & Assert Loop Chain Simulation
@@ -353,7 +442,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             // Arrange
             var vm = CreateViewModel();
 
-            vm.MockedSelectedService = new ConcreteServiceItem { Name = "LiveService", Pid = 9999 };
+            vm.MockedSelectedService = CreateLiveService();
             vm.StartMonitoring();
 
             // Retain reference to the underlying DispatcherTimer object instance before it is wiped
@@ -449,12 +538,12 @@ namespace Servy.Manager.UnitTests.ViewModels
 
                 // Assert
                 Assert.Equal("1248", vm.Pid);
-                // Symmetrical Verification: Verify that the change-suppression optimization actually prevented event execution loops
+                // The redundant assignment must not raise PropertyChanged
                 Assert.False(propertyChangedFired, "PropertyChanged was erroneously raised for an optimized redundant value assignment.");
             }
             finally
             {
-                // Tear down event handlers to preserve test runner sandbox limits
+                // Detach the handler so later asserts cannot observe stale events
                 vm.PropertyChanged -= handler;
             }
         }
@@ -480,6 +569,37 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task CopyPidAsync_WhileMonitoring_PassesTheSessionTokenToTheCommand()
+        {
+            // Arrange
+            var vm = CreateViewModel();
+            vm.MockedSelectedService = new ConcreteServiceItem { Name = "ServyEngine", Pid = 5028 };
+            vm.StartMonitoring();
+            var sessionToken = vm.ExposeCurrentToken();
+
+            // Act
+            await vm.CopyPidCommand.ExecuteAsync(null);
+
+            // Assert - the token is the live session token, not CancellationToken.None
+            Assert.True(sessionToken.CanBeCanceled);
+            _serviceCommandsMock.Verify(c => c.CopyPidAsync(It.IsAny<Service>(), sessionToken), Times.Once);
+        }
+
+        [Fact]
+        public void StartMonitoring_AfterFailuresInAPreviousSession_ResetsTheErrorCounter()
+        {
+            // Arrange - a previous session left the counter in the middle of a throttle window
+            var vm = CreateViewModel();
+            TestReflection.SetField(vm, "_tickErrorCount", 5L);
+
+            // Act
+            vm.StartMonitoring();
+
+            // Assert
+            Assert.Equal(0L, TestReflection.GetField<long>(vm, "_tickErrorCount"));
+        }
+
+        [Fact]
         public async Task CopyPidAsync_NullOrMissingProperties_BypassesExecutionAndReturnsSilently()
         {
             // Arrange
@@ -490,7 +610,7 @@ namespace Servy.Manager.UnitTests.ViewModels
             vm.MockedSelectedService = null;
             await vm.CopyPidCommand.ExecuteAsync(null);
 
-            // Scenario 2: Service instance assigned but numerical Pid collection value is missing
+            // Scenario 2: service assigned but its Pid is null
             // Act
             vm.MockedSelectedService = new ConcreteServiceItem { Pid = null };
             await vm.CopyPidCommand.ExecuteAsync(null);
@@ -508,17 +628,7 @@ namespace Servy.Manager.UnitTests.ViewModels
         /// </summary>
         public void Dispose()
         {
-            foreach (var vm in _allocatedViewModels)
-            {
-                try
-                {
-                    vm.Dispose();
-                }
-                catch
-                {
-                    // Catch-all block to guarantee adjacent cleanup executions complete safely
-                }
-            }
+            _allocatedViewModels.Dispose();
         }
 
         #endregion

@@ -1,8 +1,7 @@
-using Servy.Core.Data;
 using Servy.Core.Enums;
 using Servy.Core.EnvironmentVariables;
-using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using Servy.Service.CommandLine;
 using Servy.Service.ProcessManagement;
 using Servy.Service.StreamWriters;
@@ -18,9 +17,13 @@ namespace Servy.Service.UnitTests
     public class TestableService : Service
     {
         /// <summary>
-        /// Caches reflection bindings at class-load time.
-        /// Throws loudly and immediately if the underlying Service class is refactored
-        /// (e.g., variables renamed) ensuring tests don't silently fail.
+        /// Caches reflection bindings to <see cref="Service"/>'s private members.
+        /// Binding runs on first access to this class, not when <see cref="TestableService"/>
+        /// loads, and a failed binding throws (wrapped in a
+        /// <see cref="TypeInitializationException"/>, so the message is one InnerException down)
+        /// rather than letting a renamed member degrade into a silently skipped assertion.
+        /// Members that reach <see cref="Service"/> directly, such as InvokeCheckHealthAsync,
+        /// do not pass through here and validate nothing.
         /// </summary>
         private static class ServiceReflection
         {
@@ -31,6 +34,7 @@ namespace Servy.Service.UnitTests
             public static readonly FieldInfo RecoveryActionField = GetField("_recoveryAction");
             public static readonly FieldInfo FailedChecksField = GetField("_failedChecks");
             public static readonly FieldInfo MaxRestartAttemptsField = GetField("_maxRestartAttempts");
+            public static readonly FieldInfo RestartAttemptsServiceNameField = GetField("_restartAttemptsServiceName");
             public static readonly FieldInfo ServiceNameField = GetField("_serviceName");
             public static readonly FieldInfo RecoveryActionEnabledField = GetField("_recoveryActionEnabled");
 
@@ -41,6 +45,9 @@ namespace Servy.Service.UnitTests
             public static readonly MethodInfo OnProcessExitedMethod = GetMethod("OnProcessExited");
             public static readonly MethodInfo StartProcessMethod = GetMethod("StartProcess");
             public static readonly MethodInfo SafeKillProcessMethod = GetMethod("SafeKillProcess");
+            public static readonly MethodInfo StartPreStopProcessMethod = GetMethod("StartPreStopProcess");
+            public static readonly MethodInfo InitiateRecoveryAsyncMethod = GetMethod("InitiateRecoveryAsync");
+            public static readonly MethodInfo ExecuteRecoveryActionMethod = GetMethod("ExecuteRecoveryAction");
 
             private static FieldInfo GetField(string name) =>
                 typeof(Service).GetField(name, Flags)
@@ -58,29 +65,11 @@ namespace Servy.Service.UnitTests
             ITimerFactory timerFactory,
             IProcessFactory processFactory,
             IPathValidator pathValidator,
-            IServiceRepository serviceRepository,
-            IProcessKiller processKiller
+            INamedPipesService namedPipesService
             )
-            : base(serviceHelper, logger, streamWriterFactory, timerFactory, processFactory, pathValidator, serviceRepository, processKiller)
+            : base(serviceHelper, logger, streamWriterFactory, timerFactory, processFactory, pathValidator, namedPipesService)
         {
         }
-
-        public void TestOnStart(string[] args)
-        {
-            // Guarantee TestModeFlag is at position 0 so args[0] in Service.OnStart always matches
-            var testArgs = args ?? Array.Empty<string>();
-
-            if (testArgs.Length == 0 || !string.Equals(testArgs[0], TestModeFlag, StringComparison.OrdinalIgnoreCase))
-            {
-                // Remove duplicate TestModeFlag if it was placed elsewhere in the array, then insert at position 0
-                var filtered = testArgs.Where(a => !string.Equals(a, TestModeFlag, StringComparison.OrdinalIgnoreCase));
-                testArgs = new[] { TestModeFlag }.Concat(filtered).ToArray();
-            }
-
-            base.OnStart(testArgs);
-        }
-
-        public void InvokeSetProcessPriority(ProcessPriorityClass priority) => SetProcessPriority(priority);
 
         public void SetChildProcess(IProcessWrapper process) =>
             ServiceReflection.ChildProcessField.SetValue(this, process);
@@ -103,6 +92,11 @@ namespace Servy.Service.UnitTests
         public void SetMaxRestartAttempts(int value) =>
             ServiceReflection.MaxRestartAttemptsField.SetValue(this, value);
 
+        // Only OnStart sets this field, so the health-check tests must supply it themselves;
+        // while it is blank the restart-attempt counter is pinned to 0 and the cap is unreachable.
+        public void SetRestartAttemptsServiceName(string? serviceName) =>
+            ServiceReflection.RestartAttemptsServiceNameField.SetValue(this, serviceName);
+
         public void SetServiceName(string serviceName) =>
             ServiceReflection.ServiceNameField.SetValue(this, serviceName);
 
@@ -121,22 +115,51 @@ namespace Servy.Service.UnitTests
         public void InvokeOnProcessExited(object? sender, EventArgs e) =>
             ServiceReflection.OnProcessExitedMethod.Invoke(this, new object?[] { sender, e });
 
-        // Expose child process for asserts
         public IProcessWrapper GetChildProcess() =>
             (IProcessWrapper)ServiceReflection.ChildProcessField.GetValue(this)!;
 
-        // Expose StartProcess protected method and allow override logic
-        public void InvokeStartProcess(string exePath, string args, string workingDir, List<EnvironmentVariable> environmentVariables, CancellationToken cancellationToken)
+        // Expose the private StartProcess method for direct invocation
+        public void InvokeStartProcess(string exePath, string args, string workingDir, List<EnvironmentVariable> environmentVariables, bool allowOverriddenRuntimeVars, CancellationToken cancellationToken)
         {
-            ServiceReflection.StartProcessMethod.Invoke(this, new object?[] { exePath, args, workingDir, environmentVariables, cancellationToken });
+            ServiceReflection.StartProcessMethod.Invoke(this, new object?[] { exePath, args, workingDir, environmentVariables, allowOverriddenRuntimeVars, cancellationToken });
         }
 
-        // Expose SafeKillProcess protected method
-        public void InvokeSafeKillProcess(IProcessWrapper process) =>
-            ServiceReflection.SafeKillProcessMethod.Invoke(this, new object?[] { process, 5000 });
+        // Expose the private SafeKillProcess method, including the timeout it computes its deadline from
+        public void InvokeSafeKillProcess(IProcessWrapper process, int timeoutMs) =>
+            ServiceReflection.SafeKillProcessMethod.Invoke(this, new object?[] { process, timeoutMs });
+
+        // Expose the private StartPreStopProcess method. Its return value IS the pre-stop failure policy
+        // (true when the hook succeeded or its failure is ignored), which Cleanup reads, so the tests
+        // assert on it rather than only on the log lines.
+        public bool InvokeStartPreStopProcess(StartOptions options) =>
+            (bool)ServiceReflection.StartPreStopProcessMethod.Invoke(this, new object?[] { options })!;
 
         // Forces the state of the private backer field '_recoveryActionEnabled' via reflection.
         public void SetRecoveryActionEnabled(bool enabled) =>
             ServiceReflection.RecoveryActionEnabledField.SetValue(this, enabled);
+
+        // Expose the private InitiateRecoveryAsync method. The process-exit path reaches it through a
+        // scheduled task and the health-check path only after a failed check, so a test that targets
+        // its own arms - the semaphore teardown races, the recovery-execution catch - awaits it
+        // directly instead of arranging either trigger.
+        public Task InvokeInitiateRecoveryAsync() =>
+            (Task)ServiceReflection.InitiateRecoveryAsyncMethod.Invoke(this, null)!;
+
+        // Expose the private ExecuteRecoveryAction method, including the attempt count it formats
+        // into its "Performing recovery action" line. Invoking it directly is what lets a test
+        // observe the tracked-hook pruning without first driving a whole recovery.
+        public void InvokeExecuteRecoveryAction(int attemptCount) =>
+            ServiceReflection.ExecuteRecoveryActionMethod.Invoke(this, new object?[] { attemptCount });
+
+        /// <summary>
+        /// Gets or sets the boot time the reset evaluation sees, or <see langword="null"/> for the real one.
+        /// </summary>
+        public DateTime? BootTimeUtcForTest { get; set; }
+
+        /// <summary>
+        /// Serves the boot time from <see cref="BootTimeUtcForTest"/>, or the real one when none was supplied.
+        /// </summary>
+        /// <returns>The supplied boot time, or the value computed from the system uptime.</returns>
+        protected override DateTime GetSystemBootTimeUtc() => BootTimeUtcForTest ?? base.GetSystemBootTimeUtc();
     }
 }

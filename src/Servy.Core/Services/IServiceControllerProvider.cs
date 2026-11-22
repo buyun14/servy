@@ -6,10 +6,24 @@ namespace Servy.Core.Services
     public interface IServiceControllerProvider
     {
         /// <summary>
+        /// Retrieves a specific Windows service controller wrapper by service name.
+        /// </summary>
+        /// <param name="serviceName">The name that identifies the service to the system.</param>
+        /// <returns>
+        /// An <see cref="IServiceControllerWrapper"/> instance for the target service.
+        /// <b>The caller owns the returned wrapper and must dispose it</b>; it holds a live Service
+        /// Control Manager handle, the same as each element <see cref="GetServices"/> returns.
+        /// </returns>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="serviceName"/> is null, empty or white space.</exception>
+        IServiceControllerWrapper GetService(string serviceName);
+
+        /// <summary>
         /// Retrieves all Windows services currently registered on the local computer.
         /// </summary>
         /// <returns>
         /// An array of <see cref="IServiceControllerWrapper"/> instances representing the services.
+        /// <b>The caller owns the returned wrappers and must dispose every element</b>, including
+        /// any it does not go on to use; each wrapper holds a live Service Control Manager handle.
         /// </returns>
         /// <remarks>
         /// This is typically a wrapper around the static <see cref="System.ServiceProcess.ServiceController.GetServices()"/>

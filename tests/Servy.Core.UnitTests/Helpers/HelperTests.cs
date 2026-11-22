@@ -1,7 +1,9 @@
+using Servy.Core.Config;
 using Servy.Core.Resources;
-using Servy.Testing;
+using System.Diagnostics;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.InteropServices;
 using System.Text;
 using Helper = Servy.Core.Helpers.Helper;
 
@@ -38,7 +40,7 @@ namespace Servy.Core.UnitTests.Helpers
         [Theory]
         [InlineData(null, false)]
         [InlineData("", false)]
-        [InlineData("   ", false)]
+        [InlineData("    ", false)]
         [InlineData("..\\somepath", false)]            // Explicit directory traversal at start
         [InlineData("C:\\valid\\path.txt", true)]     // Valid absolute path (Windows style)
         [InlineData("C:/valid/path.txt", true)]       // Valid absolute path (forward slash)
@@ -111,66 +113,70 @@ namespace Servy.Core.UnitTests.Helpers
             Assert.Equal(expected, result);
         }
 
-        // Tests for CreateParentDirectory
-        [Fact]
-        public void CreateParentDirectory_NullOrWhitespace_ReturnsFalse()
-        {
-            Assert.False(Helper.CreateParentDirectory(null));
-            Assert.False(Helper.CreateParentDirectory(""));
-            Assert.False(Helper.CreateParentDirectory("    "));
-        }
-
-        [Fact]
-        public void CreateParentDirectory_PathHasNoParentDirectory_ReturnsFalse()
-        {
-            Assert.False(Helper.CreateParentDirectory("C:\\"));
-        }
+        #region EnsureDirectoryExists Tests
 
         [Theory]
-        [InlineData("file.txt")]
-        [InlineData("folder\\file.txt")]
-        [InlineData("folder/file.txt")]
-        [InlineData("deeply\\nested\\subfolder\\file.txt")]
-        public void CreateParentDirectory_DirectoryExistsOrCreated_ReturnsTrue(string filePath)
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void EnsureDirectoryExists_NullOrEmpty_DoesNotThrow(string? path)
         {
-            // Arrange
-            var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
-            Directory.CreateDirectory(tempDir);
-
-            // SANDBOX GUARD: By passing clean relative combinations, testFilePath is guaranteed
-            // to resolve directly inside the safe, unique tempDir boundary layout.
-            var testFilePath = Path.Combine(tempDir, filePath);
-
-            try
-            {
-                // Act
-                var result = Helper.CreateParentDirectory(testFilePath);
-
-                // Assert
-                Assert.True(result);
-
-                var parentDir = Path.GetDirectoryName(testFilePath);
-                Assert.NotNull(parentDir);
-                Assert.True(Directory.Exists(parentDir), $"The expected parent directory container '{parentDir}' was not physically instantiated on disk.");
-            }
-            finally
-            {
-                // Cleanup
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
+            // Act & Assert
+            var exception = Record.Exception(() => Helper.EnsureDirectoryExists(path));
+            Assert.Null(exception);
         }
 
         [Fact]
-        public void CreateParentDirectory_InvalidPath_ReturnsFalse()
+        public void EnsureDirectoryExists_ValidPath_CreatesDirectory()
         {
-            // Give an invalid path that will throw
-            var invalidPath = "?:\\invalid\\path\\file.txt";
-            var result = Helper.CreateParentDirectory(invalidPath);
-            Assert.False(result);
+            // Arrange
+            string targetDir = Path.Combine(_testRoot, "EnsureDirectoryFolder");
+            string dummyFilePath = Path.Combine(targetDir, "dummy.log");
+
+            Assert.False(Directory.Exists(targetDir));
+
+            // Act
+            Helper.EnsureDirectoryExists(dummyFilePath);
+
+            // Assert
+            Assert.True(Directory.Exists(targetDir), $"Directory was not created at target path: '{targetDir}'");
         }
+
+        #endregion
+
+        #region GetUniqueTempPath Tests
+
+        [Fact]
+        public void GetUniqueTempPath_ReturnsUniquePathWithGivenPrefixAndTmpExtension()
+        {
+            // Arrange
+            string basePath = Path.Combine(_testRoot, "Servy_Test");
+
+            // Act
+            string path1 = Helper.GetUniqueTempPath(basePath);
+            string path2 = Helper.GetUniqueTempPath(basePath);
+
+            // Assert
+            Assert.NotNull(path1);
+            Assert.NotNull(path2);
+            Assert.NotEqual(path1, path2);
+
+            // Verify it starts with the provided base path and ends with .tmp
+            Assert.StartsWith(basePath, path1, StringComparison.OrdinalIgnoreCase);
+            Assert.EndsWith(".tmp", path1, StringComparison.OrdinalIgnoreCase);
+
+            // Verify the generated format: basepath.<16-char-guid-hash>.tmp
+            string fileName = Path.GetFileName(path1);
+            string baseFileName = Path.GetFileName(basePath);
+            string[] parts = fileName.Split('.');
+
+            Assert.Equal(3, parts.Length); // [Servy_Test, <hash>, tmp]
+            Assert.Equal(baseFileName, parts[0], StringComparer.OrdinalIgnoreCase);
+            Assert.Equal(16, parts[1].Length);
+            Assert.Equal("tmp", parts[2], StringComparer.OrdinalIgnoreCase);
+        }
+
+        #endregion
 
         [Theory]
         [InlineData(null, "\"\"")]                  // null input
@@ -214,12 +220,12 @@ namespace Servy.Core.UnitTests.Helpers
 
         [Theory]
         [InlineData(null, "")]                               // Null input
-        [InlineData("", "")]                                 // Empty string
-        [InlineData("abc", "abc")]                           // Simple text, nothing to escape
-        [InlineData(@"C:\Path", @"C:\Path")]              // Backslashes not before quotes - unchanged
+        [InlineData("", "")]                                  // Empty string
+        [InlineData("abc", "abc")]                            // Simple text, nothing to escape
+        [InlineData(@"C:\Path", @"C:\Path")]               // Backslashes not before quotes - unchanged
         [InlineData(@"C:\Path\""File", @"C:\Path\\""File")] // Backslash immediately before quote - doubled
         [InlineData(@"NoQuotesHere\", @"NoQuotesHere\")] // Trailing backslash - unchanged
-        [InlineData(@"\""", @"\\""")]                     // Single backslash + quote - doubled before quote
+        [InlineData(@"\""", @"\\""")]                      // Single backslash + quote - doubled before quote
         [InlineData(@"\\\""", @"\\\\\\""")]               // Multiple backslashes before quote
         [InlineData(@"Mix\ed\\\""Case", @"Mix\ed\\\\\\""Case")] // Mixed case: normal + before quote
         [InlineData("abc\0def", @"abc\0def")]           // Contains null char -> replaced with literal "\0"
@@ -238,17 +244,17 @@ namespace Servy.Core.UnitTests.Helpers
         [InlineData("V3.4.5", "3.4.5")]
         [InlineData("2.0", "2.0")]
         [InlineData("v1.10", "1.10")]
-        // --- NEW TEST CASES ---
+        // Suffixes and date-based tags
         [InlineData("v1.2.3-rc.1", "1.2.3")]   // SemVer pre-release suffix
         [InlineData("v1.2.3+build.42", "1.2.3")] // SemVer build metadata
         [InlineData("8.3-stable", "8.3")]      // Common non-standard suffix
         [InlineData("v2026.5.25", "2026.5.25")] // Date-based tags
         [InlineData("2026.05.25", "2026.5.25")] // Leading zeros in segments
-                                                // --- EDGE CASES ---
+        // Edge cases
         [InlineData("1.2.3.4", "1.2.3.4")]     // 4-part versioning
-        [InlineData("", null)]                 // New null contract
-        [InlineData("   ", null)]              // Whitespace handling
-        [InlineData("invalid", null)]          // New null contract
+        [InlineData("", null)]                  // Empty input returns null
+        [InlineData("    ", null)]              // Whitespace handling
+        [InlineData("invalid", null)]          // Non-numeric input returns null
         [InlineData("1.x.0", null)]            // Invalid structure
         public void ParseVersion_ReturnsExpectedVersion(string version, string? expectedVersionString)
         {
@@ -280,57 +286,82 @@ namespace Servy.Core.UnitTests.Helpers
 
             // Pass the freshly-built dynamic assembly explicitly so GetBuiltWithFramework
             // reads the BuiltWithFramework metadata from it instead of the executing assembly.
-            return InvokeInAssembly(assemblyBuilder);
-        }
-
-        private string InvokeInAssembly(Assembly assembly)
-        {
-            // Arrange & Act
-            // Invoke the public static method safely using the updated reflection infrastructure
-            return (string)TestReflection.InvokePublicStatic(typeof(Helper), "GetBuiltWithFramework", assembly)!;
+            return Helper.GetBuiltWithFramework(assemblyBuilder);
         }
 
         [Fact]
         public void GetBuiltWithFramework_AttributeMissing_ReturnsUnknown()
         {
+            // Act
             var result = Run(null);
+
+            // Assert
             Assert.Equal("Unknown", result);
         }
 
         [Fact]
         public void GetBuiltWithFramework_TfmIsNull_ReturnsUnknown()
         {
+            // Act
             var result = Run((string?)null);
+
+            // Assert
             Assert.Equal("Unknown", result);
         }
 
         [Theory]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void GetBuiltWithFramework_TfmEmptyOrWhitespace_ReturnsUnknown(string tfm)
         {
+            // Act
             var result = Run(tfm);
+
+            // Assert
             Assert.Equal("Unknown", result);
         }
 
         [Fact]
         public void GetBuiltWithFramework_PlatformSuffix_IsRemoved()
         {
+            // Act
             var result = Run("net8.0-windows");
+
+            // Assert
             Assert.Equal(".NET 8.0", result);
         }
 
         [Fact]
         public void GetBuiltWithFramework_PlainNetTfm_IsFormatted()
         {
+            // Act
             var result = Run("net8.0");
+
+            // Assert
             Assert.Equal(".NET 8.0", result);
+        }
+
+        [Theory]
+        [InlineData("netstandard2.0", ".NET Standard 2.0")]
+        [InlineData("netcoreapp3.1", ".NET Core 3.1")]
+        [InlineData("net48", ".NET Framework 4.8")]
+        [InlineData("net472", ".NET Framework 4.7.2")]
+        public void GetBuiltWithFramework_LegacyMonikers_AreFormatted(string tfm, string expected)
+        {
+            // Act
+            var result = Run(tfm);
+
+            // Assert
+            Assert.Equal(expected, result);
         }
 
         [Fact]
         public void GetBuiltWithFramework_NotNetTfm_ReturnsRawValue()
         {
+            // Act
             var result = Run("random");
+
+            // Assert
             Assert.Equal("random", result);
         }
 
@@ -350,6 +381,28 @@ namespace Servy.Core.UnitTests.Helpers
             // Assert
             // Confirm the parameterless overload targets the core library assembly frame as its baseline
             Assert.Equal(expectedFrameworkString, actualFrameworkString);
+
+            // Both sides are the same call, so pin the result against the "Unknown" fallback:
+            // if the BuiltWithFramework metadata stops resolving, the equality alone stays green.
+            Assert.NotEqual("Unknown", actualFrameworkString);
+        }
+
+        /// <summary>
+        /// <see cref="Helper.IsReservedForServyHost(string)"/> matches the Servy host service name only, in any case
+        /// and with surrounding white space, and never a longer name, a blank one or <see langword="null"/>.
+        /// </summary>
+        [Theory]
+        [InlineData("Servy", true)]
+        [InlineData("servy", true)]
+        [InlineData(" SERVY ", true)]
+        [InlineData("ServyApp", false)]
+        [InlineData("Servy.Host", false)]
+        [InlineData("", false)]
+        [InlineData(null, false)]
+        public void IsReservedForServyHost_MatchesOnlyTheHostServiceName(string? name, bool expected)
+        {
+            // Arrange, Act & Assert
+            Assert.Equal(expected, Helper.IsReservedForServyHost(name));
         }
 
         /// <summary>
@@ -358,7 +411,7 @@ namespace Servy.Core.UnitTests.Helpers
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void IsServiceNameValid_NullOrWhitespace_ReturnsValidationError(string? input)
         {
             // Act
@@ -370,7 +423,7 @@ namespace Servy.Core.UnitTests.Helpers
         }
 
         /// <summary>
-        /// Covers Branch 2: serviceName != serviceName.Trim()
+        /// Covers Branch 2: serviceName != serviceName.TrimStart()
         /// </summary>
         [Theory]
         [InlineData(" MyService")] // Leading space
@@ -386,7 +439,7 @@ namespace Servy.Core.UnitTests.Helpers
         }
 
         /// <summary>
-        /// Covers Branch 2: serviceName != serviceName.Trim()
+        /// Covers Branch 2: serviceName != serviceName.TrimEnd()
         /// </summary>
         [Theory]
         [InlineData("MyService ")] // Trailing space
@@ -402,6 +455,41 @@ namespace Servy.Core.UnitTests.Helpers
         }
 
         /// <summary>
+        /// Covers Branch 3: serviceName.Length > AppConfig.MaxServiceNameLength
+        /// </summary>
+        [Fact]
+        public void IsServiceNameValid_ExceedsMaxLength_ReturnsFalseWithFormattedMessage()
+        {
+            // Arrange
+            string longName = new string('a', AppConfig.MaxServiceNameLength + 1);
+            string expectedMessage = string.Format(Strings.Msg_ServiceNameLengthReached, AppConfig.MaxServiceNameLength);
+
+            // Act
+            var (isValid, errorMessage) = Helper.IsServiceNameValid(longName);
+
+            // Assert
+            Assert.False(isValid);
+            Assert.Equal(expectedMessage, errorMessage);
+        }
+
+        /// <summary>
+        /// Covers the accepting side of Branch 3: a name of exactly AppConfig.MaxServiceNameLength characters is valid.
+        /// </summary>
+        [Fact]
+        public void IsServiceNameValid_ExactlyAtMaxLength_ReturnsSuccess()
+        {
+            // Arrange
+            string atCap = new string('a', AppConfig.MaxServiceNameLength);
+
+            // Act
+            var (isValid, error) = Helper.IsServiceNameValid(atCap);
+
+            // Assert
+            Assert.True(isValid);
+            Assert.Equal(string.Empty, error);
+        }
+
+        /// <summary>
         /// Covers Branch 3a: serviceName.IndexOfAny(InvalidServiceChars) >= 0
         /// </summary>
         [Theory]
@@ -414,6 +502,7 @@ namespace Servy.Core.UnitTests.Helpers
         [InlineData("My<Service")]
         [InlineData("My>Service")]
         [InlineData("My|Service")]
+        [InlineData("My;Service")]
         public void IsServiceNameValid_ForbiddenCharacters_ReturnsInvalidCharError(string input)
         {
             // Act
@@ -425,12 +514,14 @@ namespace Servy.Core.UnitTests.Helpers
         }
 
         /// <summary>
-        /// Covers Branch 3b: serviceName.Any(c => char.IsControl(c))
+        /// Covers Branch 3b: IsValidServiceNameCharset's name.Any(IsDisallowedNameChar) (Unicode control, format, line and paragraph separator categories)
         /// </summary>
         [Theory]
         [InlineData("My\nService")] // Newline
         [InlineData("My\tService")] // Tab
         [InlineData("MyService\u0000")] // Null character
+        [InlineData("My\u200BService")] // Unicode Format Character (Zero-Width Space, Category Cf)
+        [InlineData("My\u2028Service")] // Unicode Line Separator (Category Zl)
         public void IsServiceNameValid_ControlCharacters_ReturnsInvalidCharError(string input)
         {
             // Act
@@ -449,6 +540,11 @@ namespace Servy.Core.UnitTests.Helpers
         [InlineData("Servy-Agent")]
         [InlineData("Wexflow_Service")]
         [InlineData("Service.123")]
+        [InlineData("Servy-Café")]
+        [InlineData("My Service (v2)")]
+        [InlineData("Backup,Sync")]
+        [InlineData("net_svc+1")]
+        [InlineData("데이터베이스")]
         public void IsServiceNameValid_ValidInput_ReturnsSuccess(string input)
         {
             // Act
@@ -477,7 +573,7 @@ namespace Servy.Core.UnitTests.Helpers
 
             // Assert
             Assert.False(isValid);
-            Assert.Equal(Strings.Msg_InvalidServiceName, error);
+            Assert.Equal(Strings.Msg_ServiceNameLeadingTrailingDot, error);
         }
 
         /// <summary>
@@ -497,7 +593,7 @@ namespace Servy.Core.UnitTests.Helpers
 
             // Assert
             Assert.False(isValid);
-            Assert.Equal(Strings.Msg_InvalidServiceName, error);
+            Assert.Equal(string.Format(Strings.Msg_ServiceNameReservedDeviceName, input), error);
         }
 
         /// <summary>
@@ -514,7 +610,7 @@ namespace Servy.Core.UnitTests.Helpers
 
             // Assert
             Assert.False(isValid);
-            Assert.Equal(Strings.Msg_InvalidServiceName, error);
+            Assert.Equal(Strings.Msg_ServiceNameLeadingTrailingDot, error);
         }
 
         /// <summary>
@@ -538,7 +634,7 @@ namespace Servy.Core.UnitTests.Helpers
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public void NormalizePath_NullOrWhiteSpace_ReturnsNull(string? input)
         {
             // Act
@@ -607,82 +703,122 @@ namespace Servy.Core.UnitTests.Helpers
             Assert.Equal(expected, result);
         }
 
+        [Theory]
+        [InlineData(@"C:\")]
+        [InlineData("C:/")]
+        public void NormalizePath_DriveRootOnly_PreservesRootSeparator(string input)
+        {
+            // Arrange
+            // The trailing-separator tests above all pass a path with a segment below the root, so
+            // they only ever exercise the TrimEnd return. A bare drive root is the one input the
+            // method deliberately returns untrimmed - the guard added for #1744.
+            var expected = @"C:\";
+
+            // Act
+            var result = Helper.NormalizePath(input);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
+        [Fact]
+        public void NormalizePath_PathWithNullCharacter_ReturnsNull()
+        {
+            // Arrange
+            // A NUL byte makes Path.GetFullPath throw, which is the only way into the catch that
+            // turns a malformed path into null instead of letting the exception reach the caller.
+            var input = "C:\\Invalid\0Path";
+
+            // Act
+            var result = Helper.NormalizePath(input);
+
+            // Assert
+            Assert.Null(result);
+        }
+
         #region WriteFileAtomic (Synchronous) Tests
 
         [Fact]
         public void WriteFileAtomic_Success_WritesFileAndCleansUpTemp()
         {
             // Arrange
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
             string targetPath = Path.Combine(tempDir, "target.txt");
 
-            try
+            // Act: WriteFileAtomic ensures parent directory creation
+            Helper.WriteFileAtomic(targetPath, (Stream stream) =>
             {
-                // Act: WriteFileAtomic ensures parent directory creation
-                Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
                 {
-                    using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
-                    {
-                        writer.Write("atomic-sync-test-48");
-                    }
-                }, TestContext.Current.CancellationToken);
+                    writer.Write("atomic-sync-test-48");
+                }
+            }, TestContext.Current.CancellationToken);
 
-                // Assert
-                Assert.True(File.Exists(targetPath));
-                Assert.Equal("atomic-sync-test-48", File.ReadAllText(targetPath));
+            // Assert
+            Assert.True(File.Exists(targetPath));
+            Assert.Equal("atomic-sync-test-48", File.ReadAllText(targetPath));
 
-                // VACUOUS CHECK REFACTOR: Evaluate all matching staging remnants in the container directory
-                // to verify that the core dynamic GUID-suffixed file format handles cleanup routines successfully.
-                var leftovers = Directory.GetFiles(tempDir, "*.tmp");
-                Assert.Empty(leftovers);
-            }
-            finally
+            // No GUID-suffixed *.tmp staging file may remain after a successful write.
+            var leftovers = Directory.GetFiles(tempDir, "*.tmp");
+            Assert.Empty(leftovers);
+        }
+
+        [Fact]
+        public void WriteFileAtomic_CreatesNestedDirectories()
+        {
+            // Arrange
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            string nestedPath = Path.Combine(tempDir, "deeply", "nested", "path");
+            string targetPath = Path.Combine(nestedPath, "test.log");
+
+            // Act: WriteFileAtomic calls Directory.CreateDirectory
+            Helper.WriteFileAtomic(targetPath, (Stream stream) =>
             {
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
-            }
+                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                {
+                    writer.Write("nesting-test");
+                }
+            }, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(Directory.Exists(nestedPath));
+            Assert.True(File.Exists(targetPath));
         }
 
         [Fact]
         public void WriteFileAtomic_OnException_CleansUpTempAndDoesNotCreateTarget()
         {
             // Arrange
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
             string targetPath = Path.Combine(tempDir, "target.txt");
 
-            try
+            // Act & Assert
+            Assert.Throws<InvalidOperationException>(() =>
             {
-                // Act & Assert
-                Assert.Throws<InvalidOperationException>(() =>
+                Helper.WriteFileAtomic(targetPath, (Stream stream) =>
                 {
-                    Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                    using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
                     {
-                        using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8))
-                        {
-                            writer.Write("partial-data");
-                            throw new InvalidOperationException("Simulated failure");
-                        }
-                    }, TestContext.Current.CancellationToken);
-                });
+                        writer.Write("partial-data");
+                        throw new InvalidOperationException("Simulated failure");
+                    }
+                }, TestContext.Current.CancellationToken);
+            });
 
-                // CleanupTempFile is called in finally to ensure .tmp is removed
-                Assert.False(File.Exists(targetPath), "Target should not exist if move was never reached.");
+            // CleanupTempFile is called in finally to ensure .tmp is removed
+            Assert.False(File.Exists(targetPath), "Target should not exist if move was never reached.");
 
-                // Ensure no dynamically generated GUID staging targets
-                // are leaked inside the scratch tracking folder when an unhandled execution exception triggers.
-                var leftovers = Directory.GetFiles(tempDir, "*.tmp");
-                Assert.Empty(leftovers);
-            }
-            finally
-            {
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
-            }
+            // Ensure no dynamically generated GUID staging targets
+            // are leaked inside the scratch tracking folder when an unhandled execution exception triggers.
+            var leftovers = Directory.GetFiles(tempDir, "*.tmp");
+            Assert.Empty(leftovers);
         }
 
         [Fact]
         public void WriteFileAtomic_OverwritesReadOnlyFile()
         {
             // Arrange
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tempDir);
             string targetPath = Path.Combine(tempDir, "target.txt");
 
@@ -711,10 +847,447 @@ namespace Servy.Core.UnitTests.Helpers
             finally
             {
                 if (File.Exists(targetPath)) File.SetAttributes(targetPath, FileAttributes.Normal);
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
             }
         }
 
+        [Fact]
+        public void WriteFileAtomic_FailedMove_RestoresReadOnlyAttributeOnDestination()
+        {
+            // Arrange
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+
+            try
+            {
+                File.WriteAllText(targetPath, "initial-content");
+                File.SetAttributes(targetPath, FileAttributes.ReadOnly);
+
+                // Lock with FileAccess.Read so opening the handle succeeds on a ReadOnly file,
+                // but FileShare.None makes the File.Move onto targetPath fail.
+                using (var lockStream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    Assert.ThrowsAny<Exception>(() =>
+                    {
+                        Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                        {
+                            using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                            {
+                                writer.Write("unreachable-content");
+                            }
+                        }, TestContext.Current.CancellationToken);
+                    });
+                }
+
+                // Assert: The existing target file remains unchanged and has its ReadOnly attribute restored
+                Assert.True(File.Exists(targetPath));
+                Assert.Equal("initial-content", File.ReadAllText(targetPath));
+
+                FileAttributes attributes = File.GetAttributes(targetPath);
+                Assert.True((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly, "ReadOnly attribute should have been restored after write failure.");
+            }
+            finally
+            {
+                if (File.Exists(targetPath)) File.SetAttributes(targetPath, FileAttributes.Normal);
+            }
+        }
+
+        /// <summary>
+        /// Reads the ReadOnly attribute of <paramref name="path"/> without ever throwing.
+        /// Used as a handshake by the transient-lock tests below, from a background thread that
+        /// must not fault: an escaping exception there would tear the test host down rather than
+        /// fail a single test.
+        /// </summary>
+        private static bool HasReadOnlyAttribute(string path)
+        {
+            try
+            {
+                return File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReadOnly) == FileAttributes.ReadOnly;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        [Fact]
+        public void WriteFileAtomic_TransientLockReleasedDuringRetry_Succeeds()
+        {
+            // Arrange
+            const int handshakeTimeoutMs = 5000;
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+
+            try
+            {
+                File.WriteAllText(targetPath, "initial-content");
+
+                // The ReadOnly attribute is a handshake here, not the subject under test:
+                // PrepareDestinationForMove clears it on the first pass of the retry loop, which is the only
+                // externally observable signal that the first File.Move has been attempted. Attribute
+                // access is exempt from share-mode checks, so it stays readable and writable through
+                // the lock below - the existing FailedMove tests already rely on that.
+                File.SetAttributes(targetPath, FileAttributes.ReadOnly);
+
+                // FileAccess.Read so the handle opens on a ReadOnly file, FileShare.None so the move
+                // onto targetPath fails the way an antivirus or indexer lock makes it fail.
+                using (var lockStream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    bool observed = false;
+                    var releaser = new Thread(() =>
+                    {
+                        try
+                        {
+                            var waited = Stopwatch.StartNew();
+                            while (waited.ElapsedMilliseconds < handshakeTimeoutMs && HasReadOnlyAttribute(targetPath))
+                            {
+                                Thread.Sleep(5);
+                            }
+
+                            observed = !HasReadOnlyAttribute(targetPath);
+
+                            // The attribute is cleared immediately before File.Move runs, so wait that
+                            // first attempt out: the write has to be proven to succeed on a LATER pass.
+                            Thread.Sleep(AppConfig.WriteFileAtomicRetryDelayMs / 4);
+                        }
+                        finally
+                        {
+                            lockStream.Dispose();
+                        }
+                    })
+                    { IsBackground = true };
+                    releaser.Start();
+
+                    try
+                    {
+                        // Act
+                        var elapsed = Stopwatch.StartNew();
+                        Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                        {
+                            using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                            {
+                                writer.Write("new-content");
+                            }
+                        }, TestContext.Current.CancellationToken);
+                        elapsed.Stop();
+
+                        // Assert
+                        Assert.True(observed, "The lock releaser never observed the retry loop clearing the ReadOnly attribute.");
+                        Assert.Equal("new-content", File.ReadAllText(targetPath));
+
+                        // At least one retry delay elapsed, so the move did not succeed on its first
+                        // attempt: this is the retry loop succeeding, not a plain overwrite.
+                        Assert.True(elapsed.ElapsedMilliseconds >= AppConfig.WriteFileAtomicRetryDelayMs,
+                            $"Expected at least one retry delay ({AppConfig.WriteFileAtomicRetryDelayMs} ms) to elapse, but the call returned after {elapsed.ElapsedMilliseconds} ms.");
+                    }
+                    finally
+                    {
+                        releaser.Join(handshakeTimeoutMs);
+                    }
+                }
+            }
+            finally
+            {
+                if (File.Exists(targetPath)) File.SetAttributes(targetPath, FileAttributes.Normal);
+            }
+        }
+
+        [Fact]
+        public void WriteFileAtomic_TransientIOExceptionOnMove_RetriesAndSucceeds()
+        {
+            // Arrange
+            string targetPath = Path.Combine(_testRoot, "transient-io-sync.txt");
+            File.WriteAllText(targetPath, "initial-content");
+            int moveAttempts = 0;
+
+            // The transient arm needs the overwrite move itself to fail with an IOException, which is a
+            // sharing violation on the STAGING file - a handle no test can hold, because WriteFileAtomic
+            // closes it microseconds before the move. The injected mover raises it deterministically and
+            // then performs the real move, so a later attempt succeeds.
+            void FlakyMove(string source, string destination)
+            {
+                moveAttempts++;
+                if (moveAttempts == 1)
+                {
+                    throw new IOException("The process cannot access the file because it is being used by another process.");
+                }
+
+                File.Move(source, destination, overwrite: true);
+            }
+
+            // Act
+            Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+            {
+                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                {
+                    writer.Write("new-content");
+                }
+            }, FlakyMove, TestContext.Current.CancellationToken);
+
+            // Assert
+            // Two attempts, not one: the first IOException was swallowed by the transient retry arm rather
+            // than escaping, and the second pass of the loop is what wrote the file.
+            Assert.Equal(2, moveAttempts);
+            Assert.Equal("new-content", File.ReadAllText(targetPath));
+        }
+
+        [Fact]
+        public void WriteFileAtomic_TempPathExceedsMaxPathLength_ThrowsPathTooLongException()
+        {
+            // Arrange: a target path that is itself within MAX_PATH, but whose 21-character
+            // ".{16-hex}.tmp" staging suffix (added by GetUniqueTempPath) pushes the staging
+            // path past AppConfig.WriteFileAtomicMaxPathLength.
+            string prefix = Path.Combine(_testRoot, "t");
+            string targetPath = prefix + new string('a', AppConfig.WriteFileAtomicMaxPathLength - prefix.Length);
+
+            // Act
+            var ex = Assert.Throws<PathTooLongException>(() =>
+                Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                {
+                    Assert.Fail("writeContent must not run: the MAX_PATH guard is evaluated before the staging file is opened.");
+                }, TestContext.Current.CancellationToken));
+
+            // Assert: the target path was legal and the guard is what threw, not a long-path
+            // failure raised by the filesystem itself.
+            Assert.Equal(AppConfig.WriteFileAtomicMaxPathLength, targetPath.Length);
+            Assert.Contains("exceeds the Windows MAX_PATH limit", ex.Message);
+        }
+
+        [Fact]
+        public void WriteFileAtomic_HardenedTargetFallback_MoveAsideBlocked_KeepsOriginalAndLeavesNoTempFiles()
+        {
+            // Arrange
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+
+            // Act: the handle shares neither write nor delete, so the fallback's own first step,
+            // File.Move(path, backup), is blocked too and the call reaches its final throw.
+            using (var lockStream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                Assert.ThrowsAny<Exception>(() =>
+                {
+                    Helper.WriteFileAtomic(targetPath, stream =>
+                    {
+                        using var writer = new StreamWriter(stream, Encoding.UTF8, 1024, true);
+                        writer.Write("new-content");
+                    }, TestContext.Current.CancellationToken);
+                });
+            }
+
+            // Assert: the original was never moved aside, so it is still there untouched.
+            Assert.Equal("original-content", File.ReadAllText(targetPath));
+
+            // No "*.tmp" may be left behind: the finally block removes the staging file, and the backup
+            // the fallback names with the same suffix is never created here, because the move-aside is blocked.
+            var leftovers = Directory.GetFiles(tempDir, "*.tmp");
+            Assert.Empty(leftovers);
+        }
+
+        [Fact]
+        public void WriteFileAtomic_HardenedTargetFallback_MoveAsideSucceeds_ReplacesTargetAndRemovesBackup()
+        {
+            // Arrange: the target itself is NOT locked, so only the direct overwrite is denied. That is the
+            // hardened-ACL shape the fallback exists for, and it is the one the blocked-move-aside test above
+            // cannot reach: here File.Move(path, backup) succeeds and the staging file is moved in.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            int moveAttempts = 0;
+
+            void DeniedMove(string source, string destination)
+            {
+                moveAttempts++;
+                throw new UnauthorizedAccessException("Access to the path is denied.");
+            }
+
+            // Act
+            Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+            {
+                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                {
+                    writer.Write("new-content");
+                }
+            }, DeniedMove, TestContext.Current.CancellationToken);
+
+            // Assert
+            // One attempt only: the fallback completed the replacement itself, so the loop broke without
+            // falling through to a retry.
+            Assert.Equal(1, moveAttempts);
+            Assert.Equal("new-content", File.ReadAllText(targetPath));
+
+            // The backup is named with the same ".{hex}.tmp" suffix as the staging file, so a skipped
+            // File.Delete(backup) shows up here as a leftover copy of the original.
+            Assert.Empty(Directory.GetFiles(tempDir, "*.tmp"));
+        }
+
+        [Fact]
+        public void WriteFileAtomic_HardenedTargetFallback_SecondMoveFails_RestoresOriginalBeforeRetry()
+        {
+            // Arrange: the direct overwrite is denied, and the staging file is held the way an AV scanner holds
+            // it, for the first pass only. So the fallback moves the original aside, its own File.Move(tmp, path)
+            // hits the sharing violation, and the restore arm has to put the original back before the retry.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            int moveAttempts = 0;
+            string? contentSeenOnRetry = null;
+            FileStream? stagingLock = null;
+
+            void Move(string source, string destination)
+            {
+                moveAttempts++;
+                if (moveAttempts == 1)
+                {
+                    stagingLock = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None);
+                    throw new UnauthorizedAccessException("Access to the path is denied.");
+                }
+
+                // Second pass: whatever the restore left at the destination is what this reads. Without the
+                // restore the original is still sitting at the backup path and this reads null.
+                contentSeenOnRetry = File.Exists(destination) ? File.ReadAllText(destination) : null;
+                stagingLock!.Dispose();
+                File.Move(source, destination, overwrite: true);
+            }
+
+            try
+            {
+                // Act
+                Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                {
+                    using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                    {
+                        writer.Write("new-content");
+                    }
+                }, Move, TestContext.Current.CancellationToken);
+            }
+            finally
+            {
+                stagingLock?.Dispose();
+            }
+
+            // Assert
+            // Two attempts: the fallback's failure was handled by the retry arm rather than escaping.
+            Assert.Equal(2, moveAttempts);
+
+            // This is the whole of the restore: it is what keeps the original from being lost when the
+            // move-aside succeeds and the move-in does not.
+            Assert.Equal("original-content", contentSeenOnRetry);
+            Assert.Equal("new-content", File.ReadAllText(targetPath));
+            Assert.Empty(Directory.GetFiles(tempDir, "*.tmp"));
+        }
+
+        [Fact]
+        public void WriteFileAtomic_HardenedTargetFallback_RetriesExhaustedAfterMoveAside_RestoresOriginal()
+        {
+            // Arrange: every direct overwrite is denied, and the staging file stays locked for the whole call,
+            // so each fallback pass moves the original aside, fails to move the staging file in, and must restore.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            int moveAttempts = 0;
+            string? stagingPath = null;
+            FileStream? stagingLock = null;
+
+            void DeniedMove(string source, string destination)
+            {
+                moveAttempts++;
+                stagingPath = source;
+                stagingLock ??= new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None);
+                throw new UnauthorizedAccessException("Access to the path is denied.");
+            }
+
+            try
+            {
+                // Act
+                Assert.Throws<AggregateException>(() =>
+                    Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                    {
+                        using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                        {
+                            writer.Write("new-content");
+                        }
+                    }, DeniedMove, TestContext.Current.CancellationToken));
+
+                // Assert
+                // Every pass took the fallback, and the last one threw instead of retrying again.
+                Assert.Equal(AppConfig.WriteFileAtomicMaxRetries + 1, moveAttempts);
+            }
+            finally
+            {
+                stagingLock?.Dispose();
+            }
+
+            // Assert
+            // The restore runs before the retries-exhausted throw, so the original is back at the target
+            // rather than stranded at its backup path. This is #7154's "a move that keeps failing".
+            Assert.True(File.Exists(targetPath), "The original was left at its backup path when the retries ran out.");
+            Assert.Equal("original-content", File.ReadAllText(targetPath));
+
+            // The only leftover ".tmp" is the staging file this test held open, never a backup copy.
+            Assert.Equal(new[] { stagingPath! }, Directory.GetFiles(tempDir, "*.tmp"));
+        }
+
+        [Fact]
+        public void WriteFileAtomic_HardenedTargetFallback_CancelledDuringBackOff_RestoresOriginal()
+        {
+            // Arrange: the first pass moves the original aside and fails its move-in. The token is cancelled
+            // inside that pass, so the back-off wait returns at once and the call leaves through the cancellation.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            int moveAttempts = 0;
+            string? stagingPath = null;
+            FileStream? stagingLock = null;
+
+            void DeniedMove(string source, string destination)
+            {
+                moveAttempts++;
+                stagingPath = source;
+                stagingLock ??= new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None);
+                cts.Cancel();
+                throw new UnauthorizedAccessException("Access to the path is denied.");
+            }
+
+            try
+            {
+                // Act
+                Assert.ThrowsAny<OperationCanceledException>(() =>
+                    Helper.WriteFileAtomic(targetPath, (Stream stream) =>
+                    {
+                        using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                        {
+                            writer.Write("new-content");
+                        }
+                    }, DeniedMove, cts.Token));
+
+                // Assert
+                // One pass only: the cancellation in the back-off ended the call, not a further retry.
+                Assert.Equal(1, moveAttempts);
+            }
+            finally
+            {
+                stagingLock?.Dispose();
+            }
+
+            // Assert
+            // The restore runs before the back-off, so the cancellation cannot strand the original.
+            // This is #7154's "a cancellation during the back-off".
+            Assert.True(File.Exists(targetPath), "The original was left at its backup path when the back-off was cancelled.");
+            Assert.Equal("original-content", File.ReadAllText(targetPath));
+            Assert.Equal(new[] { stagingPath! }, Directory.GetFiles(tempDir, "*.tmp"));
+        }
         #endregion
 
         #region WriteFileAtomicAsync Tests
@@ -723,100 +1296,78 @@ namespace Servy.Core.UnitTests.Helpers
         public async Task WriteFileAtomicAsync_Success_WritesFile()
         {
             // Arrange
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
             string targetPath = Path.Combine(tempDir, "target.txt");
 
-            try
+            // Act: Uses WriteFileAtomicCore internally
+            await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
             {
-                // Act: Uses WriteFileAtomicCore internally
-                await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
-                {
-                    byte[] data = Encoding.UTF8.GetBytes("atomic-async-test-48");
-                    await stream.WriteAsync(data, 0, data.Length, cancellationToken);
-                }, TestContext.Current.CancellationToken);
+                byte[] data = Encoding.UTF8.GetBytes("atomic-async-test-48");
+                await stream.WriteAsync(data, 0, data.Length, cancellationToken);
+            }, TestContext.Current.CancellationToken);
 
-                // Assert
-                Assert.True(File.Exists(targetPath));
+            // Assert
+            Assert.True(File.Exists(targetPath));
 
-                string result;
-                using (StreamReader reader = new StreamReader(targetPath))
-                {
-                    result = await reader.ReadToEndAsync(TestContext.Current.CancellationToken);
-                }
-                Assert.Equal("atomic-async-test-48", result);
-            }
-            finally
+            string result;
+            using (StreamReader reader = new StreamReader(targetPath))
             {
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+                result = await reader.ReadToEndAsync(TestContext.Current.CancellationToken);
             }
+            Assert.Equal("atomic-async-test-48", result);
         }
 
         [Fact]
         public async Task WriteFileAtomicAsync_CreatesNestedDirectories()
         {
             // Arrange
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
             string nestedPath = Path.Combine(tempDir, "deeply", "nested", "path");
             string targetPath = Path.Combine(nestedPath, "test.log");
 
-            try
+            // Act: Core logic calls Directory.CreateDirectory
+            await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
             {
-                // Act: Core logic calls Directory.CreateDirectory
-                await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
-                {
-                    byte[] data = Encoding.UTF8.GetBytes("nesting-test");
-                    await stream.WriteAsync(data, 0, data.Length, cancellationToken);
-                }, TestContext.Current.CancellationToken);
+                byte[] data = Encoding.UTF8.GetBytes("nesting-test");
+                await stream.WriteAsync(data, 0, data.Length, cancellationToken);
+            }, TestContext.Current.CancellationToken);
 
-                // Assert
-                Assert.True(Directory.Exists(nestedPath));
-                Assert.True(File.Exists(targetPath));
-            }
-            finally
-            {
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
-            }
+            // Assert
+            Assert.True(Directory.Exists(nestedPath));
+            Assert.True(File.Exists(targetPath));
         }
 
         [Fact]
         public async Task WriteFileAtomicAsync_OnException_CleansUpTempAndDoesNotCreateTarget()
         {
             // Arrange
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
             string targetPath = Path.Combine(tempDir, "target.txt");
-            Directory.CreateDirectory(tempDir);
 
-            try
+            // Act & Assert
+            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             {
-                // Act & Assert
-                await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
                 {
-                    await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
-                    {
-                        byte[] data = Encoding.UTF8.GetBytes("partial-async-data");
-                        await stream.WriteAsync(data, 0, data.Length, cancellationToken);
-                        throw new InvalidOperationException("Simulated failure");
-                    }, TestContext.Current.CancellationToken);
-                });
+                    byte[] data = Encoding.UTF8.GetBytes("partial-async-data");
+                    await stream.WriteAsync(data, 0, data.Length, cancellationToken);
+                    throw new InvalidOperationException("Simulated failure");
+                }, TestContext.Current.CancellationToken);
+            });
 
-                // CleanupTempFile should be executed in the finally block of WriteFileAtomicCore
-                Assert.False(File.Exists(targetPath), "Target should not exist if move operation was never reached.");
+            // CleanupTempFile should be executed in the finally block of WriteFileAtomicCore
+            Assert.False(File.Exists(targetPath), "Target should not exist if move operation was never reached.");
 
-                // Ensure no dynamically generated GUID staging targets are leaked inside the scratch folder
-                var leftovers = Directory.GetFiles(tempDir, "*.tmp");
-                Assert.Empty(leftovers);
-            }
-            finally
-            {
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
-            }
+            // Ensure no dynamically generated GUID staging targets are leaked inside the scratch folder
+            var leftovers = Directory.GetFiles(tempDir, "*.tmp");
+            Assert.Empty(leftovers);
         }
 
         [Fact]
         public async Task WriteFileAtomicAsync_OverwritesReadOnlyFile()
         {
             // Arrange
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tempDir);
             string targetPath = Path.Combine(tempDir, "target.txt");
 
@@ -843,10 +1394,385 @@ namespace Servy.Core.UnitTests.Helpers
             finally
             {
                 if (File.Exists(targetPath)) File.SetAttributes(targetPath, FileAttributes.Normal);
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
             }
         }
 
+        [Fact]
+        public async Task WriteFileAtomicAsync_FailedMove_RestoresReadOnlyAttributeOnDestination()
+        {
+            // Arrange
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+
+            try
+            {
+                File.WriteAllText(targetPath, "initial-content");
+                File.SetAttributes(targetPath, FileAttributes.ReadOnly);
+
+                // Lock with FileAccess.Read so opening the handle succeeds on a ReadOnly file,
+                // but FileShare.None makes the File.Move onto targetPath fail.
+                using (var lockStream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    await Assert.ThrowsAnyAsync<Exception>(async () =>
+                    {
+                        await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+                        {
+                            byte[] data = Encoding.UTF8.GetBytes("unreachable-content");
+                            await stream.WriteAsync(data, 0, data.Length, cancellationToken);
+                        }, TestContext.Current.CancellationToken);
+                    });
+                }
+
+                // Assert: The existing target file remains unchanged and has its ReadOnly attribute restored
+                Assert.True(File.Exists(targetPath));
+                Assert.Equal("initial-content", File.ReadAllText(targetPath));
+
+                FileAttributes attributes = File.GetAttributes(targetPath);
+                Assert.True((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly, "ReadOnly attribute should have been restored after async write failure.");
+            }
+            finally
+            {
+                if (File.Exists(targetPath)) File.SetAttributes(targetPath, FileAttributes.Normal);
+            }
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicAsync_TransientLockReleasedDuringRetry_Succeeds()
+        {
+            // Arrange
+            const int handshakeTimeoutMs = 5000;
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+
+            try
+            {
+                File.WriteAllText(targetPath, "initial-content");
+
+                // The ReadOnly attribute is a handshake here, not the subject under test:
+                // PrepareDestinationForMove clears it on the first pass of WriteFileAtomicCore's loop, which is the only
+                // externally observable signal that the first File.Move has been attempted. Attribute
+                // access is exempt from share-mode checks, so it stays readable and writable through
+                // the lock below - the existing FailedMove tests already rely on that.
+                File.SetAttributes(targetPath, FileAttributes.ReadOnly);
+
+                // FileAccess.Read so the handle opens on a ReadOnly file, FileShare.None so the move
+                // onto targetPath fails the way an antivirus or indexer lock makes it fail.
+                using (var lockStream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    bool observed = false;
+                    var releaser = new Thread(() =>
+                    {
+                        try
+                        {
+                            var waited = Stopwatch.StartNew();
+                            while (waited.ElapsedMilliseconds < handshakeTimeoutMs && HasReadOnlyAttribute(targetPath))
+                            {
+                                Thread.Sleep(5);
+                            }
+
+                            observed = !HasReadOnlyAttribute(targetPath);
+
+                            // The attribute is cleared immediately before File.Move runs, so wait that
+                            // first attempt out: the write has to be proven to succeed on a LATER pass.
+                            Thread.Sleep(AppConfig.WriteFileAtomicRetryDelayMs / 4);
+                        }
+                        finally
+                        {
+                            lockStream.Dispose();
+                        }
+                    })
+                    { IsBackground = true };
+                    releaser.Start();
+
+                    try
+                    {
+                        // Act
+                        var elapsed = Stopwatch.StartNew();
+                        await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+                        {
+                            byte[] data = Encoding.UTF8.GetBytes("new-async-content");
+                            await stream.WriteAsync(data, 0, data.Length, cancellationToken);
+                        }, TestContext.Current.CancellationToken);
+                        elapsed.Stop();
+
+                        // Assert
+                        Assert.True(observed, "The lock releaser never observed the retry loop clearing the ReadOnly attribute.");
+                        Assert.Equal("new-async-content", File.ReadAllText(targetPath));
+
+                        // At least one retry delay elapsed, so the move did not succeed on its first
+                        // attempt: this is the retry loop succeeding, not a plain overwrite.
+                        Assert.True(elapsed.ElapsedMilliseconds >= AppConfig.WriteFileAtomicRetryDelayMs,
+                            $"Expected at least one retry delay ({AppConfig.WriteFileAtomicRetryDelayMs} ms) to elapse, but the call returned after {elapsed.ElapsedMilliseconds} ms.");
+                    }
+                    finally
+                    {
+                        releaser.Join(handshakeTimeoutMs);
+                    }
+                }
+            }
+            finally
+            {
+                if (File.Exists(targetPath)) File.SetAttributes(targetPath, FileAttributes.Normal);
+            }
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicCore_TransientIOExceptionOnMove_RetriesAndSucceeds()
+        {
+            // Arrange: the asynchronous twin of the synchronous case above. WriteFileAtomicCore carries its
+            // own copy of the retry loop, so its transient arm needs its own witness.
+            string targetPath = Path.Combine(_testRoot, "transient-io-async.txt");
+            File.WriteAllText(targetPath, "initial-content");
+            int moveAttempts = 0;
+
+            void FlakyMove(string source, string destination)
+            {
+                moveAttempts++;
+                if (moveAttempts == 1)
+                {
+                    throw new IOException("The process cannot access the file because it is being used by another process.");
+                }
+
+                File.Move(source, destination, overwrite: true);
+            }
+
+            // Act
+            await Helper.WriteFileAtomicCore(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+            {
+                byte[] payload = Encoding.UTF8.GetBytes("new-content");
+                await stream.WriteAsync(payload, cancellationToken);
+            }, FlakyMove, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(2, moveAttempts);
+            Assert.Equal("new-content", File.ReadAllText(targetPath));
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicAsync_TempPathExceedsMaxPathLength_ThrowsPathTooLongException()
+        {
+            // Arrange: same legal target with an over-long staging path as the synchronous
+            // case; WriteFileAtomicCore carries its own copy of the guard.
+            string prefix = Path.Combine(_testRoot, "t");
+            string targetPath = prefix + new string('a', AppConfig.WriteFileAtomicMaxPathLength - prefix.Length);
+
+            // Act
+            var ex = await Assert.ThrowsAsync<PathTooLongException>(async () =>
+                await Helper.WriteFileAtomicAsync(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+                {
+                    Assert.Fail("writer must not run: the MAX_PATH guard is evaluated before the staging file is opened.");
+                    await Task.CompletedTask;
+                }, TestContext.Current.CancellationToken));
+
+            // Assert: the target path was legal and the guard is what threw, not a long-path
+            // failure raised by the filesystem itself.
+            Assert.Equal(AppConfig.WriteFileAtomicMaxPathLength, targetPath.Length);
+            Assert.Contains("exceeds the Windows MAX_PATH limit", ex.Message);
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicAsync_HardenedTargetFallback_MoveAsideBlocked_KeepsOriginalAndLeavesNoTempFiles()
+        {
+            // Arrange
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+
+            // Act: the handle shares neither write nor delete, so the fallback's own first step,
+            // File.Move(path, backup), is blocked too and the call reaches its final throw.
+            using (var lockStream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                await Assert.ThrowsAnyAsync<Exception>(async () =>
+                {
+                    await Helper.WriteFileAtomicAsync(targetPath, async (stream, ct) =>
+                    {
+                        byte[] data = Encoding.UTF8.GetBytes("new-async-content");
+                        await stream.WriteAsync(data, 0, data.Length, ct);
+                    }, TestContext.Current.CancellationToken);
+                });
+            }
+
+            // Assert: the original was never moved aside, so it is still there untouched.
+            Assert.Equal("original-content", File.ReadAllText(targetPath));
+
+            // No "*.tmp" may be left behind: the finally block removes the staging file, and the backup
+            // the fallback names with the same suffix is never created here, because the move-aside is blocked.
+            var leftovers = Directory.GetFiles(tempDir, "*.tmp");
+            Assert.Empty(leftovers);
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicCore_HardenedTargetFallback_MoveAsideSucceeds_ReplacesTargetAndRemovesBackup()
+        {
+            // Arrange: the asynchronous twin of the synchronous case above. WriteFileAtomicCore carries its own
+            // copy of the fallback, so its success path needs its own witness.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            int moveAttempts = 0;
+
+            void DeniedMove(string source, string destination)
+            {
+                moveAttempts++;
+                throw new UnauthorizedAccessException("Access to the path is denied.");
+            }
+
+            // Act
+            await Helper.WriteFileAtomicCore(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+            {
+                byte[] payload = Encoding.UTF8.GetBytes("new-content");
+                await stream.WriteAsync(payload, cancellationToken);
+            }, DeniedMove, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.Equal(1, moveAttempts);
+            Assert.Equal("new-content", File.ReadAllText(targetPath));
+            Assert.Empty(Directory.GetFiles(tempDir, "*.tmp"));
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicCore_HardenedTargetFallback_SecondMoveFails_RestoresOriginalBeforeRetry()
+        {
+            // Arrange: the asynchronous twin of the restore case above. WriteFileAtomicCore has its own copy of
+            // the restore arm, so deleting that copy alone would otherwise leave the suite green.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            int moveAttempts = 0;
+            string? contentSeenOnRetry = null;
+            FileStream? stagingLock = null;
+
+            void Move(string source, string destination)
+            {
+                moveAttempts++;
+                if (moveAttempts == 1)
+                {
+                    stagingLock = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None);
+                    throw new UnauthorizedAccessException("Access to the path is denied.");
+                }
+
+                contentSeenOnRetry = File.Exists(destination) ? File.ReadAllText(destination) : null;
+                stagingLock!.Dispose();
+                File.Move(source, destination, overwrite: true);
+            }
+
+            try
+            {
+                // Act
+                await Helper.WriteFileAtomicCore(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+                {
+                    byte[] payload = Encoding.UTF8.GetBytes("new-content");
+                    await stream.WriteAsync(payload, cancellationToken);
+                }, Move, TestContext.Current.CancellationToken);
+            }
+            finally
+            {
+                stagingLock?.Dispose();
+            }
+
+            // Assert
+            Assert.Equal(2, moveAttempts);
+            Assert.Equal("original-content", contentSeenOnRetry);
+            Assert.Equal("new-content", File.ReadAllText(targetPath));
+            Assert.Empty(Directory.GetFiles(tempDir, "*.tmp"));
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicCore_HardenedTargetFallback_RetriesExhaustedAfterMoveAside_RestoresOriginal()
+        {
+            // Arrange: the asynchronous twin of the retries-exhausted case above. WriteFileAtomicCore carries
+            // its own copy of the restore arm, so deleting that copy alone would otherwise leave the suite green.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            int moveAttempts = 0;
+            string? stagingPath = null;
+            FileStream? stagingLock = null;
+
+            void DeniedMove(string source, string destination)
+            {
+                moveAttempts++;
+                stagingPath = source;
+                stagingLock ??= new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None);
+                throw new UnauthorizedAccessException("Access to the path is denied.");
+            }
+
+            try
+            {
+                // Act
+                await Assert.ThrowsAsync<AggregateException>(async () =>
+                    await Helper.WriteFileAtomicCore(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+                    {
+                        byte[] payload = Encoding.UTF8.GetBytes("new-content");
+                        await stream.WriteAsync(payload, cancellationToken);
+                    }, DeniedMove, TestContext.Current.CancellationToken));
+
+                // Assert
+                Assert.Equal(AppConfig.WriteFileAtomicMaxRetries + 1, moveAttempts);
+            }
+            finally
+            {
+                stagingLock?.Dispose();
+            }
+
+            // Assert
+            Assert.True(File.Exists(targetPath), "The original was left at its backup path when the retries ran out.");
+            Assert.Equal("original-content", File.ReadAllText(targetPath));
+            Assert.Equal(new[] { stagingPath! }, Directory.GetFiles(tempDir, "*.tmp"));
+        }
+
+        [Fact]
+        public async Task WriteFileAtomicCore_HardenedTargetFallback_CancelledDuringBackOff_RestoresOriginal()
+        {
+            // Arrange: the asynchronous twin of the cancelled-back-off case above. Task.Delay observes the
+            // cancelled token, so the call leaves through TaskCanceledException after a single fallback pass.
+            string tempDir = Path.Combine(_testRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            string targetPath = Path.Combine(tempDir, "target.txt");
+            File.WriteAllText(targetPath, "original-content");
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            int moveAttempts = 0;
+            string? stagingPath = null;
+            FileStream? stagingLock = null;
+
+            void DeniedMove(string source, string destination)
+            {
+                moveAttempts++;
+                stagingPath = source;
+                stagingLock ??= new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None);
+                cts.Cancel();
+                throw new UnauthorizedAccessException("Access to the path is denied.");
+            }
+
+            try
+            {
+                // Act
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                    await Helper.WriteFileAtomicCore(targetPath, async (Stream stream, CancellationToken cancellationToken) =>
+                    {
+                        byte[] payload = Encoding.UTF8.GetBytes("new-content");
+                        await stream.WriteAsync(payload, cancellationToken);
+                    }, DeniedMove, cts.Token));
+
+                // Assert
+                Assert.Equal(1, moveAttempts);
+            }
+            finally
+            {
+                stagingLock?.Dispose();
+            }
+
+            // Assert
+            Assert.True(File.Exists(targetPath), "The original was left at its backup path when the back-off was cancelled.");
+            Assert.Equal("original-content", File.ReadAllText(targetPath));
+            Assert.Equal(new[] { stagingPath! }, Directory.GetFiles(tempDir, "*.tmp"));
+        }
         #endregion
 
         #region HasAncestorReparsePoint tests
@@ -960,9 +1886,322 @@ namespace Servy.Core.UnitTests.Helpers
             }
         }
 
+        [Fact]
+        public void HasAncestorReparsePoint_WhenJunctionPrintNameIsSpoofedVolumeGuid_ReturnsTrue()
+        {
+            // Arrange
+            string realDir = Path.Combine(_testRoot, "RealDirForSpoof");
+            Directory.CreateDirectory(realDir);
+            string spoofedJunction = Path.Combine(_testRoot, "SpoofedJunction");
+
+            // Create a junction where the substitute name points to realDir,
+            // but the print name is artificially spoofed as a Volume GUID.
+            CreateJunctionWithSpoofedPrintName(spoofedJunction, realDir, @"Volume{00000000-0000-0000-0000-000000000000}\");
+
+            try
+            {
+                string targetPath = Path.Combine(spoofedJunction, "test.log");
+
+                // Act
+                bool result = Helper.HasAncestorReparsePoint(targetPath);
+
+                // Assert
+                // GetVolumeNameForVolumeMountPoint resolves via substitute name, refusing
+                // the spoofed print name and returning true for reparse point detection.
+                Assert.True(result);
+            }
+            finally
+            {
+                TeardownDirectoryLinkWithRetry(spoofedJunction, realDir);
+            }
+        }
+
+        [Fact]
+        public void HasAncestorReparsePoint_WhenAncestorIsPlainJunction_ReturnsTrue()
+        {
+            // Arrange
+            // A junction whose print name is its own target, so nothing about it is spoofed:
+            // this is the ordinary IO_REPARSE_TAG_MOUNT_POINT shape the three symlink-backed
+            // tests above never create.
+            string realDir = Path.Combine(_testRoot, "RealDirForJunction");
+            string plainJunction = Path.Combine(_testRoot, "PlainJunction");
+            CreateJunctionWithSpoofedPrintName(plainJunction, realDir, Path.GetFullPath(realDir));
+
+            try
+            {
+                string targetPath = Path.Combine(plainJunction, "test.log");
+
+                // Act
+                bool result = Helper.HasAncestorReparsePoint(targetPath);
+
+                // Assert
+                Assert.True(result);
+            }
+            finally
+            {
+                TeardownDirectoryLinkWithRetry(plainJunction, realDir);
+            }
+        }
+
+        [Fact]
+        public void HasAncestorReparsePoint_WhenAncestorIsVolumeMountPoint_ReturnsFalse()
+        {
+            // Arrange: mount the temp directory's own volume on an empty folder under _testRoot, so
+            // the ancestor really is a reparse point. A plain directory has a null LinkTarget and
+            // would take the ordinary walk, which is the same case as
+            // HasAncestorReparsePoint_WhenStandardLocalPath_ReturnsFalse and never reaches the
+            // IsVolumeMountPoint exemption this test is named for.
+            string mountDir = Path.Combine(_testRoot, "VolumeMountPoint");
+            Directory.CreateDirectory(mountDir);
+
+            string volumeRoot = Path.GetPathRoot(_testRoot)!;
+            string volumeName = RunMountvol($"{volumeRoot} /L").Trim();
+            if (!volumeName.StartsWith(@"\\?\Volume{", StringComparison.OrdinalIgnoreCase))
+            {
+                Assert.Skip($"mountvol did not report a volume GUID path for '{volumeRoot}': '{volumeName}'.");
+            }
+
+            RunMountvol($"\"{mountDir}\" {volumeName}");
+            try
+            {
+                if ((new DirectoryInfo(mountDir).Attributes & FileAttributes.ReparsePoint) == 0)
+                {
+                    Assert.Skip("mountvol could not mount the volume on this runner (not elevated?).");
+                }
+
+                // Act
+                bool result = Helper.HasAncestorReparsePoint(Path.Combine(mountDir, "sub", "test.log"));
+
+                // Assert
+                // Branch Covered: the IsVolumeMountPoint exemption skips the reparse
+                // check for the mounted volume, so the walk reaches the plain ancestors and returns
+                // false.
+                Assert.False(result);
+            }
+            finally
+            {
+                RunMountvol($"\"{mountDir}\" /D");
+            }
+        }
+
+        [Fact]
+        public void HasAncestorReparsePoint_WhenPathIsDriveRoot_ReturnsFalse()
+        {
+            // Arrange: a drive-root path has no parent directory, so Path.GetDirectoryName
+            // returns null. GetPathRoot keeps this portable across whatever drive the temp
+            // directory sits on instead of hardcoding a drive letter.
+            string driveRoot = Path.GetPathRoot(_testRoot)!;
+
+            // Act
+            bool result = Helper.HasAncestorReparsePoint(driveRoot);
+
+            // Assert
+            // Branch Covered: the early-exit guard returns false immediately, without
+            // constructing a DirectoryInfo from the null parent or walking any ancestor.
+            Assert.False(result);
+        }
+
         #endregion
 
         #region Reparse Points Management Helpers
+
+        /// <summary>
+        /// Creates or opens a file or I/O device.
+        /// </summary>
+        /// <param name="lpFileName">The name of the file or device to be created or opened.</param>
+        /// <param name="dwDesiredAccess">The requested access to the file or device.</param>
+        /// <param name="dwShareMode">The requested sharing mode of the file or device.</param>
+        /// <param name="lpSecurityAttributes">A pointer to a SECURITY_ATTRIBUTES structure, or <see cref="IntPtr.Zero"/>.</param>
+        /// <param name="dwCreationDisposition">An action to take on a file or device that exists or does not exist.</param>
+        /// <param name="dwFlagsAndAttributes">The file or device attributes and flags.</param>
+        /// <param name="hTemplateFile">A valid handle to a template file with the GENERIC_READ access right, or <see cref="IntPtr.Zero"/>.</param>
+        /// <returns>An open handle to the specified file or device if successful; otherwise, <see cref="Servy.Core.Native.NativeMethods.INVALID_HANDLE_VALUE"/>.</returns>
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFile(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile);
+
+        /// <summary>
+        /// Sends a control code directly to a specified device driver, causing the corresponding device to perform the corresponding operation.
+        /// </summary>
+        /// <param name="hDevice">A handle to the device on which the operation is to be performed.</param>
+        /// <param name="dwIoControlCode">The control code for the operation.</param>
+        /// <param name="inBuffer">A pointer to the input buffer that contains the data required to perform the operation.</param>
+        /// <param name="nInBufferSize">The size of the input buffer, in bytes.</param>
+        /// <param name="outBuffer">A pointer to the output buffer that is to receive the data returned by the operation.</param>
+        /// <param name="nOutBufferSize">The size of the output buffer, in bytes.</param>
+        /// <param name="lpBytesReturned">A variable that receives the size of the data stored in the output buffer, in bytes.</param>
+        /// <param name="lpOverlapped">A pointer to an OVERLAPPED structure, or <see cref="IntPtr.Zero"/>.</param>
+        /// <returns><see langword="true"/> if the operation succeeds; otherwise, <see langword="false"/>.</returns>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(
+            IntPtr hDevice,
+            uint dwIoControlCode,
+            byte[] inBuffer,
+            uint nInBufferSize,
+            IntPtr outBuffer,
+            uint nOutBufferSize,
+            out uint lpBytesReturned,
+            IntPtr lpOverlapped);
+
+        /// <summary>
+        /// Closes an open object handle.
+        /// </summary>
+        /// <param name="hObject">A valid handle to an open object.</param>
+        /// <returns><see langword="true"/> if the function succeeds; otherwise, <see langword="false"/>.</returns>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        /// <summary>
+        /// Requests write access to an object.
+        /// </summary>
+        private const uint GENERIC_WRITE = 0x40000000;
+
+        /// <summary>
+        /// Enables subsequent open operations on an object to request read access.
+        /// </summary>
+        private const uint FILE_SHARE_READ = 0x00000001;
+
+        /// <summary>
+        /// Enables subsequent open operations on an object to request write access.
+        /// </summary>
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+
+        /// <summary>
+        /// Opens a file or device only if it exists.
+        /// </summary>
+        private const uint OPEN_EXISTING = 3;
+
+        /// <summary>
+        /// Flag indicating that file opening should operate on the reparse point itself rather than its target.
+        /// </summary>
+        private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+
+        /// <summary>
+        /// Flag required to open a handle to a directory for backup/restore operations or reparse point modification.
+        /// </summary>
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+
+        /// <summary>
+        /// File system control code used to set a reparse point on a file or directory.
+        /// </summary>
+        private const uint FSCTL_SET_REPARSE_POINT = 0x000900A4;
+
+        /// <summary>
+        /// Reparse tag identifying mount points and directory junctions.
+        /// </summary>
+        private const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
+
+        /// <summary>
+        /// Creates a junction point on disk with an arbitrary, spoofed print name to test reparse point spoofing mitigations.
+        /// </summary>
+        /// <param name="junctionPath">The directory path where the junction point should be established.</param>
+        /// <param name="targetDirectory">The actual target directory path the junction should resolve to via its substitute name.</param>
+        /// <param name="spoofedPrintName">An arbitrary, artificially assigned print name payload used to test resolution guards.</param>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when opening the junction handle or invoking <c>DeviceIoControl</c> with <c>FSCTL_SET_REPARSE_POINT</c> fails.
+        /// </exception>
+        private static void CreateJunctionWithSpoofedPrintName(string junctionPath, string targetDirectory, string spoofedPrintName)
+        {
+            Directory.CreateDirectory(junctionPath);
+            Directory.CreateDirectory(targetDirectory);
+
+            string substituteName = @"\??\" + Path.GetFullPath(targetDirectory);
+
+            byte[] subBytes = Encoding.Unicode.GetBytes(substituteName);
+            byte[] printBytes = Encoding.Unicode.GetBytes(spoofedPrintName);
+
+            ushort subLen = (ushort)subBytes.Length;
+            ushort printLen = (ushort)printBytes.Length;
+
+            // ReparseDataLength excludes the 8-byte header (added to the buffer size below): Offsets (8) + SubName (subLen + 2 NUL) + PrintName (printLen + 2 NUL)
+            ushort dataLength = (ushort)(8 + subLen + 2 + printLen + 2);
+            byte[] buffer = new byte[8 + dataLength];
+
+            // IO_REPARSE_TAG_MOUNT_POINT
+            BitConverter.GetBytes(IO_REPARSE_TAG_MOUNT_POINT).CopyTo(buffer, 0);
+            BitConverter.GetBytes(dataLength).CopyTo(buffer, 4);
+
+            ushort subOffset = 0;
+            ushort printOffset = (ushort)(subLen + 2);
+
+            BitConverter.GetBytes(subOffset).CopyTo(buffer, 8);
+            BitConverter.GetBytes(subLen).CopyTo(buffer, 10);
+            BitConverter.GetBytes(printOffset).CopyTo(buffer, 12);
+            BitConverter.GetBytes(printLen).CopyTo(buffer, 14);
+
+            Array.Copy(subBytes, 0, buffer, 16 + subOffset, subLen);
+            Array.Copy(printBytes, 0, buffer, 16 + printOffset, printLen);
+
+            IntPtr handle = CreateFile(
+                junctionPath,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero);
+
+            if (handle == new IntPtr(-1))
+            {
+                throw new InvalidOperationException($"CreateFile failed for junction path '{junctionPath}': {Marshal.GetLastWin32Error()}");
+            }
+
+            try
+            {
+                bool success = DeviceIoControl(
+                    handle,
+                    FSCTL_SET_REPARSE_POINT,
+                    buffer,
+                    (uint)buffer.Length,
+                    IntPtr.Zero,
+                    0,
+                    out _,
+                    IntPtr.Zero);
+
+                if (!success)
+                {
+                    throw new InvalidOperationException($"DeviceIoControl FSCTL_SET_REPARSE_POINT failed: {Marshal.GetLastWin32Error()}");
+                }
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+
+        /// <summary>
+        /// Runs <c>mountvol.exe</c> with the supplied arguments and returns what it wrote to standard
+        /// output, so a volume mount point can be created, inspected and removed from a test.
+        /// </summary>
+        /// <param name="arguments">The arguments to pass to <c>mountvol.exe</c>.</param>
+        /// <returns>The tool's standard output.</returns>
+        /// <remarks>
+        /// The executable is resolved from <see cref="Environment.SystemDirectory"/> rather than by
+        /// bare name, so the test never picks up a <c>mountvol</c> that happens to sit earlier on PATH.
+        /// </remarks>
+        private static string RunMountvol(string arguments)
+        {
+            var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "mountvol.exe"), arguments)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using (var process = Process.Start(psi)!)
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit();
+                return output;
+            }
+        }
 
         /// <summary>
         /// Centralized factory method to create symbolic links with backoff retry routines.
@@ -985,19 +2224,23 @@ namespace Servy.Core.UnitTests.Helpers
                 {
                     Assert.Skip("Symlink creation unavailable on this runner (SeCreateSymbolicLinkPrivilege not held; enable Developer Mode or run elevated).");
                 }
-                catch (Exception ex) when ((ex is IOException || ex is UnauthorizedAccessException) && i < MaxFileSystemRetries - 1)
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
                 {
+                    if (i == MaxFileSystemRetries - 1)
+                    {
+                        Assert.Fail($"Failed to establish a directory link from '{linkPath}' to '{targetPath}' after {MaxFileSystemRetries} attempts: {ex.Message}");
+                    }
+
                     try { if (Directory.Exists(linkPath)) Directory.Delete(linkPath); } catch { }
                     Thread.Sleep(200 * (i + 1));
                 }
             }
-
-            Assert.Fail($"Failed to establish a directory link from '{linkPath}' to '{targetPath}' after {MaxFileSystemRetries} attempts.");
         }
 
         /// <summary>
-        /// Centralized teardown engine ensuring that both link anchors and real backup items
-        /// are cleared via safe DeleteDirectoryLink calls rather than divergent inline Directory.Delete overrides.
+        /// Centralized teardown: unlinks the directory link through <see cref="DeleteDirectoryLink"/>, which logs
+        /// and swallows its own failures, then deletes the real target directory recursively, retrying that
+        /// delete on I/O and access errors.
         /// </summary>
         private static void TeardownDirectoryLinkWithRetry(string linkPath, string targetPath)
         {
@@ -1013,8 +2256,16 @@ namespace Servy.Core.UnitTests.Helpers
                     }
                     break;
                 }
-                catch (Exception ex) when (i < MaxFileSystemRetries - 1 && (ex is IOException || ex is UnauthorizedAccessException))
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
                 {
+                    if (i == MaxFileSystemRetries - 1)
+                    {
+                        // Every call site runs this from a finally block, so a teardown
+                        // failure must not hide the test result - same stance as Dispose().
+                        Console.WriteLine($"Failed to tear down directory link '{linkPath}': {ex.Message}");
+                        return;
+                    }
+
                     Thread.Sleep(200 * (i + 1));
                 }
             }

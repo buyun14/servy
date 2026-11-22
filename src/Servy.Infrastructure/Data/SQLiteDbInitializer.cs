@@ -1,6 +1,8 @@
 using Dapper;
+using Servy.Core.Config;
 using Servy.Core.DTOs;
 using Servy.Core.Logging;
+using Servy.Core.Security;
 using System.Data.Common;
 using System.Data.SQLite;
 using System.Reflection;
@@ -16,7 +18,7 @@ namespace Servy.Infrastructure.Data
         /// <summary>
         /// Single Source of Truth for the absolute latest schema migration version sequence.
         /// </summary>
-        public const int LatestSchemaVersion = 8;
+        public const int LatestSchemaVersion = 12;
 
         private static readonly char[] SplitWhitespaceChars = { ' ', '\t' };
 
@@ -48,9 +50,57 @@ namespace Servy.Infrastructure.Data
         /// Analyzes the current database state, applies necessary migrations,
         /// and ensures all schema requirements match the current application version.
         /// </summary>
+        /// <remarks>
+        /// When this start migrates the database to version 10, it also imports the restart attempts counter files of
+        /// <see cref="AppConfig.RecoveryFolderPath"/> and then deletes that folder, so on a machine with a legacy
+        /// <c>recovery\</c> folder this call changes the file system as well as the database.
+        /// </remarks>
         /// <param name="connection">An open database connection to execute commands on.</param>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when the version 12 migration finds a heartbeat URL stored in clear text: it can only be encrypted with
+        /// the keys, so production callers use <see cref="Initialize(DbConnection, ISecureData)"/>.
+        /// </exception>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="connection"/> is <see langword="null"/>.</exception>
         public static void Initialize(DbConnection connection)
+            => Initialize(connection, AppConfig.RecoveryFolderPath);
+
+        /// <summary>
+        /// Analyzes the current database state, applies necessary migrations, and ensures all schema requirements match
+        /// the current application version, encrypting the values a migration moves under encryption at rest with
+        /// <paramref name="secureData"/>.
+        /// </summary>
+        /// <remarks>
+        /// The version 12 migration encrypts every heartbeat URL stored in clear text (#7579). <paramref name="secureData"/>
+        /// is used only when there is such a value, so a lazily created instance reads the keys only when needed.
+        /// </remarks>
+        /// <param name="connection">An open database connection to execute commands on.</param>
+        /// <param name="secureData">Encrypts the values a migration moves under encryption at rest.</param>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="connection"/> is <see langword="null"/>.</exception>
+        public static void Initialize(DbConnection connection, ISecureData? secureData)
+            => Initialize(connection, AppConfig.RecoveryFolderPath, secureData);
+
+        /// <summary>
+        /// Analyzes the current database state, applies necessary migrations, imports the restart attempts counters of the
+        /// legacy recovery folder, and ensures all schema requirements match the current application version.
+        /// </summary>
+        /// <param name="connection">An open database connection to execute commands on.</param>
+        /// <param name="legacyRecoveryFolderPath">
+        /// The legacy folder whose per-service counter files are imported into <c>RestartAttempts</c>, and which is
+        /// deleted once every file in it was imported; <see langword="null"/> imports nothing. It is read only by the
+        /// start that migrates the database to version 10; later starts never scan it.
+        /// </param>
+        /// <param name="secureData">
+        /// Encrypts the heartbeat URLs the version 12 migration finds in clear text; <see langword="null"/> makes that
+        /// migration throw, rolling every migration of this start back, when there is one to encrypt.
+        /// </param>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="connection"/> is <see langword="null"/>.</exception>
+        internal static void Initialize(DbConnection connection, string? legacyRecoveryFolderPath, ISecureData? secureData = null)
         {
+            if (connection == null) throw new ArgumentNullException(nameof(connection));
+
+            bool importLegacyRecoveryFolder = false;
+            bool deleteLegacyRecoveryFolder = false;
+
             // Register the collation sequence BEFORE any DDL or PRAGMA is sent to the SQLite engine.
             // This prevents immediate engine parsing errors if the index already exists on disk from a prior application run.
             SQLiteFunction.RegisterFunction(typeof(UnicodeNoCaseCollation));
@@ -59,14 +109,15 @@ namespace Servy.Infrastructure.Data
             // Scan and report legacy whitespace-padded rows on every initialization pass instead of dropping them.
             // Because unique indexes like 'idx_services_name_unique' permit 'foo' and ' foo ' to coexist under COLLATE UNICODE_NOCASE,
             // lookups that automatically trim keys first will hit the clean row. This satisfies the fallback evaluation predicate
-            // of the read path, which causes the verbatim secondary check to never fire-leaving the padded legacy variant masked and unreachable.
+            // of the read path, which causes the verbatim secondary check to never fire, leaving the padded legacy variant masked and unreachable.
             try
             {
+                string trimChars = " \t";
                 var legacyCollisions = connection.Query($@"
                     SELECT a.Id AS ZombieId, a.Name AS ZombieName, b.Id AS TwinId, b.Name AS TwinName
                     FROM {SqlConstants.ServicesTableName} a
-                    JOIN {SqlConstants.ServicesTableName} b ON TRIM(a.Name) = b.Name COLLATE UNICODE_NOCASE
-                    WHERE a.Name <> TRIM(a.Name);").ToList();
+                    JOIN {SqlConstants.ServicesTableName} b ON TRIM(a.Name, '{trimChars}') = b.Name COLLATE UNICODE_NOCASE
+                    WHERE a.Name <> TRIM(a.Name, '{trimChars}');").ToList();
 
                 foreach (var collision in legacyCollisions)
                 {
@@ -188,18 +239,71 @@ namespace Servy.Infrastructure.Data
                             currentVersion = 8;
                         }
 
+                        // Version 9 Migration to normalize legacy whitespace-padded UserAccount values
+                        if (currentVersion < 9)
+                        {
+                            ApplyVersion9(connection, transaction);
+                            UpdateSchemaVersion(connection, 9, transaction);
+                            currentVersion = 9;
+                        }
+
+                        // Version 10 Migration to add RestartAttempts and RestartAttemptsUpdatedAtTicks, which replace the
+                        // per-service counter files of the recovery folder
+                        if (currentVersion < 10)
+                        {
+                            ApplyVersion10(connection, transaction);
+                            UpdateSchemaVersion(connection, 10, transaction);
+                            currentVersion = 10;
+
+                            // The counter files these columns replace are imported by this migration only (step 7)
+                            importLegacyRecoveryFolder = true;
+                        }
+
+                        // Version 11 Migration to add AllowOverriddenRuntimeVars
+                        if (currentVersion < 11)
+                        {
+                            ApplyVersion11(connection, transaction);
+                            UpdateSchemaVersion(connection, 11, transaction);
+                            currentVersion = 11;
+                        }
+
+                        // Version 12 Migration to encrypt the heartbeat URLs stored in clear text, now that HeartbeatUrl
+                        // is one of ServiceRepository's sensitive fields (#7579)
+                        if (currentVersion < 12)
+                        {
+                            ApplyVersion12(connection, transaction, secureData);
+                            UpdateSchemaVersion(connection, 12, transaction);
+                            currentVersion = 12;
+                        }
+
                         // --- FUTURE MIGRATIONS GO HERE ---
-                        // if (currentVersion < 9) { ... }
+                        // if (currentVersion < 13) { ... }
 
                         // Double check that the final tracked migration index completely aligns with the central declaration
-                        if (currentVersion != LatestSchemaVersion)
+                        if (currentVersion > LatestSchemaVersion)
                         {
-                            Logger.Warn($"Migration chain sync warning: Current database version is {currentVersion}, but LatestSchemaVersion is defined as {LatestSchemaVersion}. Ensure future migration blocks are properly wired.");
+                            // Refuse to touch a database written by a newer Servy: the reconciliation
+                            // pass below would ADD COLUMN for anything the newer version renamed.
+                            throw new InvalidOperationException(
+                                $"The Servy database is at schema version {currentVersion}, but this build supports up to {LatestSchemaVersion}. " +
+                                "It was created by a newer version of Servy. Upgrade Servy, or restore a database backup taken before the upgrade.");
+                        }
+                        else if (currentVersion < LatestSchemaVersion)
+                        {
+                            Logger.Warn($"Migration chain sync warning: current database version is {currentVersion}, but LatestSchemaVersion is defined as " +
+                                        $"{LatestSchemaVersion}. A migration block for one of versions {currentVersion + 1}-{LatestSchemaVersion} is missing from the runner in Initialize.");
                         }
 
                         // 6. Reconciliation safety net
                         // Ensures that any columns added to SqlConstants but missed in migrations are applied.
                         ReconcileSchema(connection, currentVersion, transaction);
+
+                        // 7. Import the legacy recovery folder, once: only in the start that runs the version 10
+                        // migration, which is committed with it. Later starts never scan the folder again, so a file
+                        // that was skipped or could not be read is not retried: the folder then stays on disk, and
+                        // its leftover grants are the permissions hardener's to remove (#7532).
+                        if (importLegacyRecoveryFolder)
+                            deleteLegacyRecoveryFolder = LegacyRecoveryImporter.Import(connection, transaction, legacyRecoveryFolderPath);
 
                         transaction.Commit();
                     }
@@ -218,6 +322,10 @@ namespace Servy.Infrastructure.Data
                 try { connection.Execute("PRAGMA foreign_keys=ON;"); }
                 catch (Exception ex) { Logger.Error("Failed to restore foreign_keys=ON after migration.", ex); }
             }
+
+            // Only once the counters are committed: a failed migration keeps the folder for the next start.
+            if (deleteLegacyRecoveryFolder)
+                LegacyRecoveryImporter.DeleteFolder(legacyRecoveryFolderPath!);
         }
 
         /// <summary>
@@ -233,7 +341,7 @@ namespace Servy.Infrastructure.Data
             // Fetch full column definitions (name and type) from PRAGMA
             var tableInfo = connection.Query($"PRAGMA table_info({SqlConstants.ServicesTableName});", transaction: transaction).ToList();
 
-            // DRY PASS: Derive hash set from raw metadata rows directly to save an extra query round-trip
+            // Reuse the PRAGMA rows fetched above instead of calling GetExistingColumnNames, saving a second round-trip.
             var existingColumns = new HashSet<string>(
                 tableInfo.Select(row => (string)row.name),
                 StringComparer.OrdinalIgnoreCase);
@@ -268,7 +376,7 @@ namespace Servy.Infrastructure.Data
 
             // 2. Detect Orphaned Columns (Present in DB, but not in SqlConstants)
             var orphans = existingColumns
-                .MakeOrphanFilter(expectedColumns)
+                .GetOrphanColumns(expectedColumns)
                 .ToList();
 
             if (orphans.Count > 0)
@@ -285,7 +393,7 @@ namespace Servy.Infrastructure.Data
                 // SQLite returns 1 for NOT NULL and 0 for nullable
                 bool dbNotNull = Convert.ToInt64(row.notnull) == 1;
 
-                // Only check types for columns managed by GetSqlType (StandardColumns)
+                // Check types for every InsertColumns-managed column (Id is excluded above)
                 if (expectedColumns.Contains(colName) && !coreKeys.Contains(colName, StringComparer.OrdinalIgnoreCase))
                 {
                     string expectedFullType = GetSqlType(colName); // e.g., "TEXT NOT NULL" or "INTEGER DEFAULT 0"
@@ -363,6 +471,28 @@ namespace Servy.Infrastructure.Data
         }
 
         /// <summary>
+        /// Builds the full Services table DDL for the given table name from the Single Source of Truth (SqlConstants),
+        /// so the fresh-install schema and the Version 4 rebuild schema cannot drift apart.
+        /// </summary>
+        /// <param name="tableName">The target table name to create.</param>
+        /// <returns>A CREATE TABLE IF NOT EXISTS statement covering the primary key and every expected column.</returns>
+        private static string BuildCreateTableSql(string tableName)
+        {
+            var columnDefinitions = new List<string>
+            {
+                "Id INTEGER PRIMARY KEY AUTOINCREMENT" // PK is not in InsertColumns
+            };
+
+            foreach (var col in GetExpectedColumns())
+            {
+                columnDefinitions.Add($"{col} {GetSqlType(col)}");
+            }
+
+            // IF NOT EXISTS to prevent concurrent racer crashes.
+            return $"CREATE TABLE IF NOT EXISTS {tableName} (\n    {string.Join(",\n    ", columnDefinitions)}\n);";
+        }
+
+        /// <summary>
         /// Queries the SQLite engine schema to map and return all current structural column fields for the Services table.
         /// </summary>
         private static HashSet<string> GetExistingColumnNames(DbConnection connection, DbTransaction transaction)
@@ -383,20 +513,7 @@ namespace Servy.Infrastructure.Data
         /// <param name="transaction">The active atomic transaction.</param>
         private static void ApplyVersion1(DbConnection connection, DbTransaction transaction)
         {
-            var expectedColumns = GetExpectedColumns();
-
-            var columnDefinitions = new List<string>
-            {
-                "Id INTEGER PRIMARY KEY AUTOINCREMENT" // PK is not in InsertColumns
-            };
-
-            foreach (var col in expectedColumns)
-            {
-                columnDefinitions.Add($"{col} {GetSqlType(col)}");
-            }
-
-            // IF NOT EXISTS to prevent concurrent racer crashes.
-            var createTableSql = $"CREATE TABLE IF NOT EXISTS {SqlConstants.ServicesTableName} (\n    {string.Join(",\n    ", columnDefinitions)}\n);";
+            var createTableSql = BuildCreateTableSql(SqlConstants.ServicesTableName);
             connection.Execute(createTableSql, transaction: transaction);
 
             // Create the UNIQUE functional index (IF NOT EXISTS protects against concurrent creations)
@@ -454,7 +571,6 @@ namespace Servy.Infrastructure.Data
 
             connection.Execute($"CREATE UNIQUE INDEX IF NOT EXISTS idx_services_name_lower ON {SqlConstants.ServicesTableName}(LOWER(Name));", transaction: transaction);
 
-            // DRY PASS: Utilize centralized factory query engine helper
             var existingColumns = GetExistingColumnNames(connection, transaction);
 
             // --- Intercept ambiguous legacy column and rename before dynamic column mapping ---
@@ -506,21 +622,12 @@ namespace Servy.Infrastructure.Data
             Logger.Info($"Migrating database to Version 4: Rebuilding '{SqlConstants.ServicesTableName}' table to drop strict NOT NULL constraints.");
 
             var expectedColumns = GetExpectedColumns().ToList();
-            var columnDefinitions = new List<string>
-            {
-                "Id INTEGER PRIMARY KEY AUTOINCREMENT"
-            };
-
-            // Dynamically construct the v4 table schema matching the exact DTO definition
-            foreach (var col in expectedColumns)
-            {
-                columnDefinitions.Add($"{col} {GetSqlType(col)}");
-            }
 
             // Clean up any stale staging table left over from a prior failed/interrupted migration attempt
             connection.Execute("DROP TABLE IF EXISTS Services_v4;", transaction: transaction);
 
-            var createTableSql = $"CREATE TABLE IF NOT EXISTS Services_v4 (\n    {string.Join(",\n    ", columnDefinitions)}\n);";
+            // Dynamically construct the v4 table schema matching the exact DTO definition
+            var createTableSql = BuildCreateTableSql("Services_v4");
             connection.Execute(createTableSql, transaction: transaction);
 
             // --- Extract only the columns that actually exist in the old table using unified discovery helper ---
@@ -627,10 +734,15 @@ namespace Servy.Infrastructure.Data
                     string serviceName = dup.Name;
                     long keepId = Convert.ToInt64(dup.KeepId);
 
-                    connection.Execute(
+                    int removed = connection.Execute(
                         $"DELETE FROM {SqlConstants.ServicesTableName} WHERE Name = @Name COLLATE UNICODE_NOCASE AND Id <> @KeepId;",
                         new { Name = serviceName, KeepId = keepId },
                         transaction: transaction);
+
+                    // The deleted rows are whole service configurations and they are gone once the transaction
+                    // commits, so this line is the only record there will ever be of what was removed. Name the
+                    // service and the kept ID, exactly as the V1 legacy dedup above already does.
+                    Logger.Warn($"Version 6 Remediation: kept ID {keepId} for service name '{serviceName}' and removed {removed} case-variant row(s).");
                 }
             }
 
@@ -661,6 +773,109 @@ namespace Servy.Infrastructure.Data
             AddColumnIfMissing(connection, transaction, version, "CpuAffinity");
         }
 
+        /// <summary>
+        /// Applies the Version 9 schema migration, trimming legacy whitespace-padded UserAccount values.
+        /// Safely checks for the column's presence to prevent errors on partial or custom test schemas.
+        /// </summary>
+        private static void ApplyVersion9(DbConnection connection, DbTransaction transaction)
+        {
+            Logger.Info("Migrating database to Version 9: Normalizing whitespace-padded UserAccount values.");
+
+            var existingColumns = GetExistingColumnNames(connection, transaction);
+            if (!existingColumns.Contains("UserAccount"))
+            {
+                Logger.Info("Migration to Version 9 skipped: Column 'UserAccount' was not found in the table layout.");
+                return;
+            }
+
+            string trimChars = " \t";
+            int affectedRows = connection.Execute($@"
+                UPDATE {SqlConstants.ServicesTableName}
+                SET UserAccount = TRIM(UserAccount, '{trimChars}')
+                WHERE UserAccount IS NOT NULL AND UserAccount <> TRIM(UserAccount, '{trimChars}');",
+                transaction: transaction);
+
+            if (affectedRows > 0)
+            {
+                Logger.Info($"Version 9 Migration: Cleaned and normalized {affectedRows} whitespace-padded UserAccount record(s).");
+            }
+
+            Logger.Info("Database successfully migrated to Version 9.");
+        }
+
+        /// <summary>
+        /// Applies the Version 10 schema migration: adds the <c>RestartAttempts</c> and <c>RestartAttemptsUpdatedAtTicks</c>
+        /// columns, which hold the restart attempts counter the wrapper kept in a file of the recovery folder before.
+        /// </summary>
+        private static void ApplyVersion10(DbConnection connection, DbTransaction transaction)
+        {
+            const int version = 10;
+            AddColumnIfMissing(connection, transaction, version, "RestartAttempts");
+            AddColumnIfMissing(connection, transaction, version, "RestartAttemptsUpdatedAtTicks");
+        }
+
+        /// <summary>
+        /// Applies the Version 11 schema migration: adds the <c>AllowOverriddenRuntimeVars</c> column, which allows
+        /// overridden runtime environment variables.
+        /// </summary>
+        private static void ApplyVersion11(DbConnection connection, DbTransaction transaction) => AddColumnIfMissing(connection, transaction, 11, "AllowOverriddenRuntimeVars");
+
+        /// <summary>
+        /// Applies the Version 12 data migration: re-saves every <c>HeartbeatUrl</c> stored in clear text in encrypted
+        /// form, now that it is encrypted at rest like the other sensitive fields of <c>ServiceRepository</c> (#7579).
+        /// A heartbeat URL is a capability URL: it identifies the check and may carry a token.
+        /// </summary>
+        /// <remarks>
+        /// Blank values stay as they are, the same way the repository leaves them unencrypted, and a value that already
+        /// carries the encryption marker is not encrypted twice. Only the <c>HeartbeatUrl</c> column is written.
+        /// </remarks>
+        /// <param name="connection">The active database connection.</param>
+        /// <param name="transaction">The migration transaction.</param>
+        /// <param name="secureData">Encrypts the values; read only when there is one to encrypt.</param>
+        /// <exception cref="InvalidOperationException">Thrown when a value must be encrypted and <paramref name="secureData"/> is <see langword="null"/>.</exception>
+        private static void ApplyVersion12(DbConnection connection, DbTransaction transaction, ISecureData? secureData)
+        {
+            Logger.Info("Migrating database to Version 12: Encrypting heartbeat URLs stored in clear text.");
+
+            var existingColumns = GetExistingColumnNames(connection, transaction);
+            if (!existingColumns.Contains("HeartbeatUrl"))
+            {
+                Logger.Info("Migration to Version 12 skipped: Column 'HeartbeatUrl' was not found in the table layout.");
+                return;
+            }
+
+            var plaintextRows = connection.Query<(long Id, string HeartbeatUrl)>($@"
+                SELECT Id, HeartbeatUrl
+                FROM {SqlConstants.ServicesTableName}
+                WHERE HeartbeatUrl IS NOT NULL;",
+                transaction: transaction)
+                .Where(row => !string.IsNullOrWhiteSpace(row.HeartbeatUrl) && !SecureData.HasEncryptionMarker(row.HeartbeatUrl))
+                .ToList();
+
+            if (plaintextRows.Count > 0)
+            {
+                if (secureData == null)
+                {
+                    throw new InvalidOperationException(
+                        $"{plaintextRows.Count} heartbeat URL(s) are stored in clear text and must be encrypted, but no encryption service was supplied to the database initializer.");
+                }
+
+                foreach (var row in plaintextRows)
+                {
+                    connection.Execute($@"
+                        UPDATE {SqlConstants.ServicesTableName}
+                        SET HeartbeatUrl = @HeartbeatUrl
+                        WHERE Id = @Id;",
+                        new { HeartbeatUrl = secureData.Encrypt(row.HeartbeatUrl), row.Id },
+                        transaction: transaction);
+                }
+
+                Logger.Info($"Version 12 Migration: Encrypted {plaintextRows.Count} heartbeat URL(s).");
+            }
+
+            Logger.Info("Database successfully migrated to Version 12.");
+        }
+
         #endregion
 
         #region Migration Helpers
@@ -670,7 +885,6 @@ namespace Servy.Infrastructure.Data
         /// </summary>
         private static void AddColumnIfMissing(DbConnection conn, DbTransaction tx, int version, string columnName)
         {
-            // DRY PASS: Utilize centralized factory query engine helper
             var existing = GetExistingColumnNames(conn, tx);
 
             if (!existing.Contains(columnName))
@@ -692,7 +906,6 @@ namespace Servy.Infrastructure.Data
         /// </summary>
         private static void RenameColumnIfExists(DbConnection conn, DbTransaction tx, int version, string oldName, string newName)
         {
-            // DRY PASS: Utilize centralized factory query engine helper
             var existing = GetExistingColumnNames(conn, tx);
 
             if (existing.Contains(oldName) && !existing.Contains(newName))
@@ -758,9 +971,10 @@ namespace Servy.Infrastructure.Data
         }
 
         /// <summary>
-        /// Extension-like helper logic utilized to filter collection groups cleanly.
+        /// Identifies orphan column names by returning elements from the source collection
+        /// that do not exist in the reference set using a case-insensitive comparison.
         /// </summary>
-        private static IEnumerable<string> MakeOrphanFilter(this IEnumerable<string> source, HashSet<string> references)
+        private static IEnumerable<string> GetOrphanColumns(this IEnumerable<string> source, HashSet<string> references)
         {
             return source.Except(references, StringComparer.OrdinalIgnoreCase);
         }

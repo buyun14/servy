@@ -20,8 +20,12 @@ namespace Servy.Core.UnitTests.Validation
 
             // Assert
             Assert.True(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.None, result.FailureKind);
             Assert.NotNull(result.ValidPath);
-            Assert.Equal(filePath, result.ValidPath!.ResolvedPath);
+            // ResolvedPath is the kernel-resolved target (GetFinalPathNameByHandle), not the caller's string:
+            // 8.3 components such as C:\Users\RUNNER~1 are expanded, so assert same file rather than same text.
+            Assert.Equal(Path.GetFileName(filePath), Path.GetFileName(result.ValidPath!.ResolvedPath));
+            Assert.True(File.Exists(result.ValidPath.ResolvedPath));
             Assert.Equal(expectedContent, content);
         }
 
@@ -37,9 +41,10 @@ namespace Servy.Core.UnitTests.Validation
 
             // Assert
             Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
             Assert.Null(content);
             Assert.NotNull(result.ErrorMessage);
-            Assert.Contains(".txt", result.ErrorMessage);
+            Assert.Equal(string.Format(Strings.Msg_SecurityInvalidFileType, ".txt"), result.ErrorMessage);
         }
 
         [Fact]
@@ -47,9 +52,12 @@ namespace Servy.Core.UnitTests.Validation
         {
             // Arrange
             string filePath = Path.Combine(TempDirectory, "huge.json");
+            long fileSizeBytes = AppConfig.MaxConfigFileSizeBytes + 1;
             using (var fs = new FileStream(filePath, FileMode.CreateNew))
             {
-                fs.SetLength(AppConfig.MaxConfigFileSizeBytes + 1); // sparse, no real IO cost
+                // SetLength extends the file without writing any data (the tail reads as zeros),
+                // so this costs 10 MiB of allocated disk but no write IO.
+                fs.SetLength(fileSizeBytes);
             }
 
             // Act
@@ -57,10 +65,47 @@ namespace Servy.Core.UnitTests.Validation
 
             // Assert
             Assert.False(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.InvalidArgument, result.FailureKind);
             Assert.Null(content);
 
-            string expectedMessage = string.Format(Strings.Msg_ConfigSizeLimitReached, filePath, AppConfig.MaxConfigFileSizeMB);
+            // The production message is formatted with securityCheck.ValidPath.ResolvedPath - the
+            // kernel-resolved target (GetFinalPathNameByHandle) - not the caller's string. 8.3
+            // components such as C:\Users\RUNNER~1 are expanded there, so comparing against
+            // filePath fails on any runner whose temp path is shortened (the #5757 class).
+            // Resolve through the same gate the production code uses.
+            var pathCheck = PathSecurityGuard.ValidatePath(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, out var validatedStream);
+            string resolvedPath;
+            using (validatedStream)
+            {
+                Assert.True(pathCheck.IsValid);
+                resolvedPath = pathCheck.ValidPath.ResolvedPath;
+            }
+
+            double actualSizeMb = (double)fileSizeBytes / (1024 * 1024);
+            string expectedMessage = string.Format(Strings.Msg_ConfigSizeLimitReached, resolvedPath, actualSizeMb, AppConfig.MaxConfigFileSizeMB);
             Assert.Equal(expectedMessage, result.ErrorMessage);
+        }
+
+        [Fact]
+        public void ValidatePathSecurityAndSize_FileAtSizeLimit_IsAccepted()
+        {
+            // Arrange: exactly at the limit. The guard rejects a file only when it is strictly
+            // larger, so a file of precisely MaxConfigFileSizeBytes is still a valid import.
+            string filePath = Path.Combine(TempDirectory, "at_limit.json");
+            using (var fs = new FileStream(filePath, FileMode.CreateNew))
+            {
+                // SetLength extends the file without writing any data (the tail reads as zeros),
+                // so this costs 10 MiB of allocated disk but no write IO.
+                fs.SetLength(AppConfig.MaxConfigFileSizeBytes);
+            }
+
+            // Act
+            var result = ImportGuard.ValidatePathSecurityAndSize(filePath, out var content);
+
+            // Assert
+            Assert.True(result.IsValid);
+            Assert.Equal(PathSecurityFailureKind.None, result.FailureKind);
+            Assert.NotNull(content);
         }
     }
 }

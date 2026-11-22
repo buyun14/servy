@@ -10,6 +10,7 @@ using System.Windows.Threading;
 
 namespace Servy.Manager.UnitTests.ViewModels
 {
+    [Collection(AmbientTestCollection.Name)]
     public class ServiceRowViewModelTests
     {
         private readonly Mock<IServiceCommands> _serviceCommandsMock;
@@ -40,9 +41,9 @@ namespace Servy.Manager.UnitTests.ViewModels
         {
             // Arrange & Act & Assert
             var ex = Assert.Throws<ArgumentNullException>(() => new ServiceRowViewModel(
-                nullIndex == 0 ? null : new Service { Name = "RowSvc" },
-                nullIndex == 1 ? null : _serviceCommandsMock.Object,
-                nullIndex == 2 ? null : _cursorServiceMock.Object));
+                nullIndex == 0 ? null! : new Service { Name = "RowSvc" },
+                nullIndex == 1 ? null! : _serviceCommandsMock.Object,
+                nullIndex == 2 ? null! : _cursorServiceMock.Object));
 
             Assert.Equal(expectedParamName, ex.ParamName);
         }
@@ -69,23 +70,6 @@ namespace Servy.Manager.UnitTests.ViewModels
         #endregion
 
         #region Command Functional Execution Tests
-
-        [Fact]
-        public void CanExecuteServiceCommand_ShouldReturnFalse_WhenInternalServiceNameIsEmpty()
-        {
-            // Arrange
-            var vm = new ServiceRowViewModel(
-                new Service { Name = "" },
-                _serviceCommandsMock.Object,
-                _cursorServiceMock.Object
-            );
-
-            // Act
-            var result = (bool)TestReflection.InvokeNonPublic(vm, "CanExecuteServiceCommand", new object[] { null! })!;
-
-            // Assert
-            Assert.False(result);
-        }
 
         [Fact]
         public async Task StartCommand_ShouldCallStartServiceAsync()
@@ -170,6 +154,24 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task ConfigureCommand_LeavesTheCursorToConfigureServiceAsync()
+        {
+            // Arrange
+            var vm = CreateViewModel("RowSvc");
+
+            _serviceCommandsMock.Setup(s => s.ConfigureServiceAsync(It.IsAny<Service>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            // Act
+            await vm.ConfigureCommand.ExecuteAsync(null);
+
+            // Assert - the call went out, and the row view model touched the cursor neither before nor after it
+            _serviceCommandsMock.Verify(s => s.ConfigureServiceAsync(It.Is<Service>(srv => ReferenceEquals(srv, vm.Service)), It.IsAny<CancellationToken>()), Times.Once);
+            _cursorServiceMock.Verify(c => c.SetWaitCursor(), Times.Never);
+            _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Never);
+        }
+
+        [Fact]
         public async Task InstallCommand_ShouldCallInstallServiceAsync()
         {
             // Arrange
@@ -185,6 +187,26 @@ namespace Servy.Manager.UnitTests.ViewModels
 
             // Assert
             _serviceCommandsMock.Verify();
+        }
+
+        [Fact]
+        public async Task InstallCommand_ShowsTheWaitCursorAroundTheCall()
+        {
+            // Arrange
+            var vm = CreateViewModel("RowSvc");
+            var events = new List<string>();
+
+            _cursorServiceMock.Setup(c => c.SetWaitCursor()).Callback(() => events.Add("set"));
+            _cursorServiceMock.Setup(c => c.ResetCursor()).Callback(() => events.Add("reset"));
+            _serviceCommandsMock.Setup(s => s.InstallServiceAsync(It.IsAny<Service>(), It.IsAny<CancellationToken>()))
+                .Callback(() => events.Add("call"))
+                .ReturnsAsync(true);
+
+            // Act
+            await vm.InstallCommand.ExecuteAsync(null);
+
+            // Assert - set before the call, reset after it, once each
+            Assert.Equal(new[] { "set", "call", "reset" }, events);
         }
 
         [Fact]
@@ -280,6 +302,108 @@ namespace Servy.Manager.UnitTests.ViewModels
             _serviceCommandsMock.Verify(c => c.CopyPidAsync(It.Is<Service>(s => s.Name == "RowSvc" && s.Pid == 123), It.IsAny<CancellationToken>()), Times.Once);
         }
 
+        /// <summary>
+        /// Reads one row command's predicate, selected by the command's property name, so the theories
+        /// below can vary which command they exercise without reflection.
+        /// </summary>
+        /// <param name="vm">The row view model whose command predicate is read.</param>
+        /// <param name="commandName">
+        /// The name of the command property to read, as <c>nameof</c> spells it.
+        /// </param>
+        /// <returns><c>true</c> when the selected command can execute; otherwise <c>false</c>.</returns>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// <paramref name="commandName"/> is not one of the row commands.
+        /// </exception>
+        private static bool CanExecuteByName(ServiceRowViewModel vm, string commandName)
+        {
+            if (commandName == nameof(ServiceRowViewModel.StartCommand)) return vm.StartCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.StopCommand)) return vm.StopCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.RestartCommand)) return vm.RestartCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.UninstallCommand)) return vm.UninstallCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.ConfigureCommand)) return vm.ConfigureCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.InstallCommand)) return vm.InstallCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.RemoveCommand)) return vm.RemoveCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.ExportXmlCommand)) return vm.ExportXmlCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.ExportJsonCommand)) return vm.ExportJsonCommand.CanExecute(null);
+            if (commandName == nameof(ServiceRowViewModel.CopyPidCommand)) return vm.CopyPidCommand.CanExecute(null);
+
+            throw new ArgumentOutOfRangeException(nameof(commandName), commandName, "Unknown row command.");
+        }
+
+        [Theory]
+        [InlineData(nameof(ServiceRowViewModel.StartCommand), false, ServiceStatus.Stopped)]
+        [InlineData(nameof(ServiceRowViewModel.StopCommand), false, ServiceStatus.Running)]
+        [InlineData(nameof(ServiceRowViewModel.RestartCommand), false, ServiceStatus.Running)]
+        [InlineData(nameof(ServiceRowViewModel.RestartCommand), true, ServiceStatus.Stopped)]
+        [InlineData(nameof(ServiceRowViewModel.UninstallCommand), false, ServiceStatus.Stopped)]
+        public void StateGatedCommands_CanExecute_IsFalseWhenTheServiceCannotTakeTheAction(string commandName, bool isInstalled, ServiceStatus status)
+        {
+            // Arrange - every other term of the predicate holds, so only the varied one can disable it
+            var vm = new ServiceRowViewModel(
+                new Service { Name = "RowSvc", Pid = 123, IsInstalled = isInstalled, Status = status },
+                _serviceCommandsMock.Object,
+                _cursorServiceMock.Object
+            );
+
+            // Act
+            var canExecute = CanExecuteByName(vm, commandName);
+
+            // Assert
+            Assert.False(canExecute);
+        }
+
+        [Theory]
+        [InlineData(nameof(ServiceRowViewModel.StartCommand), ServiceStatus.Stopped, "")]
+        [InlineData(nameof(ServiceRowViewModel.StopCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.RestartCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.ConfigureCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.InstallCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.UninstallCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.RemoveCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.ExportXmlCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.ExportJsonCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.CopyPidCommand), ServiceStatus.Running, "")]
+        [InlineData(nameof(ServiceRowViewModel.ConfigureCommand), ServiceStatus.Running, "   ")]
+        public void RowCommands_CanExecute_IsFalseWhenTheServiceHasNoName(string commandName, ServiceStatus status, string name)
+        {
+            // Arrange - IsInstalled, Status and Pid all hold on both rows, so only the name can disable the command
+            var named = new ServiceRowViewModel(
+                new Service { Name = "RowSvc", Pid = 123, IsInstalled = true, Status = status },
+                _serviceCommandsMock.Object,
+                _cursorServiceMock.Object
+            );
+            var unnamed = new ServiceRowViewModel(
+                new Service { Name = name, Pid = 123, IsInstalled = true, Status = status },
+                _serviceCommandsMock.Object,
+                _cursorServiceMock.Object
+            );
+
+            // Act
+            var namedCanExecute = CanExecuteByName(named, commandName);
+            var unnamedCanExecute = CanExecuteByName(unnamed, commandName);
+
+            // Assert - the control row proves the arrange enables the command, so the false below comes from the name
+            Assert.True(namedCanExecute);
+            Assert.False(unnamedCanExecute);
+        }
+
+        [Fact]
+        public void CopyPidCommand_CanExecute_IsFalseWithoutAPid()
+        {
+            // Arrange
+            var vm = new ServiceRowViewModel(
+                new Service { Name = "RowSvc", Pid = null },
+                _serviceCommandsMock.Object,
+                _cursorServiceMock.Object
+            );
+
+            // Act
+            var canExecute = vm.CopyPidCommand.CanExecute(null);
+
+            // Assert
+            Assert.False(canExecute);
+        }
+
         #endregion
 
         #region Properties & Model Propagation Tests
@@ -297,8 +421,7 @@ namespace Servy.Manager.UnitTests.ViewModels
                 LogOnAs = "LocalSystem",
                 IsInstalled = true,
                 IsDesktopAppAvailable = true,
-                Pid = 1234,
-                IsPidEnabled = true,
+                Pid = 1234,   // IsPidEnabled is derived from this
                 CpuUsage = 5.5,
                 RamUsage = 1024 * 1024 // 1 MB
             };
@@ -337,6 +460,26 @@ namespace Servy.Manager.UnitTests.ViewModels
             // Core model mutations should still stream through at-least-once via automatic forwarding hooks
             Assert.Contains(nameof(vm.Status), propertiesChanged);
             Assert.Contains(nameof(vm.Pid), propertiesChanged);
+        }
+
+        [Theory]
+        [InlineData(null, 4321, true)]
+        [InlineData(4321, null, false)]
+        public void IsPidEnabled_IsDerivedFromPid_AndIsRaisedWhenPidChanges(int? initialPid, int? newPid, bool expected)
+        {
+            // Arrange
+            var service = new Service { Name = "RowSvc", Pid = initialPid };
+            var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+            var propertiesChanged = new List<string>();
+            vm.PropertyChanged += (s, e) => { if (e.PropertyName != null) propertiesChanged.Add(e.PropertyName); };
+
+            // Act - only Pid is written; nothing restates the IsPidEnabled rule
+            service.Pid = newPid;
+
+            // Assert - the Copy PID menu item binds IsPidEnabled through this passthrough, so the
+            // notification matters as much as the value
+            Assert.Equal(expected, vm.IsPidEnabled);
+            Assert.Contains(nameof(vm.IsPidEnabled), propertiesChanged);
         }
 
         [Fact]
@@ -401,6 +544,78 @@ namespace Servy.Manager.UnitTests.ViewModels
         }
 
         [Fact]
+        public async Task Service_PropertyChanged_IsInstalledUpdated_RaisesCanExecuteChangedOnCommands()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var service = new Service { Name = "RowSvc", IsInstalled = false, Status = ServiceStatus.Stopped };
+                var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+                var wasRaised = false;
+                EventHandler handler = (sender, args) => wasRaised = true;
+
+                vm.StartCommand.CanExecuteChanged += handler;
+
+                try
+                {
+                    // Assert state transition before mutation
+                    Assert.False(vm.StartCommand.CanExecute(null));
+
+                    // Act - an install is the IsInstalled term of the requery trigger
+                    service.IsInstalled = true;
+
+                    // Pump the STA dispatcher frames so CommandManager.RequerySuggested fires
+                    await Dispatcher.Yield(DispatcherPriority.Background);
+
+                    // Assert
+                    Assert.True(wasRaised, "CanExecuteChanged was not raised when a relevant property (IsInstalled) was updated.");
+                    Assert.True(vm.StartCommand.CanExecute(null));
+                }
+                finally
+                {
+                    vm.StartCommand.CanExecuteChanged -= handler;
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
+        public async Task Service_PropertyChanged_PidUpdated_RaisesCanExecuteChangedOnCommands()
+        {
+            await Helper.RunOnSTA(async () =>
+            {
+                // Arrange
+                var service = new Service { Name = "RowSvc", IsInstalled = true, Status = ServiceStatus.Running, Pid = 123 };
+                var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+                var wasRaised = false;
+                EventHandler handler = (sender, args) => wasRaised = true;
+
+                vm.CopyPidCommand.CanExecuteChanged += handler;
+
+                try
+                {
+                    // Assert state transition before mutation
+                    Assert.True(vm.CopyPidCommand.CanExecute(null));
+
+                    // Act - losing the PID is the Pid term of the requery trigger
+                    service.Pid = null;
+
+                    // Pump the STA dispatcher frames so CommandManager.RequerySuggested fires
+                    await Dispatcher.Yield(DispatcherPriority.Background);
+
+                    // Assert
+                    Assert.True(wasRaised, "CanExecuteChanged was not raised when a relevant property (Pid) was updated.");
+                    Assert.False(vm.CopyPidCommand.CanExecute(null));
+                }
+                finally
+                {
+                    vm.CopyPidCommand.CanExecuteChanged -= handler;
+                }
+            }, createApp: true);
+        }
+
+        [Fact]
         public async Task Service_PropertyChanged_IrrelevantPropertyUpdated_DoesNotRaiseCanExecuteChangedOnCommands()
         {
             await Helper.RunOnSTA(async () =>
@@ -440,6 +655,71 @@ namespace Servy.Manager.UnitTests.ViewModels
             }, createApp: true);
         }
 
+        [Fact]
+        public void Name_WhenTheModelHasNoName_IsTheEmptyString()
+        {
+            // Arrange
+            var service = new Service { Name = null };
+
+            // Act
+            var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+            // Assert
+            Assert.Equal(string.Empty, vm.Name);
+        }
+
+        [Fact]
+        public void Description_WhenTheModelHasNoDescription_IsTheEmptyString()
+        {
+            // Arrange
+            var service = new Service { Name = "RowSvc", Description = null };
+
+            // Act
+            var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+            // Assert
+            Assert.Equal(string.Empty, vm.Description);
+        }
+
+        [Fact]
+        public void LogOnAs_WhenTheModelHasNoAccount_IsTheEmptyString()
+        {
+            // Arrange
+            var service = new Service { Name = "RowSvc", LogOnAs = null };
+
+            // Act
+            var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+            // Assert
+            Assert.Equal(string.Empty, vm.LogOnAs);
+        }
+
+        [Fact]
+        public void DisplayName_ReflectsTheModelValue()
+        {
+            // Arrange
+            var service = new Service { Name = "RowSvc", DisplayName = "Row Service" };
+
+            // Act
+            var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+            // Assert
+            Assert.Equal("Row Service", vm.DisplayName);
+        }
+
+        [Fact]
+        public void DisplayName_WhenTheModelHasNoDisplayName_IsTheEmptyString()
+        {
+            // Arrange
+            var service = new Service { Name = "RowSvc", DisplayName = null };
+
+            // Act
+            var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+            // Assert
+            Assert.Equal(string.Empty, vm.DisplayName);
+        }
+
         #endregion
 
         #region Execution Safety & Disposal Tests
@@ -455,13 +735,44 @@ namespace Servy.Manager.UnitTests.ViewModels
                 .Setup(s => s.ConfigureServiceAsync(It.IsAny<Service>(), It.IsAny<CancellationToken>()))
                 .ThrowsAsync(new InvalidOperationException("SCM access denied simulation error."));
 
-            // Act
             Func<Task> faultyAction = () => _serviceCommandsMock.Object.ConfigureServiceAsync(service, TestContext.Current.CancellationToken);
 
-            var taskResult = (Task)TestReflection.InvokeNonPublic(vm, "ExecuteSafeAsync", faultyAction)!;
-            await taskResult;
+            // Act
+            // The file log is captured because the Logger.Error line is the only thing the general
+            // catch (Exception) arm does that the cancellation arm deliberately does not, so it is
+            // the only assertion that tells the two arms apart.
+            var log = await LogCapture.RunAsync(
+                () => (Task)TestReflection.InvokeNonPublic(vm, "ExecuteSafeAsync", nameof(vm.ConfigureCommand), faultyAction, true)!);
 
             // Assert
+            Assert.Contains("ConfigureCommand failed for FaultyService.", log);
+            _cursorServiceMock.Verify(c => c.SetWaitCursor(), Times.Once);
+            _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
+        }
+
+        [Fact]
+        public async Task ExecuteSafeAsync_OperationCanceledException_SwallowsAndResetsCursor()
+        {
+            // Arrange
+            var service = new Service { Name = "CancelledService" };
+            var vm = new ServiceRowViewModel(service, _serviceCommandsMock.Object, _cursorServiceMock.Object);
+
+            // A cancelled action must reach the dedicated catch (OperationCanceledException) arm,
+            // which swallows it silently instead of logging it like the general catch (Exception) arm.
+            Func<Task> cancelledAction = () => Task.FromException(new OperationCanceledException());
+
+            // Act
+            var taskResult = Task.CompletedTask;
+            var log = await LogCapture.RunAsync(
+                () => taskResult = (Task)TestReflection.InvokeNonPublic(vm, "ExecuteSafeAsync", nameof(vm.ConfigureCommand), cancelledAction, true)!);
+
+            // Assert
+            // Awaiting without throwing is the proof the cancellation was absorbed, not rethrown.
+            Assert.True(taskResult.IsCompletedSuccessfully, "ExecuteSafeAsync did not absorb the OperationCanceledException.");
+            // Deleting the cancellation arm routes this into catch (Exception), which logs this line,
+            // and adding a Logger.Error to the cancellation arm logs it from there. Either way the
+            // silence this arm exists for is gone, and only this assertion sees it.
+            Assert.DoesNotContain("failed for CancelledService", log);
             _cursorServiceMock.Verify(c => c.SetWaitCursor(), Times.Once);
             _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
         }
@@ -486,8 +797,23 @@ namespace Servy.Manager.UnitTests.ViewModels
             vm.Dispose();
 
             // A genuinely different value, so the model definitely raises PropertyChanged.
-            service.Status = ServiceStatus.Stopped;
-            Assert.NotEqual(ServiceStatus.Running, service.Status);   // guards the arrange itself
+            // Observe the model's own event instead of re-reading the value just written: Status is
+            // an equality-guarded setter, so whether it raises depends on the baseline set above,
+            // which a comparison against the freshly assigned value cannot see.
+            var modelRaised = false;
+            PropertyChangedEventHandler probe = (s, e) => modelRaised = true;
+            service.PropertyChanged += probe;
+            try
+            {
+                service.Status = ServiceStatus.Stopped;
+            }
+            finally
+            {
+                service.PropertyChanged -= probe;
+            }
+
+            // The arrange is only valid if the model actually notified.
+            Assert.True(modelRaised, "The model did not raise PropertyChanged, so this test cannot prove the view model unsubscribed.");
 
             // Assert
             Assert.Equal(0, receivedNotifications);

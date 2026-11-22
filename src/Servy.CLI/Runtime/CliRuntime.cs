@@ -1,0 +1,114 @@
+using Servy.CLI.Helpers;
+using Servy.Core.Data;
+using Servy.Core.Helpers;
+using Servy.Core.Security;
+using Servy.Core.Services;
+using Servy.Infrastructure.Data;
+using Servy.Infrastructure.Helpers;
+using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
+
+namespace Servy.CLI.Runtime
+{
+    /// <summary>
+    /// The production <see cref="ICliRuntime"/>: runs each bootstrap step against the real machine.
+    /// </summary>
+    [ExcludeFromCodeCoverage]
+    internal sealed class CliRuntime : ICliRuntime
+    {
+        /// <summary>
+        /// The base namespace where embedded resource files are located.
+        /// Used for locating and extracting files such as the service executable.
+        /// </summary>
+        private const string ResourcesNamespace = "Servy.CLI.Resources";
+
+        /// <summary>
+        /// Reports whether the current process runs with administrative privileges.
+        /// </summary>
+        private readonly Func<bool> _isAdministrator;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="CliRuntime"/> class that reads the elevation of the current process.
+        /// </summary>
+        public CliRuntime() : this(SecurityHelper.IsAdministrator)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="CliRuntime"/> class with the given elevation probe, so a test can
+        /// run the real bootstrap steps without depending on the elevation of the host that runs it.
+        /// </summary>
+        /// <param name="isAdministrator">Reports whether the current process runs with administrative privileges.</param>
+        internal CliRuntime(Func<bool> isAdministrator)
+        {
+            _isAdministrator = isAdministrator;
+        }
+
+        /// <summary>
+        /// Checks that the loaded SQLite library is not a version known to be vulnerable.
+        /// </summary>
+        /// <param name="detectedVersion">The SQLite version that was detected, or <see langword="null"/> when it could not be read.</param>
+        /// <returns><see langword="true"/> when the version is safe to use; otherwise <see langword="false"/>.</returns>
+        public bool IsSqliteVersionSafe(out string? detectedVersion)
+            => DatabaseValidator.IsSqliteVersionSafe(out detectedVersion);
+
+        /// <summary>
+        /// Determines whether the current process runs with administrative privileges.
+        /// </summary>
+        /// <returns><see langword="true"/> when the process is elevated; otherwise <see langword="false"/>.</returns>
+        public bool IsAdministrator() => _isAdministrator();
+
+        /// <summary>
+        /// Creates the database and security folders, registers the event source, and initializes the database.
+        /// </summary>
+        /// <param name="connectionString">The SQLite connection string.</param>
+        /// <param name="aesKeyFilePath">The path of the AES key file.</param>
+        /// <param name="aesIVFilePath">The path of the AES IV file.</param>
+        /// <param name="dbContext">The database context to initialize.</param>
+        /// <param name="secureData">Encrypts the values a schema migration moves under encryption at rest; read only when there is one.</param>
+        public void EnsureDatabase(string connectionString, string aesKeyFilePath, string aesIVFilePath, IAppDbContext dbContext, ISecureData secureData)
+        {
+            // Ensure db and security folders exist
+            AppFoldersHelper.EnsureFolders(connectionString, aesKeyFilePath, aesIVFilePath);
+
+            // Ensure event source exists
+            Core.Helpers.Helper.EnsureEventSourceExists();
+
+            // Initialize the database
+            DatabaseInitializer.InitializeDatabase(dbContext, connection => SQLiteDbInitializer.Initialize(connection, secureData));
+        }
+
+        /// <summary>
+        /// Extracts the embedded service wrapper, restarter and host binaries, removes the legacy Sysinternals Handle
+        /// executables, then installs and starts the Servy host service.
+        /// </summary>
+        /// <param name="serviceRepository">The repository holding the installed services.</param>
+        /// <param name="controllerFactory">Creates a service controller wrapper for a service name.</param>
+        /// <param name="cancellationToken">A token that cancels the extraction and the waits.</param>
+        /// <returns>A task that completes when the binaries are in place and the host was handled.</returns>
+        public Task EnsureServiceBinariesAsync(IServiceRepository serviceRepository, Func<string, IServiceControllerWrapper> controllerFactory, CancellationToken cancellationToken)
+        {
+            var bootstrapper = new ServiceBinariesBootstrapper(
+                new EmbeddedResourceExtractor(new ResourceHelper(new ProcessKiller()), Assembly.GetExecutingAssembly(), ResourcesNamespace),
+                new ServiceHelper(serviceRepository),
+                new ServyHostInstaller(new WindowsServiceApi(), new Win32ErrorProvider(), new ServiceControllerProvider(controllerFactory)),
+                serviceRepository,
+                new ServyExePermissionsHardener());
+
+            return bootstrapper.EnsureAsync(cancellationToken);
+        }
+
+        /// <summary>
+        /// Determines whether the process runs in a real, interactive console window.
+        /// </summary>
+        /// <returns><see langword="true"/> when a console that supports the loading animation is attached; otherwise <see langword="false"/>.</returns>
+        public bool IsRealConsole() => Program.IsRealConsole();
+
+        /// <summary>
+        /// Runs an action while a loading animation is shown on the console.
+        /// </summary>
+        /// <param name="action">The action to run.</param>
+        /// <returns>A task that completes when the action completes.</returns>
+        public Task RunWithLoadingAnimationAsync(Func<Task> action) => ConsoleHelper.RunWithLoadingAnimation(action);
+    }
+}

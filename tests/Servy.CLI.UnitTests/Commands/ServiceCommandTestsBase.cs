@@ -1,7 +1,9 @@
 using Moq;
 using Servy.CLI.Commands;
 using Servy.CLI.Models;
+using Servy.Core.Resources;
 using Servy.Core.Services;
+using CliStrings = Servy.CLI.Resources.Strings;
 
 namespace Servy.CLI.UnitTests.Commands
 {
@@ -79,6 +81,30 @@ namespace Servy.CLI.UnitTests.Commands
         protected abstract string ExpectedGenericActionMessage(string serviceName);
 
         /// <summary>
+        /// When overridden in a derived class, returns the suggestion the command under test passes to
+        /// <c>BaseCommand.ExecuteWithHandling</c>/<c>ExecuteWithHandlingAsync</c>.
+        /// </summary>
+        protected abstract string ExpectedSuggestion { get; }
+
+        /// <summary>
+        /// When overridden in a derived class, returns the command name the command under test passes to
+        /// <c>BaseCommand.ExecuteWithHandling</c>/<c>ExecuteWithHandlingAsync</c> (e.g. "start", "stop"),
+        /// which is the value formatted into <see cref="CliStrings.Msg_CommandCancelled"/>.
+        /// </summary>
+        protected abstract string ExpectedCommandName { get; }
+
+        /// <summary>
+        /// When overridden in a derived class, returns the expected error message when the target service is not installed.
+        /// Defaults to <see cref="Strings.Msg_ServiceNotFound"/>.
+        /// </summary>
+        /// <param name="serviceName">The target service name.</param>
+        /// <returns>The expected service not found error message.</returns>
+        protected virtual string ExpectedServiceNotFoundMessage(string serviceName)
+        {
+            return Strings.Msg_ServiceNotFound;
+        }
+
+        /// <summary>
         /// When overridden in a derived class, configures the mock service manager to return success for the specified service name.
         /// </summary>
         /// <param name="mockManager">The mock service manager.</param>
@@ -102,8 +128,20 @@ namespace Servy.CLI.UnitTests.Commands
         protected abstract void SetupServiceManagerException<TException>(Mock<IServiceManager> mockManager, string serviceName) where TException : Exception, new();
 
         /// <summary>
+        /// When overridden in a derived class, configures the mock service manager to simulate an uninstalled or missing service.
+        /// Defaults to setting up <see cref="IServiceManager.IsServiceInstalled"/> to return <c>false</c>.
+        /// </summary>
+        /// <param name="mockManager">The mock service manager.</param>
+        /// <param name="serviceName">The target service name.</param>
+        protected virtual void SetupServiceNotInstalled(Mock<IServiceManager> mockManager, string serviceName)
+        {
+            mockManager.Setup(sm => sm.IsServiceInstalled(serviceName, It.IsAny<CancellationToken>())).Returns(false);
+        }
+
+        /// <summary>
         /// Executes the command under test with the provided options.
-        /// Checks for an asynchronous <c>ExecuteAsync</c> method via dynamic dispatch, falling back to synchronous <c>Execute</c>.
+        /// Invokes the asynchronous <c>ExecuteAsync</c> entry point via dynamic dispatch, since the commands do not share an interface.
+        /// A command exposing a synchronous <c>Execute</c> instead overrides this method (see <c>ServiceStatusCommandTests</c>).
         /// </summary>
         /// <param name="command">The command instance to execute.</param>
         /// <param name="options">The options instance to pass to the command.</param>
@@ -112,15 +150,7 @@ namespace Servy.CLI.UnitTests.Commands
         {
             dynamic cmd = command!;
 
-            try
-            {
-                var result = cmd.ExecuteAsync(options, TestContext.Current.CancellationToken);
-                return await result;
-            }
-            catch (Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
-            {
-                return cmd.Execute(options, TestContext.Current.CancellationToken);
-            }
+            return await cmd.ExecuteAsync(options, TestContext.Current.CancellationToken);
         }
 
         #endregion
@@ -176,7 +206,7 @@ namespace Servy.CLI.UnitTests.Commands
 
             // Assert
             Assert.False(result.IsSuccess);
-            Assert.Equal(Core.Resources.Strings.Msg_ServiceNameRequired, result.Message);
+            Assert.Equal(Strings.Msg_ServiceNameRequired, result.Message);
         }
 
         /// <summary>
@@ -200,7 +230,7 @@ namespace Servy.CLI.UnitTests.Commands
         }
 
         /// <summary>
-        /// Validates that an <see cref="UnauthorizedAccessException"/> thrown by the service manager is caught and returns an "Access Denied" failure result.
+        /// Validates that an <see cref="UnauthorizedAccessException"/> thrown by the service manager is caught and returns the admin-privileges failure result for this command's verb.
         /// </summary>
         [Fact]
         public virtual async Task Execute_UnauthorizedAccessException_ReturnsFailure()
@@ -214,8 +244,11 @@ namespace Servy.CLI.UnitTests.Commands
             var result = await ExecuteCommandAsync(Command, options);
 
             // Assert
+            // Assert the resource rather than the first two English words of its value: a
+            // reworded or localised Msg_AdminPrivilegesRequired must not fail this test, and
+            // the substring form pinned nothing about the {0} verb argument.
             Assert.False(result.IsSuccess);
-            Assert.Contains("Access Denied", result.Message);
+            Assert.Equal(string.Format(CliStrings.Msg_AdminPrivilegesRequired, ExpectedCommandName), result.Message);
         }
 
         /// <summary>
@@ -228,13 +261,37 @@ namespace Servy.CLI.UnitTests.Commands
             const string serviceName = "TestService";
             var options = CreateValidOptions(serviceName);
             SetupServiceManagerException<Exception>(MockServiceManager, serviceName);
+            var expectedMessage =
+                string.Format(CliStrings.Msg_CommandFailedTemplate, ExpectedGenericActionMessage(serviceName), new Exception().Message)
+                + Environment.NewLine
+                + string.Format(CliStrings.Msg_SuggestionTemplate, ExpectedSuggestion);
 
             // Act
             var result = await ExecuteCommandAsync(Command, options);
 
             // Assert
             Assert.False(result.IsSuccess);
-            Assert.Contains(ExpectedGenericActionMessage(serviceName), result.Message);
+            Assert.Equal(expectedMessage, result.Message);
+        }
+
+        /// <summary>
+        /// Validates that a cancelled operation is reported as a clean cancellation result carrying the command name,
+        /// rather than being routed through the generic exception handler.
+        /// </summary>
+        [Fact]
+        public virtual async Task Execute_OperationCanceled_ReturnsCancelledResult()
+        {
+            // Arrange
+            const string serviceName = "TestService";
+            var options = CreateValidOptions(serviceName);
+            SetupServiceManagerException<OperationCanceledException>(MockServiceManager, serviceName);
+
+            // Act
+            var result = await ExecuteCommandAsync(Command, options);
+
+            // Assert
+            Assert.False(result.IsSuccess);
+            Assert.Equal(string.Format(CliStrings.Msg_CommandCancelled, ExpectedCommandName), result.Message);
         }
 
         /// <summary>
@@ -246,14 +303,36 @@ namespace Servy.CLI.UnitTests.Commands
             // Arrange
             const string serviceName = "MissingService";
             var options = CreateValidOptions(serviceName);
-            MockServiceManager.Setup(sm => sm.IsServiceInstalled(serviceName, It.IsAny<CancellationToken>())).Returns(false);
+            SetupServiceNotInstalled(MockServiceManager, serviceName);
 
             // Act
             var result = await ExecuteCommandAsync(Command, options);
 
             // Assert
             Assert.False(result.IsSuccess);
-            Assert.Equal(Core.Resources.Strings.Msg_ServiceNotFound, result.Message);
+            Assert.Equal(ExpectedServiceNotFoundMessage(serviceName), result.Message);
+        }
+
+        /// <summary>
+        /// Runs the Disabled-startup-type refusal scenario: an installed service whose startup type is
+        /// Disabled must be refused with <see cref="CliStrings.Msg_ServiceDisabledError"/>.
+        /// Only the commands that perform that pre-check call it, which is why it is a helper here
+        /// rather than a [Fact] every derived class would inherit.
+        /// </summary>
+        protected async Task AssertDisabledStartupTypeIsRefusedAsync()
+        {
+            // Arrange
+            const string serviceName = "DisabledService";
+            var options = CreateValidOptions(serviceName);
+            MockServiceManager.Setup(sm => sm.IsServiceInstalled(serviceName, It.IsAny<CancellationToken>())).Returns(true);
+            MockServiceManager.Setup(sm => sm.GetServiceStartupType(serviceName, It.IsAny<CancellationToken>())).Returns(Core.Enums.ServiceStartType.Disabled);
+
+            // Act
+            var result = await ExecuteCommandAsync(Command, options);
+
+            // Assert
+            Assert.False(result.IsSuccess);
+            Assert.Equal(CliStrings.Msg_ServiceDisabledError, result.Message);
         }
 
         #endregion

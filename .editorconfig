@@ -15,24 +15,37 @@ insert_final_newline = true
 indent_style = space
 indent_size = 4
 trim_trailing_whitespace = true
+end_of_line = crlf
 
 # MSBuild / Project Files
 [*.{csproj,fsproj,vbproj,props,targets,manifest}]
 indent_style = space
 indent_size = 2
+end_of_line = crlf
 
 # PowerShell Scripts
 [*.{ps1,psm1,psd1}]
 indent_style = space
 indent_size = 4
+end_of_line = crlf
+charset = utf-8-bom
 
-# JSON / YAML / Web Configs
-[*.{json,yml,yaml,xml,config}]
+# XML & Config Files
+[*.{xml,config}]
 indent_style = space
 indent_size = 2
+end_of_line = crlf
+charset = utf-8-bom
+
+# JSON / YAML Configs
+[*.{json,yml,yaml}]
+indent_style = space
+indent_size = 2
+end_of_line = crlf
 
 # Markdown Files
 [*.md]
 indent_style = space
 indent_size = 2
+end_of_line = crlf
 trim_trailing_whitespace = false

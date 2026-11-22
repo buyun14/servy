@@ -10,8 +10,10 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "_global", "_global", "{02EA
 		.gitattributes = .gitattributes
 		.gitignore = .gitignore
 		.gitleaks.toml = .gitleaks.toml
+		.gitleaksignore = .gitleaksignore
 		bump-runtime.ps1 = bump-runtime.ps1
 		bump-version.ps1 = bump-version.ps1
+		CHANGELOG-v1.0-v7.9.md = CHANGELOG-v1.0-v7.9.md
 		CHANGELOG.md = CHANGELOG.md
 		codecov.yml = codecov.yml
 		Directory.Build.props = Directory.Build.props
@@ -22,16 +24,19 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "_global", "_global", "{02EA
 		Get-FileEncoding.test.ps1 = Get-FileEncoding.test.ps1
 		global.json = global.json
 		LICENSE.txt = LICENSE.txt
+		llms-full.txt = llms-full.txt
+		llms.txt = llms.txt
 		NOTES.md = NOTES.md
 		README.md = README.md
-		ROADMAP.md = ROADMAP.md
-		THIRD-PARTY-NOTICES.md = THIRD-PARTY-NOTICES.md
 		Update-FileHelpers.ps1 = Update-FileHelpers.ps1
 	EndProjectSection
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "apps", "apps", "{525B29D4-743C-4A5B-BFB6-82A3F981495E}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{F56CEF5B-4A0B-4494-8BFD-F6EC660B510E}"
+	ProjectSection(SolutionItems) = preProject
+		src\linker.shared.xml = src\linker.shared.xml
+	EndProjectSection
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "core", "core", "{7D103998-9A71-474A-A668-10311727E6E7}"
 EndProject
@@ -39,6 +44,9 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "service", "service", "{66EE
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{50795869-2933-430F-98BD-956C414ABBE4}"
 	ProjectSection(SolutionItems) = preProject
+		tests\coverage-filters.ps1 = tests\coverage-filters.ps1
+		tests\Directory.Build.props = tests\Directory.Build.props
+		tests\Directory.Build.targets = tests\Directory.Build.targets
 		tests\test.ps1 = tests\test.ps1
 	EndProjectSection
 EndProject
@@ -71,6 +79,7 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "workflows", "workflows", "{
 		.github\workflows\scoop.yml = .github\workflows\scoop.yml
 		.github\workflows\security.yml = .github\workflows\security.yml
 		.github\workflows\sonar.yml = .github\workflows\sonar.yml
+		.github\workflows\test-project.yml = .github\workflows\test-project.yml
 		.github\workflows\test.yml = .github\workflows\test.yml
 		.github\workflows\wiki.yml = .github\workflows\wiki.yml
 		.github\workflows\winget.yml = .github\workflows\winget.yml
@@ -85,11 +94,13 @@ EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "setup", "setup", "{11479D8F-D8B6-4AD7-BC82-A423FCC30779}"
 	ProjectSection(SolutionItems) = preProject
 		setup\build-common.ps1 = setup\build-common.ps1
+		setup\build-common.test.ps1 = setup\build-common.test.ps1
 		setup\build-config.ps1 = setup\build-config.ps1
 		setup\build-config.test.ps1 = setup\build-config.test.ps1
 		setup\common-helpers.ps1 = setup\common-helpers.ps1
 		setup\generate-sbom.ps1 = setup\generate-sbom.ps1
 		setup\publish-common.ps1 = setup\publish-common.ps1
+		setup\publish-common.test.ps1 = setup\publish-common.test.ps1
 		setup\publish-res.ps1 = setup\publish-res.ps1
 		setup\publish-sc.ps1 = setup\publish-sc.ps1
 		setup\publish.ps1 = setup\publish.ps1
@@ -124,6 +135,7 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "taskschd", "taskschd", "{92
 		setup\taskschd\Get-ServyLastErrors.ps1 = setup\taskschd\Get-ServyLastErrors.ps1
 		setup\taskschd\Import-ServyDependencies.ps1 = setup\taskschd\Import-ServyDependencies.ps1
 		setup\taskschd\Servy-Watermark.psm1 = setup\taskschd\Servy-Watermark.psm1
+		setup\taskschd\Servy-Watermark.test.ps1 = setup\taskschd\Servy-Watermark.test.ps1
 		setup\taskschd\ServyFailureEmail.ps1 = setup\taskschd\ServyFailureEmail.ps1
 		setup\taskschd\ServyFailureEmail.vbs = setup\taskschd\ServyFailureEmail.vbs
 		setup\taskschd\ServyFailureEmail.xml = setup\taskschd\ServyFailureEmail.xml
@@ -175,11 +187,6 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{DA3B55F8
 		setup\choco\servy\tools\chocolateyinstall.ps1 = setup\choco\servy\tools\chocolateyinstall.ps1
 	EndProjectSection
 EndProject
-Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "_global", "_global", "{AF414E4C-11AC-4D83-A5CB-C9225D44F7F2}"
-	ProjectSection(SolutionItems) = preProject
-		src\linker.shared.xml = src\linker.shared.xml
-	EndProjectSection
-EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Servy.Infrastructure.IntegrationTests", "tests\Servy.Infrastructure.IntegrationTests\Servy.Infrastructure.IntegrationTests.csproj", "{99D2C270-5AF9-482B-B8F4-780A6687554D}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "resolve-version", "resolve-version", "{BF373F26-8DEF-486B-8AE7-C38420BF50C0}"
@@ -208,6 +215,12 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "winget", "winget", "{F59B09
 	ProjectSection(SolutionItems) = preProject
 		setup\winget\README.md = setup\winget\README.md
 	EndProjectSection
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Servy.Host", "src\Servy.Host\Servy.Host.csproj", "{20BABBB5-6D23-B4B1-7FB8-D6F62B8975F4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Servy.Host.UnitTests", "tests\Servy.Host.UnitTests\Servy.Host.UnitTests.csproj", "{3F5F38A2-2B9F-AFAB-48D3-AD217E060370}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Servy.Host.IntegrationTests", "tests\Servy.Host.IntegrationTests\Servy.Host.IntegrationTests.csproj", "{3B2E6327-7EB9-5BF5-56C1-0F690595AA47}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -303,6 +316,18 @@ Global
 		{840AE4B4-22C9-4943-AE94-16F9A2695537}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{840AE4B4-22C9-4943-AE94-16F9A2695537}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{840AE4B4-22C9-4943-AE94-16F9A2695537}.Release|Any CPU.Build.0 = Release|Any CPU
+		{20BABBB5-6D23-B4B1-7FB8-D6F62B8975F4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{20BABBB5-6D23-B4B1-7FB8-D6F62B8975F4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{20BABBB5-6D23-B4B1-7FB8-D6F62B8975F4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{20BABBB5-6D23-B4B1-7FB8-D6F62B8975F4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3F5F38A2-2B9F-AFAB-48D3-AD217E060370}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3F5F38A2-2B9F-AFAB-48D3-AD217E060370}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3F5F38A2-2B9F-AFAB-48D3-AD217E060370}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3F5F38A2-2B9F-AFAB-48D3-AD217E060370}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3B2E6327-7EB9-5BF5-56C1-0F690595AA47}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3B2E6327-7EB9-5BF5-56C1-0F690595AA47}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3B2E6327-7EB9-5BF5-56C1-0F690595AA47}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3B2E6327-7EB9-5BF5-56C1-0F690595AA47}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -323,6 +348,7 @@ Global
 		{72845E12-0BFD-4C14-93BF-4E005DE27554} = {50795869-2933-430F-98BD-956C414ABBE4}
 		{17B715D3-353A-4370-9FBE-8A0F079F5D56} = {7D103998-9A71-474A-A668-10311727E6E7}
 		{AE1B7B00-6FC4-4385-8C69-CE3C4FFE2E4E} = {50795869-2933-430F-98BD-956C414ABBE4}
+		{600A36AC-7B7F-44A9-9BDF-B9D86BB31E82} = {50795869-2933-430F-98BD-956C414ABBE4}
 		{502C7577-7E31-4BAE-B259-E2EDC15CF541} = {525B29D4-743C-4A5B-BFB6-82A3F981495E}
 		{7A15D976-7395-4827-BB96-9362167C7D26} = {7D103998-9A71-474A-A668-10311727E6E7}
 		{9947CE01-9A62-4503-92DD-25723F8EA56B} = {50795869-2933-430F-98BD-956C414ABBE4}
@@ -339,7 +365,6 @@ Global
 		{0C916905-AFCC-4C80-85FD-7D98DF5E6DE5} = {11479D8F-D8B6-4AD7-BC82-A423FCC30779}
 		{09CA340C-8754-4FCC-92DA-441D279C604C} = {0C916905-AFCC-4C80-85FD-7D98DF5E6DE5}
 		{DA3B55F8-FA18-4FF3-9221-F528D0501C72} = {09CA340C-8754-4FCC-92DA-441D279C604C}
-		{AF414E4C-11AC-4D83-A5CB-C9225D44F7F2} = {F56CEF5B-4A0B-4494-8BFD-F6EC660B510E}
 		{99D2C270-5AF9-482B-B8F4-780A6687554D} = {50795869-2933-430F-98BD-956C414ABBE4}
 		{BF373F26-8DEF-486B-8AE7-C38420BF50C0} = {FED01F22-71C4-4504-9BC6-217F6DE9F152}
 		{B2C6492F-B0F0-4AF1-A4CF-730FF719DE16} = {FED01F22-71C4-4504-9BC6-217F6DE9F152}
@@ -347,6 +372,9 @@ Global
 		{9ECF4CFF-05CD-43DA-9751-191FBE4A3B5C} = {FED01F22-71C4-4504-9BC6-217F6DE9F152}
 		{840AE4B4-22C9-4943-AE94-16F9A2695537} = {50795869-2933-430F-98BD-956C414ABBE4}
 		{F59B094D-9ABF-4617-AD00-3F789DC14E4C} = {11479D8F-D8B6-4AD7-BC82-A423FCC30779}
+		{20BABBB5-6D23-B4B1-7FB8-D6F62B8975F4} = {66EEF7A1-9E3D-4957-896A-394C6422F01F}
+		{3F5F38A2-2B9F-AFAB-48D3-AD217E060370} = {50795869-2933-430F-98BD-956C414ABBE4}
+		{3B2E6327-7EB9-5BF5-56C1-0F690595AA47} = {50795869-2933-430F-98BD-956C414ABBE4}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {93B02B52-77CF-4BAA-AD7E-08960E6D6482}

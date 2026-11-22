@@ -6,14 +6,19 @@ using Servy.Core.Data;
 using Servy.Core.DTOs;
 using Servy.Core.Enums;
 using Servy.Core.Helpers;
+using Servy.Core.Security;
 using Servy.Core.Services;
+using Servy.Core.Validation;
 using Servy.Manager.Config;
 using Servy.Manager.Models;
 using Servy.Manager.Resources;
 using Servy.Manager.Services;
-using Servy.Manager.Validation;
+using Servy.Testing;
 using Servy.UI.Services;
+using Servy.UI.Validation;
 using System.Diagnostics;
+using Helper = Servy.Core.Helpers.Helper;
+using TempFile = Servy.Testing.TempFile;
 
 namespace Servy.Manager.UnitTests.Services
 {
@@ -26,11 +31,10 @@ namespace Servy.Manager.UnitTests.Services
         private readonly Mock<IServiceConfigurationValidator> _serviceConfigurationValidatorMock;
         private readonly Mock<IXmlServiceValidator> _xmlServiceValidatorMock;
         private readonly Mock<IJsonServiceValidator> _jsonServiceValidatorMock;
-        private readonly Mock<IXmlServiceSerializer> _xmlServiceSerializerMock;
-        private readonly Mock<IJsonServiceSerializer> _jsonServiceSerializerMock;
         private readonly Mock<IAppConfiguration> _appConfigMock;
         private readonly Mock<IProcessHelper> _processHelperMock;
         private readonly Mock<IUiDispatcher> _uiDispatcherMock;
+        private readonly Mock<ICursorService> _cursorServiceMock;
         private readonly List<ServiceCommands> _created = new List<ServiceCommands>();
 
         private bool _refreshCalled;
@@ -47,11 +51,10 @@ namespace Servy.Manager.UnitTests.Services
             _serviceConfigurationValidatorMock = new Mock<IServiceConfigurationValidator>();
             _xmlServiceValidatorMock = new Mock<IXmlServiceValidator>();
             _jsonServiceValidatorMock = new Mock<IJsonServiceValidator>();
-            _xmlServiceSerializerMock = new Mock<IXmlServiceSerializer>();
-            _jsonServiceSerializerMock = new Mock<IJsonServiceSerializer>();
             _appConfigMock = new Mock<IAppConfiguration>();
             _processHelperMock = new Mock<IProcessHelper>();
             _uiDispatcherMock = new Mock<IUiDispatcher>();
+            _cursorServiceMock = new Mock<ICursorService>();
 
             // Default safe returns for ServiceManager to prevent internal NullRefs
             _serviceManagerMock.Setup(m => m.StartServiceAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(OperationResult.Success());
@@ -80,11 +83,10 @@ namespace Servy.Manager.UnitTests.Services
                 _serviceConfigurationValidatorMock.Object,
                 _xmlServiceValidatorMock.Object,
                 _jsonServiceValidatorMock.Object,
-                _xmlServiceSerializerMock.Object,
-                _jsonServiceSerializerMock.Object,
                 _appConfigMock.Object,
                 _processHelperMock.Object,
-                _uiDispatcherMock.Object
+                _uiDispatcherMock.Object,
+                _cursorServiceMock.Object
             );
             _created.Add(sut);
             return sut;
@@ -94,6 +96,55 @@ namespace Servy.Manager.UnitTests.Services
         {
             foreach (var sut in _created) sut.Dispose();
         }
+
+        #region Constructor Tests
+
+        /// <summary>
+        /// Verifies that passing null for any one of the thirteen constructor dependencies throws an
+        /// <see cref="ArgumentNullException"/> whose <see cref="ArgumentException.ParamName"/> names that dependency.
+        /// </summary>
+        /// <param name="nullIndex">Zero-based position of the constructor argument passed as null.</param>
+        /// <param name="expectedParamName">The parameter name the guard must report.</param>
+        [Theory]
+        [InlineData(0, "serviceManager")]
+        [InlineData(1, "serviceRepository")]
+        [InlineData(2, "messageBoxService")]
+        [InlineData(3, "fileDialogService")]
+        [InlineData(4, "removeServiceCallback")]
+        [InlineData(5, "refreshCallback")]
+        [InlineData(6, "serviceConfigurationValidator")]
+        [InlineData(7, "xmlServiceValidator")]
+        [InlineData(8, "jsonServiceValidator")]
+        [InlineData(9, "appConfig")]
+        [InlineData(10, "processHelper")]
+        [InlineData(11, "dispatcher")]
+        [InlineData(12, "cursorService")]
+        public void Constructor_NullDependency_ThrowsArgumentNullExceptionNamingIt(int nullIndex, string expectedParamName)
+        {
+            // Arrange
+            ServiceCommands Build() => new ServiceCommands(
+                nullIndex == 0 ? null! : _serviceManagerMock.Object,
+                nullIndex == 1 ? null! : _serviceRepositoryMock.Object,
+                nullIndex == 2 ? null! : _messageBoxServiceMock.Object,
+                nullIndex == 3 ? null! : _fileDialogServiceMock.Object,
+                nullIndex == 4 ? null! : (Action<string>)(_ => { }),
+                nullIndex == 5 ? null! : (Func<Task>)(() => Task.CompletedTask),
+                nullIndex == 6 ? null! : _serviceConfigurationValidatorMock.Object,
+                nullIndex == 7 ? null! : _xmlServiceValidatorMock.Object,
+                nullIndex == 8 ? null! : _jsonServiceValidatorMock.Object,
+                nullIndex == 9 ? null! : _appConfigMock.Object,
+                nullIndex == 10 ? null! : _processHelperMock.Object,
+                nullIndex == 11 ? null! : _uiDispatcherMock.Object,
+                nullIndex == 12 ? null! : _cursorServiceMock.Object);
+
+            // Act
+            var ex = Assert.Throws<ArgumentNullException>(Build);
+
+            // Assert
+            Assert.Equal(expectedParamName, ex.ParamName);
+        }
+
+        #endregion
 
         #region Import/Export & Config Tests
 
@@ -105,41 +156,58 @@ namespace Servy.Manager.UnitTests.Services
             var dto = new ServiceDto { Name = "MyService", ExecutablePath = @"C:\Windows\System32\notepad.exe" };
             var json = JsonConvert.SerializeObject(dto);
 
-            // Change extension from .tmp to .json to pass ValidatePathSecurity
-            var baseTempFile = Path.GetTempFileName();
-            var tempFile = Path.ChangeExtension(baseTempFile, ".json");
-
-            try
+            // A .json path the SUT's path-security guard accepts; nothing lands on disk until it is written
+            using (var tempFile = new TempFile(".json").Write(json))
             {
-                // Clean up original .tmp file and write the payload to the authorized .json path
-                if (File.Exists(baseTempFile)) File.Delete(baseTempFile);
-                File.WriteAllText(tempFile, json);
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile.Path);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), true, It.IsAny<CancellationToken>())).ReturnsAsync(true);
 
-                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile);
-                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
-
-                _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, true, It.IsAny<CancellationToken>()))
                     .ReturnsAsync(1);
 
-                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny))
-                    .Returns(true);
-
-                _jsonServiceSerializerMock.Setup(s => s.Deserialize(It.IsAny<string?>()))
-                    .Returns(dto);
+                ServiceDto? jsonParsedDto = dto;
+                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out jsonParsedDto)).Returns(true);
 
                 // Act
                 await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
-                _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
-                _jsonServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny), Times.Once);
-                _jsonServiceSerializerMock.Verify(s => s.Deserialize(It.IsAny<string?>()), Times.Once);
+                _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, true, It.IsAny<CancellationToken>()), Times.Once);
+                _serviceConfigurationValidatorMock.Verify(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), true, It.IsAny<CancellationToken>()), Times.Once);
+                _jsonServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(Strings.ImportJson_Success, UiAppConfig.Caption), Times.Once);
                 Assert.True(_refreshCalled);
             }
-            finally
+        }
+
+        [Fact]
+        public async Task ImportJsonConfigAsync_ShouldShowDecryptionReason_WhenRepositoryRefusesUndecryptableRow()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var dto = new ServiceDto { Name = "MyService", ExecutablePath = @"C:\Windows\System32\notepad.exe" };
+            var json = JsonConvert.SerializeObject(dto);
+            var refused = new ServiceDecryptionFailedException("MyService", "Password");
+
+            // A .json path the SUT's path-security guard accepts; nothing lands on disk until it is written
+            using (var tempFile = new TempFile(".json").Write(json))
             {
-                // Teardown
-                if (File.Exists(tempFile)) File.Delete(tempFile);
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile.Path);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                    .ThrowsAsync(refused);
+
+                ServiceDto? jsonParsedDto = dto;
+                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out jsonParsedDto)).Returns(true);
+
+                // Act
+                await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
+
+                // Assert
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(refused.Message, UiAppConfig.Caption), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Servy.Core.Resources.Strings.Msg_UnexpectedError, It.IsAny<string>()), Times.Never);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+                Assert.False(_refreshCalled);
             }
         }
 
@@ -148,36 +216,25 @@ namespace Servy.Manager.UnitTests.Services
         {
             // Arrange
             var sut = CreateServiceCommands();
-            var rawTempFile = Path.GetTempFileName();
 
-            // Mutate the extension to .json to safely pass the foundational ImportGuard path security check
-            var tempJsonFile = Path.ChangeExtension(rawTempFile, ".json");
-
-            try
+            // A .json path the SUT's path-security guard accepts; nothing lands on disk until it is written
+            using (var tempJsonFile = new TempFile(".json").Write("{ invalid-json }"))
             {
-                File.WriteAllText(tempJsonFile, "{ invalid-json }");
-
-                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempJsonFile);
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempJsonFile.Path);
 
                 string? outErr = "Invalid JSON";
-                _jsonServiceValidatorMock
-                    .Setup(v => v.TryValidate(It.IsAny<string>(), out outErr))
-                    .Returns(false);
+                ServiceDto? jsonParsedDto = null;
+                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out jsonParsedDto)).Returns(false);
 
                 // Act
                 await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
                 // Explicit verify constraint ensures that execution actually bypassed the path guard and hit the format validator
-                _jsonServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny), Times.Once);
-                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Once);
+                _jsonServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync("Invalid JSON", UiAppConfig.Caption), Times.Once);
                 _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
-            }
-            finally
-            {
-                // Clean up all local operating context artifacts cleanly
-                if (File.Exists(rawTempFile)) File.Delete(rawTempFile);
-                if (File.Exists(tempJsonFile)) File.Delete(tempJsonFile);
+                Assert.False(_refreshCalled);
             }
         }
 
@@ -190,44 +247,32 @@ namespace Servy.Manager.UnitTests.Services
 
             var serializer = new System.Xml.Serialization.XmlSerializer(typeof(ServiceDto));
 
-            // Change extension from .tmp to .xml to pass ValidatePathSecurity
-            var baseTempFile = Path.GetTempFileName();
-            var tempFile = Path.ChangeExtension(baseTempFile, ".xml");
-
-            try
+            // A .xml path the SUT's path-security guard accepts; nothing lands on disk until it is written
+            using (var tempFile = new TempFile(".xml"))
             {
-                // Clean up original .tmp file and write the payload to the authorized .xml path
-                if (File.Exists(baseTempFile)) File.Delete(baseTempFile);
-
-                using (var writer = new StreamWriter(tempFile))
+                using (var writer = new StreamWriter(tempFile.Path))
                 {
                     serializer.Serialize(writer, dto);
                 }
 
-                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempFile);
+                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempFile.Path);
 
                 string? outErr = null;
-                _xmlServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr)).Returns(true);
-                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                ServiceDto? xmlParsedDto = dto;
+                _xmlServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out xmlParsedDto)).Returns(true);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
 
                 _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
                     .ReturnsAsync(1);
-
-                _xmlServiceSerializerMock.Setup(s => s.Deserialize(It.IsAny<string?>()))
-                    .Returns(dto);
 
                 // Act
                 await sut.ImportXmlConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
                 _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
-                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny), Times.Once);
-                _xmlServiceSerializerMock.Verify(s => s.Deserialize(It.IsAny<string?>()), Times.Once);
+                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(Strings.ImportXml_Success, UiAppConfig.Caption), Times.Once);
                 Assert.True(_refreshCalled);
-            }
-            finally
-            {
-                if (File.Exists(tempFile)) File.Delete(tempFile);
             }
         }
 
@@ -236,37 +281,25 @@ namespace Servy.Manager.UnitTests.Services
         {
             // Arrange
             var sut = CreateServiceCommands();
-            var rawTempFile = Path.GetTempFileName();
 
-            // Mutate the extension to .xml to safely pass the foundational ImportGuard path security check
-            var tempXmlFile = Path.ChangeExtension(rawTempFile, ".xml");
-
-            try
+            // A .xml path the SUT's path-security guard accepts; nothing lands on disk until it is written
+            using (var tempXmlFile = new TempFile(".xml").Write("<invalid><xml>"))
             {
-                File.WriteAllText(tempXmlFile, "<invalid><xml>");
-
-                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempXmlFile);
+                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempXmlFile.Path);
 
                 string? outErr = "Malformed XML";
-                _xmlServiceValidatorMock
-                    .Setup(v => v.TryValidate(It.IsAny<string>(), out outErr))
-                    .Returns(false);
+                ServiceDto? xmlParsedDto = null;
+                _xmlServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out xmlParsedDto)).Returns(false);
 
                 // Act
                 await sut.ImportXmlConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
                 // Explicit verify constraint ensures that execution actually bypassed the path guard and hit the format validator
-                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny), Times.Once);
-                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Once);
+                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync("Malformed XML", UiAppConfig.Caption), Times.Once);
                 _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
                 Assert.False(_refreshCalled);
-            }
-            finally
-            {
-                // Clean up all local operating context artifacts cleanly
-                if (File.Exists(rawTempFile)) File.Delete(rawTempFile);
-                if (File.Exists(tempXmlFile)) File.Delete(tempXmlFile);
             }
         }
 
@@ -281,7 +314,29 @@ namespace Servy.Manager.UnitTests.Services
             await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
 
             // Assert
-            _jsonServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny), Times.Never);
+            _jsonServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Never);
+            Assert.False(_refreshCalled);
+        }
+
+        [Fact]
+        public async Task ImportConfigAsync_SecurityGuardRejectsPath_DisplaysGuardErrorAndStops()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+
+            // A UNC path is refused by ImportGuard before the size check, so no file has to exist on disk
+            _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(@"\\MaliciousServer\Share\attack.json");
+
+            // Act
+            await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
+
+            // Assert
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_SecurityUncPathProhibited, UiAppConfig.Caption), Times.Once);
+
+            // Nothing after the guard runs on a refused path
+            _jsonServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Never);
+            _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            Assert.False(_refreshCalled);
         }
 
         [Fact]
@@ -289,29 +344,21 @@ namespace Servy.Manager.UnitTests.Services
         {
             // Arrange
             var sut = CreateServiceCommands();
-            var baseTempFile = Path.GetTempFileName();
-            var tempFile = Path.ChangeExtension(baseTempFile, ".json");
 
-            try
+            using (var tempFile = new TempFile(".json").Write("{}"))
             {
-                if (File.Exists(baseTempFile)) File.Delete(baseTempFile);
-                File.WriteAllText(tempFile, "{}");
-
-                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile);
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile.Path);
                 string? outErr = null;
-                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr)).Returns(true);
-                _jsonServiceSerializerMock.Setup(s => s.Deserialize(It.IsAny<string?>())).Returns((ServiceDto?)null);
+                ServiceDto? jsonParsedDto = null;
+                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out jsonParsedDto)).Returns(true);
 
                 // Act
                 await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
                 _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_FailedToLoadJson, UiAppConfig.Caption), Times.Once);
-                _serviceConfigurationValidatorMock.Verify(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
-            }
-            finally
-            {
-                if (File.Exists(tempFile)) File.Delete(tempFile);
+                _serviceConfigurationValidatorMock.Verify(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+                Assert.False(_refreshCalled);
             }
         }
 
@@ -320,29 +367,21 @@ namespace Servy.Manager.UnitTests.Services
         {
             // Arrange
             var sut = CreateServiceCommands();
-            var baseTempFile = Path.GetTempFileName();
-            var tempFile = Path.ChangeExtension(baseTempFile, ".json");
 
-            try
+            using (var tempFile = new TempFile(".json").Write("{}"))
             {
-                if (File.Exists(baseTempFile)) File.Delete(baseTempFile);
-                File.WriteAllText(tempFile, "{}");
-
-                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile);
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile.Path);
                 string? outErr = null;
-                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr)).Returns(true);
-                _jsonServiceSerializerMock.Setup(s => s.Deserialize(It.IsAny<string?>())).Returns(new ServiceDto { Name = "InvalidDomain" });
-                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
+                ServiceDto? jsonParsedDto = new ServiceDto { Name = "InvalidDomain" };
+                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out jsonParsedDto)).Returns(true);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
 
                 // Act
                 await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
                 _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
-            }
-            finally
-            {
-                if (File.Exists(tempFile)) File.Delete(tempFile);
+                Assert.False(_refreshCalled);
             }
         }
 
@@ -355,44 +394,34 @@ namespace Servy.Manager.UnitTests.Services
 
             var serializer = new System.Xml.Serialization.XmlSerializer(typeof(ServiceDto));
 
-            var baseTempFile = Path.GetTempFileName();
-            var tempFile = Path.ChangeExtension(baseTempFile, ".xml");
-
-            try
+            using (var tempFile = new TempFile(".xml"))
             {
-                if (File.Exists(baseTempFile)) File.Delete(baseTempFile);
-
-                using (var writer = new StreamWriter(tempFile))
+                using (var writer = new StreamWriter(tempFile.Path))
                 {
                     serializer.Serialize(writer, dto);
                 }
 
-                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempFile);
+                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempFile.Path);
 
                 string? outErr = null;
-                _xmlServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr)).Returns(true);
-                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                ServiceDto? xmlParsedDto = dto;
+                _xmlServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out xmlParsedDto)).Returns(true);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), true, It.IsAny<CancellationToken>())).ReturnsAsync(true);
 
                 _serviceRepositoryMock.Setup(r => r.GetByNameAsync(dto.Name, false, It.IsAny<CancellationToken>())).ReturnsAsync(dto);
-                _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_ImportServiceConfirmation, UiAppConfig.Caption)).ReturnsAsync(true);
-                _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(1);
-
-                _xmlServiceSerializerMock.Setup(s => s.Deserialize(It.IsAny<string?>())).Returns(dto);
+                _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ImportServiceConfirmation, dto.Name), UiAppConfig.Caption)).ReturnsAsync(true);
+                _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, true, It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
                 // Act
                 await sut.ImportXmlConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
                 _serviceRepositoryMock.Verify(r => r.GetByNameAsync(dto.Name, false, It.IsAny<CancellationToken>()), Times.Once);
-                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny), Times.Once);
-                _xmlServiceSerializerMock.Verify(s => s.Deserialize(It.IsAny<string?>()), Times.Once);
-                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(Strings.Msg_ImportServiceConfirmation, UiAppConfig.Caption), Times.Once);
-                _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
+                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ImportServiceConfirmation, dto.Name), UiAppConfig.Caption), Times.Once);
+                _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, true, It.IsAny<CancellationToken>()), Times.Once);
+                _serviceConfigurationValidatorMock.Verify(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), true, It.IsAny<CancellationToken>()), Times.Once);
                 Assert.True(_refreshCalled);
-            }
-            finally
-            {
-                if (File.Exists(tempFile)) File.Delete(tempFile);
             }
         }
 
@@ -405,43 +434,32 @@ namespace Servy.Manager.UnitTests.Services
 
             var serializer = new System.Xml.Serialization.XmlSerializer(typeof(ServiceDto));
 
-            var baseTempFile = Path.GetTempFileName();
-            var tempFile = Path.ChangeExtension(baseTempFile, ".xml");
-
-            try
+            using (var tempFile = new TempFile(".xml"))
             {
-                if (File.Exists(baseTempFile)) File.Delete(baseTempFile);
-
-                using (var writer = new StreamWriter(tempFile))
+                using (var writer = new StreamWriter(tempFile.Path))
                 {
                     serializer.Serialize(writer, dto);
                 }
 
-                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempFile);
+                _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string?>())).Returns(tempFile.Path);
 
                 string? outErr = null;
-                _xmlServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr)).Returns(true);
-                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                ServiceDto? xmlParsedDto = dto;
+                _xmlServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out xmlParsedDto)).Returns(true);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
 
                 _serviceRepositoryMock.Setup(r => r.GetByNameAsync(dto.Name, false, It.IsAny<CancellationToken>())).ReturnsAsync(dto);
-                _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_ImportServiceConfirmation, UiAppConfig.Caption)).ReturnsAsync(false);
-
-                _xmlServiceSerializerMock.Setup(s => s.Deserialize(It.IsAny<string?>())).Returns(dto);
+                _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ImportServiceConfirmation, dto.Name), UiAppConfig.Caption)).ReturnsAsync(false);
 
                 // Act
                 await sut.ImportXmlConfigAsync(TestContext.Current.CancellationToken);
 
                 // Assert
                 _serviceRepositoryMock.Verify(r => r.GetByNameAsync(dto.Name, false, It.IsAny<CancellationToken>()), Times.Once);
-                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny), Times.Once);
-                _xmlServiceSerializerMock.Verify(s => s.Deserialize(It.IsAny<string?>()), Times.Once);
-                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(Strings.Msg_ImportServiceConfirmation, UiAppConfig.Caption), Times.Once);
+                _xmlServiceValidatorMock.Verify(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out It.Ref<ServiceDto?>.IsAny), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ImportServiceConfirmation, dto.Name), UiAppConfig.Caption), Times.Once);
                 _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
                 Assert.False(_refreshCalled);
-            }
-            finally
-            {
-                if (File.Exists(tempFile)) File.Delete(tempFile);
             }
         }
 
@@ -450,19 +468,14 @@ namespace Servy.Manager.UnitTests.Services
         {
             // Arrange
             var sut = CreateServiceCommands();
-            var baseTempFile = Path.GetTempFileName();
-            var tempFile = Path.ChangeExtension(baseTempFile, ".json");
 
-            try
+            using (var tempFile = new TempFile(".json").Write("{}"))
             {
-                if (File.Exists(baseTempFile)) File.Delete(baseTempFile);
-                File.WriteAllText(tempFile, "{}");
-
-                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile);
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile.Path);
                 string? outErr = null;
-                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr)).Returns(true);
-                _jsonServiceSerializerMock.Setup(s => s.Deserialize(It.IsAny<string?>())).Returns(new ServiceDto { Name = "FailedUpsert" });
-                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                ServiceDto? jsonParsedDto = new ServiceDto { Name = "FailedUpsert" };
+                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out outErr, out jsonParsedDto)).Returns(true);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
                 _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(0);
 
                 // Act
@@ -471,10 +484,6 @@ namespace Servy.Manager.UnitTests.Services
                 // Assert
                 _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.ImportJson_Error, UiAppConfig.Caption), Times.Once);
                 Assert.False(_refreshCalled);
-            }
-            finally
-            {
-                if (File.Exists(tempFile)) File.Delete(tempFile);
             }
         }
 
@@ -485,19 +494,12 @@ namespace Servy.Manager.UnitTests.Services
             var sut = CreateServiceCommands();
             var service = new Service { Name = "TestService" };
 
-            // 1. Generate a unique base path template from the OS
-            var baseTmpFile = Path.GetTempFileName();
-            var tempExe = Path.ChangeExtension(baseTmpFile, ".exe");
+            // Generate a unique target executable path inside the application directory
+            string baseDir = AppFoldersHelper.GetAppDirectory();
 
-            try
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
             {
-                // 2. Delete initial empty temp file before writing mock executable payload
-                if (File.Exists(baseTmpFile)) File.Delete(baseTmpFile);
-
-                // 3. Write our mock executable artifact safely
-                File.WriteAllText(tempExe, "dummy");
-
-                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe);
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
 
                 // Mock Repository to return a valid domain entity
                 _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
@@ -505,11 +507,13 @@ namespace Servy.Manager.UnitTests.Services
 
                 ProcessStartInfo? capturedPsi = null;
 
-                // INTERCEPTION SEAM: Capture launch metadata via callback to inspect arguments and prevent actual process creation
+                // INTERCEPTION SEAM: Capture launch metadata via callback to inspect arguments and prevent actual
+                // process creation. The current process is handed back as a non-null Process the SUT can dispose,
+                // so this test stays on the successful-launch branch (a null result is the failure branch).
                 _processHelperMock
                     .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
                     .Callback<ProcessStartInfo>(psi => capturedPsi = psi)
-                    .Returns((Process?)null);
+                    .Returns(() => Process.GetCurrentProcess());
 
                 // Act
                 await sut.ConfigureServiceAsync(service, TestContext.Current.CancellationToken);
@@ -517,29 +521,67 @@ namespace Servy.Manager.UnitTests.Services
                 // Assert
                 _appConfigMock.Verify(c => c.DesktopAppPublishPath, Times.AtLeastOnce);
                 Assert.NotNull(capturedPsi);
-                Assert.Equal(tempExe, capturedPsi.FileName);
+                Assert.Equal(tempExe.Path, capturedPsi.FileName);
                 Assert.True(capturedPsi.UseShellExecute);
 
                 // Argument Validation: Verify the skip-splash flag and quoted service name arguments
-                Assert.Contains("\"false\"", capturedPsi.Arguments);
-                Assert.Contains(Helper.Quote(service.Name), capturedPsi.Arguments);
-            }
-            finally
-            {
-                // 4. Clean up our active dummy testing file artifact safely
-                if (File.Exists(tempExe))
-                {
-                    try { File.Delete(tempExe); } catch { /* fail-silent */ }
-                }
+                Assert.Equal($"\"{AppConfig.SkipSplashArgument}\" {Helper.Quote(service.Name)}", capturedPsi.Arguments.Trim());
+
+                // The launch succeeded, so no failure dialog was shown
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
             }
         }
 
         [Fact]
-        public async Task ConfigureServiceAsync_MissingOrInvalidAppPublishPath_ShowsNotFoundError()
+        public async Task ConfigureServiceAsync_ForceSoftwareRendering_AppendsRenderingFlagAfterServiceName()
         {
             // Arrange
             var sut = CreateServiceCommands();
-            _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(string.Empty);
+            var service = new Service { Name = "TestService" };
+
+            string baseDir = AppFoldersHelper.GetAppDirectory();
+
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
+            {
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
+                _appConfigMock.Setup(c => c.ForceSoftwareRendering).Returns(true);
+
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = service.Name });
+
+                ProcessStartInfo? capturedPsi = null;
+
+                // A non-null Process keeps this test on the successful-launch branch
+                _processHelperMock
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Callback<ProcessStartInfo>(psi => capturedPsi = psi)
+                    .Returns(() => Process.GetCurrentProcess());
+
+                // Act
+                await sut.ConfigureServiceAsync(service, TestContext.Current.CancellationToken);
+
+                // Assert
+                Assert.NotNull(capturedPsi);
+                Assert.Equal(
+                    $"\"{AppConfig.SkipSplashArgument}\" {Helper.Quote(service.Name)} {AppConfig.ForceSoftwareRenderingArg}",
+                    capturedPsi.Arguments.Trim());
+
+                // The launch succeeded, so no failure dialog was shown
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+            }
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData("   ")]
+        // The "Invalid" arm: a configured path that is not on disk, which is what a stale
+        // DesktopAppPublishPath looks like after the desktop app is moved or uninstalled.
+        [InlineData(@"C:\definitely\not\here\Servy.exe")]
+        public async Task ConfigureServiceAsync_MissingOrInvalidAppPublishPath_ShowsNotFoundError(string configuredPath)
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(configuredPath);
 
             // Act
             await sut.ConfigureServiceAsync(new Service { Name = "AnyService" }, TestContext.Current.CancellationToken);
@@ -553,24 +595,22 @@ namespace Servy.Manager.UnitTests.Services
         public async Task ConfigureServiceAsync_NullServiceParameter_LaunchesAppDirectlyWithoutArguments()
         {
             // Arrange
-            // Create an empty, non-executable tracking file context to pass the File.Exists guard
-            string tempTrackingFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"{Guid.NewGuid():N}.exe");
+            // Create an empty tracking file context in the application directory to satisfy the containment guard across build modes
+            string baseDir = AppFoldersHelper.GetAppDirectory();
 
-            try
+            using (var tempTrackingFile = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write(string.Empty))
             {
-                File.WriteAllText(tempTrackingFile, string.Empty);
-
-                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempTrackingFile);
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempTrackingFile.Path);
                 _appConfigMock.Setup(c => c.ForceSoftwareRendering).Returns(false);
 
                 ProcessStartInfo? capturedPsi = null;
 
-                // INTERCEPTION SEAM: Capture the launch metadata via callback and return null
-                // to safely complete the fire-and-forget execution block without triggering ShellExecute.
+                // INTERCEPTION SEAM: Capture the launch metadata via callback and hand back the current
+                // process, a non-null Process the SUT can dispose, without triggering ShellExecute.
                 _processHelperMock
                     .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
                     .Callback<ProcessStartInfo>(psi => capturedPsi = psi)
-                    .Returns((Process?)null);
+                    .Returns(() => Process.GetCurrentProcess());
 
                 var sut = CreateServiceCommands();
 
@@ -585,7 +625,7 @@ namespace Servy.Manager.UnitTests.Services
 
                 // 2. HERMETIC VERIFICATION: Positively assert the precise launch state parameters
                 Assert.NotNull(capturedPsi);
-                Assert.Equal(tempTrackingFile, capturedPsi.FileName);
+                Assert.Equal(tempTrackingFile.Path, capturedPsi.FileName);
                 Assert.True(capturedPsi.UseShellExecute);
 
                 // 3. ARGUMENT VALIDATION: Ensure only the skip-splash argument is supplied, and no service name payload exists
@@ -595,14 +635,64 @@ namespace Servy.Manager.UnitTests.Services
                 // Confirm the arguments consist solely of the splash skip payload (and optional whitespace) without any service parameters
                 string expectedArgs = $"\"{AppConfig.SkipSplashArgument}\"";
                 Assert.Equal(expectedArgs, capturedPsi.Arguments.Trim());
+
+                // 4. The launch succeeded, so no failure dialog was shown
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
             }
-            finally
+        }
+
+        [Fact]
+        public async Task ConfigureServiceAsync_ProcessStartReturnsNull_ShowsLaunchFailedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+
+            string baseDir = AppFoldersHelper.GetAppDirectory();
+
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
             {
-                // Delete temporary executable path on test completion
-                if (File.Exists(tempTrackingFile))
-                {
-                    File.Delete(tempTrackingFile);
-                }
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
+
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = service.Name });
+
+                // A null Process is the launch-failure branch introduced by #5268
+                _processHelperMock
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns((Process?)null);
+
+                // Act
+                await sut.ConfigureServiceAsync(service, TestContext.Current.CancellationToken);
+
+                // Assert
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_DesktopAppLaunchFailed, UiAppConfig.Caption), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task ConfigureServiceAsync_NullServiceParameterAndProcessStartReturnsNull_ShowsLaunchFailedError()
+        {
+            // Arrange
+            string baseDir = AppFoldersHelper.GetAppDirectory();
+
+            using (var tempTrackingFile = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write(string.Empty))
+            {
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempTrackingFile.Path);
+                _appConfigMock.Setup(c => c.ForceSoftwareRendering).Returns(false);
+
+                // A null Process is the launch-failure branch of the no-service launch site
+                _processHelperMock
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Returns((Process?)null);
+
+                var sut = CreateServiceCommands();
+
+                // Act
+                await sut.ConfigureServiceAsync(null, TestContext.Current.CancellationToken);
+
+                // Assert
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_DesktopAppLaunchFailed, UiAppConfig.Caption), Times.Once);
             }
         }
 
@@ -611,24 +701,17 @@ namespace Servy.Manager.UnitTests.Services
         {
             // Arrange
             var sut = CreateServiceCommands();
-            var baseTmpFile = Path.GetTempFileName();
-            var tempExe = Path.ChangeExtension(baseTmpFile, ".exe");
-            if (File.Exists(baseTmpFile)) File.Delete(baseTmpFile);
+            string baseDir = AppFoldersHelper.GetAppDirectory();
 
-            try
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
             {
-                File.WriteAllText(tempExe, "dummy");
-                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe);
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
 
                 // Act
                 await sut.ConfigureServiceAsync(new Service { Name = " " }, TestContext.Current.CancellationToken);
 
                 // Assert
-                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_InvalidServiceName, UiAppConfig.Caption), Times.Once);
-            }
-            finally
-            {
-                if (File.Exists(tempExe)) File.Delete(tempExe);
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_InvalidServiceName, UiAppConfig.Caption), Times.Once);
             }
         }
 
@@ -637,14 +720,11 @@ namespace Servy.Manager.UnitTests.Services
         {
             // Arrange
             var sut = CreateServiceCommands();
-            var baseTmpFile = Path.GetTempFileName();
-            var tempExe = Path.ChangeExtension(baseTmpFile, ".exe");
-            if (File.Exists(baseTmpFile)) File.Delete(baseTmpFile);
+            string baseDir = AppFoldersHelper.GetAppDirectory();
 
-            try
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
             {
-                File.WriteAllText(tempExe, "dummy");
-                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe);
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
 
                 _serviceRepositoryMock
                     .Setup(r => r.GetByNameAsync("Missing", false, It.IsAny<CancellationToken>()))
@@ -657,10 +737,240 @@ namespace Servy.Manager.UnitTests.Services
                 _serviceRepositoryMock.Verify(r => r.GetByNameAsync("Missing", false, It.IsAny<CancellationToken>()), Times.Once);
                 _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_ServiceNotFound, UiAppConfig.Caption), Times.Once);
             }
-            finally
+        }
+
+        [Fact]
+        public async Task ConfigureServiceAsync_SuccessfulLaunch_SetsWaitCursorOnceAndResetsItOnceAfterTheLaunch()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+            string baseDir = AppFoldersHelper.GetAppDirectory();
+
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
             {
-                if (File.Exists(tempExe)) File.Delete(tempExe);
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = service.Name });
+
+                var events = new List<string>();
+                _cursorServiceMock.Setup(c => c.SetWaitCursor()).Callback(() => events.Add("set"));
+                _processHelperMock
+                    .Setup(h => h.Start(It.IsAny<ProcessStartInfo>()))
+                    .Callback<ProcessStartInfo>(_ => events.Add("start"))
+                    .Returns(() => Process.GetCurrentProcess());
+                _cursorServiceMock.Setup(c => c.ResetCursor()).Callback(() => events.Add("reset"));
+
+                // Act
+                await sut.ConfigureServiceAsync(service, TestContext.Current.CancellationToken);
+
+                // Assert
+                Assert.Equal(new[] { "set", "start", "reset" }, events);
             }
+        }
+
+        [Fact]
+        public async Task ConfigureServiceAsync_ServiceNotFoundInDb_ResetsCursorBeforeTheErrorDialogWithoutTheLaunchDelay()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            string baseDir = AppFoldersHelper.GetAppDirectory();
+
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
+            {
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
+                _serviceRepositoryMock
+                    .Setup(r => r.GetByNameAsync("Missing", false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((ServiceDto?)null);
+
+                // Captured at the moment the dialog is shown: the cursor must already be back to normal by then
+                bool cursorResetWhileDialogOpen = false;
+                _messageBoxServiceMock
+                    .Setup(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_ServiceNotFound, UiAppConfig.Caption))
+                    .Callback(() => cursorResetWhileDialogOpen = _cursorServiceMock.Invocations.Any(i => i.Method.Name == nameof(ICursorService.ResetCursor)))
+                    .Returns(Task.CompletedTask);
+
+                // Act
+                var stopwatch = Stopwatch.StartNew();
+                await sut.ConfigureServiceAsync(new Service { Name = "Missing" }, TestContext.Current.CancellationToken);
+                stopwatch.Stop();
+
+                // Assert
+                _cursorServiceMock.Verify(c => c.SetWaitCursor(), Times.Once);
+                _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
+                Assert.True(stopwatch.ElapsedMilliseconds < AppConfig.DesktopAppLaunchCursorDelayMs,
+                    $"A failed launch must not wait for the paint delay, took {stopwatch.ElapsedMilliseconds} ms");
+                Assert.True(cursorResetWhileDialogOpen, "The wait cursor must be reset before the error dialog is shown");
+            }
+        }
+
+        [Fact]
+        public async Task ConfigureServiceAsync_ProcessStartReturnsNull_ResetsCursorImmediatelyWithoutTheLaunchDelay()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+            string baseDir = AppFoldersHelper.GetAppDirectory();
+
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
+            {
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = service.Name });
+                _processHelperMock.Setup(h => h.Start(It.IsAny<ProcessStartInfo>())).Returns((Process?)null);
+
+                // Act
+                var stopwatch = Stopwatch.StartNew();
+                await sut.ConfigureServiceAsync(service, TestContext.Current.CancellationToken);
+                stopwatch.Stop();
+
+                // Assert
+                _cursorServiceMock.Verify(c => c.SetWaitCursor(), Times.Once);
+                _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
+                Assert.True(stopwatch.ElapsedMilliseconds < AppConfig.DesktopAppLaunchCursorDelayMs,
+                    $"A failed launch must not wait for the paint delay, took {stopwatch.ElapsedMilliseconds} ms");
+            }
+        }
+
+#if !DEBUG
+        [Fact]
+        public async Task ConfigureServiceAsync_TargetOutsideAppDirectory_RefusesToLaunch()
+        {
+            // Arrange
+            string outside = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.exe");
+            File.WriteAllText(outside, string.Empty);
+            _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(outside);
+            var sut = CreateServiceCommands();
+            try
+            {
+                // Act
+                await sut.ConfigureServiceAsync(new Service { Name = "TestService" }, TestContext.Current.CancellationToken);
+
+                // Assert
+                _processHelperMock.Verify(h => h.Start(It.IsAny<ProcessStartInfo>()), Times.Never);
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Resources.Strings.Msg_DesktopAppLaunchFailed, UiAppConfig.Caption), Times.Once);
+            }
+            finally { File.Delete(outside); }
+        }
+#endif
+
+        #endregion
+
+        #region Passwordless Account Import (real XML/JSON validators)
+
+        [Theory]
+        [InlineData("xml", @"NT SERVICE\PasswordlessService")]
+        [InlineData("json", @"NT SERVICE\PasswordlessService")]
+        [InlineData("xml", @"NT AUTHORITY\LocalService")]
+        [InlineData("json", @"DOMAIN\svc_gmsa$")]
+        public async Task ImportConfigAsync_FileNamesPasswordlessAccount_UpsertsTheAccount(string format, string account)
+        {
+            // Act
+            var upserted = await ImportWithRealValidatorsAsync(format, account);
+
+            // Assert
+            Assert.NotNull(upserted);
+            Assert.False(upserted.RunAsLocalSystem);
+            Assert.Equal(account, upserted.UserAccount);
+            Assert.Null(upserted.Password);
+        }
+
+        [Theory]
+        [InlineData("xml")]
+        [InlineData("json")]
+        public async Task ImportConfigAsync_FileNamesAccountThatNeedsAPassword_UpsertsTheLocalSystemBaseline(string format)
+        {
+            // Act
+            var upserted = await ImportWithRealValidatorsAsync(format, @"DOMAIN\User");
+
+            // Assert
+            Assert.NotNull(upserted);
+            Assert.True(upserted.RunAsLocalSystem);
+            Assert.Null(upserted.UserAccount);
+            Assert.Null(upserted.Password);
+        }
+
+        [Theory]
+        [InlineData("xml", 0, true)]
+        [InlineData("json", 0, true)]
+        [InlineData("xml", 1, false)]
+        [InlineData("json", 1, false)]
+        public async Task ImportConfigAsync_FileNamesBlankPasswordLocalAccount_IsKeptOnlyWhenBlankPasswordsAreAllowed(string format, int policy, bool kept)
+        {
+            // Arrange: LimitBlankPasswordUse = policy, and the account logs on with a blank password
+            const string account = @".\servy_blank_manager";
+            ServiceDto? upserted;
+
+            // Act
+            using (new BlankPasswordProbe(policy, account))
+            {
+                upserted = await ImportWithRealValidatorsAsync(format, account);
+            }
+
+            // Assert
+            Assert.NotNull(upserted);
+            Assert.Equal(!kept, upserted.RunAsLocalSystem);
+            Assert.Equal(kept ? account : null, upserted.UserAccount);
+            Assert.Null(upserted.Password);
+        }
+
+        /// <summary>
+        /// Imports a manifest naming <paramref name="account"/> through Manager's import command wired to the
+        /// production XML and JSON validators, and returns the definition handed to the repository.
+        /// </summary>
+        private async Task<ServiceDto?> ImportWithRealValidatorsAsync(string format, string account)
+        {
+            const string exePath = @"C:\Windows\System32\notepad.exe";
+            var content = format == "xml"
+                ? "<ServiceDto><Name>PasswordlessService</Name><ExecutablePath>" + exePath + "</ExecutablePath>" +
+                  "<UserAccount>" + account + "</UserAccount><Password>ignored</Password></ServiceDto>"
+                : "{\"Name\":\"PasswordlessService\",\"ExecutablePath\":\"" + exePath.Replace(@"\", @"\\") + "\"," +
+                  "\"UserAccount\":\"" + account.Replace(@"\", @"\\") + "\",\"Password\":\"ignored\"}";
+
+            _processHelperMock.Setup(ph => ph.ValidatePath(It.IsAny<string>(), It.IsAny<bool>())).Returns(true);
+            var rules = new ServiceValidationRules(_processHelperMock.Object);
+            var sut = new ServiceCommands(
+                _serviceManagerMock.Object,
+                _serviceRepositoryMock.Object,
+                _messageBoxServiceMock.Object,
+                _fileDialogServiceMock.Object,
+                name => _removedServiceName = name,
+                () =>
+                {
+                    _refreshCalled = true;
+                    return Task.CompletedTask;
+                },
+                _serviceConfigurationValidatorMock.Object,
+                new XmlServiceValidator(rules),
+                new JsonServiceValidator(rules),
+                _appConfigMock.Object,
+                _processHelperMock.Object,
+                _uiDispatcherMock.Object,
+                _cursorServiceMock.Object);
+            _created.Add(sut);
+
+            ServiceDto? upserted = null;
+            _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), true, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+            _serviceRepositoryMock
+                .Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, true, It.IsAny<CancellationToken>()))
+                .Callback<ServiceDto, bool, bool, CancellationToken>((dto, keepState, keepCredentials, token) => upserted = dto)
+                .ReturnsAsync(1);
+
+            using (var tempFile = new TempFile("." + format).Write(content))
+            {
+                if (format == "xml")
+                {
+                    _fileDialogServiceMock.Setup(d => d.OpenXml(It.IsAny<string>())).Returns(tempFile.Path);
+                    await sut.ImportXmlConfigAsync(TestContext.Current.CancellationToken);
+                }
+                else
+                {
+                    _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string>())).Returns(tempFile.Path);
+                    await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
+                }
+            }
+
+            return upserted;
         }
 
         #endregion
@@ -682,11 +992,17 @@ namespace Servy.Manager.UnitTests.Services
             _serviceManagerMock.Setup(m => m.GetServiceStartupType(service.Name, It.IsAny<CancellationToken>())).Returns(ServiceStartType.Manual);
 
             // Act
-            var result = await sut.StartServiceAsync(service, showMessageBox: false, cancellationToken: TestContext.Current.CancellationToken);
+            var result = await sut.StartServiceAsync(service, cancellationToken: TestContext.Current.CancellationToken);
 
             // Assert
             Assert.True(result);
             _serviceManagerMock.Verify(m => m.StartServiceAsync(service.Name, It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
+
+            // On success the wrapper flips the UI model's status to match the verb
+            Assert.Equal(ServiceStatus.Running, service.Status);
+            // Expected text as a literal, not through the accessor: the SUT and this test now read the
+            // same Servy.Core entry, so re-deriving it here would pass whatever that entry says.
+            _messageBoxServiceMock.Verify(m => m.ShowInfoAsync($"Service '{service.Name}' was started successfully.", UiAppConfig.Caption), Times.Once);
         }
 
         [Fact]
@@ -708,6 +1024,24 @@ namespace Servy.Manager.UnitTests.Services
         }
 
         [Fact]
+        public async Task StopServiceAsync_ServiceIsDisabled_StillStopsWithoutDisabledError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "DisabledButRunning" };
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = service.Name });
+            _serviceManagerMock.Setup(m => m.GetServiceStartupType(service.Name, It.IsAny<CancellationToken>())).Returns(ServiceStartType.Disabled);
+
+            // Act
+            var result = await sut.StopServiceAsync(service, showMessageBox: true, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result);
+            _serviceManagerMock.Verify(m => m.StopServiceAsync(service.Name, It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_ServiceDisabledError, It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
         public async Task StopServiceAsync_ShouldCallServiceManager()
         {
             // Arrange
@@ -718,11 +1052,15 @@ namespace Servy.Manager.UnitTests.Services
                 .ReturnsAsync(new ServiceDto { Name = service.Name });
 
             // Act
-            var result = await sut.StopServiceAsync(service, showMessageBox: false, cancellationToken: TestContext.Current.CancellationToken);
+            var result = await sut.StopServiceAsync(service, cancellationToken: TestContext.Current.CancellationToken);
 
             // Assert
             Assert.True(result);
             _serviceManagerMock.Verify(m => m.StopServiceAsync(service.Name, It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
+
+            // On success the wrapper flips the UI model's status to match the verb
+            Assert.Equal(ServiceStatus.Stopped, service.Status);
+            _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(string.Format(Core.Resources.Strings.Msg_ServiceStopped, service.Name), UiAppConfig.Caption), Times.Once);
         }
 
         [Fact]
@@ -738,11 +1076,33 @@ namespace Servy.Manager.UnitTests.Services
             _serviceManagerMock.Setup(m => m.GetServiceStartupType(service.Name, It.IsAny<CancellationToken>())).Returns(ServiceStartType.Automatic);
 
             // Act
-            var result = await sut.RestartServiceAsync(service, showMessageBox: false, cancellationToken: TestContext.Current.CancellationToken);
+            var result = await sut.RestartServiceAsync(service, cancellationToken: TestContext.Current.CancellationToken);
 
             // Assert
             Assert.True(result);
             _serviceManagerMock.Verify(m => m.RestartServiceAsync(service.Name, It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
+
+            // On success the wrapper flips the UI model's status to match the verb
+            Assert.Equal(ServiceStatus.Running, service.Status);
+            _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(string.Format(Core.Resources.Strings.Msg_ServiceRestarted, service.Name), UiAppConfig.Caption), Times.Once);
+        }
+
+        [Fact]
+        public async Task RestartServiceAsync_ServiceIsDisabled_AbortsWithDisabledError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "DisabledService" };
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = service.Name });
+            _serviceManagerMock.Setup(m => m.GetServiceStartupType(service.Name, It.IsAny<CancellationToken>())).Returns(ServiceStartType.Disabled);
+
+            // Act
+            var result = await sut.RestartServiceAsync(service, showMessageBox: true, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result);
+            _serviceManagerMock.Verify(m => m.RestartServiceAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_ServiceDisabledError, UiAppConfig.Caption), Times.Once);
         }
 
         [Fact]
@@ -755,10 +1115,16 @@ namespace Servy.Manager.UnitTests.Services
             Assert.False(await sut.StartServiceAsync(null, cancellationToken: TestContext.Current.CancellationToken));
             Assert.False(await sut.StartServiceAsync(new Service { Name = "" }, cancellationToken: TestContext.Current.CancellationToken));
             Assert.False(await sut.StartServiceAsync(new Service { Name = "  " }, cancellationToken: TestContext.Current.CancellationToken));
+            Assert.False(await sut.StopServiceAsync(null, cancellationToken: TestContext.Current.CancellationToken));
+            Assert.False(await sut.StopServiceAsync(new Service { Name = "" }, cancellationToken: TestContext.Current.CancellationToken));
+            Assert.False(await sut.StopServiceAsync(new Service { Name = "  " }, cancellationToken: TestContext.Current.CancellationToken));
+            Assert.False(await sut.RestartServiceAsync(null, cancellationToken: TestContext.Current.CancellationToken));
+            Assert.False(await sut.RestartServiceAsync(new Service { Name = "" }, cancellationToken: TestContext.Current.CancellationToken));
+            Assert.False(await sut.RestartServiceAsync(new Service { Name = "  " }, cancellationToken: TestContext.Current.CancellationToken));
         }
 
         [Fact]
-        public async Task ExecuteServiceCommandAsync_ServiceNotFoundInRepository_ReturnsFalseAndLogsError()
+        public async Task ExecuteServiceCommandAsync_ServiceNotFoundInRepository_ReturnsFalseAndShowsNotFoundError()
         {
             // Arrange
             var sut = CreateServiceCommands();
@@ -790,6 +1156,213 @@ namespace Servy.Manager.UnitTests.Services
             // Assert
             Assert.False(result);
             _messageBoxServiceMock.Verify(m => m.ShowErrorAsync("Custom Core Critical Crash Error Context", UiAppConfig.Caption), Times.Once);
+        }
+
+        [Fact]
+        public async Task StartServiceAsync_ShowMessageBoxFalse_SuccessShowsNoDialog()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "BulkStart" };
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = service.Name });
+            _serviceManagerMock.Setup(m => m.GetServiceStartupType(service.Name, It.IsAny<CancellationToken>())).Returns(ServiceStartType.Manual);
+
+            // Act
+            var result = await sut.StartServiceAsync(service, showMessageBox: false, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result);
+            Assert.Equal(ServiceStatus.Running, service.Status);
+            _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task StartServiceAsync_ShowMessageBoxFalse_FailureShowsNoDialogButReturnsFalse()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "BulkStartFails" };
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = service.Name });
+            _serviceManagerMock.Setup(m => m.GetServiceStartupType(service.Name, It.IsAny<CancellationToken>())).Returns(ServiceStartType.Manual);
+            _serviceManagerMock.Setup(m => m.StartServiceAsync(service.Name, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(OperationResult.Failure("boom"));
+
+            // Act
+            var result = await sut.StartServiceAsync(service, showMessageBox: false, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+        }
+
+        /// <summary>
+        /// Start, Stop, Restart and Uninstall (plus their shared repository lookup and the disabled pre-check)
+        /// must hand the caller's token to the collaborators, not <c>default</c>.
+        /// </summary>
+        [Fact]
+        public async Task LifecycleCommands_ForwardTheCallersToken()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = service.Name });
+            _serviceManagerMock.Setup(m => m.GetServiceStartupType(service.Name, It.IsAny<CancellationToken>())).Returns(ServiceStartType.Manual);
+
+            // Act
+            await sut.StartServiceAsync(service, showMessageBox: false, cancellationToken: token);
+            await sut.StopServiceAsync(service, showMessageBox: false, cancellationToken: token);
+            await sut.RestartServiceAsync(service, showMessageBox: false, cancellationToken: token);
+            await sut.UninstallServiceAsync(service, token);
+
+            // Assert - an exact token, not It.IsAny: a hand-over that passes default matches none of these.
+            _serviceManagerMock.Verify(m => m.StartServiceAsync(service.Name, It.IsAny<bool>(), token), Times.Once);
+            _serviceManagerMock.Verify(m => m.StopServiceAsync(service.Name, It.IsAny<bool>(), token), Times.Once);
+            _serviceManagerMock.Verify(m => m.RestartServiceAsync(service.Name, It.IsAny<bool>(), token), Times.Once);
+            _serviceManagerMock.Verify(m => m.UninstallServiceAsync(service.Name, token), Times.Once);
+
+            // The pre-checks: one repository lookup per command, one startup-type read for Start and Restart
+            // (Stop passes checkDisabled: false).
+            _serviceRepositoryMock.Verify(r => r.GetByNameAsync(service.Name, true, token), Times.Exactly(4));
+            _serviceManagerMock.Verify(m => m.GetServiceStartupType(service.Name, token), Times.Exactly(2));
+        }
+
+        /// <summary>
+        /// Search must hand the caller's token to the repository, not <c>default</c> (the non-lifecycle half of #8076).
+        /// </summary>
+        [Fact]
+        public async Task SearchServicesAsync_ForwardsTheCallersTokenToTheRepository()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+            _serviceRepositoryMock.Setup(r => r.SearchAsync(It.IsAny<string>(), false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new List<ServiceDto>());
+
+            // Act
+            await sut.SearchServicesAsync("x", calculatePerf: false, token);
+
+            // Assert - an exact token, not It.IsAny: a hand-over that passes default matches none of these.
+            _serviceRepositoryMock.Verify(r => r.SearchAsync("x", false, token), Times.Once);
+        }
+
+        /// <summary>
+        /// Configure must hand the caller's token to the repository lookup, not <c>default</c> (the non-lifecycle half of #8076).
+        /// </summary>
+        [Fact]
+        public async Task ConfigureServiceAsync_ForwardsTheCallersTokenToTheRepository()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+            string baseDir = AppFoldersHelper.GetAppDirectory();
+
+            using (var tempExe = new TempFile(baseDir, $"test_desktop_{Guid.NewGuid():N}.exe").Write("dummy"))
+            {
+                _appConfigMock.Setup(c => c.DesktopAppPublishPath).Returns(tempExe.Path);
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ServiceDto { Name = service.Name });
+                _processHelperMock.Setup(h => h.Start(It.IsAny<ProcessStartInfo>())).Returns(() => Process.GetCurrentProcess());
+
+                // Act
+                await sut.ConfigureServiceAsync(service, token);
+
+                // Assert - an exact token, not It.IsAny: a hand-over that passes default matches none of these.
+                _serviceRepositoryMock.Verify(r => r.GetByNameAsync(service.Name, false, token), Times.Once);
+            }
+        }
+
+        /// <summary>
+        /// Remove must hand the caller's token to the existence lookup, the delete and the vault revocation,
+        /// not <c>default</c> (the non-lifecycle half of #8076).
+        /// </summary>
+        [Fact]
+        public async Task RemoveServiceAsync_ForwardsTheCallersTokenToTheCollaborators()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+            var record = new ServiceDto { Name = service.Name, RunAsLocalSystem = false, UserAccount = @".\svc-account" };
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>())).ReturnsAsync(record);
+            _serviceRepositoryMock.Setup(r => r.DeleteAsync(service.Name, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+            // Act
+            await sut.RemoveServiceAsync(service, token);
+
+            // Assert - an exact token, not It.IsAny: a hand-over that passes default matches none of these.
+            _serviceRepositoryMock.Verify(r => r.GetByNameAsync(service.Name, false, token), Times.Once);
+            _serviceRepositoryMock.Verify(r => r.DeleteAsync(service.Name, token), Times.Once);
+            _serviceManagerMock.Verify(m => m.RevokeVaultAccessIfUnusedAsync(record, token), Times.Once);
+        }
+
+        /// <summary>
+        /// Export must hand the caller's token to the decrypting repository lookup, not <c>default</c>
+        /// (the non-lifecycle half of #8076).
+        /// </summary>
+        [Fact]
+        public async Task ExportServiceToXmlAsync_ForwardsTheCallersTokenToTheRepository()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+            var record = new ServiceDto { Name = service.Name, ExecutablePath = "test.exe" };
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>())).ReturnsAsync(record);
+
+            using (var targetPath = new TempFile("_export_test.xml"))
+            {
+                _fileDialogServiceMock.Setup(f => f.SaveXml(It.IsAny<string>())).Returns(targetPath.Path);
+
+                // Act
+                await sut.ExportServiceToXmlAsync(service, token);
+            }
+
+            // Assert - an exact token, not It.IsAny: a hand-over that passes default matches none of these.
+            _serviceRepositoryMock.Verify(r => r.GetByNameAsync(service.Name, true, token), Times.Once);
+        }
+
+        /// <summary>
+        /// Import must hand the caller's token to the validator, the existence lookup and the upsert,
+        /// not <c>default</c> (the non-lifecycle half of #8076).
+        /// </summary>
+        [Fact]
+        public async Task ImportJsonConfigAsync_ForwardsTheCallersTokenToTheCollaborators()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var dto = new ServiceDto { Name = "MyService", ExecutablePath = @"C:\Windows\System32\notepad.exe" };
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+            _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), true, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(dto.Name, false, It.IsAny<CancellationToken>())).ReturnsAsync(dto);
+            _serviceRepositoryMock.Setup(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, true, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+            ServiceDto? jsonParsedDto = dto;
+            _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out jsonParsedDto)).Returns(true);
+
+            using (var tempFile = new TempFile(".json").Write(JsonConvert.SerializeObject(dto)))
+            {
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile.Path);
+
+                // Act
+                await sut.ImportJsonConfigAsync(token);
+            }
+
+            // Assert - an exact token, not It.IsAny: a hand-over that passes default matches none of these.
+            _serviceConfigurationValidatorMock.Verify(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), true, token), Times.Once);
+            _serviceRepositoryMock.Verify(r => r.GetByNameAsync(dto.Name, false, token), Times.Once);
+            _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, true, token), Times.Once);
         }
 
         [Fact]
@@ -831,7 +1404,14 @@ namespace Servy.Manager.UnitTests.Services
 
                 // Assert
                 Assert.True(result, "InstallServiceAsync returned false. The Directory.Exists validation likely failed.");
-                _serviceManagerMock.Verify(m => m.InstallServiceAsync(It.Is<InstallServiceOptions>(o => o.ServiceName == service.Name), It.IsAny<CancellationToken>()), Times.Once);
+                // Exact token, not It.IsAny: the install and its pre-check must receive the caller's token.
+                var token = TestContext.Current.CancellationToken;
+                _serviceManagerMock.Verify(m => m.InstallServiceAsync(It.Is<InstallServiceOptions>(o => o.ServiceName == service.Name), token), Times.Once);
+                _serviceManagerMock.Verify(m => m.IsServiceInstalled(service.Name, token), Times.Once);
+
+                // The success tail: the UI model is flipped and the user is told
+                Assert.True(service.IsInstalled);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(string.Format(Core.Resources.Strings.Msg_ServiceInstalled, service.Name), UiAppConfig.Caption), Times.Once);
             }
             finally
             {
@@ -866,14 +1446,70 @@ namespace Servy.Manager.UnitTests.Services
             var sut = CreateServiceCommands();
             var service = new Service { Name = "AlreadyHereService" };
             _serviceManagerMock.Setup(m => m.IsServiceInstalled(service.Name, It.IsAny<CancellationToken>())).Returns(true);
-            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_ServiceAlreadyExists, UiAppConfig.Caption)).ReturnsAsync(false);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ServiceAlreadyExists, service.Name), UiAppConfig.Caption)).ReturnsAsync(false);
 
             // Act
             var result = await sut.InstallServiceAsync(service, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ServiceAlreadyExists, service.Name), UiAppConfig.Caption), Times.Once);
+            _serviceManagerMock.Verify(m => m.InstallServiceAsync(It.IsAny<InstallServiceOptions>(), It.IsAny<CancellationToken>()), Times.Never);
             _serviceRepositoryMock.Verify(r => r.GetByNameAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task InstallServiceAsync_ServiceAlreadyInstalledAndUserConfirmsOverwrite_ProceedsWithInstall()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "AlreadyHereService" };
+
+            string? debugDir = null;
+            bool directoryCreatedByTest = false;
+
+#if DEBUG
+            // Ensure the debug directory exists to satisfy the #if DEBUG validation check in InstallServiceAsync
+            debugDir = Path.GetFullPath(AppConfig.ServyServiceManagerDebugFolder);
+
+            try
+            {
+                if (!Directory.Exists(debugDir))
+                {
+                    Directory.CreateDirectory(debugDir);
+                    directoryCreatedByTest = true;
+                }
+            }
+            catch { /* Ignore creation errors if running in restricted environments */ }
+#endif
+
+            _serviceManagerMock.Setup(m => m.IsServiceInstalled(service.Name, It.IsAny<CancellationToken>())).Returns(true);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ServiceAlreadyExists, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = service.Name, ExecutablePath = "C:\\test.exe" });
+
+            try
+            {
+                // Act
+                var result = await sut.InstallServiceAsync(service, TestContext.Current.CancellationToken);
+
+                // Assert
+                Assert.True(result, "InstallServiceAsync returned false. The Directory.Exists validation likely failed.");
+                _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(string.Format(Strings.Msg_ServiceAlreadyExists, service.Name), UiAppConfig.Caption), Times.Once);
+                _serviceManagerMock.Verify(m => m.InstallServiceAsync(It.Is<InstallServiceOptions>(o => o.ServiceName == service.Name), It.IsAny<CancellationToken>()), Times.Once);
+            }
+            finally
+            {
+                // Teardown - Clean up created diagnostic folder artifacts explicitly to maintain sandbox safety boundaries
+                if (directoryCreatedByTest && !string.IsNullOrEmpty(debugDir) && Directory.Exists(debugDir))
+                {
+                    try
+                    {
+                        Directory.Delete(debugDir, recursive: true);
+                    }
+                    catch { /* Prevent teardown exceptions from hiding primary assertion faults */ }
+                }
+            }
         }
 
         [Fact]
@@ -951,13 +1587,15 @@ namespace Servy.Manager.UnitTests.Services
             // Arrange
             var sut = CreateServiceCommands();
             var service = new Service { Name = "SaveMeService" };
-            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_UninstallServiceConfirm, UiAppConfig.Caption)).ReturnsAsync(false);
+            var prompt = string.Format(Strings.Msg_UninstallServiceConfirm, service.Name);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(prompt, UiAppConfig.Caption)).ReturnsAsync(false);
 
             // Act
             var result = await sut.UninstallServiceAsync(service, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(prompt, UiAppConfig.Caption), Times.Once);
             _serviceRepositoryMock.Verify(r => r.GetByNameAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
         }
 
@@ -967,7 +1605,7 @@ namespace Servy.Manager.UnitTests.Services
             // Arrange
             var sut = CreateServiceCommands();
             var service = new Service { Name = "GhostService" };
-            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_UninstallServiceConfirm, UiAppConfig.Caption)).ReturnsAsync(true);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_UninstallServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
             _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>())).ReturnsAsync((ServiceDto?)null);
 
             // Act
@@ -984,7 +1622,7 @@ namespace Servy.Manager.UnitTests.Services
             // Arrange
             var sut = CreateServiceCommands();
             var service = new Service { Name = "UnstoppableService" };
-            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_UninstallServiceConfirm, UiAppConfig.Caption)).ReturnsAsync(true);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_UninstallServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
             _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = service.Name });
             _serviceManagerMock.Setup(m => m.UninstallServiceAsync(service.Name, It.IsAny<CancellationToken>())).ReturnsAsync(OperationResult.Failure("Service is marked for deletion hook lockout"));
 
@@ -1020,6 +1658,52 @@ namespace Servy.Manager.UnitTests.Services
         }
 
         [Fact]
+        public async Task RemoveServiceAsync_ServiceUnderCustomAccount_RevokesItsVaultAccessAfterTheDelete()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+            var record = new ServiceDto { Name = service.Name, RunAsLocalSystem = false, UserAccount = @".\svc-account" };
+            var order = new List<string>();
+
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(record);
+            _serviceRepositoryMock.Setup(r => r.DeleteAsync(service.Name, It.IsAny<CancellationToken>()))
+                .Callback(() => order.Add("delete")).ReturnsAsync(1);
+            _serviceManagerMock.Setup(m => m.RevokeVaultAccessIfUnusedAsync(It.IsAny<ServiceDto?>(), It.IsAny<CancellationToken>()))
+                .Callback(() => order.Add("revoke")).Returns(Task.CompletedTask);
+
+            // Act
+            var result = await sut.RemoveServiceAsync(service, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result);
+            _serviceManagerMock.Verify(m => m.RevokeVaultAccessIfUnusedAsync(record, It.IsAny<CancellationToken>()), Times.Once);
+            Assert.Equal(new[] { "delete", "revoke" }, order);
+        }
+
+        [Fact]
+        public async Task RemoveServiceAsync_RepositoryDeleteReturnsZeroRows_RevokesNothing()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "TestService" };
+
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(It.IsAny<string>(), It.IsAny<string>())).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = service.Name, RunAsLocalSystem = false, UserAccount = @".\svc-account" });
+            _serviceRepositoryMock.Setup(r => r.DeleteAsync(service.Name, It.IsAny<CancellationToken>())).ReturnsAsync(0);
+
+            // Act
+            var result = await sut.RemoveServiceAsync(service, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result);
+            _serviceManagerMock.Verify(m => m.RevokeVaultAccessIfUnusedAsync(It.IsAny<ServiceDto?>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
         public async Task RemoveServiceAsync_NullOrWhitespaceServiceInput_ReturnsFalse()
         {
             // Arrange
@@ -1037,13 +1721,15 @@ namespace Servy.Manager.UnitTests.Services
             // Arrange
             var sut = CreateServiceCommands();
             var service = new Service { Name = "ProtectedRecord" };
-            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_RemoveServiceConfirm, UiAppConfig.Caption)).ReturnsAsync(false);
+            var prompt = string.Format(Strings.Msg_RemoveServiceConfirm, service.Name);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(prompt, UiAppConfig.Caption)).ReturnsAsync(false);
 
             // Act
             var result = await sut.RemoveServiceAsync(service, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowConfirmAsync(prompt, UiAppConfig.Caption), Times.Once);
             _serviceRepositoryMock.Verify(r => r.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         }
 
@@ -1053,7 +1739,7 @@ namespace Servy.Manager.UnitTests.Services
             // Arrange
             var sut = CreateServiceCommands();
             var service = new Service { Name = "GhostRepoRecord" };
-            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_RemoveServiceConfirm, UiAppConfig.Caption)).ReturnsAsync(true);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_RemoveServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
             _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>())).ReturnsAsync((ServiceDto?)null);
 
             // Act
@@ -1070,7 +1756,7 @@ namespace Servy.Manager.UnitTests.Services
             // Arrange
             var sut = CreateServiceCommands();
             var service = new Service { Name = "LockedRowService" };
-            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(Strings.Msg_RemoveServiceConfirm, UiAppConfig.Caption)).ReturnsAsync(true);
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_RemoveServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
             _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = service.Name });
             _serviceRepositoryMock.Setup(r => r.DeleteAsync(service.Name, It.IsAny<CancellationToken>())).ReturnsAsync(0);
 
@@ -1079,7 +1765,7 @@ namespace Servy.Manager.UnitTests.Services
 
             // Assert
             Assert.False(result);
-            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
         }
 
         #endregion
@@ -1153,7 +1839,7 @@ namespace Servy.Manager.UnitTests.Services
             await sut.CopyPidAsync(service, cancellationToken: TestContext.Current.CancellationToken);
 
             // Assert
-            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
         }
 
         #endregion
@@ -1167,33 +1853,54 @@ namespace Servy.Manager.UnitTests.Services
             var sut = CreateServiceCommands();
             var service = new Service { Name = "XmlExportService" };
 
-            // Generate a guaranteed unique filename instead of a fixed name to avoid test collisions
-            var uniqueBaseName = Path.GetFileNameWithoutExtension(Path.GetTempFileName());
-            var targetPath = Path.Combine(Path.GetTempPath(), $"{uniqueBaseName}_export_test.xml");
-            var sampleDto = new ServiceDto { Name = service.Name, ExecutablePath = "test.exe" };
-
-            _fileDialogServiceMock.Setup(f => f.SaveXml(Strings.SaveFileDialog_XmlTitle))
-                .Returns(targetPath);
-
-            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
-                .ReturnsAsync(sampleDto);
-
-            try
+            // Generate a guaranteed unique filename without creating a zero-byte file on disk
+            using (var targetPath = new TempFile("_export_test.xml"))
             {
+                var sampleDto = new ServiceDto { Name = service.Name, ExecutablePath = "test.exe" };
+
+                _fileDialogServiceMock.Setup(f => f.SaveXml(Strings.SaveFileDialog_XmlTitle))
+                    .Returns(targetPath.Path);
+
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(sampleDto);
+
                 // Act
                 await sut.ExportServiceToXmlAsync(service, TestContext.Current.CancellationToken);
 
                 // Assert
+                var written = File.ReadAllText(targetPath.Path);
+                Assert.Contains("<Name>XmlExportService</Name>", written);
                 _serviceRepositoryMock.Verify(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()), Times.Once);
-                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(Strings.ExportXml_Success, UiAppConfig.Caption), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(string.Format(Strings.ExportXml_Success, service.Name), UiAppConfig.Caption), Times.Once);
             }
-            finally
+        }
+
+        [Fact]
+        public async Task ExportServiceToJsonAsync_ValidPathAndDto_DisplaysSuccess()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "JsonExportService" };
+
+            // Generate a guaranteed unique filename without creating a zero-byte file on disk
+            using (var targetPath = new TempFile("_export_test.json"))
             {
-                // Clean up the generated XML file if the exporter successfully wrote it to disk
-                if (File.Exists(targetPath))
-                {
-                    File.Delete(targetPath);
-                }
+                var sampleDto = new ServiceDto { Name = service.Name, ExecutablePath = "test.exe" };
+
+                _fileDialogServiceMock.Setup(f => f.SaveJson(Strings.SaveFileDialog_JsonTitle))
+                    .Returns(targetPath.Path);
+
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(sampleDto);
+
+                // Act
+                await sut.ExportServiceToJsonAsync(service, TestContext.Current.CancellationToken);
+
+                // Assert
+                var written = File.ReadAllText(targetPath.Path);
+                Assert.Contains("\"Name\": \"JsonExportService\"", written);
+                _serviceRepositoryMock.Verify(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(string.Format(Strings.ExportJson_Success, service.Name), UiAppConfig.Caption), Times.Once);
             }
         }
 
@@ -1235,6 +1942,73 @@ namespace Servy.Manager.UnitTests.Services
             _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_ServiceNotFound, UiAppConfig.Caption), Times.Once);
         }
 
+        [Theory]
+        [InlineData("xml")]
+        [InlineData("json")]
+        public async Task ExportServiceConfigAsync_RowDoesNotDecrypt_RefusesTheExportWithAnError(string format)
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "UndecryptableService" };
+
+            // Generate a guaranteed unique filename without creating a zero-byte file on disk
+            using (var targetPath = new TempFile("_export_test." + format))
+            {
+                // What a decrypting read returns for a row with a field the current key cannot decrypt
+                var unreadableDto = new ServiceDto { Name = service.Name, ExecutablePath = "test.exe", DecryptionFailed = true };
+
+                _fileDialogServiceMock.Setup(f => f.SaveXml(It.IsAny<string>())).Returns(targetPath.Path);
+                _fileDialogServiceMock.Setup(f => f.SaveJson(It.IsAny<string>())).Returns(targetPath.Path);
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(unreadableDto);
+
+                // Act
+                if (format == "xml")
+                    await sut.ExportServiceToXmlAsync(service, TestContext.Current.CancellationToken);
+                else
+                    await sut.ExportServiceToJsonAsync(service, TestContext.Current.CancellationToken);
+
+                // Assert
+                Assert.False(File.Exists(targetPath.Path));
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(string.Format(Core.Resources.Strings.Msg_ExportDecryptionFailed, service.Name), UiAppConfig.Caption), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+            }
+        }
+
+        [Theory]
+        [InlineData("xml")]
+        [InlineData("json")]
+        public async Task ExportServiceConfigAsync_RowRefusedByTheLegacyEncryptionPolicy_RefusesTheExportNamingTheLegacyEncryption(string format)
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "LegacyService" };
+
+            // Generate a guaranteed unique filename without creating a zero-byte file on disk
+            using (var targetPath = new TempFile("_export_test." + format))
+            {
+                // What a decrypting read returns for a row with a field that still uses the pre-v2 encryption (#7816)
+                var legacyDto = new ServiceDto { Name = service.Name, ExecutablePath = "test.exe", DecryptionFailed = true, LegacyEncryptionBlocked = true };
+
+                _fileDialogServiceMock.Setup(f => f.SaveXml(It.IsAny<string>())).Returns(targetPath.Path);
+                _fileDialogServiceMock.Setup(f => f.SaveJson(It.IsAny<string>())).Returns(targetPath.Path);
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(legacyDto);
+
+                // Act
+                if (format == "xml")
+                    await sut.ExportServiceToXmlAsync(service, TestContext.Current.CancellationToken);
+                else
+                    await sut.ExportServiceToJsonAsync(service, TestContext.Current.CancellationToken);
+
+                // Assert: the policy refusal is reported as such, not as a key file to restore
+                Assert.False(File.Exists(targetPath.Path));
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(string.Format(Core.Resources.Strings.Msg_ExportLegacyEncryptionBlocked, service.Name), UiAppConfig.Caption), Times.Once);
+                _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(string.Format(Core.Resources.Strings.Msg_ExportDecryptionFailed, service.Name), It.IsAny<string>()), Times.Never);
+                _messageBoxServiceMock.Verify(m => m.ShowInfoAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+            }
+        }
+
         [Fact]
         public async Task ExportServiceToJsonAsync_RepositoryThrowsException_HandlesExceptionGracefully()
         {
@@ -1250,7 +2024,7 @@ namespace Servy.Manager.UnitTests.Services
             await sut.ExportServiceToJsonAsync(service, TestContext.Current.CancellationToken);
 
             // Assert
-            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
         }
 
         [Fact]
@@ -1259,11 +2033,14 @@ namespace Servy.Manager.UnitTests.Services
             // Arrange
             var sut = CreateServiceCommands();
 
-            // Act & Assert
+            // Act
             await sut.ExportServiceToXmlAsync(null, TestContext.Current.CancellationToken);
-            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
             await sut.ExportServiceToJsonAsync(null, TestContext.Current.CancellationToken);
-            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+
+            // Assert
+            _messageBoxServiceMock.VerifyNoOtherCalls();
+            _fileDialogServiceMock.VerifyNoOtherCalls();
+            _serviceRepositoryMock.VerifyNoOtherCalls();
         }
 
         #endregion
@@ -1365,6 +2142,264 @@ namespace Servy.Manager.UnitTests.Services
 
         #endregion
 
+        #region OperationCanceledException Propagation Tests
+
+        // One test per distinct catch (OperationCanceledException) arm in ServiceCommands. Each arm only
+        // exists to keep the generic catch below it from turning a cancellation into an Error log and an
+        // "Unexpected error" dialog, so every test asserts the propagation AND that no such dialog appeared.
+
+        [Fact]
+        public async Task ConfigureServiceAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            _appConfigMock.Setup(c => c.DesktopAppPublishPath).Throws(new OperationCanceledException());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<OperationCanceledException>(
+                () => sut.ConfigureServiceAsync(new Service { Name = "CancelledService" }, TestContext.Current.CancellationToken));
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+        }
+
+        // Mirror image of the test above, from the same seam: a non-cancellation exception must fall through to
+        // the generic catch, be swallowed and reported through the "Unexpected error" dialog. Without it, the
+        // propagation assertions above would still pass if the cancellation arm were widened to catch everything.
+        [Fact]
+        public async Task ConfigureServiceAsync_UnexpectedException_ShowsUnexpectedErrorAndDoesNotPropagate()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            _appConfigMock.Setup(c => c.DesktopAppPublishPath).Throws(new InvalidOperationException("Boom!"));
+
+            // Act
+            await sut.ConfigureServiceAsync(new Service { Name = "FaultyService" }, TestContext.Current.CancellationToken);
+
+            // Assert
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+            _cursorServiceMock.Verify(c => c.ResetCursor(), Times.Once);
+        }
+
+        [Fact]
+        public async Task InstallServiceAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CancelledInstall" };
+            _serviceManagerMock.Setup(m => m.IsServiceInstalled(service.Name, It.IsAny<CancellationToken>())).Returns(false);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<OperationCanceledException>(
+                () => sut.InstallServiceAsync(service, TestContext.Current.CancellationToken));
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+        }
+
+        [Fact]
+        public async Task InstallServiceAsync_UnexpectedException_ShowsUnexpectedErrorAndReturnsFalse()
+        {
+            // Arrange - same seam as the cancellation test above, so the pair tells the two arms apart
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CrashingInstallService" };
+            _serviceManagerMock.Setup(m => m.IsServiceInstalled(service.Name, It.IsAny<CancellationToken>())).Returns(false);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("DB unavailable"));
+
+            // Act
+            var result = await sut.InstallServiceAsync(service, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+        }
+
+        [Fact]
+        public async Task UninstallServiceAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CancelledUninstall" };
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_UninstallServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<OperationCanceledException>(
+                () => sut.UninstallServiceAsync(service, TestContext.Current.CancellationToken));
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+        }
+
+        [Fact]
+        public async Task UninstallServiceAsync_UnexpectedException_ShowsUnexpectedErrorAndReturnsFalse()
+        {
+            // Arrange - same seam as the cancellation test above, so the pair tells the two arms apart
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CrashingUninstallService" };
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_UninstallServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("DB unavailable"));
+
+            // Act
+            var result = await sut.UninstallServiceAsync(service, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+        }
+
+        [Fact]
+        public async Task RemoveServiceAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CancelledRemove" };
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_RemoveServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<OperationCanceledException>(
+                () => sut.RemoveServiceAsync(service, TestContext.Current.CancellationToken));
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+        }
+
+        [Fact]
+        public async Task RemoveServiceAsync_UnexpectedException_ShowsUnexpectedErrorAndReturnsFalse()
+        {
+            // Arrange - same seam as the cancellation test above, so the pair tells the two arms apart
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CrashingRemoveService" };
+            _messageBoxServiceMock.Setup(m => m.ShowConfirmAsync(string.Format(Strings.Msg_RemoveServiceConfirm, service.Name), UiAppConfig.Caption)).ReturnsAsync(true);
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, false, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("DB unavailable"));
+
+            // Act
+            var result = await sut.RemoveServiceAsync(service, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+        }
+
+        [Fact]
+        public async Task CopyPidAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CancelledCopyPid", Pid = 1234 };
+            _uiDispatcherMock.Setup(d => d.InvokeAsync(It.IsAny<Func<bool>>()))
+                .ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<OperationCanceledException>(
+                () => sut.CopyPidAsync(service, TestContext.Current.CancellationToken));
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+        }
+
+        [Fact]
+        public async Task ExecuteServiceCommandAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CancelledLifecycle" };
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<OperationCanceledException>(
+                () => sut.StartServiceAsync(service, showMessageBox: true, cancellationToken: TestContext.Current.CancellationToken));
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+        }
+
+        [Fact]
+        public async Task ExecuteServiceCommandAsync_UnexpectedException_ShowsUnexpectedErrorAndReturnsFalse()
+        {
+            // Arrange - same seam as the cancellation test above, so the pair tells the two arms apart.
+            // Start/Stop/Restart all funnel through ExecuteServiceCommandAsync, so one case covers the arm.
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CrashingLifecycleService" };
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("DB unavailable"));
+
+            // Act
+            var result = await sut.StartServiceAsync(service, showMessageBox: true, cancellationToken: TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result);
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+        }
+
+        [Fact]
+        public async Task ExportServiceConfigAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "CancelledExport" };
+            _fileDialogServiceMock.Setup(f => f.SaveXml(It.IsAny<string>())).Returns(@"C:\out.xml");
+            _serviceRepositoryMock.Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new OperationCanceledException());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<OperationCanceledException>(
+                () => sut.ExportServiceToXmlAsync(service, TestContext.Current.CancellationToken));
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+        }
+
+        [Fact]
+        public async Task ImportConfigAsync_OperationCancelled_PropagatesInsteadOfShowingUnexpectedError()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+
+            using (var cts = new CancellationTokenSource())
+            {
+                cts.Cancel();
+
+                // Act & Assert - the pipeline opens with ThrowIfCancellationRequested
+                await Assert.ThrowsAsync<OperationCanceledException>(() => sut.ImportJsonConfigAsync(cts.Token));
+            }
+
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Never);
+            _fileDialogServiceMock.Verify(d => d.OpenJson(It.IsAny<string?>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task ImportConfigAsync_UnexpectedException_ShowsUnexpectedErrorAndDoesNotPropagate()
+        {
+            // Arrange - drive the pipeline as far as the pre-upsert existence check, then throw from it
+            var sut = CreateServiceCommands();
+            var dto = new ServiceDto { Name = "CrashingImportService", ExecutablePath = @"C:\Windows\System32\notepad.exe" };
+            var json = JsonConvert.SerializeObject(dto);
+
+            // A .json path the SUT's path-security guard accepts; nothing lands on disk until it is written
+            using (var tempFile = new TempFile(".json").Write(json))
+            {
+                _fileDialogServiceMock.Setup(d => d.OpenJson(It.IsAny<string?>())).Returns(tempFile.Path);
+                ServiceDto? jsonParsedDto = dto;
+                _jsonServiceValidatorMock.Setup(v => v.TryValidate(It.IsAny<string>(), out It.Ref<string?>.IsAny, out jsonParsedDto)).Returns(true);
+                _serviceConfigurationValidatorMock.Setup(v => v.ValidateAsync(It.IsAny<ServiceDto>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                _serviceRepositoryMock.Setup(r => r.GetByNameAsync(dto.Name, false, It.IsAny<CancellationToken>()))
+                    .ThrowsAsync(new InvalidOperationException("DB unavailable"));
+
+                // Act - the generic catch swallows it, so no exception leaves the call
+                await sut.ImportJsonConfigAsync(TestContext.Current.CancellationToken);
+            }
+
+            // Assert
+            _messageBoxServiceMock.Verify(m => m.ShowErrorAsync(Core.Resources.Strings.Msg_UnexpectedError, UiAppConfig.Caption), Times.Once);
+            _serviceRepositoryMock.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            Assert.False(_refreshCalled);
+        }
+
+        #endregion
+
         #region Dispose Tests
 
         [Fact]
@@ -1389,6 +2424,63 @@ namespace Servy.Manager.UnitTests.Services
 
             // Assert
             Assert.Null(doubleDisposeException); // Second dispose should be a clean early return
+        }
+
+        [Fact]
+        public async Task InstallServiceAsync_AfterDispose_ThrowsObjectDisposedException()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            sut.Dispose();
+
+            // Act & Assert
+            // ExecuteLockedAsync's entry guard rejects the call before any work starts, so the command
+            // never runs and no fresh semaphore is added to the dictionary Dispose() has just cleared.
+            await Assert.ThrowsAsync<ObjectDisposedException>(
+                () => sut.InstallServiceAsync(new Service { Name = "AfterDispose" }, TestContext.Current.CancellationToken));
+            _serviceManagerMock.Verify(m => m.IsServiceInstalled(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task InstallServiceAsync_DisposedWhileInFlight_DoesNotSurfaceObjectDisposedException()
+        {
+            // Arrange
+            var sut = CreateServiceCommands();
+            var service = new Service { Name = "InFlightService" };
+
+            using (var entered = new ManualResetEventSlim(false))
+            using (var gate = new ManualResetEventSlim(false))
+            {
+                // Hold the command inside the per-service lock until the test opens the gate.
+                _serviceManagerMock
+                    .Setup(m => m.IsServiceInstalled(service.Name, It.IsAny<CancellationToken>()))
+                    .Returns(() =>
+                    {
+                        entered.Set();
+                        gate.Wait(TestTimeouts.CiGenerous);
+                        return false;
+                    });
+
+                // No repository row, so once the gate opens the command takes the short
+                // "service not found" path and returns false deterministically.
+                _serviceRepositoryMock
+                    .Setup(r => r.GetByNameAsync(service.Name, true, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((ServiceDto?)null);
+
+                var install = sut.InstallServiceAsync(service, TestContext.Current.CancellationToken);
+                Assert.True(entered.Wait(TestTimeouts.CiGenerous, TestContext.Current.CancellationToken), "the install never reached IsServiceInstalled");
+
+                // Act - dispose while the action still holds the per-service semaphore, then let it finish
+                sut.Dispose();
+                gate.Set();
+                var inFlightException = await Record.ExceptionAsync(() => install);
+
+                // Assert
+                // The finally's Release() runs against a semaphore Dispose() has already disposed;
+                // its ObjectDisposedException must not reach the caller after the work has finished.
+                Assert.Null(inFlightException);
+                Assert.False(await install);
+            }
         }
 
         #endregion

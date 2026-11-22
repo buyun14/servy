@@ -1,11 +1,11 @@
-# ===========================================
+# ==========================================================================================
 # GitHub Actions Workflow - Security Audit
-# -------------------------------------------
+# ------------------------------------------------------------------------------------------
 # Performs security checks for the Servy project:
 # 1. Dependency Scanning (NuGet Audit)
 # 2. Static Analysis (CodeQL)
 # 3. Secret Scanning (Gitleaks)
-# ===========================================
+# ==========================================================================================
 
 name: security
 
@@ -55,7 +55,17 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Restore dependencies
-        run: dotnet restore Servy.sln
+        shell: pwsh
+        run: |
+          $maxRetries = [int]$env:MAX_RETRIES
+          $maxAttempts = $maxRetries + 1
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+              dotnet restore Servy.sln
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -eq $maxAttempts) { throw "Restore failed for Servy.sln (exit $LASTEXITCODE) after $maxAttempts attempts" }
+              Write-Host "dotnet restore failed (attempt $attempt/$maxAttempts), retrying..."
+              Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+          }
 
       - name: Scan for vulnerable packages
         shell: pwsh
@@ -64,9 +74,16 @@ jobs:
           $env:DOTNET_CLI_UI_LANGUAGE = 'en'
 
           # Fetch structured analysis data directly via JSON serialization to avoid brittle string matching
-          $rawJson = dotnet list Servy.sln package --vulnerable --include-transitive --format json
-
-          if ($LASTEXITCODE -ne 0) { throw "dotnet list package --vulnerable failed (exit $LASTEXITCODE)." }
+          $maxRetries = [int]$env:MAX_RETRIES
+          $rawJson = $null
+          $maxAttempts = $maxRetries + 1
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+              $rawJson = dotnet list Servy.sln package --vulnerable --include-transitive --format json
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -eq $maxAttempts) { throw "dotnet list package --vulnerable failed (exit $LASTEXITCODE) after $maxAttempts attempts." }
+              Write-Host "dotnet list package --vulnerable failed (attempt $attempt/$maxAttempts), retrying..."
+              Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+          }
 
           # Pass the raw array through the pipeline instead of using -InputObject.
           # The pipeline streams the strings sequentially, and ConvertFrom-Json automatically
@@ -125,18 +142,25 @@ jobs:
         uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 #v4.35.1
         with:
           languages: csharp
-          queries: security-extended,security-and-quality
+          queries: security-and-quality
 
       - name: Setup .NET
         uses: ./.github/actions/setup-dotnet
         with:
           max_retries: ${{ env.MAX_RETRIES }}
 
-      - name: Check .NET version
-        run: dotnet --version
-
       - name: Build for Analysis
-        run: dotnet build Servy.sln --configuration Debug
+        shell: pwsh
+        run: |
+          $maxRetries = [int]$env:MAX_RETRIES
+          $maxAttempts = $maxRetries + 1
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+              dotnet build Servy.sln --configuration Debug
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -eq $maxAttempts) { throw "Debug build failed for Servy.sln (exit $LASTEXITCODE) after $maxAttempts attempts" }
+              Write-Host "dotnet build failed (attempt $attempt/$maxAttempts), retrying..."
+              Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+          }
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@c10b8064de6f491fea524254123dbe5e09572f13 #v4.35.1
@@ -149,6 +173,9 @@ jobs:
     timeout-minutes: 30
     name: Secret Scanning
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # Needed for gitleaks-action to comment on PRs with findings
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 #v6.0.3
@@ -159,3 +186,4 @@ jobs:
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e #v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml

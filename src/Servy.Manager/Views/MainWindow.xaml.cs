@@ -15,6 +15,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Media3D;
+using System.Windows.Threading;
 
 namespace Servy.Manager.Views
 {
@@ -46,8 +47,43 @@ namespace Servy.Manager.Views
             Logs
         }
 
-        private readonly IMessageBoxService? _messageBoxService;
+        private readonly IMessageBoxService _messageBoxService;
         private readonly IProcessKiller _processKiller;
+        private readonly IAppConfiguration _appConfig;
+
+        /// <summary>
+        /// How long, in milliseconds, the window layout must stay unchanged before it is persisted.
+        /// Dragging a window edge or a column edge raises a change for every pixel; the delay turns the
+        /// whole gesture into a single write.
+        /// </summary>
+        private const int LayoutSaveDelayMs = 500;
+
+        /// <summary>
+        /// Persists the window layout <see cref="LayoutSaveDelayMs"/> after the last change to it.
+        /// </summary>
+        private readonly DispatcherTimer _layoutSaveTimer;
+
+        /// <summary>
+        /// The width the window is declared with, restored by the "Reset window layout" menu item.
+        /// </summary>
+        private readonly double _defaultWidth;
+
+        /// <summary>
+        /// The height the window is declared with, restored by the "Reset window layout" menu item.
+        /// </summary>
+        private readonly double _defaultHeight;
+
+        /// <summary>
+        /// The width each services column is declared with, recorded when the window is loaded and before
+        /// the persisted widths are applied. <see langword="null"/> until then.
+        /// </summary>
+        private IReadOnlyDictionary<DataGridColumn, DataGridLength>? _defaultServicesColumnWidths;
+
+        /// <summary>
+        /// Whether the persisted placement asks for a maximized window. Applied once the window handle
+        /// exists, so the window maximizes on the monitor its restored bounds are on.
+        /// </summary>
+        private bool _restoreMaximized;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="MainWindow"/> class using constructor injection.
@@ -55,10 +91,12 @@ namespace Servy.Manager.Views
         /// <param name="mainViewModel">The primary DataContext for the application.</param>
         /// <param name="messageBoxService">Service for displaying UI dialogs.</param>
         /// <param name="processKiller">Service for terminating child processes on application exit.</param>
+        /// <param name="appConfig">Application configuration settings.</param>
         public MainWindow(
             MainViewModel mainViewModel,
             IMessageBoxService messageBoxService,
-            IProcessKiller processKiller
+            IProcessKiller processKiller,
+            IAppConfiguration appConfig
             )
         {
             InitializeComponent();
@@ -66,10 +104,219 @@ namespace Servy.Manager.Views
             _messageBoxService = messageBoxService ?? throw new ArgumentNullException(nameof(messageBoxService));
             DataContext = mainViewModel ?? throw new ArgumentNullException(nameof(mainViewModel));
             _processKiller = processKiller ?? throw new ArgumentNullException(nameof(processKiller));
+            _appConfig = appConfig ?? throw new ArgumentNullException(nameof(appConfig));
+
+            _defaultWidth = Width;
+            _defaultHeight = Height;
+
+            // Restore the size and position of the previous session before the window is shown
+            RestoreWindowPlacement();
+
+            _layoutSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(LayoutSaveDelayMs) };
+            _layoutSaveTimer.Tick += LayoutSaveTimer_Tick;
         }
 
         /// <summary>
-        /// Handles the <see cref="Window.Loaded"/> event.
+        /// Starts persisting the window layout whenever the window is moved, resized, maximized or
+        /// restored, or a column of the services or logs table is resized or auto-fitted.
+        /// </summary>
+        /// <remarks>
+        /// Called once the window is loaded and the persisted layout has been applied, so that showing
+        /// the window and restoring its layout are not themselves persisted as changes.
+        /// </remarks>
+        private void TrackLayoutChanges()
+        {
+            SizeChanged += OnLayoutChanged;
+            LocationChanged += OnLayoutChanged;
+            StateChanged += OnLayoutChanged;
+
+            DataGridColumnWidths.AddWidthChangedHandler(ServicesDataGrid, OnLayoutChanged);
+            DataGridColumnWidths.AddAutoFitHandler(ServicesDataGrid, OnLayoutChanged);
+
+            if (LogsTab.Content is LogsView logsView)
+            {
+                logsView.ColumnWidthsChanged += OnLayoutChanged;
+            }
+        }
+
+        /// <summary>
+        /// Stops the notifications started by <see cref="TrackLayoutChanges"/> and cancels a pending save.
+        /// </summary>
+        private void StopTrackingLayoutChanges()
+        {
+            _layoutSaveTimer.Stop();
+
+            SizeChanged -= OnLayoutChanged;
+            LocationChanged -= OnLayoutChanged;
+            StateChanged -= OnLayoutChanged;
+
+            DataGridColumnWidths.RemoveWidthChangedHandler(ServicesDataGrid, OnLayoutChanged);
+            DataGridColumnWidths.RemoveAutoFitHandler(ServicesDataGrid);
+
+            if (LogsTab.Content is LogsView logsView)
+            {
+                logsView.ColumnWidthsChanged -= OnLayoutChanged;
+            }
+        }
+
+        /// <summary>
+        /// Handles every change to the window layout by (re)starting the save delay, so the layout is
+        /// persisted once the change has settled.
+        /// </summary>
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">Event arguments containing event data.</param>
+        private void OnLayoutChanged(object? sender, EventArgs e)
+        {
+            _layoutSaveTimer.Stop();
+            _layoutSaveTimer.Start();
+        }
+
+        /// <summary>
+        /// Handles the <see cref="DispatcherTimer.Tick"/> event of the save delay: persists the window layout once.
+        /// </summary>
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">Event arguments containing event data.</param>
+        private void LayoutSaveTimer_Tick(object? sender, EventArgs e)
+        {
+            _layoutSaveTimer.Stop();
+            SaveWindowLayout();
+        }
+
+        /// <summary>
+        /// Applies the persisted <see cref="IAppConfiguration.MainWindowPlacement"/> to the window, after
+        /// fitting it to the current virtual screen. Leaves the default placement when nothing usable is persisted.
+        /// </summary>
+        private void RestoreWindowPlacement()
+        {
+            if (!WindowPlacement.TryParse(_appConfig.MainWindowPlacement, out var saved) || saved == null)
+            {
+                return;
+            }
+
+            var placement = saved.FitTo(
+                SystemParameters.VirtualScreenLeft,
+                SystemParameters.VirtualScreenTop,
+                SystemParameters.VirtualScreenWidth,
+                SystemParameters.VirtualScreenHeight,
+                MinWidth,
+                MinHeight);
+
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            Left = placement.Left;
+            Top = placement.Top;
+            Width = placement.Width;
+            Height = placement.Height;
+            _restoreMaximized = placement.IsMaximized;
+        }
+
+        /// <summary>
+        /// Raises the <see cref="Window.SourceInitialized"/> event and maximizes the window when the
+        /// persisted placement asks for it.
+        /// </summary>
+        /// <param name="e">An <see cref="EventArgs"/> object that contains the event data.</param>
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+
+            if (_restoreMaximized)
+            {
+                WindowState = WindowState.Maximized;
+            }
+        }
+
+        /// <summary>
+        /// Reads the current position, size and state of the window in its persisted form.
+        /// </summary>
+        /// <returns>
+        /// The <c>Left,Top,Width,Height,State</c> string to persist, or <see langword="null"/> when the
+        /// window is minimized or has no usable bounds, in which case the persisted placement is left as it is.
+        /// </returns>
+        private string? CaptureWindowPlacement()
+        {
+            // A minimized window cannot tell whether it was maximized before, so it keeps what was persisted last
+            if (WindowState == WindowState.Minimized)
+            {
+                return null;
+            }
+
+            // A maximized window reports its restored bounds through RestoreBounds
+            var bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
+            if (bounds.IsEmpty)
+            {
+                return null;
+            }
+
+            var text = new WindowPlacement(bounds.Left, bounds.Top, bounds.Width, bounds.Height, WindowState == WindowState.Maximized).Serialize();
+
+            return WindowPlacement.TryParse(text, out _) ? text : null;
+        }
+
+        /// <summary>
+        /// Persists the window placement and the column widths of the services and logs tables.
+        /// </summary>
+        /// <remarks>
+        /// Called shortly after every change to the layout and once more when the window closes, so the
+        /// layout survives a killed process and is the one a second Manager instance starts with. The
+        /// widths of a table that was never shown in this session are left as they are. Failures are
+        /// logged and never thrown, so they cannot prevent the window from closing.
+        /// </remarks>
+        private void SaveWindowLayout()
+        {
+            try
+            {
+                if (Application.Current is App app)
+                {
+                    var servicesColumnWidths = _defaultServicesColumnWidths == null
+                        ? null
+                        : DataGridColumnWidths.Capture(ServicesDataGrid, app.ServicesColumnWidths);
+                    var logsColumnWidths = (LogsTab.Content as LogsView)?.CaptureColumnWidths();
+
+                    app.SaveWindowLayout(CaptureWindowPlacement(), servicesColumnWidths, logsColumnWidths);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Failed to save the window layout: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Handles the <see cref="MenuItem.Click"/> event of the "Reset window layout" menu item.
+        /// Restores the default size of the window, centers it on the primary work area, gives the columns
+        /// of the services and logs tables their default widths back, and replaces the persisted layout
+        /// with that default one.
+        /// </summary>
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">Event arguments containing event data.</param>
+        private void ResetWindowLayout_Click(object sender, RoutedEventArgs e)
+        {
+            WindowState = WindowState.Normal;
+            Width = _defaultWidth;
+            Height = _defaultHeight;
+
+            var workArea = SystemParameters.WorkArea;
+            Left = workArea.Left + Math.Max(0, (workArea.Width - _defaultWidth) / 2);
+            Top = workArea.Top + Math.Max(0, (workArea.Height - _defaultHeight) / 2);
+
+            if (_defaultServicesColumnWidths != null)
+            {
+                DataGridColumnWidths.Reset(ServicesDataGrid, _defaultServicesColumnWidths);
+            }
+
+            (LogsTab.Content as LogsView)?.ResetColumnWidths();
+
+            if (Application.Current is App app)
+            {
+                // Forget the persisted layout first, so no width of a hidden column survives the reset
+                app.SaveWindowLayout(string.Empty, string.Empty, string.Empty);
+            }
+
+            // Then persist the default layout once it has been laid out
+            OnLayoutChanged(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Handles the <see cref="FrameworkElement.Loaded"/> event.
         /// Acts as a synchronous wrapper that fire-and-forgets the asynchronous window initialization.
         /// </summary>
         /// <param name="sender">The source of the event.</param>
@@ -86,11 +333,66 @@ namespace Servy.Manager.Views
         /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
         private async Task Window_LoadedAsync(object sender, RoutedEventArgs e)
         {
+            // Restore column visibilities based on the configured ServicesHiddenColumns
+            RestoreColumnVisibilities();
+
+            // Record the declared column widths, then restore the widths of the previous session
+            _defaultServicesColumnWidths = DataGridColumnWidths.CaptureDefaults(ServicesDataGrid);
+            DataGridColumnWidths.Apply(ServicesDataGrid, _appConfig.ServicesColumnWidths);
+
+            // From here on, persist the layout every time the user changes it
+            TrackLayoutChanges();
+
             // Trigger the global search command to populate the dashboard
             // the moment the shell is ready for interaction.
             if (DataContext is MainViewModel vm)
             {
                 await vm.SearchCommand.ExecuteAsync(null);
+            }
+        }
+
+        /// <summary>
+        /// Restores column visibilities based on the configured ServicesHiddenColumns string.
+        /// </summary>
+        private void RestoreColumnVisibilities()
+        {
+            string displayNameHeader = Strings.Column_DisplayName;
+            string rawHidden = _appConfig.ServicesHiddenColumns ?? string.Empty;
+
+            var hiddenSet = new HashSet<string>(
+                rawHidden.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                         .Select(s => s.Trim()),
+                StringComparer.OrdinalIgnoreCase);
+
+            bool needsMigration = !_appConfig.IsDisplayNameColumnMigrated;
+
+            // 1. Initial run / v10.5 migration check:
+            // Ensure Display Name starts hidden by adding it to hiddenSet before applying column visibilities.
+            if (needsMigration)
+            {
+                hiddenSet.Add(displayNameHeader);
+            }
+
+            // 2. Apply visibility across all columns in the DataGrid using the updated hiddenSet
+            foreach (var column in ServicesDataGrid.Columns)
+            {
+                string? id = column.Header as string;
+
+                if (!string.IsNullOrEmpty(id))
+                {
+                    column.Visibility = hiddenSet.Contains(id) ? Visibility.Collapsed : Visibility.Visible;
+                }
+            }
+
+            // 3. Persist the complete grid state and set migration flag only after all column visibilities have been applied
+            if (needsMigration)
+            {
+                SaveColumnVisibilities();
+
+                if (Application.Current is App app)
+                {
+                    app.SaveIsDisplayNameColumnMigrated(true);
+                }
             }
         }
 
@@ -104,7 +406,7 @@ namespace Servy.Manager.Views
 
             if (sender is Button btn && btn.Command != null)
             {
-                var parameter = btn.CommandParameter ?? DataContext;
+                var parameter = btn.CommandParameter ?? btn.DataContext;
                 if (btn.Command.CanExecute(parameter))
                     btn.Command.Execute(parameter);
             }
@@ -159,7 +461,7 @@ namespace Servy.Manager.Views
                 }
                 else if (DependenciesTab.IsSelected && DependenciesTab.Content is DependenciesView dependenciesView && dependenciesView.DataContext is DependenciesViewModel dvm)
                 {
-                    await dvm.LoadDependencyTreeAsync(null);
+                    await dvm.RefreshCommand.ExecuteAsync(null);
                 }
             }
 
@@ -175,33 +477,7 @@ namespace Servy.Manager.Views
         }
 
         /// <summary>
-        /// Handles the click event for the Configuration menu item.
-        /// Acts as a synchronous wrapper that fire-and-forgets the asynchronous configuration sequence.
-        /// </summary>
-        /// <param name="sender">The source of the event.</param>
-        /// <param name="e">The event data.</param>
-        private void Menu_ConfigClick(object sender, RoutedEventArgs e)
-            => _ = RunAsync(() => Menu_ConfigClickAsync(sender, e));
-
-        /// <summary>
-        /// Asynchronously initiates the application configuration sequence.
-        /// Executes the <see cref="MainViewModel.ConfigureCommand"/> to open the settings interface.
-        /// </summary>
-        /// <param name="sender">The source of the event.</param>
-        /// <param name="e">The event data.</param>
-        /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
-        private async Task Menu_ConfigClickAsync(object sender, RoutedEventArgs e)
-        {
-            // Verify the ViewModel is correctly bound before attempting to
-            // launch the configuration modal or view.
-            if (DataContext is MainViewModel vm)
-            {
-                await vm.ConfigureCommand.ExecuteAsync(null);
-            }
-        }
-
-        /// <summary>
-        /// Handles the <see cref="SelectionChanged"/> event of the main <see cref="TabControl"/>.
+        /// Handles the <see cref="Selector.SelectionChanged"/> event of the main <see cref="TabControl"/>.
         /// Acts as a synchronous wrapper that fire-and-forgets the asynchronous tab transition logic.
         /// </summary>
         /// <param name="sender">The <see cref="TabControl"/> that raised the event.</param>
@@ -220,7 +496,7 @@ namespace Servy.Manager.Views
         /// <remarks>
         /// This method ensures that high-resource operations (like real-time performance monitoring or
         /// log tailing) are throttled or stopped when the user navigates away from the respective tab.
-        /// It uses the <see cref="SelectionChangedEventArgs.OriginalSource"/> check to ensure it only
+        /// It uses the <see cref="RoutedEventArgs.OriginalSource"/> check to ensure it only
         /// reacts to the main TabControl and not nested elements.
         /// </remarks>
         private async Task MainTabControl_SelectionChangedAsync(object sender, SelectionChangedEventArgs e)
@@ -233,15 +509,14 @@ namespace Servy.Manager.Views
 
                 if (DataContext is MainViewModel vm)
                 {
-                    // Route to the appropriate handler based on the selected tab
                     if (MainTab.IsSelected)
                         await HandleMainTabSelected(vm);
                     else if (PerformanceTab.IsSelected)
-                        await HandlePerfTabSelected(vm, GetPerformanceVm());
+                        await HandleMonitoringTabSelected(vm, GetPerformanceVm(), TabScope.Performance);
                     else if (ConsoleTab.IsSelected)
-                        await HandleConsoleTabSelected(vm, GetConsoleVm());
+                        await HandleMonitoringTabSelected(vm, GetConsoleVm(), TabScope.Console);
                     else if (DependenciesTab.IsSelected)
-                        await HandleDependenciesTabSelected(vm, GetDependenciesVm());
+                        await HandleMonitoringTabSelected(vm, GetDependenciesVm(), TabScope.Dependencies);
                     else if (LogsTab.IsSelected)
                         await HandleLogsTabSelected(vm, GetLogsVm());
                 }
@@ -252,13 +527,8 @@ namespace Servy.Manager.Views
             }
             catch (Exception ex)
             {
-                // Prioritize the UI notification service, falling back to static logging if initialization failed
                 Logger.Error("Tab selection failed.", ex);
-                if (_messageBoxService != null)
-                {
-                    await _messageBoxService.ShowErrorAsync(
-                        Strings.Msg_MainTabControl_SelectionChangedError, UiAppConfig.Caption);
-                }
+                await _messageBoxService.ShowErrorAsync(Strings.Msg_MainTabControl_SelectionChangedError, UiAppConfig.Caption);
             }
         }
 
@@ -317,9 +587,9 @@ namespace Servy.Manager.Views
         }
 
         /// <summary>
-        /// Handles tasks when the Main tab is selected:
-        /// cleans up logs tab resources, triggers a search for services if needed,
-        /// and starts periodic timer updates in the main tab.
+        /// Handles tasks when the Main tab is selected: stops background monitoring and searches in
+        /// every other tab, triggers a service search if none has completed yet, and starts the periodic
+        /// refresh timer.
         /// </summary>
         /// <param name="vm">The main <see cref="MainViewModel"/> instance.</param>
         private async Task HandleMainTabSelected(MainViewModel vm)
@@ -327,77 +597,34 @@ namespace Servy.Manager.Views
             // Stop background workers on all other interfaces, bypassing the Main refresh timer
             DeactivateAllExcept(vm, TabScope.Main);
 
-            // Run search for main tab if applicable
-            if (vm.ServicesView.IsEmpty)
+            if (!vm.HasSearched)
                 await vm.SearchCommand.ExecuteAsync(null);
 
-            // Start periodic timer updates in main tab
             vm.CreateAndStartTimer();
         }
 
         /// <summary>
-        /// Handles tasks when the Performance tab is selected:
-        /// cleans up main tab resources and stops search in logs tab.
+        /// Handles state transitions and resource management when a monitoring-based tab (Performance, Console, or Dependencies) is selected.
         /// </summary>
+        /// <remarks>
+        /// This method ensures that only the specified monitoring tab is active by stopping or cleaning up background
+        /// activities across all other tabs.
+        /// </remarks>
         /// <param name="vm">The main <see cref="MainViewModel"/> instance.</param>
-        /// <param name="perfVm">
-        /// The <see cref="PerformanceViewModel"/> instance for the performance tab, or <c>null</c> if unavailable.
-        /// </param>
-        private Task HandlePerfTabSelected(MainViewModel vm, PerformanceViewModel? perfVm)
+        /// <param name="monitoringVm">The target <see cref="MonitoringViewModelBase"/> instance, or <c>null</c> if unavailable.</param>
+        /// <param name="scope">The active <see cref="TabScope"/> corresponding to the selected monitoring tab.</param>
+        private Task HandleMonitoringTabSelected(MainViewModel vm, MonitoringViewModelBase? monitoringVm, TabScope scope)
         {
-            DeactivateAllExcept(vm, TabScope.Performance);
+            DeactivateAllExcept(vm, scope);
 
-            // Start timers in performance tab
-            perfVm?.StartMonitoring();
+            monitoringVm?.StartMonitoring();
 
             return Task.CompletedTask;
         }
 
         /// <summary>
-        /// Handles the necessary state transitions and resource management when the Console tab is selected in the user
-        /// interface.
-        /// </summary>
-        /// <remarks>This method ensures that only the Console tab's monitoring is active by stopping or
-        /// cleaning up background activities in other tabs. It should be called whenever the Console tab becomes active
-        /// to maintain correct application state.</remarks>
-        /// <param name="vm">The main <see cref="MainViewModel"/> instance.</param>
-        /// <param name="consoleVm">
-        /// The <see cref="ConsoleViewModel"/> instance for the console tab, or <c>null</c> if unavailable.
-        /// </param>
-        private Task HandleConsoleTabSelected(MainViewModel vm, ConsoleViewModel? consoleVm)
-        {
-            DeactivateAllExcept(vm, TabScope.Console);
-
-            // Start timers in console tab
-            consoleVm?.StartMonitoring();
-
-            return Task.CompletedTask;
-        }
-
-        /// <summary>
-        /// Handles the necessary state transitions and resource management when the Dependencies tab is selected in the user
-        /// interface.
-        /// </summary>
-        /// <remarks>This method ensures that only the Dependencies tab's monitoring is active by stopping or
-        /// cleaning up background activities in other tabs. It should be called whenever the Dependencies tab becomes active
-        /// to maintain correct application state.</remarks>
-        /// <param name="vm">The main <see cref="MainViewModel"/> instance.</param>
-        /// <param name="dependenciesVm">
-        /// The <see cref="DependenciesViewModel"/> instance for the dependencies tab, or <c>null</c> if unavailable.
-        /// </param>
-        private Task HandleDependenciesTabSelected(MainViewModel vm, DependenciesViewModel? dependenciesVm)
-        {
-            DeactivateAllExcept(vm, TabScope.Dependencies);
-
-            // Start timers in dependencies tab
-            dependenciesVm?.StartMonitoring();
-
-            return Task.CompletedTask;
-        }
-
-        /// <summary>
-        /// Handles tasks when the Logs tab is selected:
-        /// cleans up main tab resources and triggers a search for logs if the logs collection is empty.
+        /// Handles tasks when the Logs tab is selected: stops background monitoring and timers in
+        /// every other tab, and triggers a search for logs if none has completed yet.
         /// </summary>
         /// <param name="vm">The main <see cref="MainViewModel"/> instance.</param>
         /// <param name="logsVm">
@@ -407,27 +634,10 @@ namespace Servy.Manager.Views
         {
             DeactivateAllExcept(vm, TabScope.Logs);
 
-            // Run search for logs tab if applicable
-            if (logsVm?.LogsView?.IsEmpty ?? false)
-                await logsVm.SearchCommand.ExecuteAsync(null);
-        }
-
-        /// <summary>
-        /// Handles the PreviewMouseLeftButtonDown event for the DataGrid "Check All" header checkbox.
-        /// Toggles the SelectAll property in the MainViewModel when the user clicks the header checkbox.
-        /// </summary>
-        /// <param name="sender">The DataGridColumnHeader that raised the event.</param>
-        /// <param name="e">Mouse button event arguments.</param>
-        private void ColumnHeader_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-        {
-            if (sender is DataGridColumnHeader header &&
-                header.Content is CheckBox cb &&
-                ServicesDataGrid.DataContext is MainViewModel vm)
+            if (logsVm != null && !logsVm.HasSearched)
             {
-                // Toggle the SelectAll value manually (true if unchecked or indeterminate, false if checked)
-                bool newValue = cb.IsChecked != true;
-                vm.SelectAll = newValue;
-                e.Handled = true;
+                logsVm.ResetDateWindowToNow();
+                await logsVm.SearchCommand.ExecuteAsync(null);
             }
         }
 
@@ -450,9 +660,23 @@ namespace Servy.Manager.Views
         }
 
         /// <summary>
-        /// Handles the <see cref="DataGridRow.MouseDoubleClick"/> event.
-        /// Toggles the <see cref="ServiceRowViewModel.IsChecked"/> property when a row is double-clicked,
-        /// which visually changes the row background through a style trigger.
+        /// Handles the PreviewMouseRightButtonDown event for DataGrid rows.
+        /// Clears any existing row selection and selects the right-clicked row exclusively so context menu actions target the intended item.
+        /// </summary>
+        /// <param name="sender">The source of the event, expected to be a <see cref="DataGridRow"/>.</param>
+        /// <param name="e">The <see cref="MouseButtonEventArgs"/> instance containing event data.</param>
+        private void DataGridRow_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is DataGridRow row && row.DataContext is ServiceRowViewModel)
+            {
+                ServicesDataGrid.SelectedItems.Clear();
+                row.IsSelected = true;
+            }
+        }
+
+        /// <summary>
+        /// Handles the <see cref="Control.MouseDoubleClick"/> event.
+        /// Executes the <see cref="ServiceRowViewModel.ConfigureCommand"/> when a row is double-clicked to open the service configuration.
         /// </summary>
         /// <param name="sender">The source of the event, expected to be a <see cref="DataGridRow"/>.</param>
         /// <param name="e">The <see cref="MouseButtonEventArgs"/> instance containing event data.</param>
@@ -460,9 +684,12 @@ namespace Servy.Manager.Views
         {
             if (sender is DataGridRow row && row.DataContext is ServiceRowViewModel vm)
             {
-                vm.IsChecked = !vm.IsChecked;
+                if (vm.ConfigureCommand.CanExecute(null))
+                {
+                    vm.ConfigureCommand.Execute(null);
+                }
 
-                // Optional: prevent DataGrid from entering edit mode
+                // consume the double-click so it does not reach the row's default handling
                 e.Handled = true;
             }
         }
@@ -475,7 +702,6 @@ namespace Servy.Manager.Views
         /// <param name="e">Mouse button event arguments containing click information.</param>
         private void Window_MouseDown(object sender, MouseButtonEventArgs e)
         {
-            // Check if the click was outside the DataGrid
             if (e.OriginalSource is DependencyObject source && !IsDescendantOf(source, ServicesDataGrid))
             {
                 ServicesDataGrid.SelectedItems.Clear();
@@ -497,6 +723,61 @@ namespace Servy.Manager.Views
                     : LogicalTreeHelper.GetParent(source);
             }
             return false;
+        }
+
+        /// <summary>
+        /// Handles the <see cref="ContextMenu.Opened"/> event for the column header context menu.
+        /// Synchronizes the checked state of each menu item with the current visibility of its target column.
+        /// </summary>
+        /// <param name="sender">The source of the event, expected to be a <see cref="ContextMenu"/>.</param>
+        /// <param name="e">Event arguments containing event data.</param>
+        private void ColumnHeaderContextMenu_Opened(object sender, RoutedEventArgs e)
+        {
+            if (sender is ContextMenu contextMenu)
+            {
+                foreach (var item in contextMenu.Items)
+                {
+                    if (item is MenuItem menuItem && menuItem.Tag is DataGridColumn column)
+                    {
+                        menuItem.IsChecked = column.Visibility == Visibility.Visible;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Handles the <see cref="MenuItem.Click"/> event for column visibility toggle items.
+        /// Shows or hides the associated <see cref="DataGridColumn"/> based on the menu item's checked state.
+        /// </summary>
+        /// <param name="sender">The source of the event, expected to be a <see cref="MenuItem"/> whose <see cref="FrameworkElement.Tag"/> references a <see cref="DataGridColumn"/>.</param>
+        /// <param name="e">Event arguments containing event data.</param>
+        private void ToggleColumnVisibility_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is MenuItem menuItem && menuItem.Tag is DataGridColumn column)
+            {
+                column.Visibility = menuItem.IsChecked ? Visibility.Visible : Visibility.Collapsed;
+
+                // Save the updated column visibility state to configuration
+                SaveColumnVisibilities();
+            }
+        }
+
+        /// <summary>
+        /// Serializes collapsed column identifiers to a comma-separated string and saves them.
+        /// </summary>
+        private void SaveColumnVisibilities()
+        {
+            var hiddenColumns = ServicesDataGrid.Columns
+                .Where(c => c.Visibility == Visibility.Collapsed)
+                .Select(c => c.Header as string)
+                .Where(id => !string.IsNullOrEmpty(id));
+
+            string csv = string.Join(",", hiddenColumns);
+
+            if (Application.Current is App app)
+            {
+                app.SaveServicesHiddenColumns(csv);
+            }
         }
 
         /// <summary>
@@ -534,14 +815,8 @@ namespace Servy.Manager.Views
             {
                 if (DataContext is MainViewModel vm)
                 {
-                    vm.StopRefreshTimer();
                     vm.Dispose();
                 }
-
-                GetPerformanceVm()?.Dispose();
-                GetConsoleVm()?.Dispose();
-                GetDependenciesVm()?.Dispose();
-                GetLogsVm()?.Dispose();
             }
             catch (Exception ex)
             {
@@ -558,14 +833,21 @@ namespace Servy.Manager.Views
         /// Provides data for the closing event.
         /// </param>
         /// <remarks>
-        /// This explicitly calls <see cref="Application.Current.Shutdown"/> to guarantee
+        /// This explicitly calls <see cref="Application.Shutdown()"/> to guarantee
         /// that no background threads, timers, or hidden windows keep the process alive.
+        /// The window layout is persisted first, while the window still has its bounds.
         /// </remarks>
         protected override void OnClosing(CancelEventArgs e)
         {
             base.OnClosing(e);
+
+            // No handler currently sets e.Cancel, so the guard is a placeholder for a future "confirm before closing" feature rather than an active check today.
             if (!e.Cancel)
             {
+                // Persist the layout a last time; a save still pending is no longer needed
+                StopTrackingLayoutChanges();
+                SaveWindowLayout();
+
                 Application.Current.Shutdown();
             }
         }

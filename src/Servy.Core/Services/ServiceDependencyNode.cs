@@ -66,6 +66,11 @@ namespace Servy.Core.Services
         /// </summary>
         public bool IsCyclic { get; }
 
+        /// <summary>
+        /// Gets a value indicating whether this dependency could not be resolved or accessed.
+        /// </summary>
+        public bool IsUnavailable { get; }
+
         #endregion
 
         #region Constructors
@@ -80,12 +85,22 @@ namespace Servy.Core.Services
         /// Set to <see langword="true"/> if this service creates a dependency loop;
         /// this prevents further recursive discovery of child dependencies.
         /// </param>
-        public ServiceDependencyNode(string serviceName, string displayName, bool isRunning = false, bool isCyclic = false)
+        /// <param name="isUnavailable">
+        /// Set to <see langword="true"/> if this service dependency is unavailable or access is denied.
+        /// </param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="serviceName"/> or <paramref name="displayName"/> is null.</exception>
+        public ServiceDependencyNode(
+            string serviceName,
+            string displayName,
+            bool isRunning = false,
+            bool isCyclic = false,
+            bool isUnavailable = false)
         {
             ServiceName = serviceName ?? throw new ArgumentNullException(nameof(serviceName));
             _displayName = displayName ?? throw new ArgumentNullException(nameof(displayName));
-            IsRunning = isRunning;
+            _isRunning = isRunning;
             IsCyclic = isCyclic;
+            IsUnavailable = isUnavailable;
         }
 
         #endregion

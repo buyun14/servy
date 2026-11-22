@@ -18,7 +18,7 @@ namespace Servy.Service.Helpers
         /// Includes a match timeout to prevent ReDoS attacks.
         /// </summary>
         internal static IRegexWrapper EnvVarRegex = new RegexWrapper(new Regex(
-            @"(%[a-zA-Z_][a-zA-Z0-9_]*%)",
+            @"(%[^%=\r\n]+%)",
             RegexOptions.Compiled,
             AppConfig.InputRegexTimeout)); // AppConfig.InputRegexTimeout is generous for this pattern
 
@@ -28,29 +28,38 @@ namespace Servy.Service.Helpers
         /// Expands environment variables and command-line arguments, auditing both for unexpanded placeholders.
         /// </summary>
         /// <param name="vars">The list of environment variables to expand.</param>
+        /// <param name="allowOverriddenRuntimeVars">If set to <c>true</c>, allows runtime environment variables to be overridden; if <c>false</c>, preserves existing runtime variables.</param>
         /// <param name="rawArgs">The raw command-line arguments to expand.</param>
         /// <param name="logger">The logger instance for logging messages.</param>
         /// <param name="contextPrefix">An optional prefix for logging (e.g., "Pre-Launch", "Post-Stop").</param>
         /// <returns>A tuple containing the expanded environment dictionary and the expanded arguments string.</returns>
         public static (Dictionary<string, string?> env, string expandedArgs) ExpandAndAudit(
-            List<EnvironmentVariable> vars, string rawArgs, IServyLogger? logger, string contextPrefix = "")
+            List<EnvironmentVariable> vars, bool allowOverriddenRuntimeVars,
+            string rawArgs, IServyLogger? logger, string contextPrefix = "")
         {
             string prefix = string.IsNullOrWhiteSpace(contextPrefix) ? string.Empty : $"[{contextPrefix}] ";
 
-            // 1. Expand environment variables list
-            var expandedEnv = EnvironmentVariableHelper.ExpandEnvironmentVariables(vars);
+            // 1. Expand environment variables list, keeping '%%' escapes encoded until the audit has run
+            var expandedEnv = EnvironmentVariableHelper.ExpandEnvironmentVariablesEncoded(vars, allowOverriddenRuntimeVars);
 
-            // 2. Audit expanded variables for leftover placeholders
-            foreach (var kvp in expandedEnv)
+            // 2. Audit the user-configured variables (system entries were inherited, not configured).
+            // The escape token contains no '%', so a correctly escaped '%%' cannot match as a placeholder.
+            foreach (var name in vars.Select(v => v.Name).Where(n => !string.IsNullOrWhiteSpace(n)))
             {
-                LogUnexpandedPlaceholders(kvp.Value ?? string.Empty, $"{prefix}Environment Variable '{kvp.Key}'", logger);
+                if (expandedEnv.TryGetValue(name, out var value))
+                {
+                    LogUnexpandedPlaceholders(value ?? string.Empty, $"{prefix}Environment Variable '{name}'", logger);
+                }
             }
 
-            // 3. Expand command-line arguments using the expanded environment
-            var expandedArgs = EnvironmentVariableHelper.ExpandEnvironmentVariables(rawArgs, expandedEnv);
+            EnvironmentVariableHelper.DecodePercentEscapes(expandedEnv);
 
-            // 4. Audit arguments for leftover placeholders
-            LogUnexpandedPlaceholders(expandedArgs, $"{prefix}Arguments", logger);
+            // 3. Expand command-line arguments using the expanded environment, escapes still encoded
+            var encodedArgs = EnvironmentVariableHelper.ExpandEnvironmentVariablesEncoded(rawArgs, expandedEnv);
+
+            // 4. Audit arguments for leftover placeholders, then decode the escapes
+            LogUnexpandedPlaceholders(encodedArgs, $"{prefix}Arguments", logger);
+            var expandedArgs = EnvironmentVariableHelper.DecodePercentEscapes(encodedArgs);
 
             return (expandedEnv, expandedArgs);
         }
@@ -68,11 +77,8 @@ namespace Servy.Service.Helpers
 
             try
             {
-                var matches = EnvVarRegex.Matches(input);
-
-                foreach (Match match in matches)
+                foreach (string placeholder in EnvVarRegex.MatchValues(input))
                 {
-                    string placeholder = match.Value;
                     logger?.Warn($"Unexpanded environment variable {placeholder} in {context}");
                 }
             }

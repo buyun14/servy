@@ -1,30 +1,36 @@
+# Manual test fixture: the middle rung of the Ctrl+C ladder. Spawns ctrlc.py and then runs
+# forever, producing a two-level tree (ctrlc2 -> ctrlc), so Servy's recursive termination
+# can be observed on a process it did not start itself.
+#
+# The child interpreter comes from PYTHON_EXE, falling back to sys.executable.
+# Logs to logs/ctrlc2.log next to this script; set SERVY_TEST_LOG_DIR to write elsewhere.
+#
+# It deliberately does not terminate the child it spawned: the tree is meant to be left
+# standing, so that what gets measured is Servy's own teardown.
+#
+# Install with:
+# .\servy-cli.exe install --name "ServyCtrlC2" --path "C:\path\to\python.exe" --params "C:\path\to\tests\ctrlc2.py" --envVars "PYTHON_EXE=C:\path\to\python.exe"
+#
+# Ladder: ctrlc_child.py spawns this script and notepad.exe; this script spawns ctrlc.py, the leaf.
+
 import time
 import sys
 import logging
 import os
 import subprocess
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.environ.get("SERVY_TEST_LOG_DIR", os.path.join(SCRIPT_DIR, "logs"))
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, f"{os.path.splitext(os.path.basename(__file__))[0]}.log")
+from _fixture_logging import run_fixture, setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] => %(message)s",
-    datefmt="%Y%m%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+SCRIPT_DIR = setup_logging(__file__)
 
 def main():
     logging.info("Service started")
 
-    python_exe = os.environ.get("PYTHON_EXE") or sys.executable
+    configured = os.environ.get("PYTHON_EXE")
+    python_exe = configured or sys.executable
     if not python_exe or not os.path.exists(python_exe):
-        logging.error("PYTHON_EXE is not set and sys.executable is unusable; cannot spawn the child tree")
+        source = "PYTHON_EXE" if configured else "sys.executable"
+        logging.error("%s points at %r, which does not exist; cannot spawn the child process", source, python_exe)
         sys.exit(1)
 
     try:
@@ -35,7 +41,7 @@ def main():
             ],
         )
     except OSError:
-        logging.exception("Failed to spawn the child process tree")
+        logging.exception("Failed to spawn the child process")
         sys.exit(1)
 
     logging.info(f"Spawned PID: {proc.pid}")
@@ -48,11 +54,4 @@ def main():
         logging.exception("Error in loop")
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        logging.info("(ctrlc2) Service stopped!")
-        for handler in logging.root.handlers:
-            handler.flush()
+    run_fixture(main, "(ctrlc2) Service stopped!")

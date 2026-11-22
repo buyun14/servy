@@ -6,7 +6,7 @@ using System.Windows.Threading;
 
 namespace Servy.UI.IntegrationTests.Services
 {
-    [Collection("UiSta")]
+    [Collection(UiStaCollection.Name)]
     public class CursorServiceIntegrationTests : IDisposable
     {
         private readonly CursorService _service;
@@ -21,8 +21,15 @@ namespace Servy.UI.IntegrationTests.Services
 
         public void Dispose()
         {
-            // Restore the original process-global Application instance to avoid cross-test static state pollution
-            TestReflection.SetFieldStatic(typeof(Application), "_appInstance", _originalApp);
+            // Restore the original process-global Application instance to avoid cross-test static state pollution.
+            // Only put back an Application that existed before the test and that the test cleared: when a test
+            // creates one through Helper.EnsureApplication, the snapshot taken in the constructor is null, and
+            // writing it back would discard the new instance while Helper's memo flag stays set, so every later
+            // EnsureApplication call returns null for the rest of the process (#4637).
+            if (_originalApp != null && Application.Current == null)
+            {
+                TestReflection.SetFieldStatic(typeof(Application), "_appInstance", _originalApp);
+            }
         }
 
         #region Branch: Headless / Null Dispatcher
@@ -46,6 +53,45 @@ namespace Servy.UI.IntegrationTests.Services
             Assert.Null(exception);
             // Coverage: This confirms the guard clause effectively prevented an
             // ObjectDisposedException or NullReferenceException when the WPF context is missing.
+        }
+
+        #endregion
+
+        #region Branch: UI Thread (Dispatcher.CheckAccess == true)
+
+        [Fact]
+        public void SetWaitCursorAndResetCursor_OnTheApplicationThread_SetAndClearTheOverrideCursor()
+        {
+            // Arrange
+            // CheckAccess() is true only on the thread that owns Application.Current.Dispatcher,
+            // which is the persistent STA thread Helper.EnsureApplication keeps the Application on.
+            var app = Helper.EnsureApplication();
+            Cursor? afterSet = null;
+            Cursor? afterReset = Cursors.Hand;
+
+            app.Dispatcher.Invoke(() =>
+            {
+                var previous = Mouse.OverrideCursor;
+                try
+                {
+                    Mouse.OverrideCursor = Cursors.Hand; // neither the wait cursor nor "no override"
+
+                    // Act
+                    _service.SetWaitCursor();
+                    afterSet = Mouse.OverrideCursor;
+
+                    _service.ResetCursor();
+                    afterReset = Mouse.OverrideCursor;
+                }
+                finally
+                {
+                    Mouse.OverrideCursor = previous;
+                }
+            });
+
+            // Assert
+            Assert.Same(Cursors.Wait, afterSet);
+            Assert.Null(afterReset);
         }
 
         #endregion

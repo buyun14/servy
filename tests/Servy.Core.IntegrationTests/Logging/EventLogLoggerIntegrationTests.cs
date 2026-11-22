@@ -1,5 +1,6 @@
 using Servy.Core.Config;
 using Servy.Core.Logging;
+using Servy.Core.Security;
 using Servy.Testing;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -7,15 +8,17 @@ using System.Security;
 
 namespace Servy.Core.IntegrationTests.Logging
 {
-    [Collection("CoreOsIntegration")]
+    [Collection(CoreOsIntegrationCollection.Name)]
     public class EventLogLoggerIntegrationTests : IDisposable
     {
+        private const string InsufficientPrivilegesSkipReason = "Skipping test due to insufficient privileges.";
+
         private readonly bool _isElevated;
         private readonly List<string> _createdSources = new List<string>();
 
         public EventLogLoggerIntegrationTests()
         {
-            _isElevated = Helper.IsAdministrator();
+            _isElevated = SecurityHelper.IsAdministrator();
         }
 
         #region Initialization & Enable/Disable Tests
@@ -30,6 +33,13 @@ namespace Servy.Core.IntegrationTests.Logging
             {
                 // Assert
                 Assert.False(logger.IsEventLogEnabled);
+
+                // _isInitialized is only ever set on a successful InitializeEventLog, so this
+                // distinguishes "never attempted" - the "DoesNotInitializeEventLog" half of the
+                // name - from "attempted and failed", which is what an unelevated run would give
+                // if the constructor's isEventLogEnabled guard were dropped.
+                Assert.False(TestReflection.GetField<bool>(logger, "_isInitialized"));
+
                 Assert.Null(logger.Prefix);
             }
         }
@@ -49,24 +59,41 @@ namespace Servy.Core.IntegrationTests.Logging
         }
 
         [Fact]
+        public void Constructor_WhenPrefixContainsBrackets_SanitizesToParentheses()
+        {
+            string source = GenerateSourceName();
+
+            // Act
+            using (var logger = new EventLogLogger(source, LogLevel.Info, false, "Worker] [Admin"))
+            {
+                // Assert
+                // Internal square brackets are converted to parentheses, and the whole segment is wrapped in brackets.
+                Assert.Equal("[Worker) (Admin]", logger.Prefix);
+            }
+        }
+
+        [Fact]
         public void SetIsEventLogEnabled_TogglesStateAndHandlesCorrectly()
         {
-            if (!_isElevated) Assert.Skip("Skipping test due to insufficient privileges.");
+            Assert.SkipUnless(_isElevated, InsufficientPrivilegesSkipReason);
 
             string source = GenerateSourceName();
             using (var logger = new EventLogLogger(source, LogLevel.Info, isEventLogEnabled: false))
             {
                 Assert.False(logger.IsEventLogEnabled);
 
-                // Act: Turn ON (initializes handle)
+                // Act: enable - runs InitializeEventLog and sets _isInitialized
                 logger.SetIsEventLogEnabled(true);
                 Assert.True(logger.IsEventLogEnabled);
 
-                // Act: Turn ON again (exercises the already-initialized branch)
+                // Act: enable again - takes the already-initialized branch, which only
+                // re-sets the flag. This assert reads the same on either branch.
                 logger.SetIsEventLogEnabled(true);
                 Assert.True(logger.IsEventLogEnabled);
 
-                // Act: Turn OFF (disposes handle)
+                // Act: disable - clears the flag only. Nothing is disposed and
+                // _isInitialized survives (only Dispose clears it), so a later
+                // re-enable does not run InitializeEventLog again.
                 logger.SetIsEventLogEnabled(false);
                 Assert.False(logger.IsEventLogEnabled);
             }
@@ -75,7 +102,7 @@ namespace Servy.Core.IntegrationTests.Logging
         [Fact]
         public void InitializeEventLog_WhenSourceAssignedToDifferentLog_DisablesLogger()
         {
-            if (!_isElevated) Assert.Skip("Skipping test due to insufficient privileges.");
+            Assert.SkipUnless(_isElevated, InsufficientPrivilegesSkipReason);
 
             string mismatchSource = GenerateSourceName();
 
@@ -116,8 +143,9 @@ namespace Servy.Core.IntegrationTests.Logging
                 logger.SetLogLevel(targetLevel);
 
                 // Assert
-                // Symmetrical Verification: Extract the internal volatile tracking level state via reflection
-                // to prove that the runtime configuration updates and filters boundaries accurately.
+                // Extract the internal level field via reflection to prove that SetLogLevel
+                // wrote it. This test does not call any log method, so it says nothing about
+                // whether WriteLeveled then filters on that threshold.
                 var actualLogLevelInt = TestReflection.GetField<int>(logger, "_currentLogLevel");
 
                 Assert.Equal((int)targetLevel, actualLogLevelInt);
@@ -126,17 +154,17 @@ namespace Servy.Core.IntegrationTests.Logging
         }
 
         [Theory]
-        [InlineData(LogLevel.Debug)]
-        [InlineData(LogLevel.Info)]
-        [InlineData(LogLevel.Warn)]
-        [InlineData(LogLevel.Error)]
-        public void LogMethods_AllSeverities_ExecuteWithoutThrowingAndMaintainPrefix(LogLevel targetLevel)
+        [InlineData(LogLevel.Debug, 4)]  // everything emits
+        [InlineData(LogLevel.Info, 3)]   // Debug suppressed
+        [InlineData(LogLevel.Warn, 2)]
+        [InlineData(LogLevel.Error, 1)]  // only Error emits
+        public void LogMethods_AllSeverities_EmitOnlyAtOrAboveTheConfiguredLevel(LogLevel targetLevel, int expectedEmitted)
         {
             // Arrange
             string source = GenerateSourceName();
 
             // Start with Error level (strictest), so Debug/Info/Warn should be ignored
-            using (var logger = new EventLogLogger(source, LogLevel.Error, false, "TestPrefix"))
+            using (var logger = new RecordingEventLogLogger(source, LogLevel.Error, "TestPrefix"))
             {
                 // Act
                 logger.SetLogLevel(targetLevel);
@@ -150,16 +178,96 @@ namespace Servy.Core.IntegrationTests.Logging
                 logger.Error("Error msg", null);
 
                 // Assert
-                // No exceptions thrown means branches were safely evaluated
+                // Format runs only for an entry that passed the currentLevel <= targetLevel check,
+                // so the set of severities it saw is the filter decision this theory parameterizes.
+                // Counting severities rather than calls keeps it independent of how many times a
+                // single emitted entry is formatted (Debug once, the other three twice).
+                int emitted = 0;
+                foreach (var probe in new[] { "Debug msg", "Info msg", "Warn msg", "Error msg" })
+                {
+                    foreach (var formatted in logger.Formatted)
+                    {
+                        if (formatted.StartsWith(probe, StringComparison.Ordinal))
+                        {
+                            emitted++;
+                            break;
+                        }
+                    }
+                }
+
+                Assert.Equal(expectedEmitted, emitted);
                 Assert.Equal("[TestPrefix]", logger.Prefix);
             }
+        }
+
+        [Theory]
+        [InlineData(LogLevel.Debug, true)]
+        [InlineData(LogLevel.Info, false)]
+        public void Debug_OuterLogger_AppliesTheDebugThresholdAndPrefix(LogLevel level, bool expectEmitted)
+        {
+            // Arrange
+            string source = GenerateSourceName();
+
+            // Act
+            string textLogOutput = CaptureDebugFileLog(source, level, logger => logger.Debug("outer debug message"));
+
+            // Assert
+            if (expectEmitted)
+            {
+                Assert.Contains("[Outer] outer debug message", textLogOutput);
+            }
+            else
+            {
+                Assert.DoesNotContain("outer debug message", textLogOutput);
+            }
+        }
+
+        [Theory]
+        [InlineData(LogLevel.Debug, true)]
+        [InlineData(LogLevel.Info, false)]
+        public void Debug_ScopedLogger_AppliesTheSameThresholdAndTheCombinedPrefix(LogLevel level, bool expectEmitted)
+        {
+            // Arrange
+            // The scope keeps no Debug body of its own, so this is the only assertion that the scoped
+            // site still applies the same threshold as its parent - the drift the shared body prevents.
+            string source = GenerateSourceName();
+
+            // Act
+            string textLogOutput = CaptureDebugFileLog(source, level, logger => logger.CreateScoped("Scope").Debug("scoped debug message"));
+
+            // Assert
+            if (expectEmitted)
+            {
+                Assert.Contains("[Outer] [Scope] scoped debug message", textLogOutput);
+            }
+            else
+            {
+                Assert.DoesNotContain("scoped debug message", textLogOutput);
+            }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="act"/> against a logger built at <paramref name="level"/> with the Event Log
+        /// sink disabled, and returns what reached the file sink. Debug never writes to the Event Log, so the
+        /// file log is the only observable, and it is pointed at a temporary directory rather than the
+        /// product's own logs folder.
+        /// </summary>
+        private static string CaptureDebugFileLog(string source, LogLevel level, Action<EventLogLogger> act)
+        {
+            return LogCapture.Run(() =>
+            {
+                using (var logger = new EventLogLogger(source, level, false, "Outer"))
+                {
+                    act(logger);
+                }
+            }, LogLevel.Debug);
         }
 
         [Fact]
         public void WriteRawToWindowsEventLog_OversizedMessage_TruncatesSuccessfully()
         {
             // Arrange
-            if (!_isElevated) Assert.Skip("Skipping test due to insufficient privileges.");
+            Assert.SkipUnless(_isElevated, InsufficientPrivilegesSkipReason);
 
             string source = GenerateSourceName();
 
@@ -174,9 +282,6 @@ namespace Servy.Core.IntegrationTests.Logging
             {
                 using (var logger = new EventLogLogger(source, LogLevel.Info, true))
                 {
-                    const string truncationSuffix = "...[truncated]";
-                    int expectedMaxLength = AppConfig.EventLogMessageMaxChars + truncationSuffix.Length;
-
                     // Create a massive string guaranteed to exceed the configured truncation threshold
                     string massiveString = new string('A', AppConfig.EventLogMessageMaxChars + 9_000);
 
@@ -193,40 +298,25 @@ namespace Servy.Core.IntegrationTests.Logging
                         {
                             eventLog.Source = source;
 
-                            EventLogEntry? foundEntry = null;
-
-                            // Introduce a polling loop with exponential backoff
-                            // to account for asynchronous Event Log service disk-flushing delays
-                            const int maxRetries = 10;
-                            int retryCount = 0;
-                            int delayMs = 50;
-
-                            while (foundEntry == null && retryCount++ < maxRetries)
-                            {
-                                int count = eventLog.Entries.Count;
-                                for (int i = count - 1; i >= 0; i--)
-                                {
-                                    if (eventLog.Entries[i].Source == source)
-                                    {
-                                        foundEntry = eventLog.Entries[i];
-                                        break;
-                                    }
-                                }
-
-                                if (foundEntry == null)
-                                {
-                                    Thread.Sleep(delayMs);
-                                    delayMs *= 2; // Exponential backoff (50ms, 100ms, 200ms...)
-                                }
-                            }
+                            // Poll with exponential backoff to account for asynchronous Event Log
+                            // service disk-flushing delays.
+                            EventLogEntry? foundEntry = PollForNewestEntry(eventLog, entry => entry.Source == source);
 
                             if (foundEntry != null)
                             {
-                                // Verify absolute length bounds and suffix marker format compliance
-                                Assert.True(foundEntry.Message.Length <= expectedMaxLength,
-                                    $"Persisted message length ({foundEntry.Message.Length}) exceeds the configured ceiling of {expectedMaxLength}.");
+                                // Verify absolute length bounds and suffix marker format compliance.
+                                // The cut reserves room for the suffix (#5525), so a truncated entry never exceeds the cap itself.
+                                Assert.True(foundEntry.Message.Length <= AppConfig.EventLogMessageMaxChars,
+                                    $"Persisted message length ({foundEntry.Message.Length}) exceeds the configured ceiling of {AppConfig.EventLogMessageMaxChars}.");
 
-                                Assert.EndsWith(truncationSuffix, foundEntry.Message);
+                                Assert.EndsWith(AppConfig.EventLogTruncationSuffix, foundEntry.Message);
+                            }
+                            else
+                            {
+                                // The polling window can expire without the entry appearing (slow Event Log flush,
+                                // rotation eviction, write routed elsewhere). Report it the same way the ACL-restricted
+                                // read-back below does, so a run that verified nothing is distinguishable from one that did.
+                                Trace.WriteLine($"Warning: No EventLog entry from source '{source}' appeared after {EventLogReadBackMaxRetries} retries; truncation contract not verified this run.");
                             }
                         }
                     }
@@ -252,7 +342,10 @@ namespace Servy.Core.IntegrationTests.Logging
         public void WriteRawToWindowsEventLog_OnNativeException_CatchesAndProceeds()
         {
             // Arrange
-            if (!_isElevated) Assert.Skip("Skipping test due to insufficient privileges.");
+            // No elevation guard here on purpose: WriteRawToWindowsEventLog wraps its whole body
+            // in a catch, so the asserted outcome is the same elevated or not - unelevated, the
+            // malformed source simply fails inside the try, which is the path being tested.
+            // Guarding it would skip the fail-safe boundary on every ordinary runner.
 
             // CRITICAL CONTRACT: Test the exception isolation boundaries directly on the
             // internal structural wrapper method by feeding it an illegal, un-creatable source layout configuration.
@@ -274,14 +367,267 @@ namespace Servy.Core.IntegrationTests.Logging
 
         #endregion
 
+        #region Report & MapEventLogCategory Tests
+
+        [Fact]
+        public void Report_WhenTitleAndBodyAreNullOrEmpty_DoesNotEmit()
+        {
+            // Arrange
+            string source = GenerateSourceName();
+            using (var logger = new RecordingEventLogLogger(source, LogLevel.Debug, "Test"))
+            {
+                // Act
+                logger.Report(LogLevel.Info, null!, null!);
+                logger.Report(LogLevel.Info, string.Empty, string.Empty);
+
+                // Assert
+                Assert.Empty(logger.Formatted);
+            }
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        public void LeveledMethods_NullOrEmptyMessage_DoNotReachTheSinks(string? message)
+        {
+            // Arrange
+            string source = GenerateSourceName();
+            using (var logger = new RecordingEventLogLogger(source, LogLevel.Debug, "Test"))
+            {
+                // Act
+                // Debug level so the threshold check passes for all four calls; only the empty-message
+                // guards in DebugCore and WriteLeveled can stop them.
+                logger.Debug(message!);
+                logger.Info(message!);
+                logger.Warn(message!);
+                logger.Error(message!);
+
+                // Assert
+                // Format runs only after those guards, so an empty list proves each call returned first.
+                Assert.Empty(logger.Formatted);
+            }
+        }
+
+        [Theory]
+        [InlineData(LogLevel.Debug, LogLevel.Info, true)]
+        [InlineData(LogLevel.Info, LogLevel.Info, true)]
+        [InlineData(LogLevel.Warn, LogLevel.Info, false)]
+        [InlineData(LogLevel.Error, LogLevel.Warn, false)]
+        [InlineData(LogLevel.Error, LogLevel.Error, true)]
+        public void Report_RespectsLogLevelFiltering(LogLevel currentLevel, LogLevel targetLevel, bool expectEmitted)
+        {
+            // Arrange
+            string source = GenerateSourceName();
+            using (var logger = new RecordingEventLogLogger(source, currentLevel, "ReportPrefix"))
+            {
+                // Act
+                logger.Report(targetLevel, "Report Title", "Report Body");
+
+                // Assert
+                if (expectEmitted)
+                {
+                    Assert.Contains(logger.Formatted, f => f.Contains("Report Title"));
+
+                    // The sink is disabled (this constructor passes isEventLogEnabled: false), so the
+                    // "title\nbody" block - formatted only on the way to SafeWriteToEventLog - must never appear.
+                    Assert.DoesNotContain(logger.Formatted, f => f.Contains("Report Body"));
+                }
+                else
+                {
+                    Assert.Empty(logger.Formatted);
+                }
+            }
+        }
+
+        [Fact]
+        public void Report_DebugLevel_FileOnly_SkipsEventLog()
+        {
+            // Arrange
+            Assert.SkipUnless(_isElevated, InsufficientPrivilegesSkipReason);
+
+            string source = GenerateSourceName();
+            using (var logger = new RecordingEventLogLogger(source, LogLevel.Debug, true))
+            {
+                // The sink must really be on, or the DoesNotContain below passes for the wrong reason:
+                // a runner where InitializeEventLog fails clears the flag and skips the sink branch
+                // whatever the level term says.
+                Assert.True(logger.IsEventLogEnabled);
+
+                // Act
+                // Debug report should route to file log only, never writing to Windows Event Log
+                string logOutput = LogCapture.Run(() =>
+                {
+                    logger.Report(LogLevel.Debug, "Debug Report Title", "Debug Report Body");
+                }, LogLevel.Debug);
+
+                // Assert
+                Assert.Contains("Debug Report Title", logOutput);
+                Assert.Contains("Debug Report Body", logOutput);
+
+                // The Event Log sink is the only caller that formats the title and the body as one
+                // block, so a formatted entry carrying the body means the Debug report reached it.
+                Assert.Contains(logger.Formatted, f => f.Contains("Debug Report Title"));
+                Assert.DoesNotContain(logger.Formatted, f => f.Contains("Debug Report Body"));
+            }
+        }
+
+        [Fact]
+        public void Report_WithTitleOnly_FormatsWithoutNewline()
+        {
+            // Arrange
+            string source = GenerateSourceName();
+            using (var logger = new RecordingEventLogLogger(source, LogLevel.Info, "TitlePrefix"))
+            {
+                // Act
+                logger.Report(LogLevel.Info, "Standalone Title", null!);
+
+                // Assert
+                Assert.Contains(logger.Formatted, f => f.Equals("Standalone Title", StringComparison.Ordinal));
+            }
+        }
+
+        [Fact]
+        public void Report_WithTitleOnly_SinkEnabled_SendsTheBareTitleToTheEventLog()
+        {
+            Assert.SkipUnless(_isElevated, InsufficientPrivilegesSkipReason);
+
+            // Arrange
+            string source = GenerateSourceName();
+            using (var logger = new RecordingEventLogLogger(source, LogLevel.Info, true))
+            {
+                // The sink must really be on, or the block is never built and the assert below
+                // only sees the file-sink title.
+                Assert.True(logger.IsEventLogEnabled);
+
+                // Act
+                logger.Report(LogLevel.Info, "Standalone Title", null!);
+
+                // Assert
+                // Format runs twice: once for the Event Log block and once for the file-sink title.
+                // With no body both must be the bare title, with no "\n" appended.
+                Assert.Equal(2, logger.Formatted.Count);
+                Assert.All(logger.Formatted, f => Assert.Equal("Standalone Title", f));
+            }
+        }
+
+        [Theory]
+        [InlineData(LogLevel.Error, EventLogEntryType.Error, EventIds.Error)]
+        [InlineData(LogLevel.Warn, EventLogEntryType.Warning, EventIds.Warning)]
+        [InlineData(LogLevel.Info, EventLogEntryType.Information, EventIds.Info)]
+        [InlineData(LogLevel.Debug, EventLogEntryType.Information, EventIds.Info)]
+        public void MapEventLogCategory_MapsCorrectEntryTypeAndEventId(LogLevel targetLevel, EventLogEntryType expectedType, int expectedId)
+        {
+            // Arrange
+            // Invoke internal static MapEventLogCategory via reflection
+            var method = typeof(EventLogLogger).GetMethod("MapEventLogCategory", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            Assert.NotNull(method);
+
+            object[] parameters = new object[] { targetLevel, null!, null! };
+
+            // Act
+            method.Invoke(null, parameters);
+
+            // Assert
+            EventLogEntryType actualType = (EventLogEntryType)parameters[1];
+            int actualId = (int)parameters[2];
+
+            Assert.Equal(expectedType, actualType);
+            Assert.Equal(expectedId, actualId);
+        }
+
+        [Fact]
+        public void Report_WhenEventLogEnabled_WritesToWindowsEventLog()
+        {
+            Assert.SkipUnless(_isElevated, InsufficientPrivilegesSkipReason);
+
+            string source = GenerateSourceName();
+            if (!EventLog.SourceExists(source))
+            {
+                EventLog.CreateEventSource(source, AppConfig.EventLogName);
+            }
+
+            try
+            {
+                using (var logger = new RecordingEventLogLogger(source, LogLevel.Info, true))
+                {
+                    // Arrange
+                    string title = "Integration Report " + Guid.NewGuid().ToString("N");
+                    string body = "Report Body Content";
+
+                    // Act
+                    logger.Report(LogLevel.Info, title, body);
+
+                    using (var eventLog = new EventLog(AppConfig.EventLogName))
+                    {
+                        eventLog.Source = source;
+                        EventLogEntry? foundEntry = PollForNewestEntry(eventLog, entry => entry.Source == source && entry.Message.Contains(title));
+
+                        // Assert
+                        if (foundEntry != null)
+                        {
+                            Assert.Contains(title, foundEntry.Message);
+                            Assert.Contains(body, foundEntry.Message);
+                            Assert.Equal(EventLogEntryType.Information, foundEntry.EntryType);
+                            Assert.Equal(EventIds.Info, foundEntry.InstanceId);
+                        }
+                        else
+                        {
+                            // The polling window can expire without the entry appearing (slow Event Log
+                            // flush, rotation eviction, write routed elsewhere). Report it the way the
+                            // truncation test above does, so a run that read nothing back says so.
+                            Trace.WriteLine($"Warning: No EventLog entry from source '{source}' appeared after {EventLogReadBackMaxRetries} retries; Event Log read-back not verified this run.");
+                        }
+                    }
+
+                    // The read-back above is best-effort, so the contract is pinned on the one
+                    // deterministic observable: the Event Log sink is the only caller that formats
+                    // the title and the body as a single block, so this fails when the report never
+                    // reaches the sink.
+                    Assert.Contains(logger.Formatted, f => f.Contains(title) && f.Contains(body));
+                }
+            }
+            finally
+            {
+                if (EventLog.SourceExists(source))
+                {
+                    EventLog.DeleteEventSource(source);
+                }
+            }
+        }
+
+        [Fact]
+        public void ScopedLogger_Report_DelegatesToParentWithCombinedPrefix()
+        {
+            // Arrange
+            string source = GenerateSourceName();
+            using (var logger = new EventLogLogger(source, LogLevel.Info, isEventLogEnabled: false, prefix: "Root"))
+            {
+                var scoped = logger.CreateScoped("Scope");
+
+                // Act
+                string logOutput = LogCapture.Run(() =>
+                {
+                    scoped.Report(LogLevel.Info, "Scoped Report Title", "Scoped Report Body");
+                }, LogLevel.Info);
+
+                // Assert
+                Assert.Contains("[Root] [Scope] Scoped Report Title", logOutput);
+                Assert.Contains("Scoped Report Body", logOutput);
+            }
+        }
+
+        #endregion
+
         #region ScopedEventLogLogger Tests
 
         [Fact]
         public void ScopedLogger_EmptyOrWhitespacePrefix_ReturnsSameInstanceWithoutAllocation()
         {
+            // Arrange
             string source = GenerateSourceName();
             using (var rootLogger = new EventLogLogger(source, LogLevel.Info, false))
             {
+                // Act
                 var scope1 = rootLogger.CreateScoped("    ");
                 var scope2 = rootLogger.CreateScoped(null!);
 
@@ -292,9 +638,29 @@ namespace Servy.Core.IntegrationTests.Logging
         }
 
         [Fact]
+        public void ScopedLogger_NestedEmptyOrWhitespacePrefix_ReturnsSameScopeInstance()
+        {
+            string source = GenerateSourceName();
+            using (var rootLogger = new EventLogLogger(source, LogLevel.Info, false, "Root"))
+            {
+                var level1Scope = rootLogger.CreateScoped("L1");
+
+                // Act - the early return under test is ScopedEventLogLogger's own, reachable
+                // only from an already-scoped logger, not the root logger's twin above.
+                var level2Scope = level1Scope.CreateScoped("   ");
+                var level2ScopeNull = level1Scope.CreateScoped(null!);
+
+                // Assert
+                Assert.Same(level1Scope, level2Scope);
+                Assert.Same(level1Scope, level2ScopeNull);
+                Assert.Equal("[Root] [L1]", level2Scope.Prefix);
+            }
+        }
+
+        [Fact]
         public void ScopedLogger_SetIsEventLogEnabled_PropagatesToParent()
         {
-            if (!_isElevated) Assert.Skip("Skipping test due to insufficient privileges.");
+            Assert.SkipUnless(_isElevated, InsufficientPrivilegesSkipReason);
 
             string source = GenerateSourceName();
             using (var rootLogger = new EventLogLogger(source, LogLevel.Error, false))
@@ -307,6 +673,14 @@ namespace Servy.Core.IntegrationTests.Logging
 
                 // Act - Change scope settings
                 scopedLogger.SetLogLevel(LogLevel.Debug);
+
+                // Assert
+                // The scope keeps its own level and does not push it onto the parent,
+                // which is the threshold WriteLeveled is handed for every scoped call.
+                Assert.Equal((int)LogLevel.Debug, TestReflection.GetField<int>(scopedLogger, "_currentLogLevel"));
+                Assert.Equal((int)LogLevel.Error, TestReflection.GetField<int>(rootLogger, "_currentLogLevel"));
+
+                // Act
                 scopedLogger.SetIsEventLogEnabled(true);
 
                 // Assert
@@ -320,8 +694,18 @@ namespace Servy.Core.IntegrationTests.Logging
                 scopedLogger.Warn("Scope Warn");
                 scopedLogger.Error("Scope Error", ex);
 
-                // Cover the no-op Dispose
+                // Act & Assert
+                // "Disabling a scope never affects the parent" - the other half of the
+                // documented self-heal contract, which only enables through the parent.
+                scopedLogger.SetIsEventLogEnabled(false);
+                Assert.True(rootLogger.IsEventLogEnabled);
+
+                // Act & Assert
+                // The scope's Dispose is documented as a no-op, so it must not tear down
+                // the shared parent that the other scopes are still writing through.
                 scopedLogger.Dispose();
+                Assert.True(rootLogger.IsEventLogEnabled);
+                Assert.True(TestReflection.GetField<bool>(rootLogger, "_isInitialized"));
             }
         }
 
@@ -366,6 +750,62 @@ namespace Servy.Core.IntegrationTests.Logging
         #endregion
 
         #region Teardown & Utilities
+
+        /// <summary>
+        /// Records every message the log pipeline formats. Format is only reached for an entry
+        /// that passed the level threshold, so the recorded messages are the observable side of
+        /// the filter without needing a seam in the production sink.
+        /// </summary>
+        private sealed class RecordingEventLogLogger : EventLogLogger
+        {
+            public readonly List<string> Formatted = new List<string>();
+
+            public RecordingEventLogLogger(string source, LogLevel level, string prefix)
+                : base(source, level, false, prefix)
+            {
+            }
+
+            public RecordingEventLogLogger(string source, LogLevel level, bool isEventLogEnabled)
+                : base(source, level, isEventLogEnabled)
+            {
+            }
+
+            protected override string Format(string message)
+            {
+                Formatted.Add(message);
+                return base.Format(message);
+            }
+        }
+
+        private const int EventLogReadBackMaxRetries = 10;
+        private const int EventLogReadBackFirstDelayMs = 50;
+
+        /// <summary>
+        /// Scans <paramref name="eventLog"/> newest-first for an entry that satisfies <paramref name="matches"/>,
+        /// retrying with exponential backoff because the Event Log service flushes asynchronously.
+        /// </summary>
+        /// <returns>The newest matching entry, or <c>null</c> when none appeared within the retry budget.</returns>
+        private static EventLogEntry? PollForNewestEntry(EventLog eventLog, Func<EventLogEntry, bool> matches)
+        {
+            int delayMs = EventLogReadBackFirstDelayMs;
+
+            for (int attempt = 0; attempt < EventLogReadBackMaxRetries; attempt++)
+            {
+                for (int i = eventLog.Entries.Count - 1; i >= 0; i--)
+                {
+                    EventLogEntry entry = eventLog.Entries[i];
+                    if (matches(entry))
+                    {
+                        return entry;
+                    }
+                }
+
+                Thread.Sleep(delayMs);
+                delayMs *= 2; // Exponential backoff (50ms, 100ms, 200ms...)
+            }
+
+            return null;
+        }
 
         private string GenerateSourceName()
         {

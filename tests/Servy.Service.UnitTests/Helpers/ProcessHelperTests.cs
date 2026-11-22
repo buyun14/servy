@@ -7,7 +7,7 @@ using System.Text.RegularExpressions;
 
 namespace Servy.Service.UnitTests.Helpers
 {
-    [Collection("SequentialEnvTests")]
+    [Collection(SequentialEnvTestsCollection.Name)]
     public class ProcessHelperTests
     {
         private readonly Mock<IServyLogger> _mockLogger;
@@ -18,15 +18,61 @@ namespace Servy.Service.UnitTests.Helpers
         }
 
         /// <summary>
-        /// Verifies that no unexpected warnings were logged, filtering out host/diagnostic noise.
+        /// Verifies that no warning was logged. ExpandAndAudit audits only the configured variables
+        /// and the arguments (#6506), so inherited host variables cannot produce one.
         /// </summary>
         private void VerifyNoRealWarnings()
         {
-            // Ignore diagnostic/host warnings injected during --blame-crash test runs
-            _mockLogger.Verify(l => l.Warn(
-                It.Is<string>(msg => !msg.Contains("COMPlus_") && !msg.Contains("DOTNET_")),
-                It.IsAny<Exception>()),
-                Times.Never);
+            _mockLogger.Verify(l => l.Warn(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+        }
+
+        [Theory]
+        [InlineData("%PATH%")]
+        [InlineData("%ProgramFiles(x86)%")]
+        [InlineData("%CommonProgramFiles(x86)%")]
+        [InlineData("%DOTNET_ROOT(x86)%")]
+        [InlineData("%MY-VAR-NAME%")]
+        [InlineData("%VAR.NAME%")]
+        [InlineData("%_UNDER_SCORE_123%")]
+        public void EnvVarRegex_ValidPlaceholders_MatchesExpectedVariables(string input)
+        {
+            // Act
+            var matches = ProcessHelper.EnvVarRegex.MatchValues(input).ToList();
+
+            // Assert
+            Assert.Single(matches);
+            Assert.Equal(input, matches[0]);
+        }
+
+        [Fact]
+        public void EnvVarRegex_MultiplePlaceholdersInString_FindsAllMatches()
+        {
+            // Arrange
+            string input = @"C:\Program Files\%MY_APP%\bin;%ProgramFiles(x86)%\Common;%DOTNET_ROOT%";
+
+            // Act
+            var matches = ProcessHelper.EnvVarRegex.MatchValues(input).ToList();
+
+            // Assert
+            Assert.Equal(3, matches.Count);
+            Assert.Equal("%MY_APP%", matches[0]);
+            Assert.Equal("%ProgramFiles(x86)%", matches[1]);
+            Assert.Equal("%DOTNET_ROOT%", matches[2]);
+        }
+
+        [Theory]
+        [InlineData("%%")]                  // Empty placeholder
+        [InlineData("%VAR=VALUE%")]         // Contains assignment operator '='
+        [InlineData("%VAR\rNAME%")]         // Contains carriage return
+        [InlineData("%VAR\nNAME%")]         // Contains newline
+        [InlineData("NO_PERCENTS_HERE")]    // Plain string
+        public void EnvVarRegex_InvalidOrMalformedPlaceholders_DoesNotMatch(string input)
+        {
+            // Act
+            var matches = ProcessHelper.EnvVarRegex.MatchValues(input).ToList();
+
+            // Assert
+            Assert.Empty(matches);
         }
 
         [Fact]
@@ -37,13 +83,55 @@ namespace Servy.Service.UnitTests.Helpers
             string args = "arg1";
 
             // Act
-            var result = ProcessHelper.ExpandAndAudit(vars, args, _mockLogger.Object, "Test");
+            var result = ProcessHelper.ExpandAndAudit(vars, false, args, _mockLogger.Object, "Test");
 
             // Assert
             Assert.Equal("Value", result.env["VAR"]);
             Assert.Equal("arg1", result.expandedArgs);
 
             VerifyNoRealWarnings();
+        }
+
+        [Fact]
+        public void ExpandAndAudit_AllowOverriddenRuntimeVars_IsForwardedToTheExpansion()
+        {
+            // Arrange
+            var vars = new List<EnvironmentVariable> { new EnvironmentVariable { Name = "JAVA_OPTS", Value = "-Xmx2048m" } };
+
+            // Act
+            var allowed = ProcessHelper.ExpandAndAudit(vars, true, "arg1", _mockLogger.Object, "Test");
+            var blocked = ProcessHelper.ExpandAndAudit(vars, false, "arg1", _mockLogger.Object, "Test");
+
+            // Assert - the policy decides whether the configured Tier 2 value reaches the child environment
+            Assert.Equal("-Xmx2048m", allowed.env["JAVA_OPTS"]);
+            Assert.NotEqual("-Xmx2048m", blocked.env.GetValueOrDefault("JAVA_OPTS"));
+        }
+
+        [Fact]
+        public void ExpandAndAudit_InheritedVariableWithPlaceholder_IsNotAudited()
+        {
+            // Arrange
+            // #6506: only configured variables are audited. An inherited machine variable holding a
+            // literal placeholder is not the service's misconfiguration and must not be reported.
+            const string inheritedName = "SERVY_TEST_INHERITED_PLACEHOLDER";
+            string? original = Environment.GetEnvironmentVariable(inheritedName);
+            Environment.SetEnvironmentVariable(inheritedName, "%SERVY_TEST_NOT_DEFINED%");
+
+            try
+            {
+                var vars = new List<EnvironmentVariable> { new EnvironmentVariable { Name = "VAR", Value = "Value" } };
+
+                // Act
+                var result = ProcessHelper.ExpandAndAudit(vars, false, "arg1", _mockLogger.Object, "Test");
+
+                // Assert
+                Assert.Contains("%SERVY_TEST_NOT_DEFINED%", result.env[inheritedName]);
+                _mockLogger.Verify(l => l.Warn(It.IsAny<string>(), It.IsAny<Exception>()), Times.Never);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(inheritedName, original);
+            }
         }
 
         [Fact]
@@ -55,7 +143,7 @@ namespace Servy.Service.UnitTests.Helpers
             string args = "run %UNKNOWN%";
 
             // Act
-            ProcessHelper.ExpandAndAudit(vars, args, _mockLogger.Object, "Prefix");
+            ProcessHelper.ExpandAndAudit(vars, false, args, _mockLogger.Object, "Prefix");
 
             // Assert
             _mockLogger.Verify(l => l.Warn(
@@ -73,7 +161,7 @@ namespace Servy.Service.UnitTests.Helpers
         public void ExpandAndAudit_HandlesEmptyInputGracefully()
         {
             // Act - should not throw or log for test inputs
-            ProcessHelper.ExpandAndAudit(new List<EnvironmentVariable>(), "", _mockLogger.Object);
+            ProcessHelper.ExpandAndAudit(new List<EnvironmentVariable>(), false, "", _mockLogger.Object);
 
             // Assert
             VerifyNoRealWarnings();
@@ -84,7 +172,7 @@ namespace Servy.Service.UnitTests.Helpers
         {
             // Arrange
             var mockRegex = new Mock<IRegexWrapper>();
-            mockRegex.Setup(r => r.Matches(It.IsAny<string>()))
+            mockRegex.Setup(r => r.MatchValues(It.IsAny<string>()))
                      .Throws(new RegexMatchTimeoutException());
 
             // Swap the static wrapper for the mock
@@ -94,14 +182,51 @@ namespace Servy.Service.UnitTests.Helpers
             try
             {
                 // Act
-                // Pass a non-empty string to trigger the try block
-                ProcessHelper.ExpandAndAudit(new List<EnvironmentVariable>(), "trigger", _mockLogger.Object);
+                // Pass a custom environment variable so the audit step executes
+                ProcessHelper.ExpandAndAudit(new List<EnvironmentVariable> { new EnvironmentVariable { Name = "TRIGGER", Value = "trigger" } }, false, "trigger", _mockLogger.Object);
 
                 // Assert
                 _mockLogger.Verify(l => l.Error(
                     It.Is<string>(s => s.Contains("Regex timeout")),
                     It.IsAny<RegexMatchTimeoutException>()),
                     Times.AtLeastOnce);
+            }
+            finally
+            {
+                // Restore original
+                ProcessHelper.EnvVarRegex = original;
+            }
+        }
+
+        [Fact]
+        public void ExpandAndAudit_StubbedMatchValues_WarnsOncePerReturnedPlaceholder()
+        {
+            // Arrange
+            // MatchValues returns strings, so the warning branch is now stubbable: the old
+            // MatchCollection return type had no accessible constructor, which left Throws()
+            // as the only outcome a mock of this seam could express.
+            var mockRegex = new Mock<IRegexWrapper>();
+            mockRegex.Setup(r => r.MatchValues(It.IsAny<string>()))
+                     .Returns(new[] { "%FOO%", "%BAR%" });
+
+            var original = ProcessHelper.EnvVarRegex;
+            ProcessHelper.EnvVarRegex = mockRegex.Object;
+
+            try
+            {
+                // Act
+                ProcessHelper.ExpandAndAudit(new List<EnvironmentVariable>(), false, "anything", _mockLogger.Object);
+
+                // Assert
+                _mockLogger.Verify(l => l.Warn(
+                    It.Is<string>(msg => msg == "Unexpanded environment variable %FOO% in Arguments"),
+                    It.IsAny<Exception>()),
+                    Times.Once);
+
+                _mockLogger.Verify(l => l.Warn(
+                    It.Is<string>(msg => msg == "Unexpanded environment variable %BAR% in Arguments"),
+                    It.IsAny<Exception>()),
+                    Times.Once);
             }
             finally
             {
@@ -121,7 +246,7 @@ namespace Servy.Service.UnitTests.Helpers
             string rawArgs = "cmd %VAR%";
 
             // Act
-            ProcessHelper.ExpandAndAudit(emptyVars, rawArgs, _mockLogger.Object, prefix!);
+            ProcessHelper.ExpandAndAudit(emptyVars, false, rawArgs, _mockLogger.Object, prefix!);
 
             // Assert
             // Verify that a null, empty, or whitespace prefix does not leave stray brackets
@@ -140,11 +265,97 @@ namespace Servy.Service.UnitTests.Helpers
             string args = @"--config %APP_HOME%\config.json";
 
             // Act
-            var result = ProcessHelper.ExpandAndAudit(vars, args, _mockLogger.Object, "Test");
+            var result = ProcessHelper.ExpandAndAudit(vars, false, args, _mockLogger.Object, "Test");
 
             // Assert
             Assert.Equal(@"--config C:\App\config.json", result.expandedArgs);
             _mockLogger.Verify(l => l.Warn(It.Is<string>(s => s.Contains("Arguments")), It.IsAny<Exception>()), Times.Never);
+        }
+
+        [Fact]
+        public void ExpandAndAudit_EscapedPercentsInVariable_DecodesWithoutUnexpandedWarning()
+        {
+            // Arrange
+            // Two '%%' escapes decode to '50%off%', which looks like a placeholder only after decoding
+            var vars = new List<EnvironmentVariable> { new EnvironmentVariable { Name = "LABEL", Value = "50%%off%%" } };
+
+            // Act
+            var result = ProcessHelper.ExpandAndAudit(vars, false, "arg1", _mockLogger.Object, "Test");
+
+            // Assert
+            Assert.Equal("50%off%", result.env["LABEL"]);
+            _mockLogger.Verify(l => l.Warn(
+                It.Is<string>(msg => msg.Contains("Unexpanded environment variable")),
+                It.IsAny<Exception>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public void ExpandAndAudit_EscapedPercentsInArguments_DecodesWithoutUnexpandedWarning()
+        {
+            // Arrange
+            // The escaped date format decodes to '%Y%-%m%', which looks like two placeholders only after decoding
+            var vars = new List<EnvironmentVariable>();
+            string args = "--format %%Y%%-%%m%%";
+
+            // Act
+            var result = ProcessHelper.ExpandAndAudit(vars, false, args, _mockLogger.Object, "Test");
+
+            // Assert
+            Assert.Equal("--format %Y%-%m%", result.expandedArgs);
+            _mockLogger.Verify(l => l.Warn(
+                It.Is<string>(msg => msg.Contains("Unexpanded environment variable")),
+                It.IsAny<Exception>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public void ExpandAndAudit_NullLogger_SkipsWarningsAndStillExpands()
+        {
+            // Arrange
+            // ProcessLauncher documents the logger parameter as "can be null", so every
+            // logger?. call site inside the audit must take its null path.
+            var vars = new List<EnvironmentVariable> { new EnvironmentVariable { Name = "VAR", Value = "%MISSING%" } };
+            string args = "run %UNKNOWN%";
+
+            // Act
+            var result = ProcessHelper.ExpandAndAudit(vars, false, args, null, "Prefix");
+
+            // Assert
+            // Both placeholders stay unexpanded, so the warning site is reached with no logger to write to
+            Assert.Equal("%MISSING%", result.env["VAR"]);
+            Assert.Equal("run %UNKNOWN%", result.expandedArgs);
+        }
+
+        [Fact]
+        public void ExpandAndAudit_NullLoggerOnRegexTimeout_SwallowsTimeoutWithoutLogging()
+        {
+            // Arrange
+            var mockRegex = new Mock<IRegexWrapper>();
+            mockRegex.Setup(r => r.MatchValues(It.IsAny<string>()))
+                     .Throws(new RegexMatchTimeoutException());
+
+            // Swap the static wrapper for the mock
+            var original = ProcessHelper.EnvVarRegex;
+            ProcessHelper.EnvVarRegex = mockRegex.Object;
+
+            try
+            {
+                // Act
+                // The timeout arm reports through logger?.Error; with a null logger it must stay silent
+                var result = ProcessHelper.ExpandAndAudit(
+                    new List<EnvironmentVariable> { new EnvironmentVariable { Name = "TRIGGER", Value = "trigger" } },
+                    false, "trigger", null);
+
+                // Assert
+                Assert.Equal("trigger", result.env["TRIGGER"]);
+                Assert.Equal("trigger", result.expandedArgs);
+            }
+            finally
+            {
+                // Restore original
+                ProcessHelper.EnvVarRegex = original;
+            }
         }
     }
 }

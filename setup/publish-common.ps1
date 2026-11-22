@@ -1,10 +1,11 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
     .SYNOPSIS
     Shared publish utilities for Servy projects.
 
     .DESCRIPTION
-    Provides standard functions to build installer, portable zip, and copy artifacts,
+    Provides standard functions to build installer, portable 7z package, and copy artifacts,
     ensuring DRY compliance across all project scripts.
 #>
 
@@ -12,6 +13,12 @@ $PC_ScriptDir = $PSScriptRoot
 
 # Import helpers
 . (Join-Path $PC_ScriptDir "common-helpers.ps1")
+
+# The Task Scheduler payload's exclusion list, in glob form, declared once. Two
+# enforcement points derive from it: the copy filter in Copy-TaskSchdArtifacts and the
+# post-copy leak check in Copy-CommonArtifacts. The two mechanisms stay independent on
+# purpose - the second is there to catch a bug in the first - but the data does not.
+$script:TaskSchdExcludedPatterns = @('smtp-cred.xml', 'temp.ps1', '*.dat', '*.log', '*.test.ps1')
 
 <#
     .SYNOPSIS
@@ -25,9 +32,9 @@ $PC_ScriptDir = $PSScriptRoot
 #>
 function Remove-ItemSafely {
     param ([string]$Path)
-    if (Test-Path $Path) {
+    if (Test-Path -LiteralPath $Path) {
         Write-Host "Cleaning: $Path" -ForegroundColor Gray
-        Remove-Item -Recurse -Force $Path
+        Remove-Item -Recurse -Force -LiteralPath $Path
     }
 }
 
@@ -51,18 +58,19 @@ function Copy-TaskSchdArtifacts {
         [Parameter(Mandatory=$true)][string]$DestPath
     )
 
-    Get-ChildItem -Path $SourcePath -Recurse -File |
+    $root = (Resolve-Path -LiteralPath $SourcePath).Path.TrimEnd('\')
+
+    Get-ChildItem -LiteralPath $SourcePath -Recurse -File |
         Where-Object {
-            $_.Name -notin @('smtp-cred.xml', 'temp.ps1') -and
-            $_.Extension -notin @('.dat', '.log') -and
-            $_.Name -notlike '*.test.ps1'
+            $name = $_.Name
+            -not ($script:TaskSchdExcludedPatterns | Where-Object { $name -like $_ })
         } |
         ForEach-Object {
-            $rel    = $_.FullName.Substring((Resolve-Path $SourcePath).Path.Length + 1)
+            $rel    = $_.FullName.Substring($root.Length + 1)
             $target = Join-Path $DestPath $rel
             $parent = Split-Path $target -Parent
-            if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-            Copy-Item -Path $_.FullName -Destination $target -Force
+            if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+            Copy-Item -LiteralPath $_.FullName -Destination $target -Force
         }
 }
 
@@ -84,51 +92,38 @@ function Copy-TaskSchdArtifacts {
 
     .PARAMETER Arch
     The target architecture ("x64" or "arm64") passed to the Inno preprocessor directive.
+
+    .PARAMETER BuildConfiguration
+    The build environment configuration ("Release" or "Debug") passed to the Inno preprocessor directive.
+
+    .PARAMETER Tfm
+    The target framework moniker ("net10.0-windows") passed to the Inno preprocessor directive.
+    Required: the caller resolves it from build-config.ps1 and passes the result in.
+
+    .NOTES
+    The compilation is wrapped in Invoke-WithRetry (common-helpers.ps1), the shared
+    retry policy, so the attempt count and the knob names are the same here as
+    everywhere else the build scripts retry a native command.
 #>
-function Build-Installer {
+function Invoke-BuildInstaller {
     param (
         [Parameter(Mandatory=$true)][string]$InnoCompiler,
         [Parameter(Mandatory=$true)][string]$IssFile,
         [Parameter(Mandatory=$true)][string]$Version,
+        [Parameter(Mandatory=$true)][string]$Tfm,
         [string]$Arch = "x64",
-        [int]$MaxRetry = 3,
-        [int]$RetryDelaySeconds = 2
+        [ValidateSet('Debug', 'Release')]
+        [string]$BuildConfiguration = "Release"
     )
 
     Write-Host "--- Building Installer ---" -ForegroundColor Cyan
 
-    $currentAttempt = 0
-    $success = $false
-
-    while (-not $success -and $currentAttempt -lt $MaxRetry) {
-        try {
-            $currentAttempt++
-            if ($currentAttempt -gt 1) {
-                Write-Host "Inno Setup retry attempt $currentAttempt..." -ForegroundColor Yellow
-            }
-
-            & $InnoCompiler $IssFile "/DMyAppVersion=$Version" "/DArch=$Arch"
-
-            # MUST check exit code manually to trigger the 'catch' block
-            if ($LASTEXITCODE -eq 0) {
-                $success = $true
-                Write-Host "Installer built successfully." -ForegroundColor Green
-            } else {
-                throw "ISCC.exe failed with exit code $LASTEXITCODE"
-            }
-        }
-        catch {
-            # Treat any non-zero exit as potentially transient for the first few retries.
-            if ($currentAttempt -lt $MaxRetry) {
-                # Transient failure: pause to let the AV file lock release before retrying.
-                Write-Warning "Inno Setup failed (likely AV lock). Waiting $($RetryDelaySeconds)s before retry..."
-                Start-Sleep -Seconds $RetryDelaySeconds
-            } else {
-                # This bubbles up to the global catch block at the bottom of publish.ps1
-                throw "Inno Setup failed after $MaxRetry attempts. $_"
-            }
-        }
+    # Retried because anti-virus scanners transiently lock the freshly written installer.
+    Invoke-WithRetry -ErrorMessage "Inno Setup (ISCC.exe) failed" -RetryDelaySeconds 2 -Command {
+        & $InnoCompiler $IssFile "/DMyAppVersion=$Version" "/DArch=$Arch" "/DBuildConfiguration=$BuildConfiguration" "/DTfm=$Tfm"
     }
+
+    Write-Host "Installer built successfully." -ForegroundColor Green
 }
 
 <#
@@ -156,29 +151,31 @@ function Copy-CommonArtifacts {
 
     # 1. Include Task Scheduler hooks
     $taskSchdSource = Join-Path $ScriptDir "taskschd"
-    if (Test-Path $taskSchdSource) {
+    if (Test-Path -LiteralPath $taskSchdSource) {
         $taskSchdDest = Join-Path $DestFolder "taskschd"
         [void](New-Item -Path $taskSchdDest -ItemType Directory -Force)
 
         Copy-TaskSchdArtifacts -SourcePath $taskSchdSource -DestPath $taskSchdDest
 
         # Post-copy verification to ensure no sensitive files leaked into the package
-        $excludedPatterns = @('smtp-cred.xml', '*.dat', '*.log', '*.test.ps1', 'temp.ps1')
-        $leaks = Get-ChildItem -Path $taskSchdDest -Recurse -Include $excludedPatterns
+        $leaks = Get-ChildItem -LiteralPath $taskSchdDest -Recurse -File |
+            Where-Object {
+                $leafName = $_.Name
+                $script:TaskSchdExcludedPatterns | Where-Object { $leafName -like $_ }
+            }
         if ($leaks) {
             throw "SECURITY ERROR: Excluded files leaked into package: $($leaks.FullName -join ', ')"
         }
     }
 
-    # 2. Include PowerShell Module artifacts with Test-Path guards
-    $cliArtifacts = @("Servy.psm1", "Servy.psd1", "servy-module-examples.ps1")
+    # 2. Include PowerShell Module and Dump/Restore artifacts with Test-Path guards
+    $cliArtifacts = @("Servy.psm1", "Servy.psd1", "servy-module-examples.ps1", "Servy-Dump.ps1", "Servy-Restore.ps1")
     foreach ($art in $cliArtifacts) {
         $sourcePath = Join-Path $CliDir $art
-        if (Test-Path $sourcePath) {
-            Copy-Item -Path $sourcePath -Destination $DestFolder -Force
-        } else {
+        if (-not (Test-Path -LiteralPath $sourcePath)) {
             throw "Required CLI artifact missing: $sourcePath"
         }
+        Copy-Item -LiteralPath $sourcePath -Destination $DestFolder -Force
     }
 }
 
@@ -192,7 +189,7 @@ function Copy-CommonArtifacts {
     .PARAMETER SevenZipExe
     The resolved path to the 7-Zip executable.
 
-    .PARAMETER OutputZip
+    .PARAMETER OutputArchive
     The absolute path where the final archive should be created.
 
     .PARAMETER PackageFolder
@@ -201,7 +198,7 @@ function Copy-CommonArtifacts {
 function New-PortablePackage {
     param (
         [Parameter(Mandatory=$true)][string]$SevenZipExe,
-        [Parameter(Mandatory=$true)][string]$OutputZip,
+        [Parameter(Mandatory=$true)][string]$OutputArchive,
         [Parameter(Mandatory=$true)][string]$PackageFolder
     )
 
@@ -209,20 +206,27 @@ function New-PortablePackage {
     # preserves the staging directory name as a wrapper.
 
     # ROBUSTNESS: Call operator (&) lets the PowerShell parser quote space-containing paths
-    # (OutputZip, PackageFolder) correctly for the native 7z invocation.
-    & $SevenZipExe a -t7z -m0=lzma2 -mx=9 -mfb=273 -md=128m -ms=on $OutputZip $PackageFolder
+    # (OutputArchive, PackageFolder) correctly for the native 7z invocation.
+    & $SevenZipExe a -t7z -m0=lzma2 -mx=9 -mfb=273 -md=128m -ms=on $OutputArchive $PackageFolder
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -ne 0) {
         throw "7-Zip failed with exit code $exitCode"
     }
 
-    Write-Host "Success: $OutputZip" -ForegroundColor Green
+    Write-Host "Success: $OutputArchive" -ForegroundColor Green
 }
 
 <#
-.SYNOPSIS
+    .SYNOPSIS
     Validates that a provided version string conforms to the Servy version format.
+
+    .DESCRIPTION
+    Checks the value against the pattern ^\d+\.\d+$ (major.minor, digits only) and throws when it does not match,
+    naming the expected pattern and the value that was provided. Callers run it before the version is stamped into any artifact.
+
+    .PARAMETER Version
+    The version string to validate, for example "9.9".
 #>
 function Assert-ServyVersion {
     [CmdletBinding()]

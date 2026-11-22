@@ -23,6 +23,11 @@ namespace Servy.Core.DTOs
         /// <summary>
         /// Child Process PID.
         /// </summary>
+        /// <remarks>
+        /// This is runtime state, not configuration. The wrapper reports it through the Servy host service
+        /// (<see cref="NamedPipes.INamedPipesService.UpdateRuntimeState"/>), which writes it to <c>Servy.db</c> on the
+        /// wrapper's behalf, so a service log-on account never needs any access to the database.
+        /// </remarks>
         [JsonIgnore]
         [XmlIgnore]
         [SqlColumn("INTEGER")]
@@ -49,6 +54,38 @@ namespace Servy.Core.DTOs
         /// </summary>
         [SqlColumn("TEXT")]
         public string? Description { get; set; }
+
+        /// <summary>
+        /// Whether at least one of this service's sensitive fields failed to decrypt when the row was read.
+        /// </summary>
+        /// <remarks>
+        /// Set by the repository's read path, which also prefixes <see cref="Description"/> with a
+        /// <see cref="Security.DecryptionFailureMarker"/> so the service can still be shown. It carries no
+        /// <see cref="SqlColumnAttribute"/>, so it is never a column and never round-trips through
+        /// <c>Servy.db</c>, an export or an import: it describes one read, not the configuration.
+        /// <see cref="Security.DecryptionFailureMarker.HasDecryptionFailure(ServiceDto)"/> reads this instead
+        /// of the description text, so a row whose stored description already starts with a marker - the shape
+        /// a Servy v9.5 save left behind (#5186) - stays savable when its secrets do decrypt, and so does a
+        /// description a user happens to type in that form.
+        /// </remarks>
+        [JsonIgnore]
+        [XmlIgnore]
+        public bool DecryptionFailed { get; set; }
+
+        /// <summary>
+        /// Whether the decryption failure this read reported was a policy refusal of the pre-v2 encryption of an older
+        /// Servy version, rather than a field that does not decrypt with the current key.
+        /// </summary>
+        /// <remarks>
+        /// Set by the repository's read path together with <see cref="DecryptionFailed"/>, and only when a sensitive field
+        /// was refused because <see cref="AppConfig.AllowLegacyV1Decryption"/> is <see langword="false"/>. The key
+        /// is not involved in that case and the fields that were not decrypted are left as stored, so a refusal reports the upgrade route instead of
+        /// naming <c>aes_key.dat</c>. Like <see cref="DecryptionFailed"/> it describes one read, not the configuration: it
+        /// is never a column and never round-trips through <c>Servy.db</c>, an export or an import.
+        /// </remarks>
+        [JsonIgnore]
+        [XmlIgnore]
+        public bool LegacyEncryptionBlocked { get; set; }
 
         /// <summary>
         /// Path to the executable of the service.
@@ -165,8 +202,9 @@ namespace Servy.Core.DTOs
         /// <summary>
         /// Whether debug logs are enabled.
         /// When enabled, environment variables and process parameters are recorded in the local
-        /// log file at <c>%ProgramData%\Servy\logs\Servy.Service.log</c>. Sensitive data is
-        /// never written to the Windows Event Log or shown by the CLI / PowerShell module.
+        /// log file at <c>%ProgramData%\Servy\logs\services\&lt;ServiceName&gt;\Servy.Service.log</c>. Sensitive data is
+        /// never written to the Windows Event Log; the CLI <c>show</c> command and <c>Show-ServyService</c> mask it
+        /// unless <c>--decrypt</c> / <c>-Decrypt</c> is passed.
         /// Not recommended for production environments, as the local log file may contain
         /// sensitive information.
         /// </summary>
@@ -218,7 +256,8 @@ namespace Servy.Core.DTOs
 
         /// <summary>
         /// Maximum time in seconds allowed for the heartbeat URL request to complete before it is cancelled.
-        /// Value must be clamped between <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> and <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/>.
+        /// Value must be between <see cref="AppConfig.MinHeartbeatUrlTimeoutSeconds"/> and <see cref="AppConfig.MaxHeartbeatUrlTimeoutSeconds"/>;
+        /// values outside that range are rejected by <see cref="Servy.Core.Validation.IServiceValidationRules"/> at install time.
         /// </summary>
         [SqlColumn("INTEGER")]
         public int? HeartbeatUrlTimeoutSeconds { get; set; }
@@ -257,6 +296,12 @@ namespace Servy.Core.DTOs
         public string? EnvironmentVariables { get; set; }
 
         /// <summary>
+        /// Whether to allow overriding of protected runtime variables (e.g., <c>JAVA_HOME</c>, <c>JAVA_OPTS</c>, <c>CATALINA_OPTS</c>) by the service's environment variables.
+        /// </summary>
+        [SqlColumn("INTEGER")]
+        public bool? AllowOverriddenRuntimeVars { get; set; }
+
+        /// <summary>
         /// Optional names of dependent services, separated by semicolons.
         /// </summary>
         [SqlColumn("TEXT")]
@@ -273,8 +318,12 @@ namespace Servy.Core.DTOs
         /// <summary>
         /// Optional user account name to run the service under.
         /// </summary>
-        [JsonIgnore]
-        [XmlIgnore]
+        /// <remarks>
+        /// Exported only for a passwordless account (see <see cref="ShouldSerializeUserAccount"/>); on import,
+        /// an account that is not passwordless is discarded and the imported record carries LocalSystem. A CLI or
+        /// Manager import over a service that already exists then keeps its stored account if that account has a
+        /// password (ServiceRepository.ApplyRuntimeState).
+        /// </remarks>
         [SqlColumn("TEXT")]
         public string? UserAccount { get; set; }
 
@@ -329,7 +378,8 @@ namespace Servy.Core.DTOs
         /// </summary>
         /// <value>
         /// The default is synchronous execution. Set to 0 to execute the pre-launch hook
-        /// asynchronously (fire-and-forget), which disables logging and retry support for the hook.
+        /// asynchronously (fire-and-forget), which disables stdout/stderr redirection
+        /// and retry support for the hook.
         /// </value>
         [SqlColumn("INTEGER")]
         public int? PreLaunchTimeoutSeconds { get; set; }
@@ -381,6 +431,11 @@ namespace Servy.Core.DTOs
         /// <summary>
         /// Absolute file path where standard output is currently being redirected; null if not redirected or not running.
         /// </summary>
+        /// <remarks>
+        /// This is runtime state, not configuration. The wrapper reports it through the Servy host service
+        /// (<see cref="NamedPipes.INamedPipesService.UpdateRuntimeState"/>), which writes it to <c>Servy.db</c> on the
+        /// wrapper's behalf, so a service log-on account never needs any access to the database.
+        /// </remarks>
         [JsonIgnore]
         [XmlIgnore]
         [SqlColumn("TEXT")]
@@ -389,10 +444,38 @@ namespace Servy.Core.DTOs
         /// <summary>
         /// Absolute file path where standard error output is currently being redirected; null if not redirected or not running.
         /// </summary>
+        /// <remarks>
+        /// This is runtime state, not configuration. The wrapper reports it through the Servy host service
+        /// (<see cref="NamedPipes.INamedPipesService.UpdateRuntimeState"/>), which writes it to <c>Servy.db</c> on the
+        /// wrapper's behalf, so a service log-on account never needs any access to the database.
+        /// </remarks>
         [JsonIgnore]
         [XmlIgnore]
         [SqlColumn("TEXT")]
         public string? ActiveStderrPath { get; set; }
+
+        /// <summary>
+        /// The number of restart attempts the wrapper has recorded for the service, counted against <see cref="MaxRestartAttempts"/>.
+        /// </summary>
+        /// <remarks>
+        /// Runtime state, read and written only through the Servy host service
+        /// (<see cref="NamedPipes.INamedPipesService.GetRestartAttemptsAsync"/> and
+        /// <see cref="NamedPipes.INamedPipesService.UpdateRestartAttemptsAsync"/>). It replaces the per-service counter
+        /// files earlier versions kept in <c>%ProgramData%\Servy\recovery</c>.
+        /// </remarks>
+        [JsonIgnore]
+        [XmlIgnore]
+        [SqlColumn("INTEGER")]
+        public int? RestartAttempts { get; set; }
+
+        /// <summary>
+        /// The UTC time, in ticks, at which <see cref="RestartAttempts"/> was last written; <see langword="null"/> when it
+        /// never was.
+        /// </summary>
+        [JsonIgnore]
+        [XmlIgnore]
+        [SqlColumn("INTEGER")]
+        public long? RestartAttemptsUpdatedAtTicks { get; set; }
 
         /// <summary>
         /// Optional path to an executable that runs before the service stops.
@@ -471,6 +554,14 @@ namespace Servy.Core.DTOs
 
         #region ShouldSerialize Methods
 
+        // Conditional-serialization hooks, one per optional property, honoured by both the JSON
+        // and the XML serializer. Two rules apply, chosen per property type:
+        //   - string properties are omitted when null, empty or whitespace-only;
+        //   - nullable value types are omitted only when they have no value, so an assigned
+        //     value is always written, including false and 0.
+        // Name and ExecutablePath are required and deliberately have no hook, so they are
+        // always emitted.
+
         public bool ShouldSerializeDisplayName() => !string.IsNullOrWhiteSpace(DisplayName);
         public bool ShouldSerializeDescription() => !string.IsNullOrWhiteSpace(Description);
         public bool ShouldSerializeStartupDirectory() => !string.IsNullOrWhiteSpace(StartupDirectory);
@@ -503,7 +594,26 @@ namespace Servy.Core.DTOs
         public bool ShouldSerializeFailureProgramStartupDirectory() => !string.IsNullOrWhiteSpace(FailureProgramStartupDirectory);
         public bool ShouldSerializeFailureProgramParameters() => !string.IsNullOrWhiteSpace(FailureProgramParameters);
         public bool ShouldSerializeEnvironmentVariables() => !string.IsNullOrWhiteSpace(EnvironmentVariables);
+        public bool ShouldSerializeAllowOverriddenRuntimeVars() => AllowOverriddenRuntimeVars.HasValue;
         public bool ShouldSerializeServiceDependencies() => !string.IsNullOrWhiteSpace(ServiceDependencies);
+
+        /// <summary>
+        /// Writes UserAccount only for an account that may be passwordless (see
+        /// <see cref="ServiceAccounts.CanBePasswordless"/>: a passwordless account other than LocalSystem, or a
+        /// local user account), and only when no password is set and the service does not run as LocalSystem.
+        /// A local account is stored with no password only when it was configured with a blank password; the
+        /// import on the target machine checks that it can still log on with one. An account with a password
+        /// is never written, because the password cannot travel with it.
+        /// </summary>
+        /// <remarks>
+        /// No logon is attempted here: this hook also runs for every named-pipe frame that carries a
+        /// <see cref="ServiceDto"/>, and a logon per frame would flood the Security event log.
+        /// </remarks>
+        /// <returns><c>true</c> when UserAccount is a passwordless account that may be exported; otherwise, <c>false</c>.</returns>
+        public bool ShouldSerializeUserAccount() =>
+            RunAsLocalSystem != true
+            && string.IsNullOrEmpty(Password)
+            && ServiceAccounts.CanBePasswordless(UserAccount);
         public bool ShouldSerializePreLaunchExecutablePath() => !string.IsNullOrWhiteSpace(PreLaunchExecutablePath);
         public bool ShouldSerializePreLaunchStartupDirectory() => !string.IsNullOrWhiteSpace(PreLaunchStartupDirectory);
         public bool ShouldSerializePreLaunchParameters() => !string.IsNullOrWhiteSpace(PreLaunchParameters);

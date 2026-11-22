@@ -7,48 +7,6 @@ namespace Servy.Core.UnitTests.Native
     public class HandleTests
     {
         [Fact]
-        public void OpenProcess_ShouldReturnValidHandle_WhenOpeningCurrentProcess()
-        {
-            // Arrange
-            int currentPid = GetCurrentProcessId();
-
-            // PROCESS_QUERY_LIMITED_INFORMATION (0x1000) is standard for querying state
-            // and typically does not require administrative privileges for the current process.
-            ProcessAccess access = ProcessAccess.QueryLimitedInformation;
-
-            // Act
-            using (SafeWinProcessHandle handle = OpenProcess(access, false, currentPid))
-            {
-                // Assert
-                Assert.NotNull(handle);
-                Assert.False(handle.IsInvalid, "The handle should be valid for the current process.");
-                Assert.False(handle.IsClosed, "The handle should not be closed while inside the using block.");
-
-                // Verify the underlying pointer is assigned
-                IntPtr rawValue = handle.GetHandleOrZero();
-                Assert.NotEqual(IntPtr.Zero, rawValue);
-                Assert.NotEqual(new IntPtr(-1), rawValue);
-            }
-        }
-
-        [Fact]
-        public void OpenProcess_ShouldReturnInvalidHandle_WhenProcessDoesNotExist()
-        {
-            // Arrange
-            // A high, unused PID (999999) is very unlikely to map to a running process, so kernel32 returns NULL and the handle is invalid.
-            int nonExistentPid = 999999;
-
-            // Act
-            using (SafeWinProcessHandle handle = OpenProcess(ProcessAccess.QueryLimitedInformation, false, nonExistentPid))
-            {
-                // Assert
-                Assert.NotNull(handle);
-                Assert.True(handle.IsInvalid, "Opening a non-existent PID should return an invalid handle.");
-                Assert.Equal(IntPtr.Zero, handle.GetHandleOrZero());
-            }
-        }
-
-        [Fact]
         public void Handle_Dispose_ShouldBeIdempotent()
         {
             // Arrange
@@ -68,24 +26,9 @@ namespace Servy.Core.UnitTests.Native
             Assert.Null(exception);
         }
 
-        [Fact]
-        public void GetHandleOrZero_ReturnsZero_AfterDispose()
-        {
-            // Arrange
-            var handle = OpenProcess(ProcessAccess.QueryLimitedInformation, false, GetCurrentProcessId());
-            Assert.NotEqual(IntPtr.Zero, handle.GetHandleOrZero());
-
-            // Act
-            handle.Dispose();
-
-            // Assert
-            Assert.True(handle.IsClosed);
-            Assert.Equal(IntPtr.Zero, handle.GetHandleOrZero());
-        }
-
         private int GetCurrentProcessId()
         {
-            using(var process = Process.GetCurrentProcess())
+            using (var process = Process.GetCurrentProcess())
             {
                 return process.Id;
             }

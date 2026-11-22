@@ -4,32 +4,35 @@ using Servy.CLI.Options;
 using Servy.CLI.Resources;
 using Servy.Core.Data;
 using Servy.Core.DTOs;
+using Servy.Core.Security;
+using Servy.Core.Validation;
 using Servy.Testing;
 using System.Security;
 
 namespace Servy.CLI.UnitTests.Commands
 {
-    public class ExportServiceCommandTests : IDisposable
+    [Collection(ElevationTestCollection.Name)]
+    public class ExportServiceCommandTests : TempDirectoryTestBase
     {
         private readonly Mock<IServiceRepository> _serviceRepoMock;
         private readonly ExportServiceCommand _command;
-        private readonly string _tempDir;
 
         public ExportServiceCommandTests()
         {
+            // ExportServiceCommand has run the elevation pre-flight since #5152, so take the
+            // test seam explicitly instead of relying on an elevated host or on a sibling
+            // class having left the process-global flag set.
+            BaseCommand.BypassElevationCheck = true;
+
             _serviceRepoMock = new Mock<IServiceRepository>();
             _command = new ExportServiceCommand(_serviceRepoMock.Object);
-
-            _tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
-            Directory.CreateDirectory(_tempDir);
         }
 
-        public void Dispose()
+        public override void Dispose()
         {
-            if (Directory.Exists(_tempDir))
-            {
-                try { Directory.Delete(_tempDir, recursive: true); } catch { /* fail-safe */ }
-            }
+            BaseCommand.BypassElevationCheck = false;
+
+            base.Dispose();
         }
 
         #region Constructor Tests
@@ -48,7 +51,7 @@ namespace Servy.CLI.UnitTests.Commands
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("   ")]
+        [InlineData("    ")]
         public async Task Execute_ShouldFail_WhenServiceNameIsNullOrWhiteSpace(string? name)
         {
             // Arrange
@@ -76,11 +79,14 @@ namespace Servy.CLI.UnitTests.Commands
             Assert.Equal(string.Format(Strings.Msg_UnsupportedFileType, "invalid"), result.Message);
         }
 
-        [Fact]
-        public async Task Execute_ShouldFail_WhenPathIsNullOrEmpty()
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public async Task Execute_ShouldFail_WhenPathIsNullOrWhiteSpace(string? path)
         {
             // Arrange
-            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "xml", Path = "" };
+            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "xml", Path = path! };
 
             // Act
             var result = await _command.ExecuteAsync(opts, TestContext.Current.CancellationToken);
@@ -94,8 +100,8 @@ namespace Servy.CLI.UnitTests.Commands
         public async Task Execute_ShouldFail_WhenServiceNotFound()
         {
             // Arrange
-            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync((ServiceDto?)null);
-            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "xml", Path = Path.Combine(_tempDir, "out.xml") };
+            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", false, It.IsAny<CancellationToken>())).ReturnsAsync((ServiceDto?)null);
+            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "xml", Path = Path.Combine(TempDirectory, "out.xml") };
 
             // Act
             var result = await _command.ExecuteAsync(opts, TestContext.Current.CancellationToken);
@@ -109,8 +115,8 @@ namespace Servy.CLI.UnitTests.Commands
         public async Task Execute_ShouldExportXml_WhenConfigTypeIsXml()
         {
             // Arrange
-            var filePath = Path.Combine(_tempDir, "out.xml");
-            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = "TestService" });
+            var filePath = Path.Combine(TempDirectory, "out.xml");
+            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", false, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = "TestService" });
             _serviceRepoMock.Setup(r => r.ExportXmlAsync("svc", It.IsAny<CancellationToken>())).ReturnsAsync("<xml>data</xml>");
 
             var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "xml", Path = filePath };
@@ -123,14 +129,23 @@ namespace Servy.CLI.UnitTests.Commands
             Assert.Equal(string.Format(Strings.Msg_ExportSuccess, "XML", opts.Path), result.Message);
             Assert.True(File.Exists(filePath));
             Assert.Equal("<xml>data</xml>", File.ReadAllText(filePath));
+
+            // The existence check must not decrypt secrets it never reads (#5267)
+            _serviceRepoMock.Verify(r => r.GetByNameAsync("svc", false, It.IsAny<CancellationToken>()), Times.Once);
+            _serviceRepoMock.Verify(r => r.GetByNameAsync(It.IsAny<string>(), true, It.IsAny<CancellationToken>()), Times.Never);
+
+            // Exact token, not It.IsAny: a hand-over that passes default matches nothing.
+            var token = TestContext.Current.CancellationToken;
+            _serviceRepoMock.Verify(r => r.GetByNameAsync("svc", false, token), Times.Once);
+            _serviceRepoMock.Verify(r => r.ExportXmlAsync("svc", token), Times.Once);
         }
 
         [Fact]
         public async Task Execute_ShouldExportJson_WhenConfigTypeIsJson()
         {
             // Arrange
-            var filePath = Path.Combine(_tempDir, "out.json");
-            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", It.IsAny<bool>(), It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = "TestService" });
+            var filePath = Path.Combine(TempDirectory, "out.json");
+            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", false, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = "TestService" });
             _serviceRepoMock.Setup(r => r.ExportJsonAsync("svc", It.IsAny<CancellationToken>())).ReturnsAsync("{\"name\":\"svc\"}");
 
             var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "json", Path = filePath };
@@ -143,21 +158,70 @@ namespace Servy.CLI.UnitTests.Commands
             Assert.Equal(string.Format(Strings.Msg_ExportSuccess, "JSON", opts.Path), result.Message);
             Assert.True(File.Exists(filePath));
             Assert.Equal("{\"name\":\"svc\"}", File.ReadAllText(filePath));
+
+            // Exact token, not It.IsAny: a hand-over that passes default matches nothing.
+            _serviceRepoMock.Verify(r => r.ExportJsonAsync("svc", TestContext.Current.CancellationToken), Times.Once);
         }
 
-        [Fact]
-        public async Task Execute_ShouldHandleException()
+        [Theory]
+        [InlineData("xml")]
+        [InlineData("json")]
+        public async Task Execute_ShouldFailWithTheReason_WhenTheStoredRowDoesNotDecrypt(string format)
         {
-            // Arrange
-            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", It.IsAny<bool>(), It.IsAny<CancellationToken>())).ThrowsAsync(new Exception("boom"));
-            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "xml", Path = Path.Combine(_tempDir, "out.xml") };
+            // Arrange: the repository refuses to export a row whose sensitive fields no longer decrypt
+            var filePath = Path.Combine(TempDirectory, "out." + format);
+            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", false, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = "svc" });
+            _serviceRepoMock.Setup(r => r.ExportXmlAsync("svc", It.IsAny<CancellationToken>())).ThrowsAsync(new ServiceDecryptionFailedException("svc", null));
+            _serviceRepoMock.Setup(r => r.ExportJsonAsync("svc", It.IsAny<CancellationToken>())).ThrowsAsync(new ServiceDecryptionFailedException("svc", null));
+            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = format, Path = filePath };
 
             // Act
             var result = await _command.ExecuteAsync(opts, TestContext.Current.CancellationToken);
 
             // Assert
             Assert.False(result.IsSuccess);
-            Assert.Contains(string.Format(Strings.Msg_ExportServiceAction, "svc"), result.Message);
+            Assert.Equal(string.Format(Core.Resources.Strings.Msg_ExportDecryptionFailed, "svc"), result.Message);
+            Assert.False(File.Exists(filePath));
+        }
+
+        [Theory]
+        [InlineData("xml")]
+        [InlineData("json")]
+        public async Task Execute_ShouldFailNamingTheLegacyEncryption_WhenTheStoredRowIsRefusedByTheLegacyPolicy(string format)
+        {
+            // Arrange: the repository refuses to export a row whose sensitive field still uses the pre-v2 encryption (#7816)
+            var filePath = Path.Combine(TempDirectory, "out." + format);
+            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", false, It.IsAny<CancellationToken>())).ReturnsAsync(new ServiceDto { Name = "svc" });
+            _serviceRepoMock.Setup(r => r.ExportXmlAsync("svc", It.IsAny<CancellationToken>())).ThrowsAsync(ServiceDecryptionFailedException.ForLegacyEncryption("svc", null, null));
+            _serviceRepoMock.Setup(r => r.ExportJsonAsync("svc", It.IsAny<CancellationToken>())).ThrowsAsync(ServiceDecryptionFailedException.ForLegacyEncryption("svc", null, null));
+            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = format, Path = filePath };
+
+            // Act
+            var result = await _command.ExecuteAsync(opts, TestContext.Current.CancellationToken);
+
+            // Assert: the policy refusal is reported as such, not as a key file to restore
+            Assert.False(result.IsSuccess);
+            Assert.Equal(string.Format(Core.Resources.Strings.Msg_ExportLegacyEncryptionBlocked, "svc"), result.Message);
+            Assert.False(File.Exists(filePath));
+        }
+
+        [Fact]
+        public async Task Execute_ShouldHandleException()
+        {
+            // Arrange
+            _serviceRepoMock.Setup(r => r.GetByNameAsync("svc", false, It.IsAny<CancellationToken>())).ThrowsAsync(new Exception("boom"));
+            var opts = new ExportServiceOptions { ServiceName = "svc", ConfigFileType = "xml", Path = Path.Combine(TempDirectory, "out.xml") };
+
+            // Act
+            var result = await _command.ExecuteAsync(opts, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result.IsSuccess);
+            Assert.Equal(
+                string.Format(Strings.Msg_CommandFailedTemplate, string.Format(Strings.Msg_ExportServiceAction, "svc"), "boom")
+                    + Environment.NewLine
+                    + string.Format(Strings.Msg_SuggestionTemplate, Strings.Msg_ExportServiceSuggestion),
+                result.Message);
         }
 
         #endregion
@@ -168,7 +232,7 @@ namespace Servy.CLI.UnitTests.Commands
         public void SaveFile_ShouldCreateDirectoryIfNotExists()
         {
             // Arrange
-            var filePath = Path.Combine(_tempDir, "subdir", "file.xml");
+            var filePath = Path.Combine(TempDirectory, "subdir", "file.xml");
             var content = "hello";
 
             // Act
@@ -185,10 +249,10 @@ namespace Servy.CLI.UnitTests.Commands
             // Arrange
             // Providing an invalid extension ("txt") routes to PathSecurityGuard's extension filter,
             // producing an error payload that does not contain "Access Denied" or "Security Alert".
-            var filePath = Path.Combine(_tempDir, "denied_extension.txt");
+            var filePath = Path.Combine(TempDirectory, "denied_extension.txt");
 
             // Act & Assert
-            // TestReflection unwraps TargetInvocationException cleanly to target the inner exception directly
+            // TestReflection rethrows the inner exception, so the guard's ArgumentException surfaces directly
             var ex = Assert.Throws<ArgumentException>(() => InvokeSaveFile(filePath, "data"));
             Assert.Equal(string.Format(Core.Resources.Strings.Msg_SecurityInvalidFileType, ".txt"), ex.Message);
         }
@@ -198,13 +262,13 @@ namespace Servy.CLI.UnitTests.Commands
         {
             // Arrange
             // Forcing a path sequence targeting a structural Windows system environment folder
-            // triggers an internal "Access Denied" rule inside PathSecurityGuard, hitting the SecurityException branch.
+            // triggers an internal "Security Alert" rule inside PathSecurityGuard, hitting the SecurityException branch.
             string protectedDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
             var filePath = Path.Combine(protectedDir, "malicious_export.json");
 
             // Act & Assert
             var ex = Assert.Throws<SecurityException>(() => InvokeSaveFile(filePath, "data"));
-            Assert.Contains("Access Denied", ex.Message);
+            Assert.Contains("Security Alert", ex.Message);
         }
 
         #endregion
@@ -215,20 +279,19 @@ namespace Servy.CLI.UnitTests.Commands
         public void SaveFile_ShouldThrowSecurityException_WhenFileStreamWriteFailsFromExternalLock()
         {
             // Arrange
-            var filePath = Path.Combine(_tempDir, "locked_out.json");
+            var filePath = Path.Combine(TempDirectory, "locked_out.json");
             File.WriteAllText(filePath, "original contents");
 
-            // Exclusively open and lock down the target filesystem file channel before running SaveFile.
-            // When SaveFile invokes PathSecurityGuard, it opens with FileMode.OpenOrCreate and FileAccess.ReadWrite.
-            // Because our file handle context restricts any sharing options (FileShare.None), PathSecurityGuard
-            // will throw a SecurityException while trying to allocate the stream.
+            // Hold the file open with FileShare.None so PathSecurityGuard cannot open it for validation:
+            // SaveFile invokes PathSecurityGuard, which opens the file with FileMode.OpenOrCreate and
+            // FileAccess.ReadWrite and therefore throws a SecurityException while the lock is held.
             using (var lockStream = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
             {
                 // Act & Assert
                 var ex = Assert.Throws<SecurityException>(() => InvokeSaveFile(filePath, "new config payload"));
 
-                // Unwraps target reflection errors to expose the inner thrown exception rule
-                Assert.Contains(string.Format(Core.Resources.Strings.Msg_SecurityHandleValidationFailed, string.Empty), ex.Message);
+                // The guard's message identifies the failed file-handle validation
+                Assert.Contains("Security Alert: Target file handle validation was rejected", ex.Message);
             }
         }
 
@@ -240,7 +303,7 @@ namespace Servy.CLI.UnitTests.Commands
         public void SaveFile_ShouldCreateDeepDirectoryTree_WhenPathIsValid()
         {
             // Arrange
-            var deepSubDir = Path.Combine(_tempDir, "level1", "level2", "level3");
+            var deepSubDir = Path.Combine(TempDirectory, "level1", "level2", "level3");
             var filePath = Path.Combine(deepSubDir, "service_export.json");
             var content = "{ \"Name\": \"TestServiceConfig\" }";
 
@@ -248,8 +311,8 @@ namespace Servy.CLI.UnitTests.Commands
             InvokeSaveFile(filePath, content);
 
             // Assert
-            Assert.True(Directory.Exists(deepSubDir), "The multi-level parent directory chain should be created successfully.");
-            Assert.True(File.Exists(filePath), "The targeted service export payload file should be created.");
+            Assert.True(Directory.Exists(deepSubDir), "The parent directory chain should be created.");
+            Assert.True(File.Exists(filePath), "The output file should be created.");
             Assert.Equal(content, File.ReadAllText(filePath));
         }
 
@@ -257,58 +320,50 @@ namespace Servy.CLI.UnitTests.Commands
         public void SaveFile_ValidationFailsOnInvalidExtension_RollsBackCreatedDirectoriesCleanly()
         {
             // Arrange
-            var deepSubDir = Path.Combine(_tempDir, "orphaned_tree", "nested_level");
+            var deepSubDir = Path.Combine(TempDirectory, "orphaned_tree", "nested_level");
             var filePath = Path.Combine(deepSubDir, "illegal_device_target.txt");
             var content = "[Stale Config Payload Data]";
 
             // Act & Assert
-            // 1. Catch the unwrapped exception directly from TestReflection
             var actualEx = Assert.Throws<ArgumentException>(() => InvokeSaveFile(filePath, content));
 
-            // 2. Assert against the actual exception content profile
             Assert.Contains(".txt", actualEx.Message);
 
-            // Transactional Rollback Integrity Assertions
-            Assert.False(File.Exists(filePath), "The target file should not have been generated.");
-            Assert.False(Directory.Exists(deepSubDir), "The nested parent leaf folder should be rolled back and deleted.");
-            Assert.False(Directory.Exists(Path.Combine(_tempDir, "orphaned_tree")), "The entire newly created parent path root should be swept away if empty.");
+            // Directory cleanup assertions
+            Assert.False(File.Exists(filePath), "The output file should not have been created.");
+            Assert.False(Directory.Exists(deepSubDir), "The nested parent folder should be removed on failure.");
+            Assert.False(Directory.Exists(Path.Combine(TempDirectory, "orphaned_tree")), "The entire newly created parent path root should be removed if empty.");
         }
 
         [Fact]
         public void SaveFile_ValidationFailsOnReservedDeviceName_RollsBackCreatedDirectoriesCleanly()
         {
             // Arrange
-            var deepSubDir = Path.Combine(_tempDir, "dos_device_tree");
+            var deepSubDir = Path.Combine(TempDirectory, "dos_device_tree");
             var filePath = Path.Combine(deepSubDir, "COM1.json");
             var content = "{ }";
 
-            // Act
-            var actualEx = Record.Exception(() => InvokeSaveFile(filePath, content));
-            Assert.NotNull(actualEx);
+            // Act & Assert
+            // The reserved-device check fails with PathSecurityFailureKind.InvalidArgument, which SaveFile
+            // maps to ArgumentException, and the message names the offending device segment.
+            var actualEx = Assert.Throws<ArgumentException>(() => InvokeSaveFile(filePath, content));
+            Assert.Contains("COM1", actualEx.Message);
 
-            // Assert
-            bool isValidExceptionType = actualEx is ArgumentException || actualEx is SecurityException;
-            Assert.True(isValidExceptionType, $"Expected ArgumentException or SecurityException, but caught: {actualEx.GetType().Name}");
-
-            // If it's a modern argument rejection, execute the localized syntax verification check
-            if (actualEx is ArgumentException)
-            {
-                bool matchedExpectedSecurityRules = actualEx.Message.Contains("COM1");
-
-                Assert.True(matchedExpectedSecurityRules,
-                    $"The security guard rejected the path, but with an unexpected message profile: '{actualEx.Message}'");
-            }
-
-            // Assert file system state left no permanent footprint across both frameworks
+            // Nothing SaveFile created may remain on disk
             Assert.False(File.Exists(filePath));
-            Assert.False(Directory.Exists(deepSubDir), "The directory allocated for the device name target should be atomically removed on error.");
+            Assert.False(Directory.Exists(deepSubDir), "The directory created before validation failed must be removed.");
         }
 
         [Fact]
-        public void SaveFile_ValidationFailsOnProtectedFolder_LeavesPreExistingRootUntouched()
+        public void SaveFile_ValidationFailsOnDisallowedExtension_LeavesPreExistingRootUntouched()
         {
             // Arrange
-            var preExistingRoot = Path.Combine(_tempDir, "stable_corporate_root");
+            // The path is entirely inside the test's own sandbox, so no protected system folder is
+            // involved: what rejects it is the allowed-extension filter (.json/.xml only), which runs
+            // in the ValidatePathOnly pre-flight BEFORE any directory is created. The property under
+            // test is therefore that a rejected save adds nothing next to a pre-existing root and
+            // leaves that root alone.
+            var preExistingRoot = Path.Combine(TempDirectory, "stable_corporate_root");
             Directory.CreateDirectory(preExistingRoot);
 
             var generatedSubDir = Path.Combine(preExistingRoot, "dynamic_session_branch");
@@ -317,30 +372,167 @@ namespace Servy.CLI.UnitTests.Commands
             // Act & Assert
             var actualEx = Assert.Throws<ArgumentException>(() => InvokeSaveFile(filePath, "content"));
 
-            // Assert
-            Assert.False(Directory.Exists(generatedSubDir), "The dynamic folder leaf created during this call should be cleanly rolled back.");
-            Assert.True(Directory.Exists(preExistingRoot), "The pre-existing folder root must remain untouched by our transaction fallback loop.");
+            // Assert: pin WHICH guard fired, so a future change that starts rejecting this path for a
+            // different reason (or stops rejecting it) fails here instead of passing silently.
+            Assert.Contains(".log", actualEx.Message);
+
+            Assert.False(Directory.Exists(generatedSubDir), "No directory should be left behind next to the pre-existing root when the save is rejected.");
+            Assert.True(Directory.Exists(preExistingRoot), "The pre-existing folder root must remain untouched by a rejected save.");
         }
 
         [Fact]
-        public void SaveFile_DirectoryCreatedButValidationFailsLater_TriggersFinallyFallbackRollback()
+        public void SaveFile_PostDirectoryCreationValidationFailure_RollsBackCreatedDirectories()
         {
             // Arrange
-            // We use a path where the directory chain does NOT exist, forcing SaveFile to create it.
-            var deepSubDir = Path.Combine(_tempDir, "finally_coverage_tree", "nested_leaf");
+            var deepSubDir = Path.Combine(TempDirectory, "rollback_test_tree", "nested");
+            var filePath = Path.Combine(deepSubDir, "valid_file.json");
 
-            // We use an invalid file extension (.log). This ensures that the directory creation pass
-            // succeeds completely, populates 'directoriesCreatedByUs', and THEN PathSecurityGuard
-            // rejects the file layout, throwing an ArgumentException!
-            var filePath = Path.Combine(deepSubDir, "validation_failure_target.log");
+            // Use test seam to allow pre-flight, create directory chain, and then fail handle validation
+            _command.PathValidator = (userPath, mode, access, share) =>
+            {
+                var failureResult = PathSecurityResult.Fail(
+                    PathSecurityFailureKind.InvalidArgument,
+                    "Simulated handle-level validation error");
+                return new ExportServiceCommand.PathSecurityResultWithStream(failureResult, null);
+            };
 
             // Act & Assert
-            var actualEx = Assert.Throws<ArgumentException>(() => InvokeSaveFile(filePath, "{ }"));
+            var ex = Assert.Throws<ArgumentException>(() => InvokeSaveFile(filePath, "data"));
+            Assert.Contains("Simulated handle-level validation error", ex.Message);
 
-            // Assert: Verify that the fallback mechanism inside the finally block caught the failure,
-            // executed the loop tracking arrays, and cleanly wiped the orphaned directories!
-            Assert.False(Directory.Exists(deepSubDir), "The nested leaf directory should be rolled back via the finally loop.");
-            Assert.False(Directory.Exists(Path.Combine(_tempDir, "finally_coverage_tree")), "The parent directory root should be swept cleanly.");
+            Assert.False(Directory.Exists(deepSubDir), "The directory chain created prior to handle validation failure should be rolled back.");
+            Assert.False(Directory.Exists(Path.Combine(TempDirectory, "rollback_test_tree")), "The entire orphaned root folder created during execution should be deleted.");
+        }
+
+        [Fact]
+        public void SaveFile_DirectoryCreationFails_WrapsTheFailureInIOException()
+        {
+            // Arrange
+            // Block the directory chain by pre-creating a FILE at the exact path the chain has to
+            // create as a directory, so Directory.CreateDirectory itself throws. The sibling rollback
+            // tests all let the chain succeed and fail a later PathSecurityGuard/PathValidator check,
+            // so none of them reaches the catch around the creation call.
+            var blockerPath = Path.Combine(TempDirectory, "blocker");
+            File.WriteAllText(blockerPath, "not a directory");
+            var filePath = Path.Combine(blockerPath, "nested", "file.xml");
+
+            // Act & Assert
+            var ex = Assert.Throws<IOException>(() => InvokeSaveFile(filePath, "data"));
+
+            Assert.Contains("Failed to create directory structure chain", ex.Message);
+            Assert.Contains(Path.GetFullPath(blockerPath), ex.Message);
+
+            // The catch's whole job is to wrap, so the original filesystem failure must survive.
+            Assert.NotNull(ex.InnerException);
+        }
+
+        [Fact]
+        public void SaveFile_WriteFails_RollsBackDirectoriesCreatedDuringThisCall()
+        {
+            // Arrange
+            var deepSubDir = Path.Combine(TempDirectory, "write_fail_tree", "nested");
+            var filePath = Path.Combine(deepSubDir, "file.json");
+
+            // Let the directory chain be created and the handle validation SUCCEED, but hand back a
+            // read-only stream, so the StreamWriter construction throws and "committed" stays false.
+            // That reaches the outer finally's rollback - the second RollbackCreatedDirectories call
+            // site, which the sibling post-validation-failure test does not exercise.
+            _command.PathValidator = (userPath, mode, access, share) =>
+            {
+                var resolvedPath = Path.GetFullPath(userPath);
+                var readOnlyStream = new FileStream(resolvedPath, FileMode.OpenOrCreate, FileAccess.Read, FileShare.None);
+                return new ExportServiceCommand.PathSecurityResultWithStream(PathSecurityResult.Success(resolvedPath), readOnlyStream);
+            };
+
+            // Act & Assert
+            // StreamWriter rejects a non-writable stream with ArgumentException, which the write catch
+            // filter (IOException / UnauthorizedAccessException) deliberately does not swallow.
+            Assert.Throws<ArgumentException>(() => InvokeSaveFile(filePath, "data"));
+
+            Assert.False(Directory.Exists(deepSubDir), "The directory chain created before the write failure should be rolled back.");
+            Assert.False(Directory.Exists(Path.Combine(TempDirectory, "write_fail_tree")), "The orphaned root created during execution should be removed too.");
+        }
+
+        [Fact]
+        public void SaveFile_WriteThrowsIOException_WrapsFailureAndPropagates()
+        {
+            // Arrange
+            // The sibling rollback test above fails the StreamWriter CONSTRUCTOR (ArgumentException),
+            // which the write catch filter deliberately does not match. Hand back a genuinely
+            // writable handle whose first flush fails instead, so the failure lands inside the try
+            // block and reaches the IOException arm of the filter.
+            var filePath = Path.Combine(TempDirectory, "throwing_write.json");
+            _command.PathValidator = (userPath, mode, access, share) =>
+            {
+                var resolvedPath = Path.GetFullPath(userPath);
+                var throwingStream = new ThrowingFlushFileStream(resolvedPath);
+                return new ExportServiceCommand.PathSecurityResultWithStream(PathSecurityResult.Success(resolvedPath), throwingStream);
+            };
+
+            // Act
+            var ex = Assert.Throws<IOException>(() => InvokeSaveFile(filePath, "data"));
+
+            // Assert - the write failure is wrapped with the target path rather than surfacing raw,
+            // and the original IO error is preserved as the inner exception.
+            Assert.Contains("Failed to write export file", ex.Message);
+            Assert.Contains(Path.GetFullPath(filePath), ex.Message);
+            var inner = Assert.IsType<IOException>(ex.InnerException);
+            Assert.Equal("Simulated disk failure", inner.Message);
+        }
+
+        [Fact]
+        public void SaveFile_WriteFailsOverAPreExistingFile_KeepsTheFile()
+        {
+            // Arrange
+            // The two sibling failure tests above both target a path that did not exist, so
+            // createdByUs is true and the finally deleting the file is the expected outcome. This
+            // one pre-creates the target, which is the input the #2039 guard exists for.
+            var filePath = Path.Combine(TempDirectory, "existing_export.json");
+            File.WriteAllText(filePath, "original contents");
+            _command.PathValidator = (userPath, mode, access, share) =>
+            {
+                var resolvedPath = Path.GetFullPath(userPath);
+                var throwingStream = new ThrowingFlushFileStream(resolvedPath);
+                return new ExportServiceCommand.PathSecurityResultWithStream(PathSecurityResult.Success(resolvedPath), throwingStream);
+            };
+
+            // Act
+            Assert.Throws<IOException>(() => InvokeSaveFile(filePath, "data"));
+
+            // Assert
+            // The file existed before the call, so the failed write must not delete it (#2039).
+            // What it now CONTAINS is a separate question: the stream is opened OpenOrCreate and the
+            // failing flush is the StreamWriter's, before SetLength runs, so the new bytes overwrite
+            // the head of the old content without truncating it. Only existence is asserted here.
+            Assert.True(File.Exists(filePath), "A failed export must not delete a file that existed before the call.");
+        }
+
+        /// <summary>
+        /// A real, writable file stream whose first flush fails, standing in for a write-time IO
+        /// failure (disk full, sharing violation) without needing one to occur. <c>FileStream.Flush()</c>
+        /// routes through this override, so in <c>SaveFile</c> the flush that fails is the
+        /// <c>StreamWriter</c>'s, ahead of the <c>SetLength</c> and <c>Flush(true)</c> calls.
+        /// Subsequent flushes succeed so the stream still disposes cleanly during unwinding.
+        /// </summary>
+        private sealed class ThrowingFlushFileStream : FileStream
+        {
+            private bool _thrown;
+
+            public ThrowingFlushFileStream(string path)
+                : base(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+            {
+            }
+
+            public override void Flush(bool flushToDisk)
+            {
+                if (!_thrown)
+                {
+                    _thrown = true;
+                    throw new IOException("Simulated disk failure");
+                }
+
+                base.Flush(flushToDisk);
+            }
         }
 
         #endregion
@@ -348,11 +540,10 @@ namespace Servy.CLI.UnitTests.Commands
         #region Reflection Helper Definition
 
         /// <summary>
-        /// Safely executes the private SaveFile system method using reflection layers.
+        /// Invokes the private SaveFile(path, content) via TestReflection, which rethrows the inner exception.
         /// </summary>
         private void InvokeSaveFile(string path, string content)
         {
-            // Let TestReflection seamlessly invoke the non-public implementation framework
             TestReflection.InvokeNonPublic(_command, "SaveFile", path, content);
         }
 

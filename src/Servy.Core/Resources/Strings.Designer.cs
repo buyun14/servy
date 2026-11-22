@@ -97,11 +97,56 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Administrator privileges are required..
+        ///   Looks up a localized string similar to Failure Program Parameters.
         /// </summary>
-        public static string Msg_AdminRightsRequired {
+        public static string Label_FailureProgramParameters {
             get {
-                return ResourceManager.GetString("Msg_AdminRightsRequired", resourceCulture);
+                return ResourceManager.GetString("Label_FailureProgramParameters", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Parameters.
+        /// </summary>
+        public static string Label_Parameters {
+            get {
+                return ResourceManager.GetString("Label_Parameters", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Post-Launch Parameters.
+        /// </summary>
+        public static string Label_PostLaunchParameters {
+            get {
+                return ResourceManager.GetString("Label_PostLaunchParameters", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Post-Stop Parameters.
+        /// </summary>
+        public static string Label_PostStopParameters {
+            get {
+                return ResourceManager.GetString("Label_PostStopParameters", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Pre-Launch Parameters.
+        /// </summary>
+        public static string Label_PreLaunchParameters {
+            get {
+                return ResourceManager.GetString("Label_PreLaunchParameters", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Pre-Stop Parameters.
+        /// </summary>
+        public static string Label_PreStopParameters {
+            get {
+                return ResourceManager.GetString("Label_PreStopParameters", resourceCulture);
             }
         }
         
@@ -115,7 +160,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Configuration file &apos;{0}&apos; exceeds maximum size ({1} MB)..
+        ///   Looks up a localized string similar to Configuration file &apos;{0}&apos; is {1:N2} MB, which exceeds the maximum allowed size of {2} MB..
         /// </summary>
         public static string Msg_ConfigSizeLimitReached {
             get {
@@ -124,7 +169,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Core index &apos;{0}&apos; is out of bounds (0-{1})..
+        ///   Looks up a localized string similar to CPU affinity core index &apos;{0}&apos; is out of bounds (0-{1})..
         /// </summary>
         public static string Msg_CoreIndexOutOfBounds {
             get {
@@ -133,7 +178,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Core index in range &apos;{0}&apos; is out of bounds (0-{1})..
+        ///   Looks up a localized string similar to CPU affinity core index in range &apos;{0}&apos; is out of bounds (0-{1})..
         /// </summary>
         public static string Msg_CoreIndexRangeOutOfBounds {
             get {
@@ -169,11 +214,47 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to (details unavailable: access denied).
+        /// </summary>
+        public static string Msg_DetailsUnavailableAccessDenied {
+            get {
+                return ResourceManager.GetString("Msg_DetailsUnavailableAccessDenied", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to (details unavailable: {0}).
+        /// </summary>
+        public static string Msg_DetailsUnavailableFaulted {
+            get {
+                return ResourceManager.GetString("Msg_DetailsUnavailableFaulted", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to (details unavailable: native query timed out).
+        /// </summary>
+        public static string Msg_DetailsUnavailableTimedOut {
+            get {
+                return ResourceManager.GetString("Msg_DetailsUnavailableTimedOut", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Display name exceeds {0} characters..
         /// </summary>
         public static string Msg_DisplayNameLengthReached {
             get {
                 return ResourceManager.GetString("Msg_DisplayNameLengthReached", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to CPU affinity mask &apos;{0}&apos; selects no processors..
+        /// </summary>
+        public static string Msg_EmptyAffinityMask {
+            get {
+                return ResourceManager.GetString("Msg_EmptyAffinityMask", resourceCulture);
             }
         }
         
@@ -187,7 +268,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Environment variable key cannot be empty..
+        ///   Looks up a localized string similar to Environment variable key cannot be empty (record {0})..
         /// </summary>
         public static string Msg_EnvironmentVariableKeyEmpty {
             get {
@@ -205,7 +286,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Each environment variable must contain an unescaped &apos;=&apos; character to separate the key from the value..
+        ///   Looks up a localized string similar to Each environment variable must contain an unescaped &apos;=&apos; character to separate the key from the value (record {0})..
         /// </summary>
         public static string Msg_EnvironmentVariableMissingEquals {
             get {
@@ -223,11 +304,47 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Access denied to Windows Event Log. Please ensure the application is running with sufficient privileges (Administrator)..
+        /// </summary>
+        public static string Msg_EventLogAccessDenied {
+            get {
+                return ResourceManager.GetString("Msg_EventLogAccessDenied", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot access Windows Event Log. Ensure the &apos;Windows Event Log&apos; service is running and the query is valid..
+        /// </summary>
+        public static string Msg_EventLogUnavailable {
+            get {
+                return ResourceManager.GetString("Msg_EventLogUnavailable", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Service process path cannot be empty..
         /// </summary>
         public static string Msg_ExecutablePathRequired {
             get {
                 return ResourceManager.GetString("Msg_ExecutablePathRequired", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Service &apos;{0}&apos; was not exported: at least one sensitive field cannot be decrypted with the current encryption key (aes_key.dat), so the file would be written without its parameters and environment variables. If the key file is corrupt or was replaced, restore the original aes_key.dat, or copy Servy.db back to the machine that has it, and export the configuration from there..
+        /// </summary>
+        public static string Msg_ExportDecryptionFailed {
+            get {
+                return ResourceManager.GetString("Msg_ExportDecryptionFailed", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Service &apos;{0}&apos; was not exported: at least one sensitive field uses the pre-v2 encryption of an older Servy version, which this version refuses to decrypt. The encryption key (aes_key.dat) is not involved. To upgrade the service, export its configuration with a v1-compatible version of Servy, remove the service here, then import the exported file..
+        /// </summary>
+        public static string Msg_ExportLegacyEncryptionBlocked {
+            get {
+                return ResourceManager.GetString("Msg_ExportLegacyEncryptionBlocked", resourceCulture);
             }
         }
         
@@ -246,6 +363,15 @@ namespace Servy.Core.Resources {
         public static string Msg_FatalError_Title {
             get {
                 return ResourceManager.GetString("Msg_FatalError_Title", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to CPU affinity mask &apos;{0}&apos; selects processors outside the allowable range (0-{1})..
+        /// </summary>
+        public static string Msg_HexMaskOutOfBounds {
+            get {
+                return ResourceManager.GetString("Msg_HexMaskOutOfBounds", resourceCulture);
             }
         }
         
@@ -277,38 +403,11 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Invalid {0} structure: {1}.
+        ///   Looks up a localized string similar to Invalid {0} structure: {1}..
         /// </summary>
         public static string Msg_ImportInvalidStructure {
             get {
                 return ResourceManager.GetString("Msg_ImportInvalidStructure", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Failed to deserialize service configuration from JSON content..
-        /// </summary>
-        public static string Msg_ImportJsonDeserializationFailed {
-            get {
-                return ResourceManager.GetString("Msg_ImportJsonDeserializationFailed", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Failed to import service from JSON: {0}.
-        /// </summary>
-        public static string Msg_ImportJsonFailed {
-            get {
-                return ResourceManager.GetString("Msg_ImportJsonFailed", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to JSON content cannot be null or empty..
-        /// </summary>
-        public static string Msg_ImportJsonNullOrEmpty {
-            get {
-                return ResourceManager.GetString("Msg_ImportJsonNullOrEmpty", resourceCulture);
             }
         }
         
@@ -322,16 +421,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Failed to open configuration file for reading..
-        /// </summary>
-        public static string Msg_ImportReadFailure {
-            get {
-                return ResourceManager.GetString("Msg_ImportReadFailure", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to {0} structure error: {1}.
+        ///   Looks up a localized string similar to {0} structure error: {1}..
         /// </summary>
         public static string Msg_ImportStructureError {
             get {
@@ -340,34 +430,16 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Failed to deserialize service configuration from XML content..
+        ///   Looks up a localized string similar to Invalid {0} in configuration..
         /// </summary>
-        public static string Msg_ImportXmlDeserializationFailed {
+        public static string Msg_InvalidConfig {
             get {
-                return ResourceManager.GetString("Msg_ImportXmlDeserializationFailed", resourceCulture);
+                return ResourceManager.GetString("Msg_InvalidConfig", resourceCulture);
             }
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Failed to import service from XML: {0}.
-        /// </summary>
-        public static string Msg_ImportXmlFailed {
-            get {
-                return ResourceManager.GetString("Msg_ImportXmlFailed", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to XML content cannot be null or empty..
-        /// </summary>
-        public static string Msg_ImportXmlNullOrEmpty {
-            get {
-                return ResourceManager.GetString("Msg_ImportXmlNullOrEmpty", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Invalid core specification: &apos;{0}&apos;.
+        ///   Looks up a localized string similar to Invalid CPU affinity core specification: &apos;{0}&apos;..
         /// </summary>
         public static string Msg_InvalidCoreSpecification {
             get {
@@ -421,7 +493,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Invalid hex affinity format: {0}.
+        ///   Looks up a localized string similar to Invalid CPU affinity hexadecimal format: &apos;{0}&apos;..
         /// </summary>
         public static string Msg_InvalidHexAffinityFormat {
             get {
@@ -520,7 +592,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Pre-Launch retry attempts must be a number between {0} and {1}..
+        ///   Looks up a localized string similar to Pre-launch retry attempts must be a number between {0} and {1}..
         /// </summary>
         public static string Msg_InvalidPreLaunchRetryAttempts {
             get {
@@ -556,7 +628,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Pre-Launch timeout must be a number of seconds between {0} and {1}. Set the timeout to 0 to run the pre-launch hook in fire-and-forget mode. When set to 0, the hook is started and the service is launched immediately without waiting for completion. Use fire-and-forget only for tasks that do not affect the service&apos;s ability to start or run correctly. Stdout/Stderr redirection and retries are not available in fire-and-forget mode..
+        ///   Looks up a localized string similar to Pre-launch timeout must be a number of seconds between {0} and {1}. Set the timeout to 0 to run the pre-launch hook in fire-and-forget mode. When set to 0, the hook is started and the service is launched immediately without waiting for completion. Use fire-and-forget only for tasks that do not affect the service&apos;s ability to start or run correctly. Stdout/Stderr redirection and retries are not available in fire-and-forget mode..
         /// </summary>
         public static string Msg_InvalidPreLaunchTimeout {
             get {
@@ -583,7 +655,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Pre-Stop timeout must be a number of seconds between {0} and {1}. Set the timeout to 0 to run the pre-stop process in fire-and-forget mode..
+        ///   Looks up a localized string similar to Pre-stop timeout must be a number of seconds between {0} and {1}. Set the timeout to 0 to run the pre-stop process in fire-and-forget mode..
         /// </summary>
         public static string Msg_InvalidPreStopTimeout {
             get {
@@ -601,7 +673,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Invalid service name &apos;{0}&apos;. Only letters, digits, hyphens, underscores, spaces, and dollar signs ($) are allowed..
+        ///   Looks up a localized string similar to Invalid service name &apos;{0}&apos;. Only letters, digits, hyphens, underscores, periods, spaces, and dollar signs ($) are allowed, optionally preceded by &apos;+&apos; to reference a load-order group..
         /// </summary>
         public static string Msg_InvalidServiceDependencyName {
             get {
@@ -610,7 +682,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service name contains invalid characters. Avoid using &apos;\&apos;, &apos;/&apos;, &apos;:&apos;, &apos;*&apos;, &apos;?&apos;, &apos;&quot;&apos;, &apos;&lt;&apos;, &apos;&gt;&apos;, &apos;|&apos;..
+        ///   Looks up a localized string similar to Service name contains invalid characters. Avoid using &apos;\&apos;, &apos;/&apos;, &apos;:&apos;, &apos;*&apos;, &apos;?&apos;, &apos;&quot;&apos;, &apos;&lt;&apos;, &apos;&gt;&apos;, &apos;|&apos;, &apos;;&apos;, and non-printable characters..
         /// </summary>
         public static string Msg_InvalidServiceName {
             get {
@@ -619,7 +691,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Start timeout must be a number between {0} and {1} seconds..
+        ///   Looks up a localized string similar to Start timeout must be a number of seconds between {0} and {1}..
         /// </summary>
         public static string Msg_InvalidStartTimeout {
             get {
@@ -655,7 +727,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Stop timeout must be a number between {0} and {1} seconds..
+        ///   Looks up a localized string similar to Stop timeout must be a number of seconds between {0} and {1}..
         /// </summary>
         public static string Msg_InvalidStopTimeout {
             get {
@@ -673,7 +745,16 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Passwords don&apos;t match..
+        ///   Looks up a localized string similar to Inverted CPU affinity core range &apos;{0}&apos;: the start index is greater than the end index..
+        /// </summary>
+        public static string Msg_InvertedCoreRange {
+            get {
+                return ResourceManager.GetString("Msg_InvertedCoreRange", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Passwords do not match..
         /// </summary>
         public static string Msg_PasswordsDontMatch {
             get {
@@ -718,7 +799,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Security: Could not obtain a SafeFileHandle for the target..
+        ///   Looks up a localized string similar to Security Alert: Could not obtain a file handle for the target..
         /// </summary>
         public static string Msg_SecurityHandleInvalid {
             get {
@@ -727,16 +808,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Path validation failed at the kernel level: Kernel path resolution serialization failed..
-        /// </summary>
-        public static string Msg_SecurityHandleSerializationFailed {
-            get {
-                return ResourceManager.GetString("Msg_SecurityHandleSerializationFailed", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Path validation failed at the kernel level: Kernel size probe allocation failed..
+        ///   Looks up a localized string similar to Security Alert: Path validation failed in the kernel probe (size allocation)..
         /// </summary>
         public static string Msg_SecurityHandleSizeProbeFailed {
             get {
@@ -745,7 +817,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Security Guard Failure: Target file handle validation rejected. {0}.
+        ///   Looks up a localized string similar to Security Alert: Target file handle validation was rejected ({0})..
         /// </summary>
         public static string Msg_SecurityHandleValidationFailed {
             get {
@@ -781,7 +853,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Access Denied: The resolved path targets protected system directory &apos;{0}&apos;. Import prohibited..
+        ///   Looks up a localized string similar to Security Alert: The resolved path targets protected system directory &apos;{0}&apos;. Import prohibited..
         /// </summary>
         public static string Msg_SecurityProtectedDirectory {
             get {
@@ -790,7 +862,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Access Denied: The resolved path targets protected system directory &apos;{0}&apos;. Export prohibited..
+        ///   Looks up a localized string similar to Security Alert: The resolved path targets protected system directory &apos;{0}&apos;. Export prohibited..
         /// </summary>
         public static string Msg_SecurityProtectedDirectoryExport {
             get {
@@ -844,7 +916,16 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service was installed successfully..
+        ///   Looks up a localized string similar to Service dependency &apos;{0}&apos; exceeds the maximum length of {1} characters..
+        /// </summary>
+        public static string Msg_ServiceDependencyNameLengthReachedForName {
+            get {
+                return ResourceManager.GetString("Msg_ServiceDependencyNameLengthReachedForName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Service &apos;{0}&apos; was installed successfully..
         /// </summary>
         public static string Msg_ServiceInstalled {
             get {
@@ -871,6 +952,15 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Service name cannot begin or end with a period..
+        /// </summary>
+        public static string Msg_ServiceNameLeadingTrailingDot {
+            get {
+                return ResourceManager.GetString("Msg_ServiceNameLeadingTrailingDot", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Service name exceeds {0} characters..
         /// </summary>
         public static string Msg_ServiceNameLengthReached {
@@ -889,6 +979,24 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to &apos;{0}&apos; is a name reserved by Windows and cannot be used in a service name..
+        /// </summary>
+        public static string Msg_ServiceNameReservedDeviceName {
+            get {
+                return ResourceManager.GetString("Msg_ServiceNameReservedDeviceName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The service name &apos;{0}&apos; is reserved for the Servy host service (Servy.Host.exe). Choose another name..
+        /// </summary>
+        public static string Msg_ServiceNameReservedForServyHost {
+            get {
+                return ResourceManager.GetString("Msg_ServiceNameReservedForServyHost", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to The specified service was not found..
         /// </summary>
         public static string Msg_ServiceNotFound {
@@ -898,16 +1006,16 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service was removed successfully..
+        ///   Looks up a localized string similar to The specified service &apos;{0}&apos; was not found..
         /// </summary>
-        public static string Msg_ServiceRemoved {
+        public static string Msg_ServiceNotFoundDetailed {
             get {
-                return ResourceManager.GetString("Msg_ServiceRemoved", resourceCulture);
+                return ResourceManager.GetString("Msg_ServiceNotFoundDetailed", resourceCulture);
             }
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service was restarted successfully..
+        ///   Looks up a localized string similar to Service &apos;{0}&apos; was restarted successfully..
         /// </summary>
         public static string Msg_ServiceRestarted {
             get {
@@ -916,7 +1024,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service was started successfully..
+        ///   Looks up a localized string similar to Service &apos;{0}&apos; was started successfully..
         /// </summary>
         public static string Msg_ServiceStarted {
             get {
@@ -925,7 +1033,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Service was stopped successfully..
+        ///   Looks up a localized string similar to Service &apos;{0}&apos; was stopped successfully..
         /// </summary>
         public static string Msg_ServiceStopped {
             get {
@@ -970,7 +1078,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Unknown XML attribute encountered: &apos;{0}&apos;.
+        ///   Looks up a localized string similar to Unknown XML attribute encountered: &apos;{0}&apos;..
         /// </summary>
         public static string Msg_UnknownXmlAttribute {
             get {
@@ -979,7 +1087,7 @@ namespace Servy.Core.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Unknown XML element encountered: &apos;{0}&apos;.
+        ///   Looks up a localized string similar to Unknown XML element encountered: &apos;{0}&apos;..
         /// </summary>
         public static string Msg_UnknownXmlElement {
             get {

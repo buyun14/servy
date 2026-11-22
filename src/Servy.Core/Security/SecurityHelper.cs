@@ -11,6 +11,46 @@ namespace Servy.Core.Security
     public static class SecurityHelper
     {
         /// <summary>
+        /// The well-known principals that stand for "any standard user" in Servy's DACL audits.
+        /// </summary>
+        /// <remarks>
+        /// Both the file hardening in <see cref="ServyExePermissionsHardener"/> and the install-directory audit in
+        /// <c>PathSecurityGuard.WarnIfDirectoryAclNotHardened</c> decide who counts as a standard user, so the
+        /// set is declared once here rather than rebuilt at each site.
+        /// </remarks>
+        public static readonly IReadOnlyList<SecurityIdentifier> BroadUnprivilegedSids = new[]
+        {
+            new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),       // Users
+            new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null), // Authenticated Users
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null)              // Everyone
+        };
+
+        /// <summary>
+        /// Determines whether a SID is Everyone, Users or Authenticated Users.
+        /// </summary>
+        /// <param name="sid">The SID to test.</param>
+        /// <returns><see langword="true"/> for one of the <see cref="BroadUnprivilegedSids"/>.</returns>
+        public static bool IsBroadUnprivilegedSid(SecurityIdentifier sid)
+            => BroadUnprivilegedSids.Any(broad => broad.Equals(sid));
+
+        private static readonly SecurityIdentifier AdministratorsSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        private static readonly SecurityIdentifier LocalSystemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+
+        /// <summary>
+        /// Determines whether a principal is <c>BUILTIN\Administrators</c> or <c>Local System</c>, the two principals
+        /// Servy's hardening always keeps.
+        /// </summary>
+        /// <remarks>
+        /// The vault purge and the owner checks on secured directories, key material and extracted resources all decide
+        /// with this one test which principal may keep an entry or the ownership, so the set is declared once here.
+        /// </remarks>
+        /// <param name="identity">The principal, as a <see cref="SecurityIdentifier"/>, or <see langword="null"/>.</param>
+        /// <returns><see langword="true"/> for <c>Administrators</c> and <c>Local System</c>; <see langword="false"/> otherwise,
+        /// <see langword="null"/> included.</returns>
+        public static bool IsAdministrativePrincipal(IdentityReference? identity)
+            => identity != null && (AdministratorsSid.Equals(identity) || LocalSystemSid.Equals(identity));
+
+        /// <summary>
         /// Ensures a directory exists and applies a restrictive security descriptor to mitigate
         /// local privilege escalation (LPE) risks by limiting access to high-privileged accounts.
         /// </summary>
@@ -40,14 +80,28 @@ namespace Servy.Core.Security
         /// </list>
         /// </para>
         /// <para>
-        /// For existing directories, or immediately following initialization, the DACL is modified in-place to purge broad
-        /// unprivileged groups and anti-squatting components via <see cref="ApplySecurityRules"/>.
+        /// For existing directories, or immediately following initialization, the DACL is modified in-place to purge every
+        /// explicit entry for a principal other than <c>Administrators</c> and <c>Local System</c> via
+        /// <see cref="ApplySecurityRules"/>. An elevated process also hands the directory to <c>BUILTIN\Administrators</c>
+        /// when another principal owns it, because an owner keeps an implicit right to rewrite the DACL and could grant
+        /// itself access again (#7526).
+        /// </para>
+        /// <para>
+        /// An existing Root Vault (<c>breakInheritance: true</c>) that is a reparse point (symlink or junction) is refused:
+        /// a warning is logged and neither its owner nor its DACL is changed, because securing the link would leave the
+        /// directory it points to, where the vault's content lives, as it is (#7526). The files and folders below the vault root are purged of their non-administrative
+        /// entries by <see cref="ServyExePermissionsHardener.SecureVaultAsync"/> on each elevated start.
         /// </para>
         /// </remarks>
         /// <exception cref="ArgumentException">Thrown when <paramref name="path"/> is null or whitespace.</exception>
         /// <exception cref="UnauthorizedAccessException">
-        /// Thrown when the process lacks sufficient privileges to modify security descriptors, except when operating
-        /// as a non-administrator against an existing directory, where it gracefully falls back.
+        /// Thrown when the process lacks sufficient privileges, in three cases:
+        /// (a) Root Vault creation (breakInheritance: true on a missing directory), which is never
+        /// caught, (b) any failure in an elevated process, since both fallbacks are gated on
+        /// !IsAdministrator(), and (c) a failed non-Root-Vault directory creation by a non-administrator,
+        /// which is logged as a warning and then rethrown unless the directory exists by then.
+        /// A non-administrator gets a logged warning instead of an exception only for a failed
+        /// in-place ACL write on an existing directory, whatever the value of breakInheritance.
         /// </exception>
         /// <exception cref="IOException">Thrown when a general I/O error occurs during directory access.</exception>
         public static void CreateSecureDirectory(string path, bool breakInheritance = true)
@@ -86,9 +140,22 @@ namespace Servy.Core.Security
                 }
                 catch (UnauthorizedAccessException ex) when (!IsAdministrator())
                 {
-                    HandleNonAdminFallback(ex, $"Could not create directory '{path}' as non-admin. Falling back to inherited permissions from parent. Verify parent vault is secured.");
-                    return;
+                    HandleNonAdminFallback(ex, $"Could not create directory '{path}' as non-admin; it does not exist and no ACL was applied. Create it from an elevated process.");
+
+                    // Verify whether the directory was created before deciding to throw
+                    if (!Directory.Exists(path))
+                    {
+                        throw;
+                    }
                 }
+            }
+
+            // Securing a vault root that is a link would secure the link only, and leave the directory it points to,
+            // where the vault's content lives, as it is (#7526)
+            if (breakInheritance && (new DirectoryInfo(path).Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint)
+            {
+                Logger.Warn($"Refused to secure '{path}': the vault root is a reparse point (symlink/junction), so its owner and ACL were left unchanged. Replace it with a real directory.");
+                return;
             }
 
             // EXISTING OR INHERITANCE-INITIALIZED DIRECTORY: Harden in-place.
@@ -96,8 +163,19 @@ namespace Servy.Core.Security
             {
                 DirectoryInfo dirInfo = new DirectoryInfo(path);
 
-                // CRITICAL: Explicitly request only the Access rules (DACL).
-                var security = dirInfo.GetAccessControl(AccessControlSections.Access);
+                // CRITICAL: Explicitly request only the Access rules (DACL), plus the owner when elevated.
+                bool isAdmin = IsAdministrator();
+                var security = dirInfo.GetAccessControl(isAdmin ? AccessControlSections.Access | AccessControlSections.Owner : AccessControlSections.Access);
+
+                // A directory a standard user created before Servy did stays theirs, and its owner can rewrite the DACL
+                if (isAdmin)
+                {
+                    var owner = security.GetOwner(typeof(SecurityIdentifier));
+                    if (!IsAdministrativePrincipal(owner))
+                    {
+                        security.SetOwner(AdministratorsSid);
+                    }
+                }
 
                 // Apply the hardened rules.
                 ApplySecurityRules(security, currentUserSid, breakInheritance);
@@ -112,7 +190,7 @@ namespace Servy.Core.Security
 
         /// <summary>
         /// Configures a <see cref="FileSystemSecurity"/> object with restrictive rules,
-        /// purging broad group access and optionally managing inheritance boundaries.
+        /// purging every non-administrative explicit entry and optionally managing inheritance boundaries.
         /// </summary>
         /// <param name="security">The file or directory security descriptor to modify.</param>
         /// <param name="currentUserSid">
@@ -128,20 +206,16 @@ namespace Servy.Core.Security
         /// <list type="number">
         /// <item>
         /// <description>
-        /// <b>Inheritance Management:</b> Either blocks inheritance (Root Vault) or enables it (Child Folder)
-        /// to support multi-account setups.
+        /// <b>Inheritance Management:</b> Either blocks inheritance (Root Vault) or enables it (Child Folder),
+        /// so a child folder receives the vault root's entries.
         /// </description>
         /// </item>
         /// <item>
         /// <description>
-        /// <b>Dangerous Group Purge:</b> Explicitly removes access for <c>Users</c>, <c>Authenticated Users</c>,
-        /// and <c>Everyone</c> to close LPE vectors.
-        /// </description>
-        /// </item>
-        /// <item>
-        /// <description>
-        /// <b>Anti-Squatting Purge:</b> Explicitly removes any <c>Deny</c> rules for <c>Administrators</c> and
-        /// <c>Local System</c> (and the current user) to prevent Denial-of-Service via directory squatting.
+        /// <b>Full Purge:</b> Removes every explicit <c>Allow</c> and <c>Deny</c> entry, whatever its principal, so an entry
+        /// a standard user added to a directory it created before Servy did cannot survive (#7526). The service
+        /// accounts' own grants are written by <see cref="ServyExePermissionsHardener"/> on the files it hardens and on
+        /// each service's log folder, which it grants after securing it with this method.
         /// </description>
         /// </item>
         /// <item>
@@ -151,13 +225,15 @@ namespace Servy.Core.Security
         /// </item>
         /// <item>
         /// <description>
-        /// <b>Operational Continuity:</b> Grants <c>Full Control</c> to the current process user if they
-        /// are not a member of the Administrators group and are not the LocalSystem account.
+        /// <b>Operational Continuity:</b> Grants <c>Full Control</c> to the current process user when the
+        /// process is not running elevated and the user is not the LocalSystem account. This is an
+        /// elevation check (<see cref="IsAdministrator"/>), not a group-membership check: an administrator
+        /// running unelevated has a filtered token and therefore does receive an explicit ACE.
         /// </description>
         /// </item>
         /// </list>
         /// </remarks>
-        public static void ApplySecurityRules(FileSystemSecurity security, IdentityReference? currentUserSid, bool breakInheritance = true)
+        public static void ApplySecurityRules(FileSystemSecurity security, SecurityIdentifier? currentUserSid, bool breakInheritance = true)
         {
             // 1. Manage Inheritance Boundaries
             if (breakInheritance)
@@ -167,45 +243,19 @@ namespace Servy.Core.Security
             }
             else
             {
-                // Child Folder: Re-enable inheritance to heal folders broken by older versions
-                // and allow custom service accounts to flow down from the root vault.
+                // Child Folder: Re-enable inheritance to heal folders broken by older versions, so the root
+                // vault's entries flow down. Service accounts hold nothing on the root vault (#7526);
+                // their grants are written per item by ServyExePermissionsHardener.
                 security.SetAccessRuleProtection(isProtected: false, preserveInheritance: true);
             }
 
-            // 2. Define SIDs
-            var builtinUsersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);            // Users
-            var authenticatedUsersSid = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null); // Authenticated Users
-            var everyoneSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);                       // Everyone
-
-            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-            var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
-
-            // 3. PURGE: Remove explicit/manual GRANTS for dangerous groups AND explicit DENY rules for critical accounts
-            // Extract only explicit, non-inherited access rules to audit the DACL modifications safely
+            // 2. PURGE: Replace the DACL entirely. Every explicit rule goes, Allow or Deny, whatever its principal;
+            // the mandatory rules are added back below. The inherited rules are left to the inheritance setting above.
             var explicitRules = security.GetAccessRules(includeExplicit: true, includeInherited: false, typeof(SecurityIdentifier));
 
             foreach (FileSystemAccessRule rule in explicitRules)
             {
-                // Purge Allow rules for broad, unprivileged groups.
-                // NOTE: We intentionally preserve explicit 'Allow' rules for other principals (e.g., custom service accounts),
-                // otherwise a user could never run a service under a custom account, as CreateSecureDirectory
-                // is invoked during service start, desktop app and manager startup, and CLI operations.
-                if (rule.AccessControlType == AccessControlType.Allow &&
-                    (rule.IdentityReference.Equals(builtinUsersSid) ||
-                     rule.IdentityReference.Equals(authenticatedUsersSid) ||
-                     rule.IdentityReference.Equals(everyoneSid)))
-                {
-                    security.RemoveAccessRule(rule);
-                }
-
-                // Purge Deny rules targeting required operational accounts (Anti-squatting)
-                if (rule.AccessControlType == AccessControlType.Deny &&
-                    (rule.IdentityReference.Equals(adminSid) ||
-                     rule.IdentityReference.Equals(systemSid) ||
-                     (currentUserSid != null && rule.IdentityReference.Equals(currentUserSid))))
-                {
-                    security.RemoveAccessRule(rule);
-                }
+                security.RemoveAccessRuleSpecific(rule);
             }
 
             // Determine inheritance flags safely based on object descriptor target type
@@ -213,14 +263,14 @@ namespace Servy.Core.Security
             var inheritanceFlags = isDirectory ? (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) : InheritanceFlags.None;
             const PropagationFlags propagationFlags = PropagationFlags.None;
 
-            // 4. Add mandatory high-privilege rules
-            security.AddAccessRule(new FileSystemAccessRule(adminSid, FileSystemRights.FullControl, inheritanceFlags, propagationFlags, AccessControlType.Allow));
-            security.AddAccessRule(new FileSystemAccessRule(systemSid, FileSystemRights.FullControl, inheritanceFlags, propagationFlags, AccessControlType.Allow));
+            // 3. Add mandatory high-privilege rules
+            security.AddAccessRule(new FileSystemAccessRule(AdministratorsSid, FileSystemRights.FullControl, inheritanceFlags, propagationFlags, AccessControlType.Allow));
+            security.AddAccessRule(new FileSystemAccessRule(LocalSystemSid, FileSystemRights.FullControl, inheritanceFlags, propagationFlags, AccessControlType.Allow));
 
-            // 5. Add current user key
+            // 4. Add current user key
             // We grant explicit Full Control to the current user unless they are the
-            // LocalSystem account (which is already covered in Step 4) or have administrator privileges.
-            bool isSystem = currentUserSid != null && currentUserSid.Equals(systemSid);
+            // LocalSystem account (which is already covered in Step 3) or have administrator privileges.
+            bool isSystem = currentUserSid != null && currentUserSid.Equals(LocalSystemSid);
             bool isAdmin = IsAdministrator();
 
             if (currentUserSid != null && !isSystem && !isAdmin)
@@ -230,6 +280,19 @@ namespace Servy.Core.Security
         }
 
         /// <summary>
+        /// Seam for unit testing to supply a synthetic elevation state.
+        /// Production code defaults to the current Windows principal's administrator role.
+        /// </summary>
+        internal static Func<bool> IsAdministratorCore = () =>
+        {
+            using (var identity = WindowsIdentity.GetCurrent())
+            {
+                var principal = new WindowsPrincipal(identity);
+                return principal.IsInRole(WindowsBuiltInRole.Administrator);
+            }
+        };
+
+        /// <summary>
         /// Determines whether the current process is running with administrative privileges.
         /// </summary>
         /// <returns>
@@ -237,14 +300,7 @@ namespace Servy.Core.Security
         /// otherwise, <see langword="false"/>.
         /// </returns>
         [ExcludeFromCodeCoverage]
-        public static bool IsAdministrator()
-        {
-            using (var identity = WindowsIdentity.GetCurrent())
-            {
-                var principal = new WindowsPrincipal(identity);
-                return principal.IsInRole(WindowsBuiltInRole.Administrator);
-            }
-        }
+        public static bool IsAdministrator() => IsAdministratorCore();
 
         /// <summary>
         /// Validates that the current process is running as an administrator.

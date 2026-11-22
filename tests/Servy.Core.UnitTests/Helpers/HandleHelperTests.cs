@@ -1,0 +1,351 @@
+using Servy.Core.Config;
+using Servy.Core.Helpers;
+using Servy.Core.Native;
+using System.ComponentModel;
+using System.Diagnostics;
+
+namespace Servy.Core.UnitTests.Helpers
+{
+    /// <summary>
+    /// Covers <see cref="HandleHelper"/>'s handling of the Restart Manager results through a fake API: buffer growth,
+    /// errors, session cleanup, de-duplication and PID-reuse filtering.
+    /// </summary>
+    public class HandleHelperTests
+    {
+        private const uint Session = 42;
+
+        /// <summary>
+        /// Plays back scripted <c>RmGetList</c> results and records every call.
+        /// </summary>
+        private sealed class FakeRestartManager : IRestartManagerApi
+        {
+            public int StartResult { get; set; }
+            public int RegisterResult { get; set; }
+            public int EndResult { get; set; }
+
+            /// <summary>Each GetList call takes the next result; the last one repeats.</summary>
+            public List<(int Rc, NativeMethods.RM_PROCESS_INFO[] Entries)> Lists { get; } = new List<(int, NativeMethods.RM_PROCESS_INFO[])>();
+
+            public List<string> Registered { get; } = new List<string>();
+            public List<int?> BufferLengths { get; } = new List<int?>();
+            public int EndCalls { get; private set; }
+            public uint? EndedSession { get; private set; }
+
+            public int StartSession(out uint sessionHandle)
+            {
+                sessionHandle = Session;
+                return StartResult;
+            }
+
+            public int RegisterFile(uint sessionHandle, string filePath)
+            {
+                Registered.Add(filePath);
+                return RegisterResult;
+            }
+
+            public int GetList(uint sessionHandle, out uint needed, ref uint count, NativeMethods.RM_PROCESS_INFO[]? processes)
+            {
+                BufferLengths.Add(processes?.Length);
+                var (rc, entries) = Lists[Math.Min(BufferLengths.Count - 1, Lists.Count - 1)];
+                needed = (uint)entries.Length;
+
+                if (rc == 0)
+                {
+                    // Like the real API: success only when the entries fit.
+                    if (entries.Length > (processes?.Length ?? 0) && entries.Length > 0)
+                        return Errors.ERROR_MORE_DATA;
+                    for (int i = 0; i < entries.Length; i++)
+                        processes![i] = entries[i];
+                    count = (uint)entries.Length;
+                }
+
+                return rc;
+            }
+
+            public int EndSession(uint sessionHandle)
+            {
+                EndCalls++;
+                EndedSession = sessionHandle;
+                return EndResult;
+            }
+        }
+
+        private static NativeMethods.FILETIME ToFileTime(DateTime time)
+        {
+            long ft = time.ToUniversalTime().ToFileTimeUtc();
+            return new NativeMethods.FILETIME { dwLowDateTime = (uint)(ft & 0xFFFFFFFF), dwHighDateTime = (uint)(ft >> 32) };
+        }
+
+        private static NativeMethods.RM_PROCESS_INFO Entry(int pid, NativeMethods.FILETIME startTime) =>
+            new NativeMethods.RM_PROCESS_INFO
+            {
+                Process = new NativeMethods.RM_UNIQUE_PROCESS { dwProcessId = pid, ProcessStartTime = startTime },
+                strAppName = "app",
+                strServiceShortName = string.Empty,
+            };
+
+        private static NativeMethods.RM_PROCESS_INFO Self()
+        {
+            using (var self = Process.GetCurrentProcess())
+                return Entry(self.Id, ToFileTime(self.StartTime));
+        }
+
+        /// <summary>
+        /// Finds a process identifier no running process has, for an entry whose process has exited.
+        /// </summary>
+        private static int UnusedPid()
+        {
+            var used = new HashSet<int>(Process.GetProcesses().Select(p => { using (p) return p.Id; }));
+            int pid = 0x7FFFFFF0;
+            while (used.Contains(pid)) pid -= 4;
+            return pid;
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("  ")]
+        public void GetProcessesUsingFile_BlankPath_ThrowsArgumentExceptionWithoutStartingASession(string? path)
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+
+            // Act
+            Assert.Throws<ArgumentException>(() => HandleHelper.GetProcessesUsingFile(path!, api));
+
+            // Assert
+            Assert.Empty(api.Registered);
+            Assert.Equal(0, api.EndCalls);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_NullApi_ThrowsArgumentNullException()
+        {
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>(() => HandleHelper.GetProcessesUsingFile(@"C:\x.txt", null!));
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_RelativePath_RegistersTheFullPath()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, Array.Empty<NativeMethods.RM_PROCESS_INFO>()));
+
+            // Act
+            HandleHelper.GetProcessesUsingFile("locked.dll", api);
+
+            // Assert
+            Assert.Equal(new[] { Path.GetFullPath("locked.dll") }, api.Registered);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_StartSessionFails_ThrowsWin32ExceptionWithItsCodeAndEndsNothing()
+        {
+            // Arrange
+            var api = new FakeRestartManager { StartResult = 5 };
+
+            // Act
+            var ex = Assert.Throws<Win32Exception>(() => HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api));
+
+            // Assert
+            Assert.Equal(5, ex.NativeErrorCode);
+            Assert.Empty(api.Registered);
+            Assert.Equal(0, api.EndCalls);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_RegisterFails_ThrowsWin32ExceptionAndEndsTheSession()
+        {
+            // Arrange
+            var api = new FakeRestartManager { RegisterResult = 87 };
+
+            // Act
+            var ex = Assert.Throws<Win32Exception>(() => HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api));
+
+            // Assert
+            Assert.Equal(87, ex.NativeErrorCode);
+            Assert.Empty(api.BufferLengths);
+            Assert.Equal(1, api.EndCalls);
+            Assert.Equal(Session, api.EndedSession);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_GetListFails_ThrowsWin32ExceptionAndEndsTheSession()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((Errors.ERROR_ACCESS_DENIED, Array.Empty<NativeMethods.RM_PROCESS_INFO>()));
+
+            // Act
+            var ex = Assert.Throws<Win32Exception>(() => HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api));
+
+            // Assert
+            Assert.Equal(Errors.ERROR_ACCESS_DENIED, ex.NativeErrorCode);
+            Assert.Equal(1, api.EndCalls);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_NothingHoldsTheFile_ReturnsEmptyAfterOneSizeQuery()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, Array.Empty<NativeMethods.RM_PROCESS_INFO>()));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Empty(results);
+            Assert.Equal(new int?[] { null }, api.BufferLengths);
+            Assert.Equal(1, api.EndCalls);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_ListDoesNotFit_GrowsTheBufferToTheReportedSizeAndReturnsTheHolder()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, new[] { Self() }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            // First call sizes the list (no buffer), the second fills a buffer of exactly the reported size.
+            Assert.Equal(new int?[] { null, 1 }, api.BufferLengths);
+            var holder = Assert.Single(results);
+            Assert.Equal(Environment.ProcessId, holder.ProcessId);
+            using (var self = Process.GetCurrentProcess())
+                Assert.Equal(self.ProcessName, holder.ProcessName);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_ListGrowsBetweenCalls_SizesTheBufferAgain()
+        {
+            // Arrange
+            // Call 1 sizes for one entry. By call 2 the list has two entries, so a one-entry buffer no
+            // longer fits and the buffer has to be sized again before call 3 can succeed.
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, new[] { Self() }));
+            api.Lists.Add((0, new[] { Self(), Self() }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Equal(new int?[] { null, 1, 2 }, api.BufferLengths);
+            Assert.Single(results); // the two entries name the same process
+            Assert.Equal(1, api.EndCalls);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_ListKeepsGrowing_ThrowsInvalidOperationAfterTheConfiguredAttemptsAndEndsTheSession()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((Errors.ERROR_MORE_DATA, new[] { Self() }));
+
+            // Act
+            Assert.Throws<InvalidOperationException>(() => HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api));
+
+            // Assert
+            Assert.Equal(AppConfig.RestartManagerGetListMaxAttempts, api.BufferLengths.Count);
+            Assert.Equal(1, api.EndCalls);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_SameProcessListedTwice_ReturnsItOnce()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, new[] { Self(), Self() }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Single(results);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_NonPositivePid_IsSkipped()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, new[] { Entry(0, default), Entry(-4, default), Self() }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Equal(new[] { Environment.ProcessId }, results.Select(r => r.ProcessId));
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_ProcessExitedSinceTheList_IsSkipped()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, new[] { Entry(UnusedPid(), default), Self() }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Equal(new[] { Environment.ProcessId }, results.Select(r => r.ProcessId));
+        }
+
+        [Theory]
+        [InlineData(-3600)] // reported an hour before this process started: the PID was reused
+        [InlineData(3600)]  // reported an hour after: only Math.Abs makes this a mismatch
+        [InlineData(-5)]    // a few seconds off in either direction is already outside the
+        [InlineData(5)]     // one-second tolerance, which a looser bound would accept
+        public void GetProcessesUsingFile_ReportedStartTimeDiffersFromTheLiveProcess_IsSkipped(int offsetSeconds)
+        {
+            // Arrange
+            // The entry claims this PID belonged to a process created at a different time than this one: the holder
+            // exited and the PID was reused, so killing the current owner would kill the wrong process.
+            DateTime started;
+            using (var self = Process.GetCurrentProcess())
+                started = self.StartTime;
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, new[] { Entry(Environment.ProcessId, ToFileTime(started.AddSeconds(offsetSeconds))) }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Empty(results);
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_NoStartTimeReported_KeepsTheProcess()
+        {
+            // Arrange
+            var api = new FakeRestartManager();
+            api.Lists.Add((0, new[] { Entry(Environment.ProcessId, default) }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Equal(new[] { Environment.ProcessId }, results.Select(r => r.ProcessId));
+        }
+
+        [Fact]
+        public void GetProcessesUsingFile_EndSessionFails_StillReturnsTheResult()
+        {
+            // Arrange
+            var api = new FakeRestartManager { EndResult = 6 };
+            api.Lists.Add((0, new[] { Self() }));
+
+            // Act
+            var results = HandleHelper.GetProcessesUsingFile(@"C:\x.txt", api);
+
+            // Assert
+            Assert.Single(results);
+            Assert.Equal(1, api.EndCalls);
+        }
+    }
+}

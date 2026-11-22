@@ -1,9 +1,9 @@
 using Servy.Core.Config;
-using Servy.Core.Data;
 using Servy.Core.Enums;
 using Servy.Core.EnvironmentVariables;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using System.Diagnostics;
 using System.Security;
 
@@ -15,11 +15,12 @@ namespace Servy.Service.CommandLine
     public static class StartOptionsParser
     {
         /// <summary>
-        /// Resolves the service name from the command-line arguments, loads that service's stored
-        /// configuration from the repository, and projects it into a <see cref="StartOptions"/> instance.
+        /// Resolves the service name from the command-line arguments, fetches that service's stored
+        /// configuration from the Servy host service over its named pipe, and projects it into a
+        /// <see cref="StartOptions"/> instance.
         /// </summary>
-        /// <param name="serviceRepository">An instance of <see cref="IServiceRepository"/> used to retrieve service configuration from the database.</param>
-        /// <param name="processHelper">The process helper used to format process commands.</param>
+        /// <param name="namedPipesService">The named pipes service used to fetch service-specific configurations from the Servy host service.</param>
+        /// <param name="processHelper">The process helper used to resolve the stored executable and directory paths (environment-variable expansion and normalisation) via <see cref="IProcessHelper.ResolvePath"/>.</param>
         /// <param name="fullArgs">An array of strings representing the command-line arguments. Element 1 is the service name.</param>
         /// <returns>
         /// A <see cref="StartOptions"/> object populated from the stored service configuration.
@@ -29,9 +30,9 @@ namespace Servy.Service.CommandLine
         /// Thrown when <paramref name="fullArgs"/> is null/empty or carries no service name.
         /// </exception>
         /// <exception cref="InvalidOperationException">
-        /// Thrown when no service with that name exists in the database.
+        /// Thrown when the Servy host service has no service with that name, or when the host refuses or fails the request.
         /// </exception>
-        public static StartOptions Parse(IServiceRepository serviceRepository, IProcessHelper processHelper, string[] fullArgs)
+        public static StartOptions Parse(INamedPipesService namedPipesService, IProcessHelper processHelper, string[] fullArgs)
         {
             if (fullArgs == null || fullArgs.Length == 0)
             {
@@ -46,11 +47,11 @@ namespace Servy.Service.CommandLine
                 throw new ArgumentException("Service name is empty!");
             }
 
-            var serviceDto = serviceRepository.GetByName(serviceName);
+            var serviceDto = namedPipesService.GetByName(serviceName);
 
             if (serviceDto == null)
             {
-                throw new InvalidOperationException($"Service {serviceName} not found in the database!");
+                throw new InvalidOperationException($"Service {serviceName} was not found by the Servy host service.");
             }
 
             return new StartOptions
@@ -58,7 +59,7 @@ namespace Servy.Service.CommandLine
                 // Main
                 ServiceName = serviceName,
                 ExecutablePath = SafeResolvePath(processHelper, serviceDto.ExecutablePath, nameof(serviceDto.ExecutablePath), serviceName),
-                ExecutableArgs = Helper.EscapeBackslashes(serviceDto.Parameters ?? string.Empty),
+                ExecutableArgs = Helper.EscapeBackslashes(serviceDto.Parameters),
                 StartupDirectory = SafeResolvePath(processHelper, serviceDto.StartupDirectory, nameof(serviceDto.StartupDirectory), serviceName),
 
                 // Use ConfigParser.ParseEnum to ensure the priority is a valid member of ProcessPriority.
@@ -92,11 +93,12 @@ namespace Servy.Service.CommandLine
                 EnableHeartbeatUrlFlags = serviceDto.EnableHeartbeatUrlFlags ?? AppConfig.DefaultEnableHeartbeatUrlFlags,
 
                 EnvironmentVariables = SafeParseEnvVars(serviceDto.EnvironmentVariables, nameof(serviceDto.EnvironmentVariables), serviceName),
+                AllowOverriddenRuntimeVars = serviceDto.AllowOverriddenRuntimeVars ?? AppConfig.DefaultAllowOverriddenRuntimeVars,
 
                 // Pre-Launch settings
                 PreLaunchExecutablePath = SafeResolvePath(processHelper, serviceDto.PreLaunchExecutablePath, nameof(serviceDto.PreLaunchExecutablePath), serviceName),
                 PreLaunchStartupDirectory = SafeResolvePath(processHelper, serviceDto.PreLaunchStartupDirectory, nameof(serviceDto.PreLaunchStartupDirectory), serviceName),
-                PreLaunchExecutableArgs = Helper.EscapeBackslashes(serviceDto.PreLaunchParameters ?? string.Empty),
+                PreLaunchExecutableArgs = Helper.EscapeBackslashes(serviceDto.PreLaunchParameters),
                 PreLaunchEnvironmentVariables = SafeParseEnvVars(serviceDto.PreLaunchEnvironmentVariables, nameof(serviceDto.PreLaunchEnvironmentVariables), serviceName),
                 PreLaunchStdoutPath = serviceDto.PreLaunchStdoutPath,
                 PreLaunchStderrPath = serviceDto.PreLaunchStderrPath,
@@ -107,12 +109,12 @@ namespace Servy.Service.CommandLine
                 // Failure program settings
                 FailureProgramPath = SafeResolvePath(processHelper, serviceDto.FailureProgramPath, nameof(serviceDto.FailureProgramPath), serviceName),
                 FailureProgramStartupDirectory = SafeResolvePath(processHelper, serviceDto.FailureProgramStartupDirectory, nameof(serviceDto.FailureProgramStartupDirectory), serviceName),
-                FailureProgramArgs = Helper.EscapeBackslashes(serviceDto.FailureProgramParameters ?? string.Empty),
+                FailureProgramExecutableArgs = Helper.EscapeBackslashes(serviceDto.FailureProgramParameters),
 
                 // Post-Launch settings
                 PostLaunchExecutablePath = SafeResolvePath(processHelper, serviceDto.PostLaunchExecutablePath, nameof(serviceDto.PostLaunchExecutablePath), serviceName),
                 PostLaunchStartupDirectory = SafeResolvePath(processHelper, serviceDto.PostLaunchStartupDirectory, nameof(serviceDto.PostLaunchStartupDirectory), serviceName),
-                PostLaunchExecutableArgs = Helper.EscapeBackslashes(serviceDto.PostLaunchParameters ?? string.Empty),
+                PostLaunchExecutableArgs = Helper.EscapeBackslashes(serviceDto.PostLaunchParameters),
 
                 // Operational toggles
                 EnableDebugLogs = serviceDto.EnableDebugLogs ?? AppConfig.DefaultEnableDebugLogs,
@@ -130,14 +132,14 @@ namespace Servy.Service.CommandLine
                 // Pre-Stop settings
                 PreStopExecutablePath = SafeResolvePath(processHelper, serviceDto.PreStopExecutablePath, nameof(serviceDto.PreStopExecutablePath), serviceName),
                 PreStopStartupDirectory = SafeResolvePath(processHelper, serviceDto.PreStopStartupDirectory, nameof(serviceDto.PreStopStartupDirectory), serviceName),
-                PreStopExecutableArgs = Helper.EscapeBackslashes(serviceDto.PreStopParameters ?? string.Empty),
+                PreStopExecutableArgs = Helper.EscapeBackslashes(serviceDto.PreStopParameters),
                 PreStopTimeoutInSeconds = serviceDto.PreStopTimeoutSeconds ?? AppConfig.DefaultPreStopTimeoutSeconds,
                 PreStopLogAsError = serviceDto.PreStopLogAsError ?? AppConfig.DefaultPreStopLogAsError,
 
                 // Post-Stop settings
                 PostStopExecutablePath = SafeResolvePath(processHelper, serviceDto.PostStopExecutablePath, nameof(serviceDto.PostStopExecutablePath), serviceName),
                 PostStopStartupDirectory = SafeResolvePath(processHelper, serviceDto.PostStopStartupDirectory, nameof(serviceDto.PostStopStartupDirectory), serviceName),
-                PostStopExecutableArgs = Helper.EscapeBackslashes(serviceDto.PostStopParameters ?? string.Empty),
+                PostStopExecutableArgs = Helper.EscapeBackslashes(serviceDto.PostStopParameters),
             };
         }
 
@@ -177,9 +179,9 @@ namespace Servy.Service.CommandLine
         {
             try
             {
-                return EnvironmentVariableParser.Parse(raw ?? string.Empty);
+                return EnvironmentVariableParser.Parse(raw);
             }
-            catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
+            catch (FormatException ex)
             {
                 Logger.Error(
                     $"Service '{serviceName}': stored {fieldName} value is malformed and could not be parsed " +
@@ -194,9 +196,10 @@ namespace Servy.Service.CommandLine
         /// </summary>
         private static string SafeResolvePath(IProcessHelper processHelper, string? rawPath, string fieldName, string serviceName)
         {
+            var input = rawPath ?? string.Empty;
             try
             {
-                return processHelper.ResolvePath(rawPath ?? string.Empty) ?? string.Empty;
+                return processHelper.ResolvePath(input) ?? string.Empty;
             }
             catch (Exception ex) when (ex is InvalidOperationException
             || ex is ArgumentException
@@ -207,7 +210,7 @@ namespace Servy.Service.CommandLine
                 Logger.Error(
                     $"Service '{serviceName}': stored {fieldName} location resolution failed or is invalid " +
                     $"({ex.Message}). Proceeding with an unmapped string token path to ensure startup execution.");
-                return rawPath ?? string.Empty;
+                return input;
             }
         }
     }

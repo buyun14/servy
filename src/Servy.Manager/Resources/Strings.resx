@@ -37,10 +37,10 @@
     <value>Import</value>
   </data>
   <data name="Menu_ImportXml" xml:space="preserve">
-    <value>Import XML configuration</value>
+    <value>Import XML configuration...</value>
   </data>
   <data name="Menu_ImportJson" xml:space="preserve">
-    <value>Import JSON configuration</value>
+    <value>Import JSON configuration...</value>
   </data>
 
   <data name="Menu_Config" xml:space="preserve">
@@ -54,10 +54,16 @@
     <value>Help / Documentation</value>
   </data>
   <data name="Menu_CheckUpdates" xml:space="preserve">
-    <value>Check for updates...</value>
+    <value>Check for updates</value>
   </data>
   <data name="Menu_About" xml:space="preserve">
     <value>About Servy Manager</value>
+  </data>
+  <data name="Menu_View" xml:space="preserve">
+    <value>View</value>
+  </data>
+  <data name="Menu_ResetWindowLayout" xml:space="preserve">
+    <value>Reset window layout</value>
   </data>
 
   <data name="Text_About" xml:space="preserve">
@@ -70,8 +76,7 @@ Built with {1}
 
 Licensed under the MIT License.
 
-Copyright © {2} Akram El Assas. All rights reserved.
-    </value>
+Copyright © {2} Akram El Assas. All rights reserved.</value>
   </data>
 
   <!-- Tabs -->
@@ -126,7 +131,7 @@ Copyright © {2} Akram El Assas. All rights reserved.
     <value>Collapse all nodes in the dependency tree</value>
   </data>
   <data name="Label_Dependencies_Gear_Info" xml:space="preserve">
-    <value>Status: Running (green), Stopped (red), Cycle (orange)</value>
+    <value>Status: Running (green), Stopped (red), Cycle (orange), Unavailable (orange warning icon)</value>
   </data>
   <data name="Label_F5_Shortcut_Dependencies" xml:space="preserve">
     <value>Press F5 to refresh the dependency tree</value>
@@ -154,10 +159,13 @@ Copyright © {2} Akram El Assas. All rights reserved.
   <data name="Label_F5_Shortcut_Logs" xml:space="preserve">
     <value>Press F5 to refresh logs</value>
   </data>
-
+  
   <!-- Services DataGrid -->
   <data name="Column_Name" xml:space="preserve">
     <value>Name</value>
+  </data>
+  <data name="Column_DisplayName" xml:space="preserve">
+    <value>Display Name</value>
   </data>
   <data name="Column_Description" xml:space="preserve">
     <value>Description</value>
@@ -170,6 +178,17 @@ Copyright © {2} Akram El Assas. All rights reserved.
   </data>
   <data name="Column_LogOnAs" xml:space="preserve">
     <value>Log On As</value>
+  </data>
+
+  <!-- Built-in service accounts (Log On As column values) -->
+  <data name="Account_LocalSystem" xml:space="preserve">
+    <value>Local System</value>
+  </data>
+  <data name="Account_LocalService" xml:space="preserve">
+    <value>Local Service</value>
+  </data>
+  <data name="Account_NetworkService" xml:space="preserve">
+    <value>Network Service</value>
   </data>
 
   <!-- Status -->
@@ -196,6 +215,9 @@ Copyright © {2} Akram El Assas. All rights reserved.
   </data>
   <data name="Status_NotInstalled" xml:space="preserve">
     <value>Not Installed</value>
+  </data>
+  <data name="Status_Unknown" xml:space="preserve">
+    <value>Unknown</value>
   </data>
 
   <data name="Label_Fetching" xml:space="preserve">
@@ -270,9 +292,11 @@ Copyright © {2} Akram El Assas. All rights reserved.
   <!-- Startup Type Items -->
   <data name="StartupType_Automatic" xml:space="preserve">
     <value>Automatic</value>
+    <comment>Compact label intended for narrow grid columns in Servy.Manager UI</comment>
   </data>
   <data name="StartupType_AutomaticDelayedStart" xml:space="preserve">
     <value>Automatic (delayed)</value>
+    <comment>Compact label intended for narrow grid columns in Servy.Manager UI</comment>
   </data>
   <data name="StartupType_Manual" xml:space="preserve">
     <value>Manual</value>
@@ -292,16 +316,16 @@ Copyright © {2} Akram El Assas. All rights reserved.
     <value>Failed to load JSON service configuration.</value>
   </data>
   <data name="ImportXml_Success" xml:space="preserve">
-    <value>XML Configuration imported successfully.</value>
+    <value>XML configuration imported successfully.</value>
   </data>
   <data name="ImportJson_Success" xml:space="preserve">
-    <value>JSON Configuration imported successfully.</value>
+    <value>JSON configuration imported successfully.</value>
   </data>
   <data name="ImportXml_Error" xml:space="preserve">
-    <value>Failed to import XML Configuration.</value>
+    <value>Failed to import XML configuration.</value>
   </data>
   <data name="ImportJson_Error" xml:space="preserve">
-    <value>Failed to import JSON Configuration.</value>
+    <value>Failed to import JSON configuration.</value>
   </data>
 
   <!-- XML/JSON export -->
@@ -312,38 +336,22 @@ Copyright © {2} Akram El Assas. All rights reserved.
     <value>Export JSON configuration</value>
   </data>
   <data name="ExportXml_Success" xml:space="preserve">
-    <value>XML Configuration exported successfully.</value>
+    <value>XML configuration for service '{0}' exported successfully.</value>
   </data>
   <data name="ExportJson_Success" xml:space="preserve">
-    <value>JSON Configuration exported successfully.</value>
+    <value>JSON configuration for service '{0}' exported successfully.</value>
   </data>
 
   <!-- Messages -->
-  <data name="Msg_InvalidWrapperExePath" xml:space="preserve">
-    <value>Service wrapper executable not found.</value>
-  </data>
-
-  <data name="Msg_ServiceInstalled" xml:space="preserve">
-    <value>Service was installed successfully.</value>
-  </data>
-  <data name="Msg_UnexpectedError" xml:space="preserve">
-    <value>An unexpected error occurred.</value>
-  </data>
-  <data name="Msg_ServiceStarted" xml:space="preserve">
-    <value>Service was started successfully.</value>
-  </data>
-  <data name="Msg_ServiceStopped" xml:space="preserve">
-    <value>Service was stopped successfully.</value>
-  </data>
-  <data name="Msg_ServiceRestarted" xml:space="preserve">
-    <value>Service was restarted successfully.</value>
-  </data>
-
   <data name="Msg_UninstallServiceConfirm" xml:space="preserve">
-    <value>Are you sure you want to uninstall this service? All service configuration will be permanently lost and cannot be recovered.</value>
+    <value>Are you sure you want to uninstall the service '{0}'?
+
+All service configuration will be permanently lost and cannot be recovered.</value>
   </data>
   <data name="Msg_RemoveServiceConfirm" xml:space="preserve">
-    <value>Are you sure you want to remove this service? All service configuration will be permanently lost and cannot be recovered.</value>
+    <value>Are you sure you want to remove the service '{0}'?
+
+All service configuration will be permanently lost and cannot be recovered.</value>
   </data>
   <data name="Msg_DesktopAppNotFound" xml:space="preserve">
     <value>Servy Desktop App not found.</value>
@@ -369,6 +377,9 @@ Copyright © {2} Akram El Assas. All rights reserved.
   <data name="Column_Level" xml:space="preserve">
     <value>Level</value>
   </data>
+  <data name="Column_EventId" xml:space="preserve">
+    <value>Event ID</value>
+  </data>
   <data name="Column_Message" xml:space="preserve">
     <value>Message</value>
   </data>
@@ -378,15 +389,15 @@ Copyright © {2} Akram El Assas. All rights reserved.
   </data>
 
   <data name="Msg_ServiceAlreadyExists" xml:space="preserve">
-  <value>A service with this name already exists. Would you like to replace it?
+    <value>A service '{0}' with this name already exists. Would you like to replace it?
 
-If the service is disabled and marked for deletion, installation will fail until you restart your PC.</value>
-</data>
+If the service is disabled and marked for deletion, the installation will fail until you restart the computer.</value>
+  </data>
   <data name="Msg_ImportServiceConfirmation" xml:space="preserve">
-    <value>A service with this name already exists. Would you like to replace it?
+    <value>A service '{0}' with this name already exists. Would you like to replace it?
 
 You need to click Install after importing and restart the service for changes to take effect.
-If the service is disabled and marked for deletion, installation will fail until you restart your PC.</value>
+If the service is disabled and marked for deletion, the installation will fail until you restart the computer.</value>
   </data>
 
   <data name="Msg_ServiceDisabledError" xml:space="preserve">
@@ -435,8 +446,8 @@ If the service is disabled and marked for deletion, installation will fail until
   </data>
 
   <!-- Miscellaneous -->
-  <data name="Msg_InvalidServiceName" xml:space="preserve">
-    <value>Service name contains invalid characters. Avoid using '\', '/', ':', '*', '?', '"', '&lt;', '&gt;', '|'.</value>
+  <data name="Msg_DesktopAppLaunchFailed" xml:space="preserve">
+    <value>Failed to launch the Servy Desktop App.</value>
   </data>
 
   <!-- Service Footer Templates -->
@@ -450,7 +461,19 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Loaded {0} services in {1}</value>
   </data>
 
-  <!-- Log Footer Templates -->
+  <!-- Logs Tab -->
+  <data name="LogLevel_All" xml:space="preserve">
+    <value>All</value>
+  </data>
+  <data name="LogLevel_Error" xml:space="preserve">
+    <value>Error</value>
+  </data>
+  <data name="LogLevel_Information" xml:space="preserve">
+    <value>Information</value>
+  </data>
+  <data name="LogLevel_Warning" xml:space="preserve">
+    <value>Warning</value>
+  </data>
   <data name="Footer_Log_None" xml:space="preserve">
     <value>No logs found in {1}</value>
   </data>
@@ -464,61 +487,72 @@ If the service is disabled and marked for deletion, installation will fail until
   <data name="Msg_FailedToLoadDependencyTree" xml:space="preserve">
     <value>Failed to load service dependency tree.</value>
   </data>
+  <data name="Tooltip_DependencyUnavailable" xml:space="preserve">
+    <value>This dependency is unavailable or inaccessible.</value>
+  </data>
 
   <!-- Automation Properties -->
+  <!-- Conventions: AutomationProperties.HelpText entries use the IMPERATIVE mood ("Enter...", "Select...", "Browse..."). -->
   <data name="Automation_MainWindow_Name" xml:space="preserve">
     <value>Servy Manager Window</value>
   </data>
   <data name="Automation_MainWindow_HelpText" xml:space="preserve">
-    <value>The main interface for the Servy service manager, used to configure service parameters and monitor execution.</value>
+    <value>Configure service parameters and monitor execution using the Servy Manager interface.</value>
   </data>
 
   <data name="Automation_MainMenu_Name" xml:space="preserve">
     <value>Main Menu</value>
   </data>
   <data name="Automation_MainMenu_HelpText" xml:space="preserve">
-    <value>Provides options to import configuration, configure settings, and access help.</value>
+    <value>Access options to import configuration, configure settings, reset the window layout, and access help.</value>
   </data>
 
   <data name="Automation_ImportMenu_HelpText" xml:space="preserve">
-    <value>Opens a menu to import service configurations.</value>
+    <value>Open a menu to import service configurations.</value>
   </data>
   <data name="Automation_ImportXmlMenuItem_HelpText" xml:space="preserve">
-    <value>Imports a service configuration from an XML file.</value>
+    <value>Import a service configuration from an XML file.</value>
   </data>
   <data name="Automation_ImportJsonMenuItem_HelpText" xml:space="preserve">
-    <value>Imports a service configuration from a JSON file.</value>
+    <value>Import a service configuration from a JSON file.</value>
   </data>
 
   <data name="Automation_ConfigMenu_HelpText" xml:space="preserve">
-    <value>Opens the configuration app for the selected service.</value>
+    <value>Open the configuration app for the selected service.</value>
+  </data>
+
+  <data name="Automation_ViewMenu_HelpText" xml:space="preserve">
+    <value>Open a menu containing window layout options.</value>
+  </data>
+  <data name="Automation_ResetWindowLayoutMenuItem_HelpText" xml:space="preserve">
+    <value>Restore the default window size, position, and column widths.</value>
   </data>
 
   <data name="Automation_HelpMenu_HelpText" xml:space="preserve">
-    <value>Opens a menu containing documentation and update options.</value>
+    <value>Open a menu containing documentation and update options.</value>
   </data>
   <data name="Automation_DocMenuItem_HelpText" xml:space="preserve">
-    <value>Opens the official Servy documentation.</value>
+    <value>Open the official Servy documentation.</value>
   </data>
   <data name="Automation_CheckUpdatesMenuItem_HelpText" xml:space="preserve">
-    <value>Checks if a newer version of Servy is available.</value>
+    <value>Check if a newer version of Servy is available.</value>
   </data>
   <data name="Automation_AboutMenuItem_HelpText" xml:space="preserve">
-    <value>Displays application information and copyright details.</value>
+    <value>Show application information and copyright details.</value>
   </data>
 
   <data name="Automation_MainTabControl_Name" xml:space="preserve">
     <value>Main Navigation Tabs</value>
   </data>
   <data name="Automation_MainTabControl_HelpText" xml:space="preserve">
-    <value>Allows switching between Services, Performance, Console, Dependencies, and Logs views.</value>
+    <value>Switch between Services, Performance, Console, Dependencies, and Logs views.</value>
   </data>
 
   <data name="Automation_MainTab_Name" xml:space="preserve">
     <value>Services Tab</value>
   </data>
   <data name="Automation_MainTab_HelpText" xml:space="preserve">
-    <value>Displays the main list of managed services.</value>
+    <value>View the main list of managed services.</value>
   </data>
 
   <data name="Automation_SearchTextBox_Name" xml:space="preserve">
@@ -529,14 +563,14 @@ If the service is disabled and marked for deletion, installation will fail until
   </data>
 
   <data name="Automation_SearchButton_HelpText" xml:space="preserve">
-    <value>Execute service search.</value>
+    <value>Execute the service search.</value>
   </data>
 
   <data name="Automation_ServicesDataGrid_Name" xml:space="preserve">
     <value>Services List</value>
   </data>
   <data name="Automation_ServicesDataGrid_HelpText" xml:space="preserve">
-    <value>List of managed services.</value>
+    <value>View and manage the list of services.</value>
   </data>
 
   <data name="Automation_SelectAllColumnHeader_Name" xml:space="preserve">
@@ -546,7 +580,7 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Select All Services</value>
   </data>
   <data name="Automation_SelectAllServicesCheckBox_HelpText" xml:space="preserve">
-    <value>Selects or deselects all services in the list.</value>
+    <value>Select or deselect all services in the list.</value>
   </data>
 
   <data name="Automation_SelectServiceCheckBox_Name" xml:space="preserve">
@@ -560,56 +594,63 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Name Column</value>
   </data>
   <data name="Automation_NameColumnCell_HelpText" xml:space="preserve">
-    <value>The name of the service.</value>
+    <value>View the name of the service.</value>
+  </data>
+
+  <data name="Automation_DisplayNameColumnHeader_Name" xml:space="preserve">
+    <value>Display Name Column</value>
+  </data>
+  <data name="Automation_DisplayNameColumnCell_HelpText" xml:space="preserve">
+    <value>View the display name of the service.</value>
   </data>
 
   <data name="Automation_DescriptionColumnHeader_Name" xml:space="preserve">
     <value>Description Column</value>
   </data>
   <data name="Automation_DescriptionColumnCell_HelpText" xml:space="preserve">
-    <value>The description of the service.</value>
+    <value>View the description of the service.</value>
   </data>
 
   <data name="Automation_StatusColumnHeader_Name" xml:space="preserve">
     <value>Status Column</value>
   </data>
   <data name="Automation_StatusColumnCell_HelpText" xml:space="preserve">
-    <value>The current status of the service.</value>
+    <value>View the current status of the service.</value>
   </data>
 
   <data name="Automation_StartupTypeColumnHeader_Name" xml:space="preserve">
     <value>Startup Type Column</value>
   </data>
   <data name="Automation_StartupTypeColumnCell_HelpText" xml:space="preserve">
-    <value>The configured startup type for the service.</value>
+    <value>View the configured startup type for the service.</value>
   </data>
 
   <data name="Automation_LogOnAsColumnHeader_Name" xml:space="preserve">
-    <value>User Session Column</value>
+    <value>Log On As Column</value>
   </data>
   <data name="Automation_LogOnAsColumnCell_HelpText" xml:space="preserve">
-    <value>The user account the service is running as.</value>
+    <value>View the user account the service is running as.</value>
   </data>
 
   <data name="Automation_PidColumnHeader_Name" xml:space="preserve">
     <value>PID Column</value>
   </data>
   <data name="Automation_PidColumnCell_HelpText" xml:space="preserve">
-    <value>The process identifier (PID) of the running service.</value>
+    <value>View the process identifier (PID) of the running service.</value>
   </data>
 
   <data name="Automation_CpuColumnHeader_Name" xml:space="preserve">
     <value>CPU Column</value>
   </data>
   <data name="Automation_CpuColumnCell_HelpText" xml:space="preserve">
-    <value>The current CPU usage of the service.</value>
+    <value>View the current CPU usage of the service.</value>
   </data>
 
   <data name="Automation_RamColumnHeader_Name" xml:space="preserve">
     <value>RAM Column</value>
   </data>
   <data name="Automation_RamColumnCell_HelpText" xml:space="preserve">
-    <value>The current RAM usage of the service.</value>
+    <value>View the current RAM usage of the service.</value>
   </data>
 
   <data name="Automation_ActionsColumnHeader_Name" xml:space="preserve">
@@ -617,123 +658,116 @@ If the service is disabled and marked for deletion, installation will fail until
   </data>
 
   <data name="Automation_StartSelectedButton_HelpText" xml:space="preserve">
-    <value>Starts all selected services.</value>
+    <value>Start all selected services.</value>
   </data>
 
   <data name="Automation_StopSelectedButton_HelpText" xml:space="preserve">
-    <value>Stops all selected services.</value>
+    <value>Stop all selected services.</value>
   </data>
 
   <data name="Automation_RestartSelectedButton_HelpText" xml:space="preserve">
-    <value>Restarts all selected services.</value>
-  </data>
-
-  <data name="Automation_MoreActionsHeaderButton_Name" xml:space="preserve">
-    <value>More Actions Header Placeholder</value>
-  </data>
-  <data name="Automation_MoreActionsHeaderButton_HelpText" xml:space="preserve">
-    <value>Placeholder for the More Actions menu header.</value>
+    <value>Restart all selected services.</value>
   </data>
 
   <data name="Automation_StartServiceButton_Name" xml:space="preserve">
     <value>Start Service</value>
   </data>
   <data name="Automation_StartServiceButton_HelpText" xml:space="preserve">
-    <value>Starts the current service.</value>
+    <value>Start the current service.</value>
   </data>
 
   <data name="Automation_StopServiceButton_Name" xml:space="preserve">
     <value>Stop Service</value>
   </data>
   <data name="Automation_StopServiceButton_HelpText" xml:space="preserve">
-    <value>Stops the current service.</value>
+    <value>Stop the current service.</value>
   </data>
 
   <data name="Automation_RestartServiceButton_Name" xml:space="preserve">
     <value>Restart Service</value>
   </data>
   <data name="Automation_RestartServiceButton_HelpText" xml:space="preserve">
-    <value>Restarts the current service.</value>
+    <value>Restart the current service.</value>
   </data>
 
   <data name="Automation_MoreActionsButton_HelpText" xml:space="preserve">
-    <value>Opens a menu with additional actions for the current service.</value>
+    <value>Open a menu with additional actions for the current service.</value>
   </data>
 
   <data name="Automation_RowInstallMenuItem_Name" xml:space="preserve">
     <value>Install Service</value>
   </data>
   <data name="Automation_RowInstallMenuItem_HelpText" xml:space="preserve">
-    <value>Installs the service configuration to the system.</value>
+    <value>Install the service configuration to the system.</value>
   </data>
 
   <data name="Automation_RowUninstallMenuItem_Name" xml:space="preserve">
     <value>Uninstall Service</value>
   </data>
   <data name="Automation_RowUninstallMenuItem_HelpText" xml:space="preserve">
-    <value>Uninstalls the service from the system.</value>
+    <value>Uninstall the service from the system.</value>
   </data>
 
   <data name="Automation_RowRemoveMenuItem_Name" xml:space="preserve">
     <value>Remove Service</value>
   </data>
   <data name="Automation_RowRemoveMenuItem_HelpText" xml:space="preserve">
-    <value>Removes the service from the Servy Manager list.</value>
+    <value>Remove the service from the Servy Manager list.</value>
   </data>
 
   <data name="Automation_RowConfigMenuItem_Name" xml:space="preserve">
     <value>Configure Service</value>
   </data>
   <data name="Automation_RowConfigMenuItem_HelpText" xml:space="preserve">
-    <value>Opens the configuration app for this service.</value>
+    <value>Open the configuration app for this service.</value>
   </data>
 
   <data name="Automation_RowExportXmlMenuItem_HelpText" xml:space="preserve">
-    <value>Exports the current service configuration to an XML file.</value>
+    <value>Export the current service configuration to an XML file.</value>
   </data>
 
   <data name="Automation_RowExportJsonMenuItem_HelpText" xml:space="preserve">
-    <value>Exports the current service configuration to a JSON file.</value>
+    <value>Export the current service configuration to a JSON file.</value>
   </data>
 
   <data name="Automation_RowCopyPidMenuItem_HelpText" xml:space="preserve">
-    <value>Copies the current Process ID of the service to the clipboard.</value>
+    <value>Copy the current Process ID of the service to the clipboard.</value>
   </data>
 
   <data name="Automation_PerformanceTab_Name" xml:space="preserve">
     <value>Performance Tab</value>
   </data>
   <data name="Automation_PerformanceTab_HelpText" xml:space="preserve">
-    <value>Displays real-time CPU and memory usage statistics for the running service.</value>
+    <value>View real-time CPU and memory usage statistics for the running service.</value>
   </data>
 
   <data name="Automation_ConsoleTab_Name" xml:space="preserve">
     <value>Console Tab</value>
   </data>
   <data name="Automation_ConsoleTab_HelpText" xml:space="preserve">
-    <value>Displays the real-time standard output and error logs for the selected service.</value>
+    <value>View the real-time standard output and error logs for the selected service.</value>
   </data>
 
   <data name="Automation_DependenciesTab_Name" xml:space="preserve">
     <value>Dependencies Tab</value>
   </data>
   <data name="Automation_DependenciesTab_HelpText" xml:space="preserve">
-    <value>Shows the service dependencies tree and status hierarchy.</value>
+    <value>View the service dependencies tree and status hierarchy.</value>
   </data>
 
   <data name="Automation_LogsTab_Name" xml:space="preserve">
     <value>Logs Tab</value>
   </data>
   <data name="Automation_LogsTab_HelpText" xml:space="preserve">
-    <value>Displays a list of system events and diagnostic records for the service.</value>
+    <value>View a list of system events and diagnostic records for all services.</value>
   </data>
 
   <data name="Automation_MainFooterText_HelpText" xml:space="preserve">
-    <value>Displays the total number of services loaded and execution time.</value>
+    <value>View total number of services loaded and execution duration.</value>
   </data>
 
   <data name="Automation_MainShortcutInfo_HelpText" xml:space="preserve">
-    <value>Indicates that pressing F5 refreshes the service list.</value>
+    <value>Press F5 to refresh the service list.</value>
   </data>
 
   <!-- Performance View Specific Automation Properties -->
@@ -741,7 +775,7 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Performance Monitor View</value>
   </data>
   <data name="Automation_PerformanceView_HelpText" xml:space="preserve">
-    <value>Displays resource usage statistics for the selected process.</value>
+    <value>View resource usage statistics for the selected process.</value>
   </data>
 
   <data name="Automation_PerformanceServiceList_Name" xml:space="preserve">
@@ -755,39 +789,39 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Process ID</value>
   </data>
   <data name="Automation_PidValue_HelpText" xml:space="preserve">
-    <value>Displays the Process ID of the currently selected service process.</value>
+    <value>View the Process ID of the currently selected service process.</value>
   </data>
 
   <data name="Automation_CopyPidButton_HelpText" xml:space="preserve">
-    <value>Copies the Process ID to the clipboard.</value>
+    <value>Copy the Process ID to the clipboard.</value>
   </data>
 
   <data name="Automation_CpuGraphGrid_Name" xml:space="preserve">
     <value>CPU Usage Graph</value>
   </data>
   <data name="Automation_CpuGraphGrid_HelpText" xml:space="preserve">
-    <value>Historical view of CPU percentage usage.</value>
+    <value>View historical graph of CPU percentage usage.</value>
   </data>
 
   <data name="Automation_CpuUsageLabel_Name" xml:space="preserve">
     <value>Current CPU Usage</value>
   </data>
   <data name="Automation_CpuUsageLabel_HelpText" xml:space="preserve">
-    <value>Displays the real-time percentage of CPU utilized by the service process.</value>
+    <value>View the real-time percentage of CPU utilized by the service process.</value>
   </data>
 
   <data name="Automation_RamGraphGrid_Name" xml:space="preserve">
     <value>RAM Usage Graph</value>
   </data>
   <data name="Automation_RamGraphGrid_HelpText" xml:space="preserve">
-    <value>Historical view of memory usage.</value>
+    <value>View historical graph of memory usage.</value>
   </data>
 
   <data name="Automation_RamUsageLabel_Name" xml:space="preserve">
     <value>Current RAM Usage</value>
   </data>
   <data name="Automation_RamUsageLabel_HelpText" xml:space="preserve">
-    <value>Displays the real-time memory usage of the service process.</value>
+    <value>View the real-time memory usage of the service process.</value>
   </data>
 
   <!-- Console View Specific Automation Properties -->
@@ -795,7 +829,7 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Console Output View</value>
   </data>
   <data name="Automation_ConsoleViewRoot_HelpText" xml:space="preserve">
-    <value>Displays real-time standard output and error logs for the selected service.</value>
+    <value>View the real-time standard output and error logs for the selected service.</value>
   </data>
 
   <data name="Automation_ConsoleServiceList_Name" xml:space="preserve">
@@ -805,29 +839,18 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Select a service to view its console output.</value>
   </data>
 
-  <data name="Automation_ConsolePidValue_Name" xml:space="preserve">
-    <value>Process ID</value>
-  </data>
-  <data name="Automation_ConsolePidValue_HelpText" xml:space="preserve">
-    <value>The process identifier (PID) of the monitored service.</value>
-  </data>
-
-  <data name="Automation_ConsoleCopyPidButton_HelpText" xml:space="preserve">
-    <value>Copies the service process ID to the clipboard.</value>
-  </data>
-
   <data name="Automation_ResumeScrollButton_Name" xml:space="preserve">
     <value>Resume Scrolling</value>
   </data>
   <data name="Automation_ResumeScrollButton_HelpText" xml:space="preserve">
-    <value>Resumes automatic scrolling to the latest log entry.</value>
+    <value>Resume automatic scrolling to the latest log entry.</value>
   </data>
 
   <data name="Automation_ConsoleInstructions_Name" xml:space="preserve">
     <value>Console Instructions</value>
   </data>
   <data name="Automation_ConsoleInstructions_HelpText" xml:space="preserve">
-    <value>Instructions on how to configure stdout and stderr redirection for live console output.</value>
+    <value>Read instructions on how to configure stdout and stderr redirection for live console output.</value>
   </data>
 
   <data name="Automation_ConsoleFilterTextBox_Name" xml:space="preserve">
@@ -841,14 +864,14 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Log Terminal</value>
   </data>
   <data name="Automation_ConsoleLogList_HelpText" xml:space="preserve">
-    <value>Displays scrolling log output. Use context menu to copy selected lines.</value>
+    <value>View scrolling log output. Use context menu to copy selected lines.</value>
   </data>
 
   <data name="Automation_CopyLogMenuItem_Name" xml:space="preserve">
     <value>Copy Selection</value>
   </data>
   <data name="Automation_CopyLogMenuItem_HelpText" xml:space="preserve">
-    <value>Copies selected console log lines to the clipboard.</value>
+    <value>Copy selected console log lines to the clipboard.</value>
   </data>
 
   <!-- Dependencies View Specific Automation Properties -->
@@ -856,65 +879,54 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Dependencies View</value>
   </data>
   <data name="Automation_DependenciesViewRoot_HelpText" xml:space="preserve">
-    <value>Displays the service list and their hierarchical dependencies.</value>
+    <value>View the service list and their hierarchical dependencies.</value>
   </data>
 
   <data name="Automation_DependenciesServiceList_Name" xml:space="preserve">
-    <value>Service Selection List</value>
+    <value>Service Selector</value>
   </data>
   <data name="Automation_DependenciesServiceList_HelpText" xml:space="preserve">
     <value>Search and select a service to view its dependencies.</value>
   </data>
 
-  <data name="Automation_DependenciesPidValue_Name" xml:space="preserve">
-    <value>Process ID</value>
-  </data>
-  <data name="Automation_DependenciesPidValue_HelpText" xml:space="preserve">
-    <value>The process identifier (PID) of the selected service.</value>
-  </data>
-
-  <data name="Automation_DependenciesCopyPidButton_HelpText" xml:space="preserve">
-    <value>Copies the process ID to the clipboard.</value>
-  </data>
-
   <data name="Automation_DependenciesRefreshButton_HelpText" xml:space="preserve">
-    <value>Reloads the dependency tree for the selected service.</value>
+    <value>Reload the dependency tree for the selected service.</value>
   </data>
 
   <data name="Automation_DependenciesExpandAllButton_HelpText" xml:space="preserve">
-    <value>Expands all branches in the dependency tree.</value>
+    <value>Expand all branches in the dependency tree.</value>
   </data>
 
   <data name="Automation_DependenciesCollapseAllButton_HelpText" xml:space="preserve">
-    <value>Collapses all branches in the dependency tree.</value>
+    <value>Collapse all branches in the dependency tree.</value>
   </data>
 
   <data name="Automation_DependenciesLegendInfo_Name" xml:space="preserve">
     <value>Dependency Legend Information</value>
   </data>
   <data name="Automation_DependenciesLegendInfo_HelpText" xml:space="preserve">
-    <value>Information on the service dependency tree mechanism via Windows Service Control Manager.</value>
+    <value>Read information on the service dependency tree mechanism via Windows Service Control Manager.</value>
   </data>
 
   <data name="Automation_DependenciesTreeView_Name" xml:space="preserve">
     <value>Dependency Hierarchy Tree</value>
   </data>
   <data name="Automation_DependenciesTreeView_HelpText" xml:space="preserve">
-    <value>Displays recursive dependencies for the selected service.</value>
+    <value>View recursive dependencies for the selected service.</value>
   </data>
 
   <data name="Automation_DependenciesUsageInfo_Name" xml:space="preserve">
     <value>Usage Information</value>
   </data>
   <data name="Automation_DependenciesUsageInfo_HelpText" xml:space="preserve">
-    <value>Explains the status color indicators for tree nodes: green for running, red for stopped, orange for cycle.</value>
+    <value>View status color indicators for tree nodes: green for running, red for stopped, orange for cycle, and an orange warning icon for an unavailable dependency.</value>
   </data>
 
   <data name="Automation_DependenciesShortcutInfo_Name" xml:space="preserve">
     <value>Shortcut Information</value>
   </data>
   <data name="Automation_DependenciesShortcutInfo_HelpText" xml:space="preserve">
-    <value>Indicates that pressing F5 refreshes the dependency tree.</value>
+    <value>Press F5 to refresh the dependency tree.</value>
   </data>
 
   <!-- Logs View Specific Automation Properties -->
@@ -922,7 +934,7 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Logs View</value>
   </data>
   <data name="Automation_LogsViewRoot_HelpText" xml:space="preserve">
-    <value>Displays a list of system events and diagnostic records for services.</value>
+    <value>View a list of system events and diagnostic records for services.</value>
   </data>
 
   <data name="Automation_LogsLevelComboBox_Name" xml:space="preserve">
@@ -933,14 +945,14 @@ If the service is disabled and marked for deletion, installation will fail until
   </data>
 
   <data name="Automation_LogsFromDatePicker_Name" xml:space="preserve">
-    <value>Filter from date</value>
+    <value>Filter from Date</value>
   </data>
   <data name="Automation_LogsFromDatePicker_HelpText" xml:space="preserve">
     <value>Select the start date to filter log entries from.</value>
   </data>
 
   <data name="Automation_LogsToDatePicker_Name" xml:space="preserve">
-    <value>Filter to date</value>
+    <value>Filter to Date</value>
   </data>
   <data name="Automation_LogsToDatePicker_HelpText" xml:space="preserve">
     <value>Select the end date to filter log entries up to.</value>
@@ -954,14 +966,14 @@ If the service is disabled and marked for deletion, installation will fail until
   </data>
 
   <data name="Automation_LogsSearchButton_HelpText" xml:space="preserve">
-    <value>Executes the log search with current level, date, and keyword filters.</value>
+    <value>Execute the log search with current level, date, and keyword filters.</value>
   </data>
 
   <data name="Automation_LogsDataGrid_Name" xml:space="preserve">
     <value>System Logs</value>
   </data>
   <data name="Automation_LogsDataGrid_HelpText" xml:space="preserve">
-    <value>Displays the filtered list of diagnostic log entries.</value>
+    <value>View the filtered list of diagnostic log entries.</value>
   </data>
 
   <data name="Automation_LogsTimeColumnHeader_Name" xml:space="preserve">
@@ -976,8 +988,25 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Log Level Icon</value>
   </data>
 
+  <data name="Automation_LogsEventIdColumnHeader_Name" xml:space="preserve">
+    <value>Event ID Column</value>
+  </data>
+
   <data name="Automation_LogsMessageColumnHeader_Name" xml:space="preserve">
     <value>Message Column</value>
+  </data>
+
+  <data name="Automation_LogsTimeColumnCell_HelpText" xml:space="preserve">
+    <value>View the timestamp of the log entry.</value>
+  </data>
+  <data name="Automation_LogsLevelColumnCell_HelpText" xml:space="preserve">
+    <value>View the severity level of the log entry.</value>
+  </data>
+  <data name="Automation_LogsEventIdColumnCell_HelpText" xml:space="preserve">
+    <value>View the Windows Event ID of the log entry.</value>
+  </data>
+  <data name="Automation_LogsMessageColumnCell_HelpText" xml:space="preserve">
+    <value>View the message text of the log entry.</value>
   </data>
 
   <data name="Automation_LogsGridSplitter_Name" xml:space="preserve">
@@ -991,36 +1020,39 @@ If the service is disabled and marked for deletion, installation will fail until
     <value>Log Entry Details</value>
   </data>
   <data name="Automation_LogDetailsTextBox_HelpText" xml:space="preserve">
-    <value>Displays full message text and details for the selected log entry.</value>
+    <value>View full message text and details for the selected log entry.</value>
   </data>
 
   <data name="Automation_LogsFooterText_HelpText" xml:space="preserve">
-    <value>Shows total count and query execution duration for current logs filter.</value>
+    <value>View total count and query execution duration for current logs filter.</value>
   </data>
 
   <data name="Automation_LogsShortcutInfo_Name" xml:space="preserve">
     <value>Shortcut Information</value>
   </data>
   <data name="Automation_LogsShortcutInfo_HelpText" xml:space="preserve">
-    <value>Indicates that pressing F5 refreshes logs.</value>
+    <value>Press F5 to refresh logs.</value>
   </data>
 
-  <data name="Automation_ServiceListControl_Name" xml:space="preserve">
-    <value>Service List Control</value>
-  </data>
-  <data name="Automation_ServiceListControl_HelpText" xml:space="preserve">
-    <value>Displays a searchable list of managed services. Use the search field to filter by service name.</value>
-  </data>
   <data name="Automation_SidebarSearchTextBox_Name" xml:space="preserve">
-    <value>Search Services</value>
+    <value>Search Services (sidebar)</value>
   </data>
   <data name="Automation_SidebarSearchTextBox_HelpText" xml:space="preserve">
-    <value>Type a keyword to search services</value>
+    <value>Type a keyword to search services.</value>
   </data>
   <data name="Automation_SidebarServicesDataGrid_Name" xml:space="preserve">
-    <value>Services List</value>
+    <value>Services List (sidebar)</value>
+  </data>
+  <data name="Automation_SidebarSearchButton_HelpText" xml:space="preserve">
+    <value>Runs the search using the text entered in the search box.</value>
+  </data>
+  <data name="Automation_SidebarServicesDataGrid_HelpText" xml:space="preserve">
+    <value>List of services matching the current search. Select a service to monitor it.</value>
   </data>
   <data name="Automation_ServiceNameHeader_Name" xml:space="preserve">
     <value>Service Name Header</value>
+  </data>
+  <data name="Msg_ClipboardCopyFailed" xml:space="preserve">
+    <value>Failed to copy content to the clipboard. The clipboard may be in use by another application.</value>
   </data>
 </root>

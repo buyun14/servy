@@ -18,11 +18,17 @@ namespace Servy.Core.Helpers
         /// Null or whitespace returns <see cref="IntPtr.Zero"/>.
         /// </param>
         /// <returns>An <see cref="IntPtr"/> bitmask representing the CPU affinity mask.</returns>
-        /// <exception cref="ArgumentException">Thrown when a token or hex format is invalid.</exception>
+        /// <exception cref="ArgumentException">Thrown when a token or hex format is invalid, inverted, or empty.</exception>
         /// <exception cref="ArgumentOutOfRangeException">
         /// Thrown when core indices or hexadecimal masks exceed allowed processor bounds (0 to Math.Min(Environment.ProcessorCount, 64) - 1).
         /// </exception>
-        public static IntPtr ParseAffinity(string? affinityInput)
+        public static IntPtr ParseAffinity(string? affinityInput) =>
+            ParseAffinity(affinityInput, Math.Min(Environment.ProcessorCount, 64));
+
+        /// <summary>
+        /// Internal overload allowing test injection of explicit processor bounds.
+        /// </summary>
+        internal static IntPtr ParseAffinity(string? affinityInput, int maxAllowedCores)
         {
             if (string.IsNullOrWhiteSpace(affinityInput))
                 return IntPtr.Zero;
@@ -30,7 +36,6 @@ namespace Servy.Core.Helpers
             long mask = 0;
             string cleaned = affinityInput.Trim();
 
-            int maxAllowedCores = Math.Min(Environment.ProcessorCount, 64); // Windows IntPtr limit per group is 64
             long allowedMask = maxAllowedCores == 64 ? -1L : (1L << maxAllowedCores) - 1;
 
             // 1. Hexadecimal format (e.g., "0xFF00" or "0XFF00")
@@ -38,23 +43,37 @@ namespace Servy.Core.Helpers
             {
                 if (long.TryParse(cleaned.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out mask))
                 {
-                    if (mask == 0 || (mask & ~allowedMask) != 0)
+                    if (mask == 0)
+                    {
+                        throw new ArgumentException(
+                            string.Format(Strings.Msg_EmptyAffinityMask, cleaned),
+                            nameof(affinityInput));
+                    }
+
+                    if ((mask & ~allowedMask) != 0)
                     {
                         throw new ArgumentOutOfRangeException(
                             nameof(affinityInput),
-                            string.Format(Strings.Msg_CoreIndexRangeOutOfBounds, cleaned, maxAllowedCores - 1));
+                            string.Format(Strings.Msg_HexMaskOutOfBounds, cleaned, maxAllowedCores - 1));
                     }
 
                     return new IntPtr(mask);
                 }
 
                 throw new ArgumentException(
-                    string.Format(Strings.Msg_InvalidHexAffinityFormat, affinityInput),
+                    string.Format(Strings.Msg_InvalidHexAffinityFormat, cleaned),
                     nameof(affinityInput));
             }
 
             // 2. Comma-separated list with ranges (e.g., "0-3,8,10-12")
             string[] parts = cleaned.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+            if (parts.Length == 0)
+            {
+                throw new ArgumentException(
+                    string.Format(Strings.Msg_InvalidCoreSpecification, cleaned),
+                    nameof(affinityInput));
+            }
 
             foreach (var part in parts)
             {
@@ -66,7 +85,14 @@ namespace Servy.Core.Helpers
                         int.TryParse(range[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int start) &&
                         int.TryParse(range[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int end))
                     {
-                        if (end >= maxAllowedCores || start > end)
+                        if (start > end)
+                        {
+                            throw new ArgumentException(
+                                string.Format(Strings.Msg_InvertedCoreRange, token),
+                                nameof(affinityInput));
+                        }
+
+                        if (end >= maxAllowedCores)
                         {
                             throw new ArgumentOutOfRangeException(
                                 nameof(affinityInput),
@@ -109,7 +135,13 @@ namespace Servy.Core.Helpers
         /// When this method returns <c>false</c>, contains the error description detailing why validation failed; otherwise, <c>null</c>.
         /// </param>
         /// <returns><c>true</c> if the affinity input is null/empty or valid; otherwise, <c>false</c>.</returns>
-        public static bool ValidateAffinity(string? affinityInput, out string? errorMessage)
+        public static bool ValidateAffinity(string? affinityInput, out string? errorMessage) =>
+            ValidateAffinity(affinityInput, Math.Min(Environment.ProcessorCount, 64), out errorMessage);
+
+        /// <summary>
+        /// Internal overload allowing test injection of explicit processor bounds.
+        /// </summary>
+        internal static bool ValidateAffinity(string? affinityInput, int maxAllowedCores, out string? errorMessage)
         {
             errorMessage = null;
 
@@ -118,8 +150,18 @@ namespace Servy.Core.Helpers
 
             try
             {
-                ParseAffinity(affinityInput);
+                ParseAffinity(affinityInput, maxAllowedCores);
                 return true;
+            }
+            catch (ArgumentException ex)
+            {
+                errorMessage = ex.Message;
+                var suffix = ex.ParamName == null ? null : $" (Parameter '{ex.ParamName}')";
+                if (suffix != null && errorMessage.EndsWith(suffix, StringComparison.Ordinal))
+                {
+                    errorMessage = errorMessage.Substring(0, errorMessage.Length - suffix.Length);
+                }
+                return false;
             }
             catch (Exception ex)
             {

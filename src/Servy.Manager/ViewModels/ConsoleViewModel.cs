@@ -4,6 +4,7 @@ using Servy.Core.Logging;
 using Servy.Manager.Config;
 using Servy.Manager.Design;
 using Servy.Manager.Models;
+using Servy.Manager.Resources;
 using Servy.Manager.Services;
 using Servy.Manager.Utils;
 using Servy.UI;
@@ -11,6 +12,7 @@ using Servy.UI.Commands;
 using Servy.UI.Constants;
 using Servy.UI.Services;
 using System.ComponentModel;
+using System.IO;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Threading;
@@ -27,6 +29,7 @@ namespace Servy.Manager.ViewModels
         #region Fields
 
         private readonly IServiceRepository _serviceRepository;
+        private readonly IMessageBoxService _messageBoxService;
 
         // Controls console log filter debouncing
         private CancellationTokenSource? _logFilterCts;
@@ -118,8 +121,8 @@ namespace Servy.Manager.ViewModels
         /// performs asynchronous disk reads to load history, and starts new background tailing tasks.</description>
         /// </item>
         /// <item>
-        /// <description><b>Timer Orchestration:</b> Restarts the performance monitoring loop by calling
-        /// <see cref="StopMonitoring"/> and <see cref="StartMonitoring"/>, resetting the cancellation tokens.</description>
+        /// <description><b>Timer Orchestration:</b> Restarts the console state polling loop by calling
+        /// <see cref="MonitoringViewModelBase.StopMonitoring"/> and <see cref="MonitoringViewModelBase.StartMonitoring"/>, resetting the cancellation tokens.</description>
         /// </item>
         /// </list>
         /// </remarks>
@@ -133,7 +136,7 @@ namespace Servy.Manager.ViewModels
                 _stdoutPath = value?.StdoutPath;
                 _stderrPath = value?.StderrPath;
                 OnPropertyChanged(nameof(SelectedService));
-
+                SetPidText(value); // value may be null; SetPidText already falls back to NotAvailable
                 CopyPidCommand.RaiseCanExecuteChanged();
 
                 // Safe fire-and-forget
@@ -163,18 +166,21 @@ namespace Servy.Manager.ViewModels
         /// </summary>
         /// <param name="serviceRepository">Repository for service data access.</param>
         /// <param name="serviceCommands">Commands for service operations.</param>
+        /// <param name="messageBoxService">Service used to display modal user dialogs.</param>
         /// <param name="appConfig">Application configuration settings.</param>
         /// <param name="cursorService">Service used to control the cursor state.</param>
         /// <param name="uiDispatcher">Dispatcher for UI thread operations.</param>
         public ConsoleViewModel(
             IServiceRepository serviceRepository,
             IServiceCommands serviceCommands,
+            IMessageBoxService messageBoxService,
             IAppConfiguration appConfig,
             ICursorService cursorService,
             IUiDispatcher uiDispatcher
             ) : base(cursorService, uiDispatcher, serviceCommands)
         {
             _serviceRepository = serviceRepository ?? throw new ArgumentNullException(nameof(serviceRepository));
+            _messageBoxService = messageBoxService ?? throw new ArgumentNullException(nameof(messageBoxService));
             _appConfig = appConfig ?? throw new ArgumentNullException(nameof(appConfig));
             ClearSelectionCommand = new RelayCommand<object>(_ => SetPaused(false));
 
@@ -200,6 +206,7 @@ namespace Servy.Manager.ViewModels
         public ConsoleViewModel() : this(
             new UI.Design.DesignTimeServiceRepository(),
             new DesignTimeServiceCommands(),
+            new UI.Design.DesignTimeMessageBoxService(),
             new DesignTimeAppConfig(),
             new UI.Design.DesignTimeCursorService(),
             new UI.Design.DesignTimeUiDispatcher()
@@ -214,12 +221,12 @@ namespace Servy.Manager.ViewModels
         protected override ServiceItemBase? SelectedServiceItem => SelectedService;
 
         /// <inheritdoc />
-        protected override int RefreshIntervalMs => _appConfig.ConsoleRefreshIntervalInMs;
+        protected override int RefreshIntervalMs => _appConfig.ConsoleRefreshIntervalMs;
 
         /// <inheritdoc />
         protected override ServiceItemBase CreateServiceItem(Service? service)
         {
-            return new ConsoleService { Name = service?.Name };
+            return new ConsoleService { Name = service?.Name, Pid = service?.Pid };
         }
 
         /// <inheritdoc />
@@ -233,13 +240,7 @@ namespace Servy.Manager.ViewModels
         {
             var currentSelection = (ConsoleService)selection;
             var serviceDto = await _serviceRepository.GetServiceConsoleStateAsync(currentSelection.Name, token);
-            var cloned = serviceDto?.Clone();
-            if (serviceDto != null && !(cloned is ServiceConsoleStateDto))
-            {
-                Logger.Error($"GetServiceConsoleStateAsync returned {cloned?.GetType().Name ?? "null"}; expected {nameof(ServiceConsoleStateDto)}.");
-                return;
-            }
-            var stateSnapshot = (ServiceConsoleStateDto?)cloned;
+            var stateSnapshot = serviceDto?.Clone();
 
             // Drop this tick if the user switched services while we were awaiting the DB call.
             if (!ReferenceEquals(currentSelection, _selectedService) || token.IsCancellationRequested) return;
@@ -286,10 +287,7 @@ namespace Servy.Manager.ViewModels
             // Thread-safe CTS swap for debouncing
             var newCts = new CancellationTokenSource();
             var oldCts = Interlocked.Exchange(ref _logFilterCts, newCts);
-            if (oldCts != null)
-            {
-                Helpers.Helper.CancelAndDisposeSafely(oldCts);
-            }
+            Helpers.Helper.CancelAndDisposeSafely(oldCts);
 
             var token = newCts.Token;
 
@@ -367,6 +365,10 @@ namespace Servy.Manager.ViewModels
         /// Uses an incrementing Session ID to ensure that asynchronous history reads or delayed log updates from previously
         /// active sessions or superseded transitions (still pending in the Dispatcher queue) are safely discarded.
         /// </para>
+        /// <para>
+        /// A UNC or device path is opened only when it is the selected service's configured path for that stream; otherwise
+        /// that stream is not shown, so the elevated Manager never authenticates to a share the service account chose.
+        /// </para>
         /// </remarks>
         /// <param name="stdoutPath">Path to the standard output log file.</param>
         /// <param name="stderrPath">Path to the standard error log file.</param>
@@ -379,11 +381,20 @@ namespace Servy.Manager.ViewModels
 
                 var newCts = new CancellationTokenSource();
                 var oldCts = Interlocked.Exchange(ref _tailingCts, newCts);
-                if (oldCts != null)
-                {
-                    Helpers.Helper.CancelAndDisposeSafely(oldCts);
-                }
+                Helpers.Helper.CancelAndDisposeSafely(oldCts);
+
                 var token = newCts.Token;
+
+                if (IsUncOrDevicePath(stdoutPath) || IsUncOrDevicePath(stderrPath))
+                {
+                    var configured = await _serviceRepository.GetByNameAsync(_selectedService?.Name, decrypt: false, token);
+
+                    // Re-check: see the stale-session guard below.
+                    if (sessionId != _currentSessionId) return;
+
+                    stdoutPath = KeepOpenablePath(stdoutPath, configured?.StdoutPath);
+                    stderrPath = KeepOpenablePath(stderrPath, configured?.StderrPath);
+                }
 
                 // Explicitly stop and dispose old tailers to sever event handler closures
                 StopActiveTailers();
@@ -395,18 +406,22 @@ namespace Servy.Manager.ViewModels
                 bool hasUniqueStderr = !string.IsNullOrWhiteSpace(stderrPath) &&
                        !string.Equals(stdoutPath, stderrPath, StringComparison.OrdinalIgnoreCase);
 
-                int historyLimit = hasUniqueStderr ? _maxLines / 2 : _maxLines;
+                bool hasTwoStreams = !string.IsNullOrWhiteSpace(stdoutPath) && hasUniqueStderr;
+                int historyLimit = hasTwoStreams ? _maxLines / 2 : _maxLines;
 
                 using (var stdoutHistoryTailer = new LogTailer())
                 using (var stderrHistoryTailer = new LogTailer())
                 {
                     var stdoutTask = !string.IsNullOrWhiteSpace(stdoutPath)
                         ? stdoutHistoryTailer.GetHistoryAsync(stdoutPath, LogType.StdOut, historyLimit, cancellationToken: token)
-                        : Task.FromResult<HistoryResult?>(null);
+                        : Task.FromResult<HistoryResult>(null!);
 
+                    // This is where the same-file policy is enforced: skip stderr entirely when it
+                    // resolves to the same file as stdout, otherwise every line would be read and
+                    // shown twice. A null stderr result below is the outcome of this decision.
                     var stderrTask = hasUniqueStderr
                         ? stderrHistoryTailer.GetHistoryAsync(stderrPath, LogType.StdErr, historyLimit, cancellationToken: token)
-                        : Task.FromResult<HistoryResult?>(null);
+                        : Task.FromResult<HistoryResult>(null!);
 
                     // Wait for the necessary reads to complete
                     var results = await Task.WhenAll(stdoutTask, stderrTask);
@@ -460,16 +475,19 @@ namespace Servy.Manager.ViewModels
                     if (sessionId != _currentSessionId) return;
 
                     // 5. Start Live Tailing, passing the Session ID
-                    // Start StdOut tailer if the result and path are valid
-                    if (outRes != null && !string.IsNullOrWhiteSpace(stdoutPath))
+                    // Start StdOut tailer. A null result means the matching history task was skipped
+                    // above, so a non-null result is itself the "this stream is in play" signal.
+                    if (outRes != null)
                     {
-                        StartLiveTail(stdoutPath, LogType.StdOut, outRes.Position, outRes.CreationTime, sessionId, token);
+                        StartLiveTail(stdoutPath, LogType.StdOut, outRes.Position, outRes.CreationTimeUtc, sessionId, token);
                     }
 
-                    // Start StdErr tailer ONLY if it's a different file to prevent duplicate UI entries
-                    if (errRes != null && hasUniqueStderr)
+                    // Start StdErr tailer. The same-file check that prevents duplicate UI entries was
+                    // already made where stderrTask was built: errRes is non-null only when
+                    // hasUniqueStderr held there.
+                    if (errRes != null)
                     {
-                        StartLiveTail(stderrPath, LogType.StdErr, errRes.Position, errRes.CreationTime, sessionId, token);
+                        StartLiveTail(stderrPath, LogType.StdErr, errRes.Position, errRes.CreationTimeUtc, sessionId, token);
                     }
                 }
             }
@@ -493,6 +511,59 @@ namespace Servy.Manager.ViewModels
                     // Secondary catch blocks unhandled exception propagation if Logger itself fails
                 }
             }
+        }
+
+        /// <summary>
+        /// Determines whether a path is a UNC path (<c>\\server\share</c>) or a device path (<c>\\.\</c>, <c>\\?\</c>):
+        /// any path that starts with two directory separators, or with the NT object-manager prefix <c>\??\</c>.
+        /// </summary>
+        /// <param name="path">The path to check, or <see langword="null"/>.</param>
+        /// <returns><see langword="true"/> when <paramref name="path"/> is a UNC or device path.</returns>
+        private static bool IsUncOrDevicePath(string? path)
+        {
+            var trimmed = path?.TrimStart();
+            if (trimmed == null || trimmed.Length < 2)
+                return false;
+
+            // \??\ is the object-manager prefix: .NET and Win32 pass it through unchanged,
+            // so \??\UNC\server\share reaches a share without two leading separators.
+            if (trimmed.StartsWith(@"\??\", StringComparison.Ordinal))
+                return true;
+
+            return (trimmed[0] == '\\' || trimmed[0] == '/')
+                && (trimmed[1] == '\\' || trimmed[1] == '/');
+        }
+
+        /// <summary>
+        /// Returns a log path to open, or <see langword="null"/> when it is a UNC or device path that differs from the
+        /// configured path for its stream.
+        /// </summary>
+        /// <param name="path">The active path the service reported.</param>
+        /// <param name="configured">The path configured for the same stream, or <see langword="null"/>.</param>
+        /// <returns>
+        /// <paramref name="path"/> when it is neither a UNC nor a device path, or when it equals <paramref name="configured"/>
+        /// (ignoring case, after <see cref="Path.GetFullPath(string)"/>); otherwise <see langword="null"/>.
+        /// </returns>
+        private static string? KeepOpenablePath(string? path, string? configured)
+        {
+            if (!IsUncOrDevicePath(path))
+                return path;
+
+            if (!string.IsNullOrWhiteSpace(configured))
+            {
+                try
+                {
+                    if (string.Equals(Path.GetFullPath(path!), Path.GetFullPath(configured!), StringComparison.OrdinalIgnoreCase))
+                        return path;
+                }
+                catch (Exception)
+                {
+                    // A path that cannot be resolved is never opened
+                }
+            }
+
+            Logger.Warn($"Not opening the log path '{path}': it is a UNC or device path that differs from the configured path.");
+            return null;
         }
 
         /// <summary>
@@ -557,7 +628,7 @@ namespace Servy.Manager.ViewModels
                     throw new ArgumentOutOfRangeException(nameof(type), type, "Unsupported LogType provided for live tailing.");
             }
 
-            _ = tailer.RunFromPosition(path, type, pos, created, cancellationToken)
+            _ = tailer.RunFromPositionAsync(path, type, pos, created, cancellationToken)
                 .ContinueWith(t =>
                 {
                     // OnlyOnFaulted guarantees t.IsFaulted, so t.Exception is non-null here.
@@ -576,6 +647,15 @@ namespace Servy.Manager.ViewModels
         #endregion
 
         #region Public Methods
+
+        /// <summary>
+        /// Displays an error modal dialog informing the user that copying log lines to the system clipboard failed.
+        /// </summary>
+        /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+        public async Task ShowClipboardErrorAsync()
+        {
+            await _messageBoxService.ShowErrorAsync(Strings.Msg_ClipboardCopyFailed, UiAppConfig.Caption);
+        }
 
         /// <summary>
         /// Sets the paused state of log tailing, used to manage UI selection preservation during log updates.

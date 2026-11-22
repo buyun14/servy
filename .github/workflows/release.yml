@@ -1,20 +1,20 @@
-# ==============================================================
+# ==========================================================================================
 #  GitHub Actions Workflow - Release
-# --------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
 #  Purpose:
 #    This workflow provides a unified "release" badge
 #    that reflects the combined status of the following workflows:
 #      - winget.yml        -> Publishes the WinGet manifest
 #      - choco.yml         -> Publishes the Chocolatey package
 #      - scoop.yml         -> Publishes the Scoop manifest to aelassas/scoop-bucket
-#      - bump-version.yml -> Bumps version
-#      - changelog.yml    -> Updates the project changelog
+#      - bump-version.yml  -> Bumps version
+#      - changelog.yml     -> Updates the project changelog
 #
 #  Behavior:
-#    • Automatically runs after any of the above workflows complete.
-#    • Checks their latest runs.
-#    • Fails if any of them failed, were skipped, or did not run.
-#    • Can also be triggered manually from the GitHub Actions tab.
+#    - Automatically runs after any of the above workflows complete.
+#    - Checks their latest runs.
+#    - Fails if any of them failed, were skipped, or did not run.
+#    - Can also be triggered manually from the GitHub Actions tab.
 #
 #  Badge:
 #    ![release](https://github.com/aelassas/servy/actions/workflows/release.yml/badge.svg)
@@ -23,7 +23,7 @@
 #    Green  -> All release workflows succeeded
 #    Yellow -> One or more still in progress.
 #    Red    -> One or more failed, skipped, or missing
-# ==============================================================
+# ==========================================================================================
 name: release
 
 env:
@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check release workflows status
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd #v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9.0.0
         with:
           script: |
             const workflows = process.env.RELEASE_WORKFLOWS.split(',');

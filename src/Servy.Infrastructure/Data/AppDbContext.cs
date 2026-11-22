@@ -9,16 +9,28 @@ namespace Servy.Infrastructure.Data
     /// Provides a database context for creating SQLite connections.
     /// Implements the standard .NET disposal pattern.
     /// </summary>
-    [ExcludeFromCodeCoverage]
     public class AppDbContext : IAppDbContext
     {
         private readonly string _connectionString;
         private bool _disposed;
 
         /// <summary>
+        /// Explicit static constructor guarantees SQLiteFunction metadata is registered
+        /// in _registeredFunctions BEFORE any AppDbContext instance opens a connection.
+        /// </summary>
+        [ExcludeFromCodeCoverage] // process-wide collation registration; which instance in the
+                                  // process registers first is not controllable from a test (#5764/#5770)
+        static AppDbContext()
+        {
+            // Register the custom collation sequence process-wide before any connection opens.
+            SQLiteFunction.RegisterFunction(typeof(UnicodeNoCaseCollation));
+        }
+
+        /// <summary>
         /// Initializes a new instance of <see cref="AppDbContext"/> with the specified connection string.
         /// </summary>
         /// <param name="connectionString">The SQLite connection string used to connect to the database.</param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="connectionString"/> is null.</exception>
         public AppDbContext(string connectionString)
         {
             _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
@@ -28,6 +40,7 @@ namespace Servy.Infrastructure.Data
         /// Creates a new <see cref="DbConnection"/> for the SQLite database.
         /// </summary>
         /// <returns>A new <see cref="SQLiteConnection"/> instance.</returns>
+        /// <exception cref="ObjectDisposedException">Thrown if this context has already been disposed.</exception>
         public DbConnection CreateConnection()
         {
             ThrowIfDisposed();

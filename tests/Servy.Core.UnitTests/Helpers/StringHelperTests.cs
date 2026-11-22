@@ -19,7 +19,10 @@ namespace Servy.Core.UnitTests.Helpers
         [InlineData("VAR1=value1\r\nVAR2=value2\nVAR3=value3\rVAR4=value4", "VAR1=value1;VAR2=value2;VAR3=value3;VAR4=value4")]
         public void NormalizeString_ReplacesLineBreaksWithSemicolons(string? input, string expected)
         {
+            // Act
             var result = StringHelper.NormalizeString(input);
+
+            // Assert
             Assert.Equal(expected, result);
         }
 
@@ -40,7 +43,8 @@ namespace Servy.Core.UnitTests.Helpers
         }
 
         [Theory]
-        [InlineData("KEY=C:\\Foo\\\\\r\nNEXT=Val", "KEY=C:\\Foo\\\\;NEXT=Val")] // Trailing even run (2) safely remains even (2)
+        [InlineData("KEY=C:\\Foo\\\\\r\nNEXT=Val", "KEY=C:\\Foo\\\\;NEXT=Val")] // Trailing even run (2) before line break safely remains even (2)
+        [InlineData("KEY=C:\\Foo\\\\", "KEY=C:\\Foo\\\\")]                      // Trailing even run (2) at EOF is left alone
         public void NormalizeString_ValidatesExplicitLineBreakParity(string input, string expected)
         {
             // Act
@@ -58,19 +62,23 @@ namespace Servy.Core.UnitTests.Helpers
             {
                 new EnvironmentVariable { Name = "KEY_TRAILING_SLASH", Value = @"C:\Foo\" },
                 new EnvironmentVariable { Name = "KEY_DOUBLE_SLASH", Value = @"C:\Bar\\" },
-                new EnvironmentVariable { Name = "KEY_INTERNAL_NEWLINE", Value = "line1\\nline2" },
+                new EnvironmentVariable { Name = "KEY_LITERAL_BACKSLASH_N", Value = "line1\\nline2" },
                 new EnvironmentVariable { Name = "KEY_ESCAPED_SEMICOLON", Value = "value1;value2" },
+                new EnvironmentVariable { Name = @"KEY_WITH\SLASH", Value = "SlashInKey" },
                 new EnvironmentVariable { Name = "STANDARD_KEY", Value = "NormalValue" }
             };
 
-            // Convert raw structural model to single-line persistence string (Simulates initial load from DB)
+            // Act
+            // Convert raw structural model to single-line persistence string (Simulates initial load from DB).
+            // Both halves are escaped, matching StringHelper.FormatEnvironmentVariables, so the Name
+            // assertion below is exercised by a key that Escape actually alters.
             // Example layout: "KEY_TRAILING_SLASH=C:\\Foo\\;KEY_DOUBLE_SLASH=..."
-            string serializedDbString = string.Join(";", originalVars.Select(v => $"{v.Name}={StringHelper.Escape(v.Value)}"));
+            string serializedDbString = string.Join(";", originalVars.Select(v => $"{StringHelper.Escape(v.Name)}={StringHelper.Escape(v.Value)}"));
 
             // Step 1: Format for UI presentation (Multi-line layout)
             string uiText = StringHelper.FormatEnvironmentVariables(serializedDbString);
 
-            // Step 2: Act - Run the UI multi-line string through our updated, parity-aware normalization
+            // Step 2: Run the UI multi-line string through our updated, parity-aware normalization
             string singleLineSaveString = StringHelper.NormalizeString(uiText);
 
             // Step 3: Parse the saved string back into model objects
@@ -86,24 +94,15 @@ namespace Servy.Core.UnitTests.Helpers
             }
         }
 
-        [Fact]
-        public void FormatServiceDependencies_ShouldReturnEmpty_WhenInputIsNull()
-        {
-            var result = StringHelper.FormatServiceDependencies(null);
-            Assert.Empty(result);
-        }
-
         [Theory]
+        [InlineData(null, "")]
         [InlineData("", "")]
         [InlineData("singleDep", "singleDep")]
-        [InlineData("dep1;dep2;dep3", "dep1|dep2|dep3")] // Use a temporary pipe delimiter for tokenization
-        public void FormatServiceDependencies_ShouldReplaceSemicolonWithNewLine(string input, string expectedTemplate)
+        [InlineData("dep1;dep2;dep3", "dep1|dep2|dep3")] // Environment.NewLine cannot appear in [InlineData]; '|' is a placeholder substituted below
+        public void FormatServiceDependencies_ShouldReplaceSemicolonWithNewLine(string? input, string expectedTemplate)
         {
             // Arrange
-            // Dynamically construct the cross-platform expected string if the token template is detected
-            string expected = expectedTemplate.Contains("|")
-                ? expectedTemplate.Replace("|", Environment.NewLine)
-                : expectedTemplate;
+            string expected = expectedTemplate.Replace("|", Environment.NewLine);
 
             // Act
             var result = StringHelper.FormatServiceDependencies(input);
@@ -116,7 +115,7 @@ namespace Servy.Core.UnitTests.Helpers
         public void Escape_NullInput_ReturnsEmptyString()
         {
             // Act
-            var result = StringHelper.Escape(null!);
+            var result = StringHelper.Escape(null);
 
             // Assert
             Assert.Equal(string.Empty, result);
@@ -133,7 +132,6 @@ namespace Servy.Core.UnitTests.Helpers
             // - VAR4: '"' in value
             // - VAR5: '\' in value
             // - VAR6: combinations of multiple escaped chars
-            // - VAR7: escaped '=' in the KEY (not the value)
             var rawVars = string.Join(";", new[]
             {
                 "VAR1=val1",
@@ -141,8 +139,7 @@ namespace Servy.Core.UnitTests.Helpers
                 @"VAR3=x\;y",
                 @"VAR4=hello \""world\""",
                 @"VAR5=C:\path\to\file",
-                "VAR6=combo\\=\\;\\\"end\\\"",
-                @"VAR7\=a=b\=c",
+                "VAR6=combo\\=\\;\\\"end\\\""
             });
 
             // Act
@@ -156,12 +153,25 @@ namespace Servy.Core.UnitTests.Helpers
                 @"VAR3=x\;y",
                 @"VAR4=hello \""world\""",
                 @"VAR5=C:\\path\\to\\file",
-                "VAR6=combo\\=\\;\\\"end\\\"",
-                @"VAR7\=a=b\=c",
+                "VAR6=combo\\=\\;\\\"end\\\""
             });
 
             Assert.Equal(expected, result);
         }
 
+        [Fact]
+        public void FormatEnvironmentVariables_UnknownEscapeLetters_DoubleTheirBackslash()
+        {
+            // Arrange
+            // The value carries the two-character sequences \r and \n, not a newline: Parse keeps the
+            // backslash of an unknown escape, and Escape doubles it on the way back out.
+            string rawInput = @"MULTILINE_KEY=line1\r\nline2;STANDARD_KEY=value2";
+
+            // Act
+            string formatted = StringHelper.FormatEnvironmentVariables(rawInput);
+
+            // Assert
+            Assert.Equal(string.Join(Environment.NewLine, new[] { @"MULTILINE_KEY=line1\\r\\nline2", "STANDARD_KEY=value2" }), formatted);
+        }
     }
 }

@@ -1,0 +1,529 @@
+using Moq;
+using Servy.Core.Config;
+using Servy.Core.Data;
+using Servy.Core.DTOs;
+using Servy.Core.Enums;
+using Servy.Core.NamedPipes;
+using Servy.Core.Native;
+using Servy.Core.Security;
+using Servy.Core.Services;
+using Servy.Core.UnitTests.Logging;
+using Servy.Testing;
+using System.ServiceProcess;
+using static Servy.Core.Native.NativeMethods;
+
+namespace Servy.Core.UnitTests.Services
+{
+    /// <summary>
+    /// Covers what <see cref="ServiceManager"/> does for the Servy host service: every installed service depends on it,
+    /// its name is reserved, and the account of an installed service is granted access to the host's named pipe (the
+    /// host rebuilds the pipe's DACL from the services in <c>Servy.db</c>), which is taken back on uninstall and remove.
+    /// </summary>
+    [Collection(LoggerCollection.Name)]
+    public class ServiceManagerHostTests : IDisposable
+    {
+        private const string ServiceName = "PipedService";
+
+        private readonly FakeServiceHandles _handles = new FakeServiceHandles();
+        private readonly Mock<IWindowsServiceApi> _windowsServiceApi = new Mock<IWindowsServiceApi>();
+        private readonly Mock<IWin32ErrorProvider> _win32ErrorProvider = new Mock<IWin32ErrorProvider>();
+        private readonly Mock<IServiceRepository> _serviceRepository = new Mock<IServiceRepository>();
+        private readonly Mock<IServyExePermissionsHardener> _hardener = new Mock<IServyExePermissionsHardener>();
+        private readonly Mock<INamedPipesService> _pipes = new Mock<INamedPipesService>();
+
+        public ServiceManagerHostTests()
+        {
+            _hardener.Setup(h => h.HardenServiceAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<IServiceRepository>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+            _hardener.Setup(h => h.RevokeIfUnusedAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<IServiceRepository>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+            _pipes.Setup(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+            _serviceRepository.Setup(x => x.GetByNameAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((ServiceDto?)null);
+            _serviceRepository.Setup(x => x.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(1);
+
+            ServiceManagerInstallArrange.ScmAvailable(_windowsServiceApi, _handles);
+        }
+
+        public void Dispose() => _handles.Dispose();
+
+        private ServiceManager CreateManager(INamedPipesService? pipes)
+        {
+            var controller = new Mock<IServiceControllerWrapper>();
+            controller.Setup(c => c.Status).Returns(ServiceControllerStatus.Stopped);
+            return new ServiceManager(
+                _ => controller.Object,
+                new Mock<IServiceControllerProvider>().Object,
+                _windowsServiceApi.Object,
+                _win32ErrorProvider.Object,
+                _serviceRepository.Object,
+                _hardener.Object,
+                pipes);
+        }
+
+        private SafeServiceHandle ArrangeUninstall(string? account)
+        {
+            var serviceHandle = ServiceManagerInstallArrange.ServiceInstalledAndStopped(_windowsServiceApi, _win32ErrorProvider, _handles, ServiceName);
+            _serviceRepository.Setup(x => x.GetByNameAsync(ServiceName, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, RunAsLocalSystem = account == null, UserAccount = account });
+            return serviceHandle;
+        }
+
+        private static InstallServiceOptions CreateOptions(string? username, string? dependencies = null, string serviceName = ServiceName)
+        {
+            return new InstallServiceOptions
+            {
+                ServiceName = serviceName,
+                WrapperExePath = "wrapper.exe",
+                RealExePath = "real.exe",
+                StartType = ServiceStartType.Automatic,
+                ProcessPriority = ProcessPriority.Normal,
+                Username = username,
+                Password = string.IsNullOrWhiteSpace(username) || ServiceAccounts.IsBuiltInServiceAccount(username.Trim()) ? null : "password",
+                ServiceDependencies = dependencies,
+            };
+        }
+
+        #region Undecryptable row (#7334)
+
+        [Fact]
+        public async Task InstallService_ExistingRowFailedToDecrypt_IsRefusedBeforeTheScmOrTheDatabaseIsTouched()
+        {
+            // Arrange: the row as the repository returns it when a sensitive field cannot be decrypted - the
+            // read path sets DecryptionFailed and prefixes the description, and the flag is what is read (#7348)
+            _serviceRepository.Setup(x => x.GetByNameAsync(ServiceName, true, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto
+                {
+                    Name = ServiceName,
+                    DecryptionFailed = true,
+                    Description = string.Format(DecryptionFailureMarker.CorruptFormat, "SecureDataIntegrityException") + DecryptionFailureMarker.OriginalDescriptionSeparator + "desc",
+                });
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(null), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result.IsSuccess);
+            Assert.Equal(new ServiceDecryptionFailedException(ServiceName, null).Message, result.ErrorMessage);
+            Assert.Contains(ServiceName, result.ErrorMessage);
+            _windowsServiceApi.Verify(x => x.OpenSCManager(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<uint>()), Times.Never);
+            _serviceRepository.Verify(x => x.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            _serviceRepository.Verify(x => x.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task InstallService_ExistingRowRefusedByTheLegacyEncryptionPolicy_IsRefusedNamingTheLegacyEncryptionNotTheKey()
+        {
+            // Arrange: the row as the repository returns it when a sensitive field still uses the pre-v2 encryption -
+            // the read path sets both flags, and the key is not involved (#7816)
+            _serviceRepository.Setup(x => x.GetByNameAsync(ServiceName, true, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto
+                {
+                    Name = ServiceName,
+                    DecryptionFailed = true,
+                    LegacyEncryptionBlocked = true,
+                    Description = DecryptionFailureMarker.LegacyBlocked + DecryptionFailureMarker.OriginalDescriptionSeparator + "desc",
+                });
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(null), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.False(result.IsSuccess);
+            Assert.Equal(ServiceDecryptionFailedException.ForLegacyEncryption(ServiceName, null, null).Message, result.ErrorMessage);
+            Assert.DoesNotContain("copy Servy.db back", result.ErrorMessage);
+            _windowsServiceApi.Verify(x => x.OpenSCManager(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<uint>()), Times.Never);
+            _serviceRepository.Verify(x => x.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task InstallService_ExistingRowCarriesAStoredMarkerButDecrypts_IsNotRefused()
+        {
+            // Arrange: the shape a Servy v9.5 save persisted (#5186) - the marker is in the STORED description and
+            // the sensitive columns are blank, so the read decrypts cleanly and DecryptionFailed stays false.
+            // Reading the text instead of the flag refused every install and update of such a row for good (#7348).
+            ServiceManagerInstallArrange.ServiceAlreadyExists(_windowsServiceApi, _handles, ServiceName);
+            _serviceRepository.Setup(x => x.GetByNameAsync(ServiceName, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto
+                {
+                    Name = ServiceName,
+                    DecryptionFailed = false,
+                    Description = string.Format(DecryptionFailureMarker.CorruptFormat, "CryptographicException") + DecryptionFailureMarker.OriginalDescriptionSeparator + "My app",
+                });
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(null), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _serviceRepository.Verify(x => x.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        #endregion
+
+        #region Dependency on the host
+
+        [Theory]
+        [InlineData(null, "Servy\0\0")]
+        [InlineData("Tcpip;Dnscache", "Tcpip\0Dnscache\0Servy\0\0")]
+        [InlineData("servy;Tcpip", "servy\0Tcpip\0\0")]
+        public async Task InstallService_NewService_DependsOnTheHostService(string? dependencies, string expected)
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+            ServiceDto? saved = null;
+            _serviceRepository.Setup(x => x.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .Callback<ServiceDto, bool, bool, CancellationToken>((dto, _, _, _) => saved = dto).ReturnsAsync(1);
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(null, dependencies), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _windowsServiceApi.Verify(x => x.CreateService(
+                It.IsAny<SafeScmHandle>(), ServiceName, It.IsAny<string>(), It.IsAny<uint>(), It.IsAny<uint>(), It.IsAny<uint>(), It.IsAny<uint>(),
+                It.IsAny<string>(), null, IntPtr.Zero, expected, It.IsAny<string>(), It.IsAny<string>()), Times.Once);
+
+            // The implicit dependency is SCM-only: the configured dependencies are stored as the user typed them
+            Assert.Equal(dependencies, saved!.ServiceDependencies);
+        }
+
+        [Fact]
+        public async Task InstallService_ExistingService_KeepsDependingOnTheHostService()
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceAlreadyExists(_windowsServiceApi, _handles, ServiceName);
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(null, "Tcpip"), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _windowsServiceApi.Verify(x => x.ChangeServiceConfig(
+                It.IsAny<SafeServiceHandle>(), It.IsAny<uint>(), It.IsAny<uint>(), It.IsAny<uint>(), It.IsAny<string>(),
+                It.IsAny<string>(), It.IsAny<IntPtr>(), "Tcpip\0Servy\0\0", It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()), Times.Once);
+        }
+
+        [Theory]
+        [InlineData("Servy")]
+        [InlineData("SERVY")]
+        [InlineData(" servy ")]
+        public async Task InstallService_TheHostServiceName_IsRefusedWithoutTouchingTheScm(string name)
+        {
+            // Act
+            var (result, log) = await LogCapture.RunAsync(() => CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(null, serviceName: name), TestContext.Current.CancellationToken));
+
+            // Assert
+            Assert.False(result.IsSuccess);
+            Assert.Contains("is reserved for the Servy host service", result.ErrorMessage);
+            Assert.Contains("is reserved for the Servy host service", log);
+            _windowsServiceApi.Verify(x => x.OpenSCManager(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<uint>()), Times.Never);
+            _serviceRepository.Verify(x => x.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        #endregion
+
+        #region Pipe access on install
+
+        [Theory]
+        [InlineData(@".\svc-account")]
+        [InlineData(ServiceAccounts.LocalService)]
+        public async Task InstallService_NewServiceUnderCustomAccount_GrantsPipeAccessAfterTheRowIsSaved(string account)
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+            var order = new List<string>();
+            _serviceRepository.Setup(x => x.UpsertAsync(It.IsAny<ServiceDto>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .Callback(() => order.Add("save")).ReturnsAsync(1);
+            _pipes.Setup(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>())).Callback(() => order.Add("refresh")).ReturnsAsync(true);
+
+            // Act
+            var (result, log) = await LogCapture.RunAsync(() => CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(account), TestContext.Current.CancellationToken));
+
+            // Assert: the host derives the DACL from Servy.db, so the row must exist before it is asked to rebuild it
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            Assert.Equal(new[] { "save", "refresh" }, order);
+            Assert.Contains($"Granted '{account}' access to the Servy host named pipe (service '{ServiceName}').", log);
+        }
+
+        [Fact]
+        public async Task InstallService_ExistingServiceUnderCustomAccount_GrantsPipeAccess()
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceAlreadyExists(_windowsServiceApi, _handles, ServiceName);
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(@".\svc-account"), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _pipes.Verify(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData(ServiceAccounts.LocalSystem)]
+        public async Task InstallService_NewServiceUnderLocalSystem_DoesNotTouchThePipe(string? account)
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(account), TestContext.Current.CancellationToken);
+
+            // Assert: Local System always has Full Control on the pipe
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _pipes.Verify(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task InstallService_HostNotRunning_InstallSucceedsAndSaysWhenTheAccessApplies()
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+            _pipes.Setup(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>())).ReturnsAsync(false);
+
+            // Act
+            var (result, log) = await LogCapture.RunAsync(() => CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(@".\svc-account"), TestContext.Current.CancellationToken));
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            Assert.Contains("It applies the change the next time the 'Servy' service starts.", log);
+        }
+
+        [Fact]
+        public async Task InstallService_RefreshThrows_InstallStillSucceedsAndIsNotRolledBack()
+        {
+            // Arrange
+            var serviceHandle = ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+            _pipes.Setup(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>())).ThrowsAsync(new InvalidOperationException("pipe broke"));
+
+            // Act
+            var (result, log) = await LogCapture.RunAsync(() => CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(@".\svc-account"), TestContext.Current.CancellationToken));
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _windowsServiceApi.Verify(x => x.DeleteService(serviceHandle), Times.Never);
+            Assert.Contains(@"Refreshing the Servy host named pipe access for '.\svc-account' (service 'PipedService') failed.", log);
+        }
+
+        [Fact]
+        public async Task InstallService_RefreshCancelled_InstallStillSucceedsAndIsNotRolledBack()
+        {
+            // Arrange
+            var serviceHandle = ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+            _pipes.Setup(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>())).ThrowsAsync(new OperationCanceledException());
+
+            // Act
+            var (result, log) = await LogCapture.RunAsync(() => CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(@".\svc-account"), TestContext.Current.CancellationToken));
+
+            // Assert: the refresh runs after the service was created and saved, so cancelling it must not roll that back
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _windowsServiceApi.Verify(x => x.DeleteService(serviceHandle), Times.Never);
+            Assert.Contains(@"Refreshing the Servy host named pipe access for '.\svc-account' (service 'PipedService') was cancelled.", log);
+        }
+
+        [Fact]
+        public async Task InstallService_WithoutPipeService_InstallsWithoutAPipeRefreshError()
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+
+            // Act
+            var (result, log) = await LogCapture.RunAsync(() => CreateManager(null).InstallServiceAsync(CreateOptions(@".\svc-account"), TestContext.Current.CancellationToken));
+
+            // Assert: no pipe service means the refresh is skipped, not attempted and swallowed; the null guard is the
+            // only thing keeping a NullReferenceException out of this error line
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            Assert.DoesNotContain("Servy host named pipe", log);
+        }
+
+        #endregion
+
+        #region Pipe access on uninstall and remove
+
+        [Fact]
+        public async Task UninstallService_CustomAccount_RefreshesThePipeAccessAfterTheDelete()
+        {
+            // Arrange
+            ArrangeUninstall(@".\svc-account");
+            var order = new List<string>();
+            _serviceRepository.Setup(r => r.DeleteAsync(ServiceName, It.IsAny<CancellationToken>())).Callback(() => order.Add("delete")).ReturnsAsync(1);
+            _pipes.Setup(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>())).Callback(() => order.Add("refresh")).ReturnsAsync(true);
+
+            // Act
+            var result = await CreateManager(_pipes.Object).UninstallServiceAsync(ServiceName, TestContext.Current.CancellationToken);
+
+            // Assert: the row is gone, so the rebuilt DACL keeps the account only if another service still uses it
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            Assert.Equal(new[] { "delete", "refresh" }, order);
+        }
+
+        [Fact]
+        public async Task UninstallService_RefreshCancelled_StillReportsTheUninstallAsDone()
+        {
+            // Arrange
+            ArrangeUninstall(@".\svc-account");
+            _serviceRepository.Setup(r => r.DeleteAsync(ServiceName, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+            _pipes.Setup(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>())).ThrowsAsync(new OperationCanceledException());
+
+            // Act
+            var (result, log) = await LogCapture.RunAsync(() => CreateManager(_pipes.Object).UninstallServiceAsync(ServiceName, TestContext.Current.CancellationToken));
+
+            // Assert: the service and its row are already gone when the refresh runs, so the uninstall is not cancelled
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            Assert.Contains("was cancelled.", log);
+        }
+
+        [Fact]
+        public async Task UninstallService_LocalSystem_DoesNotTouchThePipe()
+        {
+            // Arrange
+            ArrangeUninstall(null);
+            _serviceRepository.Setup(r => r.DeleteAsync(ServiceName, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+            // Act
+            var result = await CreateManager(_pipes.Object).UninstallServiceAsync(ServiceName, TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _pipes.Verify(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task RevokeVaultAccessIfUnusedAsync_RemovedRecord_RefreshesThePipeAccess()
+        {
+            // Arrange: the Manager's "remove" deletes the row directly, then calls this
+            var record = new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @".\svc-account" };
+
+            // Act
+            var log = await LogCapture.RunAsync(() => CreateManager(_pipes.Object).RevokeVaultAccessIfUnusedAsync(record, TestContext.Current.CancellationToken));
+
+            // Assert
+            _hardener.Verify(h => h.RevokeIfUnusedAsync(@".\svc-account", ServiceName, _serviceRepository.Object, It.IsAny<CancellationToken>()), Times.Once);
+            _pipes.Verify(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>()), Times.Once);
+            Assert.Contains("the account keeps it only while another service runs under it", log);
+        }
+
+        [Fact]
+        public async Task RevokeVaultAccessIfUnusedAsync_WithoutHardener_StillRefreshesThePipeAccess()
+        {
+            // Arrange
+            var manager = new ServiceManager(
+                _ => new Mock<IServiceControllerWrapper>().Object,
+                new Mock<IServiceControllerProvider>().Object,
+                _windowsServiceApi.Object,
+                _win32ErrorProvider.Object,
+                _serviceRepository.Object,
+                exePermissionsHardener: null,
+                namedPipesService: _pipes.Object);
+            var record = new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @".\svc-account" };
+
+            // Act
+            await manager.RevokeVaultAccessIfUnusedAsync(record, TestContext.Current.CancellationToken);
+
+            // Assert
+            _pipes.Verify(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task InstallService_MovedToAnotherAccount_RefreshesForTheNewAndTheFormerAccount()
+        {
+            // Arrange: the service ran under .\old-account and is reinstalled under .\new-account
+            ServiceManagerInstallArrange.ServiceAlreadyExists(_windowsServiceApi, _handles, ServiceName);
+            _serviceRepository.Setup(x => x.GetByNameAsync(ServiceName, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @".\old-account" });
+
+            // Act
+            var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(@".\new-account"), TestContext.Current.CancellationToken);
+
+            // Assert
+            Assert.True(result.IsSuccess, result.ErrorMessage);
+            _hardener.Verify(h => h.RevokeIfUnusedAsync(@".\old-account", It.IsAny<string?>(), It.IsAny<IServiceRepository>(), It.IsAny<CancellationToken>()), Times.Once);
+            _pipes.Verify(p => p.RefreshPipeAccessAsync(It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+
+        [Fact]
+        public async Task InstallService_MovedToAnotherAccount_HandsTheCallersTokenToTheHardenerAndToBothPipeRefreshes()
+        {
+            // Arrange: the update path, with a former account, runs all three post-save hand-overs
+            ServiceManagerInstallArrange.ServiceAlreadyExists(_windowsServiceApi, _handles, ServiceName);
+            _serviceRepository.Setup(x => x.GetByNameAsync(ServiceName, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @".\old-account" });
+
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+            {
+                // Act
+                var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(@".\new-account"), cts.Token);
+
+                // Assert: a token that neither default nor CancellationToken.None equals
+                Assert.True(result.IsSuccess, result.ErrorMessage);
+                _hardener.Verify(h => h.HardenServiceAsync(ServiceName, @".\new-account", _serviceRepository.Object, cts.Token), Times.Once);
+                _hardener.Verify(h => h.RevokeIfUnusedAsync(@".\old-account", ServiceName, _serviceRepository.Object, cts.Token), Times.Once);
+                _pipes.Verify(p => p.RefreshPipeAccessAsync(cts.Token), Times.Exactly(2));
+                _serviceRepository.Verify(r => r.GetByNameAsync(ServiceName, true, cts.Token), Times.Once);
+                _serviceRepository.Verify(r => r.GetByNameAsync(ServiceName, false, cts.Token), Times.Once);
+                _serviceRepository.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), true, false, cts.Token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task InstallService_NewServiceUnderCustomAccount_HandsTheCallersTokenToTheHardenerAndThePipeRefresh()
+        {
+            // Arrange
+            ServiceManagerInstallArrange.ServiceCreated(_windowsServiceApi, _handles);
+
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+            {
+                // Act
+                var result = await CreateManager(_pipes.Object).InstallServiceAsync(CreateOptions(@".\svc-account"), cts.Token);
+
+                // Assert
+                Assert.True(result.IsSuccess, result.ErrorMessage);
+                _hardener.Verify(h => h.HardenServiceAsync(ServiceName, @".\svc-account", _serviceRepository.Object, cts.Token), Times.Once);
+                _pipes.Verify(p => p.RefreshPipeAccessAsync(cts.Token), Times.Once);
+                _serviceRepository.Verify(r => r.UpsertAsync(It.IsAny<ServiceDto>(), false, false, cts.Token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task UninstallService_CustomAccount_HandsTheCallersTokenToTheRevocationAndThePipeRefresh()
+        {
+            // Arrange
+            ArrangeUninstall(@".\svc-account");
+            _serviceRepository.Setup(r => r.DeleteAsync(ServiceName, It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+            {
+                // Act
+                var result = await CreateManager(_pipes.Object).UninstallServiceAsync(ServiceName, cts.Token);
+
+                // Assert
+                Assert.True(result.IsSuccess, result.ErrorMessage);
+                _hardener.Verify(h => h.RevokeIfUnusedAsync(@".\svc-account", ServiceName, _serviceRepository.Object, cts.Token), Times.Once);
+                _pipes.Verify(p => p.RefreshPipeAccessAsync(cts.Token), Times.Once);
+                _serviceRepository.Verify(r => r.GetByNameAsync(ServiceName, false, cts.Token), Times.Once);
+                _serviceRepository.Verify(r => r.DeleteAsync(ServiceName, cts.Token), Times.Once);
+            }
+        }
+
+        [Fact]
+        public async Task RevokeVaultAccessIfUnusedAsync_RemovedRecord_HandsTheCallersTokenToTheRevocationAndThePipeRefresh()
+        {
+            // Arrange
+            var record = new ServiceDto { Name = ServiceName, RunAsLocalSystem = false, UserAccount = @".\svc-account" };
+
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+            {
+                // Act
+                await CreateManager(_pipes.Object).RevokeVaultAccessIfUnusedAsync(record, cts.Token);
+
+                // Assert
+                _hardener.Verify(h => h.RevokeIfUnusedAsync(@".\svc-account", ServiceName, _serviceRepository.Object, cts.Token), Times.Once);
+                _pipes.Verify(p => p.RefreshPipeAccessAsync(cts.Token), Times.Once);
+            }
+        }
+
+        #endregion
+    }
+}

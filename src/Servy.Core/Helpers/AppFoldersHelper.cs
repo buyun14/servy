@@ -63,8 +63,9 @@ namespace Servy.Core.Helpers
         /// </item>
         /// <item>
         /// <description>
-        /// <b>Operational Folders:</b> Subfolders (db, security, recovery, logs) are processed. If they reside within the Root Vault,
-        /// inheritance is preserved to allow manually granted service account permissions to cascade down.
+        /// <b>Operational Folders:</b> Subfolders (db, security, logs, logs\services) are processed. If they reside within the Root Vault,
+        /// inheritance is preserved so the Root Vault's own entries flow down. Service accounts hold nothing on the Root Vault
+        /// (#7526); their grants are written per item by <see cref="Servy.Core.Security.ServyExePermissionsHardener"/>.
         /// </description>
         /// </item>
         /// <item>
@@ -76,8 +77,13 @@ namespace Servy.Core.Helpers
         /// </list>
         /// </para>
         /// </remarks>
-        /// <exception cref="ArgumentException">Thrown if any of the provided paths or connection strings are null or whitespace.</exception>
-        /// <exception cref="InvalidOperationException">Thrown if the connection string format is invalid or directory names cannot be parsed.</exception>
+        /// <exception cref="ArgumentException">
+        /// Thrown if any of the provided paths or connection strings are null or whitespace, or if
+        /// <paramref name="aesKeyFilePath"/>, <paramref name="aesIVFilePath"/> or <paramref name="rootVaultPath"/> is not an absolute path.
+        /// </exception>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown if the connection string format is invalid, its database path is empty or not absolute, or directory names cannot be parsed.
+        /// </exception>
         public static void EnsureFolders(string connectionString, string aesKeyFilePath, string aesIVFilePath, string? rootVaultPath = null)
         {
             // Reject null/blank paths before any filesystem or ACL work
@@ -85,8 +91,16 @@ namespace Servy.Core.Helpers
                 throw new ArgumentException("connectionString cannot be null or whitespace", nameof(connectionString));
             if (string.IsNullOrWhiteSpace(aesKeyFilePath))
                 throw new ArgumentException("aesKeyFilePath cannot be null or whitespace", nameof(aesKeyFilePath));
+            if (!Helper.IsAbsolute(aesKeyFilePath))
+                throw new ArgumentException("aesKeyFilePath must be an absolute path", nameof(aesKeyFilePath));
             if (string.IsNullOrWhiteSpace(aesIVFilePath))
                 throw new ArgumentException("aesIVFilePath cannot be null or whitespace", nameof(aesIVFilePath));
+            if (!Helper.IsAbsolute(aesIVFilePath))
+                throw new ArgumentException("aesIVFilePath must be an absolute path", nameof(aesIVFilePath));
+            if (rootVaultPath != null && string.IsNullOrWhiteSpace(rootVaultPath))
+                throw new ArgumentException("rootVaultPath cannot be whitespace", nameof(rootVaultPath));
+            if (rootVaultPath != null && !Helper.IsAbsolute(rootVaultPath))
+                throw new ArgumentException("rootVaultPath must be an absolute path", nameof(rootVaultPath));
 
             // 1. Utilize the BCL's robust connection string builder
             DbConnectionStringBuilder builder;
@@ -115,6 +129,8 @@ namespace Servy.Core.Helpers
             var dbFolder = Path.GetDirectoryName(dbFilePath);
             if (string.IsNullOrWhiteSpace(dbFolder))
                 throw new InvalidOperationException("Cannot determine database folder path.");
+            if (!Helper.IsAbsolute(dbFolder))
+                throw new InvalidOperationException("The database path in the connection string must be absolute.");
 
             var aesKeyFolder = Path.GetDirectoryName(aesKeyFilePath);
             if (string.IsNullOrWhiteSpace(aesKeyFolder))
@@ -125,14 +141,14 @@ namespace Servy.Core.Helpers
                 throw new InvalidOperationException("Cannot determine AES IV folder path.");
 
             var root = rootVaultPath ?? AppConfig.ProgramDataPath;
-            var recoveryFolder = rootVaultPath is null ? AppConfig.RecoveryFolderPath : Path.Combine(root, AppConfig.RecoveryFolderName);
-            var logsFolder = rootVaultPath is null ? AppConfig.LogsFolderPath : Path.Combine(root, AppConfig.LogsFolderName);
+            var logsFolder = Path.Combine(root, AppConfig.LogsFolderName);
+            var serviceLogsFolder = Path.Combine(logsFolder, AppConfig.ServiceLogsFolderName);
 
             // 4. Secure the Root Vault so its ACLs exist for children to inherit
             SecurityHelper.CreateSecureDirectory(root, breakInheritance: true);
 
             // 5. Secure operational folders while respecting inheritance
-            string[] subFolders = new[] { dbFolder, aesKeyFolder, aesIVFolder, recoveryFolder, logsFolder }
+            string[] subFolders = new[] { dbFolder, aesKeyFolder, aesIVFolder, logsFolder, serviceLogsFolder }
                 .Select(Path.GetFullPath)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -148,7 +164,7 @@ namespace Servy.Core.Helpers
                 if (folder.Equals(canonicalRoot, StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                // If a folder is nested inside the master vault, we KEEP inheritance so custom service accounts cascade down.
+                // If a folder is nested inside the master vault, we KEEP inheritance so the vault's own entries flow down.
                 // If a folder is stored externally (e.g., D:\CustomDb), it acts as its own root vault and MUST break inheritance.
                 bool isChildOfRoot = folder.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
 

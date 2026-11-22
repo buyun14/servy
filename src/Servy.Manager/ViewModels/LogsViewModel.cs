@@ -9,8 +9,8 @@ using Servy.UI.Commands;
 using Servy.UI.Design;
 using Servy.UI.Services;
 using System.ComponentModel;
+using System.Security;
 using System.Windows.Data;
-using System.Windows.Input;
 
 namespace Servy.Manager.ViewModels
 {
@@ -18,7 +18,7 @@ namespace Servy.Manager.ViewModels
     /// ViewModel for the Logs tab in Servy Manager.
     /// Provides filtering, searching, and displaying log entries from the event log.
     /// </summary>
-    public class LogsViewModel : SearchableViewModelBase, IDisposable
+    public class LogsViewModel : SearchableViewModelBase
     {
         #region Private Fields
 
@@ -34,7 +34,6 @@ namespace Servy.Manager.ViewModels
         private readonly BulkObservableCollection<LogEntryModel> _logs = new BulkObservableCollection<LogEntryModel>();
         private EventLogLevel? _selectedLevel = EventLogLevel.All;
         private string? _selectedLogMessage;
-        private bool _isDisposed;
 
         #endregion
 
@@ -160,7 +159,7 @@ namespace Servy.Manager.ViewModels
 
         /// <summary>
         /// Gets or sets the message of the currently selected log entry.
-        /// Returns an empty string if none is selected.
+        /// Set to an empty string when the selection is cleared; <see langword="null"/> until the first entry is selected.
         /// </summary>
         public string? SelectedLogMessage
         {
@@ -239,8 +238,7 @@ namespace Servy.Manager.ViewModels
             _eventLogService = eventLogService ?? throw new ArgumentNullException(nameof(eventLogService));
             _messageBoxService = messageBoxService ?? throw new ArgumentNullException(nameof(messageBoxService));
 
-            FromDate = DateTime.Now.AddDays(-_appConfig.LogsWindowDays);
-            ToDate = DateTime.Now; // Default to now
+            ResetDateWindowToNow();
 
             LogsView = new ListCollectionView(_logs);
             SearchCommand = new AsyncCommand(Search, name: nameof(SearchCommand));
@@ -294,13 +292,16 @@ namespace Servy.Manager.ViewModels
         /// </summary>
         protected override async Task HandleSearchExceptionAsync(Exception ex)
         {
-            Logger.Error($"Failed to search logs.", ex);
-            await _messageBoxService.ShowErrorAsync(Strings.Msg_UnexpectedError, UiAppConfig.Caption);
+            var message = ex is SecurityException || ex is InvalidOperationException
+                ? ex.Message
+                : Core.Resources.Strings.Msg_UnexpectedError;
+
+            await _messageBoxService.ShowErrorAsync(message, UiAppConfig.Caption);
         }
 
         /// <summary>
         /// Gets the list of available log levels for filtering.
-        /// Levels exposed in the filter dropdown - excludes Critical/Verbose because Servy itself never emits them
+        /// Levels exposed in the filter dropdown - excludes Critical/Verbose because Servy itself never emits them.
         /// </summary>
         /// <returns>Log levels.</returns>
         private static List<EventLogLevel> GetLogLevels() => Enum.GetValues(typeof(EventLogLevel))
@@ -314,34 +315,32 @@ namespace Servy.Manager.ViewModels
 
         /// <summary>
         /// Cancels any in-flight search and restores UI state (cursor, busy flag, button text).
-        /// Does not dispose the view model - see <see cref="Dispose()"/> for full teardown.
+        /// Does not dispose the view model - see <see cref="SearchableViewModelBase.Dispose()"/> for full teardown.
         /// </summary>
         public void CancelSearch()
         {
             ClearActiveSearchContext(); // Triggers atomic infrastructure base teardown safely
         }
 
-        /// <summary>
-        /// Safely disposes of resources, specifically cancelling and disposing the internal
-        /// <see cref="CancellationTokenSource"/> to prevent memory leaks.
-        /// </summary>
-        /// <param name="disposing">True if called from Dispose(), false if from a finalizer.</param>
-        protected virtual void Dispose(bool disposing)
+        /// <inheritdoc />
+        protected override void Dispose(bool disposing)
         {
-            if (_isDisposed) return;
             if (disposing)
             {
-                CancelSearch();
                 ScrollLogsToTopRequested = null;
             }
-            _isDisposed = true;
+            base.Dispose(disposing);
         }
 
-        /// <inheritdoc />
-        public void Dispose()
+        /// <summary>
+        /// Re-seeds the default search window to end at the current moment.
+        /// Called when the Logs tab is activated so a long-running Manager
+        /// does not keep searching the window it started with.
+        /// </summary>
+        public void ResetDateWindowToNow()
         {
-            Dispose(disposing: true);
-            GC.SuppressFinalize(this);
+            FromDate = DateTime.Now.AddDays(-_appConfig.LogsWindowDays);
+            ToDate = DateTime.Now;
         }
 
         #endregion

@@ -3,6 +3,7 @@ using Servy.Core.Resources;
 using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
 using System.ServiceProcess;
+using static Servy.Core.Native.Errors;
 
 namespace Servy.Core.Services
 {
@@ -21,6 +22,17 @@ namespace Servy.Core.Services
         {
             _serviceName = serviceName;
             _controller = new ServiceController(serviceName);
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ServiceControllerWrapper"/> class adopting an existing <see cref="ServiceController"/> instance.
+        /// </summary>
+        /// <param name="controller">The existing <see cref="ServiceController"/> instance to adopt and wrap.</param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="controller"/> is null.</exception>
+        internal ServiceControllerWrapper(ServiceController controller)
+        {
+            _controller = controller ?? throw new ArgumentNullException(nameof(controller));
+            _serviceName = controller.ServiceName;
         }
 
         /// <inheritdoc />
@@ -80,6 +92,14 @@ namespace Servy.Core.Services
         {
             ThrowIfDisposed();
             _controller.Stop();
+        }
+
+        /// <inheritdoc />
+        [ExcludeFromCodeCoverage]
+        public void Continue()
+        {
+            ThrowIfDisposed();
+            _controller.Continue();
         }
 
         /// <inheritdoc />
@@ -152,6 +172,27 @@ namespace Servy.Core.Services
         }
 
         /// <summary>
+        /// Recursively creates a deep clone of a resolved subtree so each position in the UI tree
+        /// maintains its own independent UI state (such as IsExpanded).
+        /// </summary>
+        private static ServiceDependencyNode CloneSubtree(ServiceDependencyNode source)
+        {
+            var copy = new ServiceDependencyNode(
+                source.ServiceName,
+                source.DisplayName,
+                source.IsRunning,
+                source.IsCyclic,
+                source.IsUnavailable);
+
+            foreach (var child in source.Dependencies)
+            {
+                copy.Dependencies.Add(CloneSubtree(child));
+            }
+
+            return copy;
+        }
+
+        /// <summary>
         /// Recursively builds a dependency tree for the specified service
         /// sorted alphabetically by Display Name.
         /// </summary>
@@ -168,7 +209,7 @@ namespace Servy.Core.Services
         /// <param name="serviceFactory">
         /// Optional internal factory used to construct child wrappers; falls back to live SCM wrapper instantiation if <c>null</c>.
         /// </param>
-        /// <param name="cancellationToken">A token to observe while waiting for the task to complete.</param>
+        /// <param name="cancellationToken">A token checked before each service is resolved and before each child is added.</param>
         /// <returns>
         /// A <see cref="ServiceDependencyNode"/> representing the service and its dependencies.
         /// If a cycle is detected, a placeholder node is returned.
@@ -188,7 +229,7 @@ namespace Servy.Core.Services
             // 2. Check if we've already built the subtree for this service elsewhere
             if (!isCyclic && fullyExpanded.TryGetValue(serviceName, out var cachedNode))
             {
-                return cachedNode;
+                return CloneSubtree(cachedNode);
             }
 
             try
@@ -227,8 +268,8 @@ namespace Servy.Core.Services
                             childNodes.Add(BuildDependencyTree(depName, currentPath, fullyExpanded, serviceFactory, cancellationToken));
                         }
 
-                        // 4. SORT and ADD: Order alphabetically by DisplayName
-                        var sortedChildren = childNodes.OrderBy(n => n.DisplayName, StringComparer.OrdinalIgnoreCase);
+                        // 4. SORT and ADD: Order alphabetically by DisplayName (or ServiceName if unavailable)
+                        var sortedChildren = childNodes.OrderBy(n => n.IsUnavailable ? n.ServiceName : n.DisplayName, StringComparer.OrdinalIgnoreCase);
                         foreach (var child in sortedChildren)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
@@ -253,18 +294,17 @@ namespace Servy.Core.Services
             catch (InvalidOperationException ex)
             {
                 Logger.Debug($"Dependency '{serviceName}' unavailable: {ex.Message}");
-                return new ServiceDependencyNode(serviceName, string.Format(Strings.Msg_DependencyUnavailable, serviceName), false, false);
+                return new ServiceDependencyNode(serviceName, string.Format(Strings.Msg_DependencyUnavailable, serviceName), isRunning: false, isCyclic: false, isUnavailable: true);
             }
             catch (Win32Exception ex)
             {
                 Logger.Warn($"Win32 error resolving dependency '{serviceName}'.", ex);
 
-                // Discrimination filter targeting Win32 error code 5 (ERROR_ACCESS_DENIED)
-                string localizedMessage = ex.NativeErrorCode == 5
+                string localizedMessage = ex.NativeErrorCode == ERROR_ACCESS_DENIED
                     ? string.Format(Strings.Msg_DependencyAccessDenied, serviceName)
                     : string.Format(Strings.Msg_DependencyUnavailable, serviceName);
 
-                return new ServiceDependencyNode(serviceName, localizedMessage, false, false);
+                return new ServiceDependencyNode(serviceName, localizedMessage, isRunning: false, isCyclic: false, isUnavailable: true);
             }
         }
 
@@ -273,7 +313,6 @@ namespace Servy.Core.Services
         /// </summary>
         private static bool HasCyclicDescendant(ServiceDependencyNode node)
         {
-            if (node == null) return false;
             if (node.IsCyclic) return true;
 
             foreach (var child in node.Dependencies)
@@ -301,7 +340,7 @@ namespace Servy.Core.Services
 
             if (disposing)
             {
-                _controller?.Dispose();
+                _controller.Dispose();
             }
 
             _disposed = true;

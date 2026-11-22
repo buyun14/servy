@@ -25,13 +25,17 @@ namespace Servy.Core.Validation
     }
 
     /// <summary>
-    /// A secure token representing a file path that has successfully passed all defense-in-depth security invariants.
-    /// The constructor is intentionally hidden to prevent arbitrary instantiation outside of the security gate.
+    /// A token representing a file path that passed the checks of the <see cref="PathSecurityGuard"/> entry point that produced it.
+    /// Note that <see cref="PathSecurityGuard.ValidatePathOnly"/> runs the pre-handle checks only; the post-open re-checks run in <see cref="PathSecurityGuard.ValidatePath"/>.
+    /// The constructor is <c>internal</c>, so construction is confined to <c>Servy.Core</c> and, through <c>InternalsVisibleTo</c>, its test assemblies and <c>Servy.Service</c>; it is not restricted to the gate itself.
+    /// Callers must not construct one outside <see cref="PathSecurityResult.Success"/>.
     /// </summary>
     public sealed class ValidatedPath
     {
         /// <summary>
         /// Gets the absolute, fully qualified, and structurally verified filesystem path.
+        /// It is kernel-resolved only when the token came from <see cref="PathSecurityGuard.ValidatePath"/>;
+        /// <see cref="PathSecurityGuard.ValidatePathOnly"/> supplies the <c>Path.GetFullPath</c> result instead.
         /// </summary>
         public string ResolvedPath { get; }
 
@@ -58,7 +62,7 @@ namespace Servy.Core.Validation
         public bool IsValid { get; }
 
         /// <summary>
-        /// Gets the classification category of the structural rule violation.
+        /// Gets the failure category; <see cref="PathSecurityFailureKind.None"/> when the path is valid.
         /// </summary>
         public PathSecurityFailureKind FailureKind { get; }
 
@@ -88,8 +92,8 @@ namespace Servy.Core.Validation
         /// <summary>
         /// Initializes a new instance of the <see cref="PathSecurityResult"/> class representing a failed validation.
         /// </summary>
-        /// <param name="kind">The architectural category of the path error rule.</param>
-        /// <param name="error">The descriptive validation failure error string.</param>
+        /// <param name="kind">The failure category (security violation vs. invalid argument).</param>
+        /// <param name="error">Human-readable description of the failed rule.</param>
         private PathSecurityResult(PathSecurityFailureKind kind, string error)
         {
             IsValid = false;
@@ -100,15 +104,20 @@ namespace Servy.Core.Validation
         /// <summary>
         /// Creates a successful <see cref="PathSecurityResult"/> encapsulating a verified path token.
         /// </summary>
-        /// <param name="path">The kernel-resolved, fully qualified path that passed security clearance invariants.</param>
+        /// <param name="path">
+        /// The fully qualified path that passed the checks of the calling entry point: the kernel-resolved
+        /// target from <see cref="PathSecurityGuard.ValidatePath"/>, or the <c>Path.GetFullPath</c> result
+        /// from <see cref="PathSecurityGuard.ValidatePathOnly"/>, which opens no handle and therefore performs
+        /// no kernel resolution.
+        /// </param>
         /// <returns>An initialized success descriptor containing a valid <see cref="ValidatedPath"/> instance.</returns>
         internal static PathSecurityResult Success(string path) => new PathSecurityResult(new ValidatedPath(path));
 
         /// <summary>
         /// Creates a failed <see cref="PathSecurityResult"/> capturing a validation rule violation error string and classification kind.
         /// </summary>
-        /// <param name="kind">The architectural category of the path rule restriction broken.</param>
-        /// <param name="error">The descriptive error explaining the security or infrastructural restriction trip.</param>
+        /// <param name="kind">The failure category (security violation vs. invalid argument).</param>
+        /// <param name="error">Human-readable description of the failed rule.</param>
         /// <returns>An initialized failure descriptor containing an explicit error message.</returns>
         internal static PathSecurityResult Fail(PathSecurityFailureKind kind, string error) => new PathSecurityResult(kind, error);
     }

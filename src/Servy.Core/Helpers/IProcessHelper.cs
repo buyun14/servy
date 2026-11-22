@@ -17,12 +17,25 @@ namespace Servy.Core.Helpers
         /// <summary>
         /// Retrieves both CPU and RAM metrics for a process using a single handle.
         /// </summary>
+        /// <param name="pid">The process ID to sample.</param>
+        /// <returns>
+        /// A <see cref="ProcessMetrics"/> for the process, or a zeroed instance if the process
+        /// has exited or cannot be queried.
+        /// </returns>
         ProcessMetrics GetProcessMetrics(int pid);
 
         /// <summary>
         /// Retrieves combined CPU and RAM metrics for an entire process tree.
-        /// Performs a single pass over the tree to minimize kernel transitions.
         /// </summary>
+        /// <param name="rootPid">The process ID of the tree root.</param>
+        /// <returns>
+        /// A <see cref="ProcessMetrics"/> whose <c>RamUsage</c> is the sum over the tree and whose
+        /// <c>CpuUsage</c> is the summed whole-machine percentage, clamped to 100.
+        /// </returns>
+        /// <remarks>
+        /// The tree is walked once to resolve membership and validate creation times against PID reuse,
+        /// then each member is queried for its metrics, so each process is opened twice per call.
+        /// </remarks>
         ProcessMetrics GetProcessTreeMetrics(int rootPid);
 
         /// <summary>
@@ -70,6 +83,12 @@ namespace Servy.Core.Helpers
         /// Resolves an input path by expanding environment variables, ensuring it is absolute,
         /// and resolving relative segment traversals (e.g., directory shifts via '..').
         /// </summary>
+        /// <remarks>
+        /// Variables are expanded by <see cref="SystemEnvironmentHelper.ExpandSystemEnvironmentVariables(string)"/>, against the
+        /// process environment brought up to date with the System variables in the registry, so a System variable added
+        /// or changed after the process started is seen without a restart (one removed is dropped only in an application,
+        /// never in the service).
+        /// </remarks>
         /// <param name="inputPath">The original raw path string to resolve.</param>
         /// <returns>A fully qualified, normalized absolute path string; or <c>null</c> if the input is empty.</returns>
         /// <exception cref="InvalidOperationException">Thrown when the input path evaluates to a relative path.</exception>
@@ -104,7 +123,7 @@ namespace Servy.Core.Helpers
         /// A new <see cref="Process"/> component that is associated with the process resource,
         /// or <c>null</c> if no process resource is started (e.g., if an existing process is reused).
         /// </returns>
-        /// <exception cref="System.InvalidOperationException">Thrown if no file name is specified in <paramref name="psi"/>.</exception>
+        /// <exception cref="InvalidOperationException">Thrown if no file name is specified in <paramref name="psi"/>.</exception>
         /// <exception cref="System.ComponentModel.Win32Exception">Thrown if there is an error opening the associated file.</exception>
         Process? Start(ProcessStartInfo psi);
     }

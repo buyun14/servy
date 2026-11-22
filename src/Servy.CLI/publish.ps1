@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Builds and publishes the Servy.CLI application (Release, self-contained) and
@@ -6,17 +7,18 @@
 
 .DESCRIPTION
     This script performs the following steps:
-      1. Runs the resource publishing script (publish-res-debug.ps1 or publish-res-release.ps1, selected by -BuildConfiguration).
+      1. Runs the resource publishing script (publish-res-debug.ps1 or publish-res-release.ps1, selected by -BuildConfiguration),
+         which builds Servy.Host.exe, Servy.Service.CLI.exe and Servy.Restarter.exe into Resources to be embedded.
       2. Builds and publishes Servy.CLI as a self-contained, single-file executable
-         for win-x64.
-      3. Signs the generated executable via the SignPath signing pipeline.
-      4. Emits standard build/progress messages used across Servy build tooling.
+         for the specified target framework and runtime.
+      3. Signs the published executable with SignPath when -BuildConfiguration is Release
+         and setup/signpath.ps1 is present; otherwise signing is skipped with a warning.
 
     This is used as part of the Release build pipeline to produce final CLI artifacts.
 
 .PARAMETER Tfm
     Target Framework Moniker to publish for.
-    Default: net10.0-windows.
+    Defaults to the value in build-config.ps1.
 
 .PARAMETER BuildConfiguration
     Build configuration to use.
@@ -28,27 +30,41 @@
 
 .EXAMPLE
     ./publish.ps1
-    Runs the script using the default TFM (net10.0-windows).
+    Publishes the CLI using the defaults (Release, net10.0-windows, win-x64).
 
 .EXAMPLE
-    ./publish.ps1 -Tfm net10.0-windows
-    Publishes the CLI for .NET target framework.
+    ./publish.ps1 -Runtime win-arm64
+    Publishes the CLI for the ARM64 runtime.
 
 .NOTES
     Author : Akram El Assas
     Project: Servy
     Requirements:
         - .NET SDK installed
-        - SignPath setup
         - Valid folder structure
+    Optional:
+        - setup/signpath.ps1: signs the output when -BuildConfiguration is Release;
+          when absent, signing is skipped with a warning.
 #>
+[CmdletBinding()]
 param(
-    [string]$Tfm                = "net10.0-windows",
+    [string]$Tfm                = "",
+    [ValidateSet('Debug', 'Release')]
     [string]$BuildConfiguration = "Release",
     [string]$Runtime            = "win-x64"
 )
 
 $P_PublishDir = $PSScriptRoot
+
+# Load central defaults
+$configPath = Join-Path $P_PublishDir "..\..\setup\build-config.ps1"
+if (Test-Path -LiteralPath $configPath) {
+    $buildConfig = & $configPath
+    if (-not $Tfm) { $Tfm = $buildConfig.Tfm }
+} else {
+    throw "Central build configuration not found at $configPath"
+}
+
 . (Join-Path $P_PublishDir "..\..\setup\build-common.ps1")
 
 Invoke-StandardPublish `

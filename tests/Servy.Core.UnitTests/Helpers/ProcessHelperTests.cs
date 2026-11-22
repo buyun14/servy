@@ -2,14 +2,67 @@ using Servy.Core.Helpers;
 
 namespace Servy.Core.UnitTests.Helpers
 {
-    public class ProcessHelperTests
+    public class ProcessHelperTests : IDisposable
     {
         private readonly ProcessHelper _processHelper;
+        private readonly string _testRootName;
+        private readonly string _testRoot;
 
         public ProcessHelperTests()
         {
             _processHelper = new ProcessHelper();
+
+            // Every filesystem artifact this class creates lives under one GUID-suffixed root, as in
+            // HelperTests and RotatingStreamWriterTests, so nothing is shared with another process
+            // and a single guarded Dispose owns all cleanup.
+            _testRootName = "ProcessHelperTests_" + Guid.NewGuid().ToString("N");
+            _testRoot = Path.Combine(Path.GetTempPath(), _testRootName);
+            Directory.CreateDirectory(_testRoot);
         }
+
+        public void Dispose()
+        {
+            try
+            {
+                if (Directory.Exists(_testRoot))
+                {
+                    Directory.Delete(_testRoot, recursive: true);
+                }
+            }
+            catch
+            {
+                // A cleanup failure must never replace the assertion failure that is already propagating.
+            }
+        }
+
+        /// <summary>
+        /// Creates an empty file inside the sandbox and returns its full path.
+        /// </summary>
+        private string CreateTempFile()
+        {
+            var file = Path.Combine(_testRoot, Guid.NewGuid().ToString("N") + ".tmp");
+            File.WriteAllText(file, string.Empty);
+
+            return file;
+        }
+
+        /// <summary>
+        /// Creates a GUID-named directory inside the sandbox.
+        /// </summary>
+        private DirectoryInfo CreateTempDirectory()
+        {
+            return CreateTempDirectory(Guid.NewGuid().ToString("N"));
+        }
+
+        /// <summary>
+        /// Creates a directory with the given name inside the sandbox.
+        /// </summary>
+        private DirectoryInfo CreateTempDirectory(string name)
+        {
+            return Directory.CreateDirectory(Path.Combine(_testRoot, name));
+        }
+
+        #region FormatCpuUsage Tests
 
         [Theory]
         [InlineData(0, "0.0%")]      // zero case
@@ -32,15 +85,25 @@ namespace Servy.Core.UnitTests.Helpers
             Assert.Equal(expected, result);
         }
 
+        #endregion
+
+        #region FormatRamUsage Tests
+
         [Theory]
+        [InlineData(0L, "0.0 B")]                                   // zero case, mirrors FormatCpuUsage
         [InlineData(512L, "512.0 B")]                               // < KB
+        [InlineData(1023L, "1023.0 B")]                             // top of B branch, must NOT promote to KB
+        [InlineData(1024L, "1.0 KB")]                               // exact KB, first promotion step
         [InlineData(2048L, "2.0 KB")]                               // exact KB
         [InlineData(3072L, "3.0 KB")]                               // KB range
-        [InlineData(1048576L, "1.0 MB")]                             // exact MB
+        [InlineData(1048575L, "1.0 MB")]                            // 1 MB - 1, must promote rather than print 1024.0 KB
+        [InlineData(1048576L, "1.0 MB")]                            // exact MB
         [InlineData((long)(1.5 * 1024 * 1024), "1.5 MB")]           // MB range
+        [InlineData(1073741823L, "1.0 GB")]                         // 1 GB - 1, must promote rather than print 1024.0 MB
         [InlineData(1073741824L, "1.0 GB")]                         // exact GB
-        [InlineData((long)(2.23 * 1024 * 1024 * 1024), "2.2 GB")]   // GB range - Truncated fraction fixed via explicit cast context
+        [InlineData((long)(2.23 * 1024 * 1024 * 1024), "2.2 GB")]   // GB range, non-exact fraction
         [InlineData((long)(2.25 * 1024 * 1024 * 1024), "2.3 GB")]   // GB range
+        [InlineData(1099511627775L, "1.0 TB")]                      // 1 TB - 1, must promote rather than print 1024.0 GB
         [InlineData(1099511627776L, "1.0 TB")]                      // exact TB
         [InlineData((long)(3.75 * 1024 * 1024 * 1024 * 1024), "3.8 TB")] // TB range
         public void FormatRamUsage_ReturnsExpected(long input, string expected)
@@ -52,25 +115,18 @@ namespace Servy.Core.UnitTests.Helpers
             Assert.Equal(expected, result);
         }
 
-        // -------------------------
-        // ResolvePath tests
-        // -------------------------
+        #endregion
 
-        [Fact]
-        public void ResolvePath_NullInput_ReturnsNull()
+        #region ResolvePath Tests
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void ResolvePath_NullOrWhitespace_ReturnsNull(string? input)
         {
             // Arrange & Act
-            var result = _processHelper.ResolvePath(null!);
-
-            // Assert
-            Assert.Null(result);
-        }
-
-        [Fact]
-        public void ResolvePath_EmptyInput_ReturnsNull()
-        {
-            // Arrange & Act
-            var result = _processHelper.ResolvePath(string.Empty);
+            var result = _processHelper.ResolvePath(input!);
 
             // Assert
             Assert.Null(result);
@@ -181,9 +237,23 @@ namespace Servy.Core.UnitTests.Helpers
             Assert.Equal(Path.Combine(systemRoot, "System32\\cmd.exe"), result, ignoreCase: true);
         }
 
-        // -------------------------
-        // ValidatePath tests
-        // -------------------------
+        [Fact]
+        public void ResolvePath_PaddedAbsolutePath_IsTrimmedBeforeTheAbsoluteCheck()
+        {
+            // Arrange
+            var expected = Path.GetFullPath(Path.Combine(_testRoot, "padded.txt"));
+            var input = "  " + expected + "  ";
+
+            // Act
+            var result = _processHelper.ResolvePath(input);
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
+        #endregion
+
+        #region ValidatePath Tests
 
         [Fact]
         public void ValidatePath_NullInput_ReturnsFalse()
@@ -203,24 +273,27 @@ namespace Servy.Core.UnitTests.Helpers
         public void ValidatePath_ExistingFile_ReturnsTrue()
         {
             // Arrange
-            var file = Path.GetTempFileName();
+            var file = CreateTempFile();
 
-            try
-            {
-                // Act & Assert
-                Assert.True(_processHelper.ValidatePath(file, isFile: true));
-            }
-            finally
-            {
-                File.Delete(file);
-            }
+            // Act & Assert
+            Assert.True(_processHelper.ValidatePath(file, isFile: true));
+        }
+
+        [Fact]
+        public void ValidatePath_PaddedExistingFile_ReturnsTrue()
+        {
+            // Arrange
+            var file = CreateTempFile();
+
+            // Act & Assert
+            Assert.True(_processHelper.ValidatePath("  " + file + "  ", isFile: true));
         }
 
         [Fact]
         public void ValidatePath_NonExistingFile_ReturnsFalse()
         {
             // Arrange
-            var file = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".txt");
+            var file = Path.Combine(_testRoot, Guid.NewGuid() + ".txt");
 
             // Act & Assert
             Assert.False(_processHelper.ValidatePath(file, isFile: true));
@@ -230,25 +303,17 @@ namespace Servy.Core.UnitTests.Helpers
         public void ValidatePath_ExistingDirectory_ReturnsTrue()
         {
             // Arrange
-            var dir = Directory.CreateDirectory(
-                Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString()));
+            var dir = CreateTempDirectory();
 
-            try
-            {
-                // Act & Assert
-                Assert.True(_processHelper.ValidatePath(dir.FullName, isFile: false));
-            }
-            finally
-            {
-                dir.Delete();
-            }
+            // Act & Assert
+            Assert.True(_processHelper.ValidatePath(dir.FullName, isFile: false));
         }
 
         [Fact]
         public void ValidatePath_NonExistingDirectory_ReturnsFalse()
         {
             // Arrange
-            var dir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            var dir = Path.Combine(_testRoot, Guid.NewGuid().ToString());
 
             // Act & Assert
             Assert.False(_processHelper.ValidatePath(dir, isFile: false));
@@ -257,19 +322,14 @@ namespace Servy.Core.UnitTests.Helpers
         [Fact]
         public void ValidatePath_UnexpandedEnvVar_IsTreatedAsLiteralSegment()
         {
-            // Arrange
-            var dir = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), "%THIS_VAR_SHOULD_NOT_EXIST%"));
-            try
-            {
-                // Act & Assert
-                // The literal '%...%' directory exists, so validation succeeds:
-                // the segment is a path component, not a failed expansion.
-                Assert.True(_processHelper.ValidatePath(dir.FullName, isFile: false));
-            }
-            finally
-            {
-                dir.Delete();
-            }
+            // Arrange: the name only has to look like an unexpanded variable, so the GUID inside the
+            // token keeps that property while making the directory this test's own.
+            var dir = CreateTempDirectory("%THIS_VAR_SHOULD_NOT_EXIST_" + Guid.NewGuid().ToString("N") + "%");
+
+            // Act & Assert
+            // The literal '%...%' directory exists, so validation succeeds:
+            // the segment is a path component, not a failed expansion.
+            Assert.True(_processHelper.ValidatePath(dir.FullName, isFile: false));
         }
 
         [Fact]
@@ -286,76 +346,49 @@ namespace Servy.Core.UnitTests.Helpers
         public void ValidatePath_EnvVar_File_ReturnsTrue()
         {
             // Arrange
-            var tempFile = Path.GetTempFileName();
+            var tempFile = CreateTempFile();
 
-            try
-            {
-                // Convert absolute temp file path into one using %TEMP%
-                var fileName = Path.GetFileName(tempFile);
-                var envPath = Path.Combine("%TEMP%", fileName);
+            // Convert absolute temp file path into one using %TEMP%
+            var fileName = Path.GetFileName(tempFile);
+            var envPath = Path.Combine("%TEMP%", _testRootName, fileName);
 
-                // Act & Assert
-                Assert.True(_processHelper.ValidatePath(envPath, isFile: true));
-            }
-            finally
-            {
-                File.Delete(tempFile);
-            }
+            // Act & Assert
+            Assert.True(_processHelper.ValidatePath(envPath, isFile: true));
         }
 
         [Fact]
         public void ValidatePath_EnvVar_Directory_ReturnsTrue()
         {
             // Arrange
-            var dir = Directory.CreateDirectory(
-                Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString()));
+            var dir = CreateTempDirectory();
 
-            try
-            {
-                var dirName = new DirectoryInfo(dir.FullName).Name;
-                var envPath = Path.Combine("%TEMP%", dirName);
+            var dirName = new DirectoryInfo(dir.FullName).Name;
+            var envPath = Path.Combine("%TEMP%", _testRootName, dirName);
 
-                // Act & Assert
-                Assert.True(_processHelper.ValidatePath(envPath, isFile: false));
-            }
-            finally
-            {
-                dir.Delete();
-            }
+            // Act & Assert
+            Assert.True(_processHelper.ValidatePath(envPath, isFile: false));
         }
 
         [Fact]
         public void ValidatePath_ExistingDirectory_AsFile_ReturnsFalse()
         {
             // Arrange: Establish a folder target to probe as an illegal file type reference
-            var dir = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString()));
+            var dir = CreateTempDirectory();
 
-            try
-            {
-                // Act & Assert
-                Assert.False(_processHelper.ValidatePath(dir.FullName, isFile: true));
-            }
-            finally
-            {
-                dir.Delete();
-            }
+            // Act & Assert
+            Assert.False(_processHelper.ValidatePath(dir.FullName, isFile: true));
         }
 
         [Fact]
         public void ValidatePath_ExistingFile_AsDirectory_ReturnsFalse()
         {
             // Arrange: Establish an active file token to probe as an illegal folder container reference
-            var file = Path.GetTempFileName();
+            var file = CreateTempFile();
 
-            try
-            {
-                // Act & Assert
-                Assert.False(_processHelper.ValidatePath(file, isFile: false));
-            }
-            finally
-            {
-                File.Delete(file);
-            }
+            // Act & Assert
+            Assert.False(_processHelper.ValidatePath(file, isFile: false));
         }
+
+        #endregion
     }
 }

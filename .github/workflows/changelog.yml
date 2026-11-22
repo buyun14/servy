@@ -1,18 +1,16 @@
-# ==============================================================================
+# ==========================================================================================
 # GitHub Actions Workflow - Changelog Automation
-# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
 # Automatically fetches release metadata from GitHub, constructs a formatted
 # CHANGELOG.md file, and commits the updates to the repository.
 #
 # Triggers:
 # - Automatically after successful completion of 'bump-version' workflow.
 # - Manually via workflow_dispatch for full rebuilds.
-# ==============================================================================
+# ==========================================================================================
 name: changelog
 
 on:
-  # release:
-  #   types: [published]
   workflow_run:             # auto-trigger after bump-version.yml
     workflows: ["bump-version"]    # must match the `name:` in bump-version.yml
     types:
@@ -21,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       reset:
-        description: 'Rebuild all servy CHANGELOG.md'
+        description: 'Rebuild CHANGELOG.md from all published releases (unchecked: append latest release only)'
         required: false
         type: boolean
         default: false
@@ -38,7 +36,7 @@ jobs:
   changelog:
     runs-on: windows-latest
     timeout-minutes: 60
-    # Logic: Only run if manually triggered OR if the automated upstream 'bump-version' run succeeded.
+    # Only run if manually triggered OR if the automated upstream 'bump-version' run succeeded.
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
@@ -68,14 +66,24 @@ jobs:
         run: |
           $repo = $env:GITHUB_REPOSITORY
           $changelogPath = "CHANGELOG.md"
+          $slnPath = "Servy.sln"
           $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          $maxBytes = 400 * 1024 # Target ~400 KB cutoff threshold per file
 
           Write-Host "Fetching releases for $repo..."
-          # Use --slurp to combine paginated responses into a single JSON array,
-          # preventing 'ConvertFrom-Json' from failing on concatenated array fragments.
-          $rawJson = gh api repos/$repo/releases --paginate --slurp
-          if ($LASTEXITCODE -ne 0) {
-              throw 'gh api releases failed (exit ' + $LASTEXITCODE + '). Aborting changelog update.'
+          $maxRetries = [int]$env:MAX_RETRIES
+          $maxAttempts = $maxRetries + 1
+          $rawJson = $null
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+              # Use --slurp to combine paginated responses into a single JSON array,
+              # preventing 'ConvertFrom-Json' from failing on concatenated array fragments.
+              $rawJson = gh api repos/$repo/releases --paginate --slurp
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -eq $maxAttempts) {
+                  throw 'gh api releases failed (exit ' + $LASTEXITCODE + ') after ' + $maxAttempts + ' attempts. Aborting changelog update.'
+              }
+              Write-Host "gh api releases failed (attempt $attempt/$maxAttempts), retrying..."
+              Start-Sleep -Seconds ([math]::Pow(2, $attempt))
           }
 
           # ROBUSTNESS: Flatten the slurped array-of-arrays into a single stream of release objects
@@ -87,22 +95,38 @@ jobs:
               exit 0
           }
 
+          Function Protect-MarkdownTags {
+              param([string]$Text)
+              if ([string]::IsNullOrEmpty($Text)) { return $Text }
+              $fenceParts = [regex]::Split($Text, '(?s)(`{3,}.*?`{3,})')
+              for ($f = 0; $f -lt $fenceParts.Count; $f++) {
+                  if ($fenceParts[$f] -match '^`{3,}') { continue }
+                  $parts = [regex]::Split($fenceParts[$f], '(``.*?``|`[^`\n]*?`)')
+                  for ($i = 0; $i -lt $parts.Count; $i++) {
+                      if ($parts[$i] -notmatch '^`') {
+                          $parts[$i] = $parts[$i] -replace '(?<!\\)<(/?(?!(?:details|summary|br|hr|p|div|span|b|i|strong|em|a|img|code|pre|blockquote|ul|ol|li|table|tr|td|th|thead|tbody)\b)[A-Za-z][A-Za-z0-9_]*(?:\s[^<>]*)?/?)>', '\<$1\>'
+                      }
+                  }
+                  $fenceParts[$f] = ($parts -join '')
+              }
+              return ($fenceParts -join '')
+          }
+
           Function Get-ReleaseEntry {
               param($Release, $PrevRelease)
 
-              # Regex pattern matching Unicode hyphens, n-dashes, m-dashes, minus signs, and related dash symbols
-              # U+2010 (hyphen), U+2011 (non-breaking hyphen), U+2012 (figure dash), U+2013 (en dash),
-              # U+2014 (em dash), U+2015 (horizontal bar), U+2212 (minus sign), plus Unicode Dash Punctuation (\p{Pd})
-              $dashPattern = '[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\p{Pd}]'
+              # Normalize all Unicode dash punctuation (\p{Pd}: hyphen, non-breaking hyphen, figure/en/em dash,
+              # horizontal bar, ...) plus the minus sign (U+2212, category Sm) to a plain ASCII hyphen.
+              $dashPattern = '[\u2212\p{Pd}]'
 
               $rawTitle = if ([string]::IsNullOrWhiteSpace($Release.name)) { $Release.tag_name } else { $Release.name }
-              $title = $rawTitle -replace $dashPattern, '-'
+              $title = Protect-MarkdownTags ($rawTitle -replace $dashPattern, '-')
 
               $url = $Release.html_url
 
               $date = if (![string]::IsNullOrWhiteSpace($Release.published_at)) {
                   [DateTime]::Parse($Release.published_at, [Globalization.CultureInfo]::InvariantCulture,
-                    [Globalization.DateTimeStyles]::AdjustToUniversal).ToString("yyyy-MM-dd")
+                    [Globalization.DateTimeStyles]::AdjustToUniversal).ToString("yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture)
               } else {
                   "Pending"
               }
@@ -116,7 +140,7 @@ jobs:
                   $normalized = $Release.body -replace "`r`n", "`n"
                   (($normalized -split "`n") | ForEach-Object { $_.TrimEnd() }) -join "`n"
               }
-              $body = $rawBody.Trim() -replace $dashPattern, '-'
+              $body = Protect-MarkdownTags ($rawBody.Trim() -replace $dashPattern, '-')
 
               $bt = [char]96
 
@@ -126,7 +150,7 @@ jobs:
               $md += "### Downloads`n"
 
               foreach ($asset in $Release.assets) {
-                  $aName = $asset.name -replace $dashPattern, '-'
+                  $aName = Protect-MarkdownTags ($asset.name -replace $dashPattern, '-')
                   $aUrl = $asset.browser_download_url
                   $size = ([math]::Round($asset.size / 1MB, 2)).ToString("F2", [Globalization.CultureInfo]::InvariantCulture)
                   $md += "* [$aName]($aUrl) - ${size} MB`n"
@@ -143,18 +167,165 @@ jobs:
               return $md
           }
 
+          Function Save-ChangelogFiles {
+              param($Releases)
+
+              # Delete any existing archive files from disk; the Commit and Push step's 'git add CHANGELOG*.md' stages their removal
+              Get-ChildItem -Path . -Filter "CHANGELOG-*.md" | ForEach-Object {
+                  Remove-Item $_.FullName -Force
+              }
+
+              # Chunk release history into blocks of ~400 KB
+              $chunks = [System.Collections.Generic.List[System.Collections.Generic.List[object]]]::new()
+              $currentChunk = [System.Collections.Generic.List[object]]::new()
+              $currentBytes = $utf8NoBom.GetByteCount("# Changelog`n`n")
+
+              for ($i = 0; $i -lt $Releases.Count; $i++) {
+                  $prev = if ($i + 1 -lt $Releases.Count) { $Releases[$i+1] } else { $null }
+                  $entry = Get-ReleaseEntry -Release $Releases[$i] -PrevRelease $prev
+                  $entryBytes = $utf8NoBom.GetByteCount($entry)
+
+                  if ($currentChunk.Count -gt 0 -and ($currentBytes + $entryBytes) -gt $maxBytes) {
+                      $chunks.Add($currentChunk)
+                      $currentChunk = [System.Collections.Generic.List[object]]::new()
+                      $currentBytes = $utf8NoBom.GetByteCount("# Changelog`n`n")
+                  }
+
+                  $currentChunk.Add($Releases[$i])
+                  $currentBytes += $entryBytes
+              }
+
+              if ($currentChunk.Count -gt 0) {
+                  $chunks.Add($currentChunk)
+              }
+
+              # Determine archive filenames and links from newest to oldest chunk
+              $archiveFileNames = [System.Collections.Generic.List[string]]::new()
+              for ($c = 1; $c -lt $chunks.Count; $c++) {
+                  $chunk = $chunks[$c]
+                  $newestInChunk = $chunk[0].tag_name
+                  $oldestInChunk = $chunk[$chunk.Count - 1].tag_name
+                  $archiveFileNames.Add("CHANGELOG-$oldestInChunk-$newestInChunk.md")
+              }
+
+              # Write primary CHANGELOG.md (Chunk 0)
+              $mainChunk = $chunks[0]
+              $mainContent = "# Changelog`n`n"
+              for ($i = 0; $i -lt $mainChunk.Count; $i++) {
+                  $rel = $mainChunk[$i]
+                  $globalIdx = $i
+                  $prev = if ($globalIdx + 1 -lt $Releases.Count) { $Releases[$globalIdx + 1] } else { $null }
+                  $mainContent += Get-ReleaseEntry -Release $rel -PrevRelease $prev
+              }
+
+              if ($archiveFileNames.Count -gt 0) {
+                  $firstArchive = $archiveFileNames[0]
+                  $mainContent += "---`n`nLooking for older releases? See: [$firstArchive](./$firstArchive)`n"
+              }
+              [System.IO.File]::WriteAllText("CHANGELOG.md", $mainContent, $utf8NoBom)
+
+              # Write each archive chunk (built above within the 400 KB bound) to its own file
+              $runningGlobalIdx = $mainChunk.Count
+              for ($c = 1; $c -lt $chunks.Count; $c++) {
+                  $chunk = $chunks[$c]
+                  $fileName = $archiveFileNames[$c - 1]
+                  $newestTag = $chunk[0].tag_name
+                  $oldestTag = $chunk[$chunk.Count - 1].tag_name
+
+                  $archiveHeader = "# Changelog ($oldestTag - $newestTag)`n`n"
+                  if ($c -eq 1) {
+                      $archiveHeader += "This is the archived release history. For newer releases, see [CHANGELOG.md](./CHANGELOG.md).`n`n"
+                  } else {
+                      $newerArchive = $archiveFileNames[$c - 2]
+                      $archiveHeader += "This is an archived release history. For newer releases, see [$newerArchive](./$newerArchive) and [CHANGELOG.md](./CHANGELOG.md).`n`n"
+                  }
+
+                  $archiveContent = $archiveHeader
+                  for ($i = 0; $i -lt $chunk.Count; $i++) {
+                      $rel = $chunk[$i]
+                      $globalIdx = $runningGlobalIdx + $i
+                      $prev = if ($globalIdx + 1 -lt $Releases.Count) { $Releases[$globalIdx + 1] } else { $null }
+                      $archiveContent += Get-ReleaseEntry -Release $rel -PrevRelease $prev
+                  }
+
+                  if ($c -lt $archiveFileNames.Count) {
+                      $nextArchive = $archiveFileNames[$c]
+                      $archiveContent += "---`n`nLooking for older releases? See the next archive: [$nextArchive](./$nextArchive)`n"
+                  }
+
+                  [System.IO.File]::WriteAllText($fileName, $archiveContent, $utf8NoBom)
+                  $runningGlobalIdx += $chunk.Count
+              }
+
+              # Synchronize the solution items section in Servy.sln
+              if ([System.IO.File]::Exists($slnPath)) {
+                  $slnContent = [System.IO.File]::ReadAllText($slnPath, $utf8NoBom)
+                  $globalProjectHeader = 'Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "_global", "_global", "{02EA681E-C7D8-13C7-8484-4AC65E1B71E8}"'
+
+                  if ($slnContent.Contains($globalProjectHeader)) {
+                      $headerIdx = $slnContent.IndexOf($globalProjectHeader)
+                      $sectionStartTag = "ProjectSection(SolutionItems) = preProject"
+                      $sectionEndTag = "EndProjectSection"
+
+                      $secStartIdx = $slnContent.IndexOf($sectionStartTag, $headerIdx)
+                      if ($secStartIdx -gt -1) {
+                          $secEndIdx = $slnContent.IndexOf($sectionEndTag, $secStartIdx)
+
+                          if ($secEndIdx -gt $secStartIdx) {
+                              $beforeSection = $slnContent.Substring(0, $secStartIdx + $sectionStartTag.Length)
+                              $sectionBody = $slnContent.Substring($secStartIdx + $sectionStartTag.Length, $secEndIdx - ($secStartIdx + $sectionStartTag.Length))
+                              $afterSection = $slnContent.Substring($secEndIdx)
+
+                              # Split lines preserving exact line endings (\r\n or \n)
+                              $newline = if ($slnContent.Contains("`r`n")) { "`r`n" } else { "`n" }
+                              $lines =$sectionBody -split "`r?\n"
+
+                              # Filter out existing CHANGELOG-*.md entries
+                              $filteredLines = [System.Collections.Generic.List[string]]::new()
+                              foreach ($line in $lines) {
+                                  if ($line -notmatch '^\s*CHANGELOG-.*\.md\s*=\s*CHANGELOG-.*\.md\s*$') {
+                                      $filteredLines.Add($line)
+                                  }
+                              }
+
+                              # Construct new solution item lines for all generated archive files
+                              $newArchiveLines = [System.Collections.Generic.List[string]]::new()
+                              foreach ($archiveFile in ($archiveFileNames | Sort-Object)) {
+                                  $newArchiveLines.Add("`t`t$archiveFile = $archiveFile")
+                              }
+
+                              # Merge and sort solution item lines alphabetically to maintain sln format conventions
+                              $itemLines = [System.Collections.Generic.List[string]]::new()
+                              foreach ($line in $filteredLines) {
+                                  if ($line -match '^\s*([^\s=]+)\s*=') {
+                                      $itemLines.Add($line)
+                                  }
+                              }
+                              foreach ($line in $newArchiveLines) {
+                                  $itemLines.Add($line)
+                              }
+
+                              # Sort items based on the key/filename
+                              $sortedItems = $itemLines | Sort-Object -Property {
+                                  if ($_ -match '^\s*([^\s=]+)\s*=') { $matches[1] } else { $_ }
+                              }
+
+                              $newSectionBody = $newline + ($sortedItems -join $newline) + $newline + "`t"
+                              $updatedSln =$beforeSection + $newSectionBody +$afterSection
+                              [System.IO.File]::WriteAllText($slnPath, $updatedSln,$utf8NoBom)
+                          }
+                      }
+                  }
+              }
+          }
+
           $isReset = ($env:IS_RESET -eq 'true')
           $bt = [char]96
           $header = "# Changelog"
 
           if ($isReset) {
-              Write-Host "Reset flag is true. Rebuilding full CHANGELOG.md..."
-              $fullLog = "$header`n`n"
-              for ($i = 0; $i -lt $releases.Count; $i++) {
-                  $prev = if ($i + 1 -lt $releases.Count) { $releases[$i+1] } else { $null }
-                  $fullLog += Get-ReleaseEntry -Release $releases[$i] -PrevRelease $prev
-              }
-              [System.IO.File]::WriteAllText($changelogPath, $fullLog, $utf8NoBom)
+              Write-Host "Reset flag is true. Rebuilding all changelog files..."
+              Save-ChangelogFiles -Releases $releases
           } else {
               $latest = $releases[0]
               $tag = $latest.tag_name
@@ -170,7 +341,7 @@ jobs:
               if ($existing.Contains($tagLine)) {
                   Write-Host "Release $tag is already in the CHANGELOG. No updates needed."
               } else {
-                  Write-Host "Appending latest release ($tag) to top of CHANGELOG.md..."
+                  Write-Host "Prepending latest release ($tag) to top of CHANGELOG.md..."
                   $prev = if ($releases.Count -gt 1) { $releases[1] } else { $null }
                   $entry = Get-ReleaseEntry -Release $latest -PrevRelease $prev
 
@@ -181,6 +352,12 @@ jobs:
                       $newLog = "$header`n`n$entry$existing"
                   }
                   [System.IO.File]::WriteAllText($changelogPath, $newLog, $utf8NoBom)
+
+                  # Auto-split if appending pushed CHANGELOG.md past 400 KB
+                  if ($utf8NoBom.GetByteCount($newLog) -gt $maxBytes) {
+                      Write-Host "CHANGELOG.md exceeds 400 KB ($($utf8NoBom.GetByteCount($newLog)) bytes). Re-chunking archives..."
+                      Save-ChangelogFiles -Releases $releases
+                  }
               }
           }
 
@@ -188,18 +365,16 @@ jobs:
         shell: pwsh
         run: |
           . "$env:RUNNER_TEMP\git-helpers.ps1"
-          Invoke-Git config core.autocrlf false
-          Invoke-Git config user.name "github-actions[bot]"
-          Invoke-Git config user.email "github-actions[bot]@users.noreply.github.com"
+          Set-BotGitIdentity
 
-          # Scope the check to CHANGELOG.md so unrelated working-tree changes don't trigger a commit
-          $hasChanges = (Invoke-Git status --porcelain CHANGELOG.md) -join "`n"
+          # Scope the check to CHANGELOG files and Servy.sln so unrelated working-tree changes don't trigger a commit
+          $hasChanges = (Invoke-Git status --porcelain CHANGELOG*.md Servy.sln) -join "`n"
           if ([string]::IsNullOrWhiteSpace($hasChanges)) {
-              Write-Host "No changes detected in CHANGELOG.md. Nothing to update."
+              Write-Host "No changes detected in CHANGELOG files or Servy.sln. Nothing to update."
               exit 0
           }
 
-          Invoke-Git add CHANGELOG.md
+          Invoke-Git add CHANGELOG*.md Servy.sln
 
           git diff --staged --quiet
           if ($LASTEXITCODE -ne 0) {

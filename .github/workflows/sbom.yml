@@ -1,6 +1,6 @@
-# ==============================================================================
+# ==========================================================================================
 # SBOM Generation Workflow
-# ==============================================================================
+# ==========================================================================================
 #
 # Purpose:
 #    This workflow generates a CycloneDX Software Bill of Materials (SBOM)
@@ -25,7 +25,7 @@
 # Output:
 #    - servy-<version>-sbom.xml (CycloneDX XML)
 #
-# ==============================================================================
+# ==========================================================================================
 
 name: sbom
 
@@ -46,7 +46,7 @@ jobs:
     env:
       # Mapping the input to an environment variable prevents Expression Injection.
       # The shell will now treat this as a literal string.
-      INPUT_VERSION: ${{ github.event.inputs.version }}
+      INPUT_VERSION: ${{ inputs.version }}
       MAX_RETRIES: 5 # Maximum retry attempts for resilient network down-stream downloads
 
     steps:

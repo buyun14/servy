@@ -9,21 +9,16 @@ namespace Servy.Core.IntegrationTests.Helpers
     /// Integration tests for ProcessHelper.
     /// Verifies ProcessHelper process-metric and process-tree aggregation behavior.
     /// </summary>
-    [Collection("ProcessIntegrationTests")]
+    [Collection(ProcessIntegrationTestsCollection.Name)]
     public class ProcessHelperIntegrationTests : IDisposable
     {
         private readonly ProcessHelper _sut;
-        private readonly string _tempDirectory;
         private readonly List<Process> _spawnedProcesses;
 
         public ProcessHelperIntegrationTests()
         {
             _sut = new ProcessHelper();
             _spawnedProcesses = new List<Process>();
-
-            // Setup real file system artifacts for path integration tests
-            _tempDirectory = Path.Combine(Path.GetTempPath(), $"Servy_Test_{Guid.NewGuid()}");
-            Directory.CreateDirectory(_tempDirectory);
         }
 
         #region Process Metrics Integration Tests
@@ -44,7 +39,7 @@ namespace Servy.Core.IntegrationTests.Helpers
                 Assert.True(firstCall.RamUsage > 0, "RAM usage should be greater than 0 for a running process.");
 
                 // Act 2: Simulate time passing and active CPU work using a dedicated spin wait loop
-                SpinWait.SpinUntil(() => false, TimeSpan.FromMilliseconds(100));
+                SpinWait.SpinUntil(() => false, TimeSpan.FromMilliseconds(TestTimeouts.CpuSampleSpinMs));
                 var secondCall = _sut.GetProcessMetrics(currentPid);
 
                 // Assert 2
@@ -57,16 +52,13 @@ namespace Servy.Core.IntegrationTests.Helpers
                 // Structural State Validation: Force reflection to confirm that an active, populated cache state entry
                 // is preserved inside the dictionary, proving the metric loop did not fall back into an error eviction path.
                 var prevCpuTimes = TestReflection.GetField<ConcurrentDictionary<int, CpuSample>>(_sut, "_prevCpuTimes");
-                if (prevCpuTimes != null)
-                {
-                    Assert.True(prevCpuTimes.ContainsKey(currentPid), "The tracking baseline sample entry was lost or prematurely evicted from the delta cache.");
-                }
+                Assert.True(prevCpuTimes.ContainsKey(currentPid), "The tracking baseline sample entry was lost or prematurely evicted from the delta cache.");
             }
         }
 
         [Theory]
         [InlineData(false)] // Scenario 1: Never-existed PID (Throws ArgumentException)
-        [InlineData(true)]  // Scenario 2: Genuinely exited PID (Throws InvalidOperationException)
+        [InlineData(true)]  // Scenario 2: Genuinely exited PID (also throws ArgumentException: the PID is no longer running)
         public void GetProcessMetrics_ForInvalidOrExitedPid_ReturnsZeroesGracefully(bool useExitedProcess)
         {
             // Arrange
@@ -87,25 +79,88 @@ namespace Servy.Core.IntegrationTests.Helpers
                     targetPid = transientProcess.Id;
 
                     // Force the thread block to wait until the OS fully unregisters the process image
-                    transientProcess.WaitForExit(5000);
+                    transientProcess.WaitForExit(TestTimeouts.CiGenerousMs);
                     Assert.True(transientProcess.HasExited, "Transient test process failed to exit within the allowed timeout window.");
                 }
             }
             else
             {
-                // Use an out-of-bounds PID that is fundamentally guaranteed not to exist on standard Windows nodes
-                targetPid = 999999;
+                // Use a PID no process can hold (see TestProcessIds.NeverValid)
+                targetPid = TestProcessIds.NeverValid;
             }
 
             // Act
             var metrics = _sut.GetProcessMetrics(targetPid);
 
             // Assert
-            // Both code paths must cleanly intercept the respective native exception type
-            // and fallback to a safe, neutral metric layout instead of blowing up.
+            // Both scenarios reach the ArgumentException arm (GetProcessById on a PID that is not running)
+            // and must fall back to a safe, neutral metric layout instead of blowing up. The
+            // InvalidOperationException arm needs the process to exit between GetProcessById and the
+            // property reads, a race no test here can time.
             Assert.Equal(0, metrics.CpuUsage);
             Assert.Equal(0, metrics.RamUsage);
         }
+
+        #endregion
+
+        #region Cache Maintenance Integration Tests
+
+        [Fact]
+        public void MaintainCache_ForExitedProcess_EvictsTheStaleSample()
+        {
+            // Arrange: seed a delta sample while the process is alive, then let it exit.
+            var transientProcess = Process.Start(new ProcessStartInfo(TestProcessStarter.PowerShellPath, "-NoProfile -Command \"Start-Sleep -Seconds 30\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                WorkingDirectory = Path.GetTempPath(),
+            });
+
+            Assert.NotNull(transientProcess);
+            _spawnedProcesses.Add(transientProcess);
+
+            int targetPid = transientProcess.Id;
+            _sut.GetProcessMetrics(targetPid);
+
+            var prevCpuTimes = TestReflection.GetField<ConcurrentDictionary<int, CpuSample>>(_sut, "_prevCpuTimes");
+            Assert.True(prevCpuTimes.ContainsKey(targetPid), "Precondition failed: the delta sample must exist before the prune runs.");
+
+            transientProcess.Kill(entireProcessTree: true);
+            transientProcess.WaitForExit(TestTimeouts.CiGenerousMs);
+            Assert.True(transientProcess.HasExited, "Transient test process failed to exit within the allowed timeout window.");
+
+            // Act
+            _sut.MaintainCache();
+
+            // Assert
+            Assert.False(prevCpuTimes.ContainsKey(targetPid), "MaintainCache must evict the sample of a process that has exited.");
+        }
+
+        [Fact]
+        public void MaintainCache_ForLiveProcess_RetainsTheSample()
+        {
+            using (var self = Process.GetCurrentProcess())
+            {
+                // Arrange
+                int currentPid = self.Id;
+                _sut.GetProcessMetrics(currentPid);
+
+                var prevCpuTimes = TestReflection.GetField<ConcurrentDictionary<int, CpuSample>>(_sut, "_prevCpuTimes");
+                Assert.True(prevCpuTimes.ContainsKey(currentPid), "Precondition failed: the delta sample must exist before the prune runs.");
+
+                // Act
+                _sut.MaintainCache();
+
+                // Assert
+                // The test host is still running, so its baseline must survive the prune;
+                // evicting it would restart the CPU delta calculation on every maintenance pass.
+                Assert.True(prevCpuTimes.ContainsKey(currentPid), "MaintainCache must retain the sample of a process that is still running.");
+            }
+        }
+
+        #endregion
+
+        #region Process Tree Integration Tests
 
         [Fact]
         public void GetProcessTreeMetrics_WithChildProcess_AggregatesRamSuccessfully()
@@ -118,7 +173,7 @@ namespace Servy.Core.IntegrationTests.Helpers
                 "Start-Process powershell -ArgumentList '-NoProfile','-Command', '$childAlloc = New-Object byte[] 25MB; Start-Sleep -Seconds 10'; " +
                 "Start-Sleep -Seconds 10";
 
-            var childProcessInfo = new ProcessStartInfo("powershell.exe", $"-NoProfile -Command \"{inlineScript}\"")
+            var childProcessInfo = new ProcessStartInfo(TestProcessStarter.PowerShellPath, $"-NoProfile -Command \"{inlineScript}\"")
             {
                 CreateNoWindow = true,
                 UseShellExecute = false,
@@ -129,26 +184,76 @@ namespace Servy.Core.IntegrationTests.Helpers
             Assert.NotNull(childProcess);
             _spawnedProcesses.Add(childProcess);
 
-            // 1. HARDEN STABILIZATION TIMING:
-            // Allow time for the root process to initialize and execute its nested child payload.
-            Thread.Sleep(3000);
-
             int childPid = childProcess.Id;
 
-            // 2. CAPTURE METRICS BACK-TO-BACK:
-            // Act
+            // 1. HARDEN STABILIZATION TIMING:
+            // Poll until the nested child process initializes, allocates memory, and tree metrics exceed single root metrics.
+            // A freshly started child can report a zero working set for a moment (measured on ARM64), so the
+            // metrics of the iteration that satisfied the condition are the ones asserted on: re-measuring
+            // after the loop could hit that transient zero again.
+            var stopwatch = Stopwatch.StartNew();
+            var timeout = TimeSpan.FromSeconds(TestTimeouts.ProcessTreeTimeoutSeconds);
             var singleMetrics = _sut.GetProcessMetrics(childPid);
             var treeMetrics = _sut.GetProcessTreeMetrics(childPid);
+
+            while (stopwatch.Elapsed < timeout)
+            {
+                // Act
+                singleMetrics = _sut.GetProcessMetrics(childPid);
+                treeMetrics = _sut.GetProcessTreeMetrics(childPid);
+
+                if (singleMetrics.RamUsage > 0 && treeMetrics.RamUsage > singleMetrics.RamUsage)
+                {
+                    break;
+                }
+
+                Thread.Sleep(TestTimeouts.MetricsPollIntervalMs);
+            }
+
+            // 2. METRICS ARE THE LAST POLLED PAIR (taken back-to-back above)
+
+            // Snapshot of the tree the SUT sees, so a red run (e.g. ARM64) says where the child went:
+            // an empty descendant list means the Toolhelp32 map never contained it; a PID with a zero
+            // working set means it was found but not yet measurable.
+            var treePids = TestReflection.InvokeNonPublic(_sut, "GetProcessTree", childPid) as List<int> ?? new List<int>();
+            string treeDiagnostics = string.Empty;
+            foreach (var treePid in treePids)
+            {
+                treeDiagnostics += $"{(treeDiagnostics.Length == 0 ? string.Empty : ", ")}{treePid}={_sut.GetProcessMetrics(treePid).RamUsage}";
+            }
 
             // Assert
             Assert.True(singleMetrics.RamUsage > 0, "Root process RAM should be captured.");
             Assert.True(treeMetrics.RamUsage > 0, "Tree process RAM aggregation should be captured.");
 
-            // 4. ROBUST DELTA VALUATION:
+            // 3. ROBUST DELTA VALUATION:
             // Verifies that tree metrics accurately sum memory across the nested worker processes.
             // Tree memory must be noticeably larger than the isolated root process node's footprint.
             Assert.True(treeMetrics.RamUsage > singleMetrics.RamUsage,
-                $"Process tree aggregation failed. Tree RAM ({treeMetrics.RamUsage} bytes) should be strictly greater than single root RAM ({singleMetrics.RamUsage} bytes).");
+                $"Process tree aggregation failed. Tree RAM ({treeMetrics.RamUsage} bytes) should be strictly greater than single root RAM ({singleMetrics.RamUsage} bytes). " +
+                $"Root PID {childPid}; tree PIDs with working set in bytes: [{treeDiagnostics}].");
+        }
+
+        [Fact]
+        public void GetProcessTreeMetrics_ForARootThatIsNotRunning_ReturnsZeroesFromARootOnlyTree()
+        {
+            // Arrange
+            // A PID no process can hold (see TestProcessIds.NeverValid), so Process.GetProcessById throws
+            // ArgumentException on the root before any snapshot is taken.
+            int deadRootPid = TestProcessIds.NeverValid;
+
+            // Act
+            // InvokeNonPublic unwraps TargetInvocationException, so a missing catch would surface here as the
+            // original ArgumentException rather than as a wrapper.
+            var tree = TestReflection.InvokeNonPublic(_sut, "GetProcessTree", deadRootPid) as List<int>;
+            var metrics = _sut.GetProcessTreeMetrics(deadRootPid);
+
+            // Assert
+            // The tree keeps the root and nothing else, and the aggregation over it is neutral instead of throwing.
+            Assert.NotNull(tree);
+            Assert.Equal(new[] { deadRootPid }, tree);
+            Assert.Equal(0, metrics.CpuUsage);
+            Assert.Equal(0, metrics.RamUsage);
         }
 
         #endregion
@@ -168,15 +273,6 @@ namespace Servy.Core.IntegrationTests.Helpers
                     catch { /* Ignore cleanup errors */ }
                 }
                 process.Dispose();
-            }
-
-            // Clean up integration test environment variables
-            Environment.SetEnvironmentVariable("SERVY_TEST_VAR", null);
-
-            // Clean up integration test artifacts
-            if (Directory.Exists(_tempDirectory))
-            {
-                try { Directory.Delete(_tempDirectory, true); } catch { /* Ignore locking issues on teardown */ }
             }
         }
     }

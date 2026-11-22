@@ -4,16 +4,16 @@ using Servy.Core.Data;
 using Servy.Core.DTOs;
 using Servy.Core.Helpers;
 using Servy.Core.Logging;
+using Servy.Core.NamedPipes;
 using Servy.Core.Security;
 using Servy.Core.Services;
 using Servy.Core.Validation;
-using Servy.Infrastructure.Data;
 using Servy.Resources;
 using Servy.Services;
 using Servy.UI.Bootstrapping;
 using Servy.UI.Services;
+using Servy.UI.Validation;
 using Servy.UI.Views;
-using Servy.Validation;
 using Servy.ViewModels;
 using Servy.Views;
 using System.ComponentModel;
@@ -44,7 +44,8 @@ namespace Servy
         #region Static Properties
 
         /// <summary>
-        /// Service provider for dependency injection, initialized by the bootstrapper.
+        /// Service provider for dependency injection, built in the App constructor.
+        /// Cleared on exit for test hosts.
         /// </summary>
         public static IServiceProvider? Services { get; private set; }
 
@@ -76,28 +77,11 @@ namespace Servy
 
         #region Internal Properties
 
-        internal AppDbContext? DbContext => _bootstrapper.DbContext;
         internal IServiceRepository? ServiceRepository => _bootstrapper.ServiceRepository;
-        internal ISecureData? SecureData => _bootstrapper.SecureData;
 
         #endregion
 
         #region Properties
-
-        /// <summary>
-        /// Connection string.
-        /// </summary>
-        public string? ConnectionString => _bootstrapper.ConnectionString;
-
-        /// <summary>
-        /// Gets the file path for the AES encryption key.
-        /// </summary>
-        public string? AESKeyFilePath => _bootstrapper.AESKeyFilePath;
-
-        /// <summary>
-        /// Gets the file path for the AES initialization vector (IV).
-        /// </summary>
-        public string? AESIVFilePath => _bootstrapper.AESIVFilePath;
 
         /// <inheritdoc />
         public string? ManagerAppPublishPath { get; private set; }
@@ -136,6 +120,7 @@ namespace Servy
             var services = new ServiceCollection();
 
             // Register dependencies
+            services.AddSingleton<IUiDispatcher, WpfUiDispatcher>();
             services.AddSingleton<IProcessHelper, ProcessHelper>();
             services.AddSingleton<IProcessKiller, ProcessKiller>();
 
@@ -150,6 +135,7 @@ namespace Servy
                 SecurityWarningMessage = Strings.Msg_SecurityWarningMessage,
                 SqliteVersionWarningTitle = Strings.Msg_SqliteVersionWarningTitle,
                 SqliteVersionWarningMessageFormat = Strings.Msg_SqliteVersionWarningMessage,
+                ResourceExtractionWarningTitle = UI.Resources.Strings.Msg_ResourceExtractionWarningTitle,
                 SplashWindowFactory = () => new SplashWindow(Strings.Splash_Text),
                 // CRITICAL: The composition root is here, not in the View.
                 MainWindowFactoryAsync = async (serviceName) =>
@@ -157,6 +143,7 @@ namespace Servy
                     // 0. Retrieve DI-managed services
                     var processHelper = Services.GetRequiredService<IProcessHelper>();
                     var processKiller = Services.GetRequiredService<IProcessKiller>();
+                    var uiDispatcher = Services.GetRequiredService<IUiDispatcher>();
 
                     // 1. Initialize Infrastructure & Domain Services
                     Func<string, IServiceControllerWrapper> controllerFactory = name => new ServiceControllerWrapper(name);
@@ -165,15 +152,17 @@ namespace Servy
                         new ServiceControllerProvider(controllerFactory),
                         new WindowsServiceApi(),
                         new Win32ErrorProvider(),
-                        ServiceRepository!
+                        ServiceRepository!,
+                        new ServyExePermissionsHardener(),
+                        new NamedPipesService()
                     );
 
                     // 2. Initialize UI Services
                     var fileDialogService = new FileDialogService();
-                    var messageBoxService = new MessageBoxService(new WpfUiDispatcher());
-                    var helperService = new HelpService(messageBoxService);
+                    var messageBoxService = new MessageBoxService(uiDispatcher);
+                    var helpService = new HelpService(messageBoxService, _bootstrapper.AppLifetimeToken);
                     var serviceValidationRules = new ServiceValidationRules(processHelper);
-                    var configValidator = new ServiceConfigurationValidator(messageBoxService, serviceValidationRules);
+                    var configValidator = new ServiceConfigurationValidator(messageBoxService, serviceValidationRules, UiAppConfig.Caption);
 
                     // 3. Resolve Circular Dependency using Proxies
                     MainViewModel? viewModel = null;
@@ -192,9 +181,7 @@ namespace Servy
                         new JsonServiceValidator(serviceValidationRules),
                         this,
                         new CursorService(),
-                        new XmlServiceSerializer(),
-                        new JsonServiceSerializer(),
-                        new ProcessHelper()
+                        processHelper
                     );
 
                     // 4. Initialize Main ViewModel
@@ -203,7 +190,7 @@ namespace Servy
                         serviceCommands,
                         messageBoxService,
                         ServiceRepository!,
-                        helperService,
+                        helpService,
                         this
                     );
 
@@ -213,7 +200,7 @@ namespace Servy
 
                     if (!string.IsNullOrWhiteSpace(serviceName))
                     {
-                        await mainWindow.LoadServiceConfiguration(serviceName);
+                        await mainWindow.LoadServiceConfigurationAsync(serviceName);
                     }
 
                     return mainWindow;
@@ -224,16 +211,27 @@ namespace Servy
                     ManagerAppPublishPath = AppConfig.ManagerAppPublishReleasePath;
 #else
                     var baseDirectory = AppFoldersHelper.GetAppDirectory();
-                    ManagerAppPublishPath = config["ManagerAppPublishPath"] ?? AppConfig.DefaultManagerAppPublishPath;
-                    if (!Helper.IsAbsolute(ManagerAppPublishPath))
+                    string configuredPath = config["ManagerAppPublishPath"] ?? AppConfig.DefaultManagerAppPublishPath;
+
+                    if (PathSecurityGuard.TryResolveWithinAppDirectory(configuredPath, baseDirectory, out var resolvedPath))
                     {
-                        ManagerAppPublishPath = Path.GetFullPath(Path.Combine(baseDirectory, ManagerAppPublishPath));
+                        ManagerAppPublishPath = resolvedPath;
+                    }
+                    else
+                    {
+                        Logger.Warn($"Security refusal: ManagerAppPublishPath '{configuredPath}' is not contained within application directory '{baseDirectory}'.");
+                        ManagerAppPublishPath = string.Empty;
                     }
 #endif
                     IsManagerAppAvailable = !string.IsNullOrEmpty(ManagerAppPublishPath) && File.Exists(ManagerAppPublishPath);
                     if (!IsManagerAppAvailable)
                     {
                         Logger.Warn($"Manager app executable not found: {ManagerAppPublishPath}");
+                    }
+                    else
+                    {
+                        // Perform diagnostic ACL check on target executable directory
+                        PathSecurityGuard.WarnIfDirectoryAclNotHardened(ManagerAppPublishPath);
                     }
                 }
             };
@@ -250,8 +248,9 @@ namespace Servy
 
         /// <summary>
         /// Called when the WPF application starts.
-        /// Loads configuration settings, initializes the database, and fire-and-forgets
-        /// the asynchronous application initialization.
+        /// Runs the bootstrapper's synchronous startup (configuration and logger), starts the
+        /// companion-app availability monitor, and fire-and-forgets the asynchronous application
+        /// initialization, which is where the database is initialized and resources are extracted.
         /// </summary>
         /// <param name="e">The startup event arguments.</param>
         protected override void OnStartup(StartupEventArgs e)
@@ -277,7 +276,7 @@ namespace Servy
             // 3. Fire-and-forget initialization
             // Use a dedicated async method instead of a chained ContinueWith
             // to ensure the startup lifecycle and any faults are correctly observed.
-            _ = _bootstrapper.InitializeAppWithFaultHandlingAsync(this, e, Config.UiAppConfig.Caption);
+            _ = _bootstrapper.InitializeAppWithFaultHandlingAsync(this, e, UiAppConfig.Caption);
         }
 
         /// <summary>
@@ -286,7 +285,7 @@ namespace Servy
         /// </summary>
         /// <param name="e">An <see cref="ExitEventArgs"/> that contains the event data.</param>
         /// <remarks>
-        /// This override ensures that <see cref="SecureData"/> (which may hold sensitive cryptographic
+        /// This override ensures that the bootstrapper's secure data (which may hold sensitive cryptographic
         /// material or file handles for AES keys) is explicitly disposed of, following the
         /// deterministic disposal pattern before the process exits.
         /// </remarks>

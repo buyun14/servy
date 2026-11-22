@@ -6,16 +6,16 @@ using Servy.Core.Security;
 using Servy.Infrastructure.Helpers;
 using Servy.Testing;
 using Servy.UI.Bootstrapping;
+using System.Data.SQLite;
 using System.Reflection;
 using System.Windows;
 using Helper = Servy.Testing.Helper;
 
 namespace Servy.UI.IntegrationTests.Bootstrapping
 {
-    [Collection("UiSta")]
-    public class AppBootstrapperIntegrationTests : IDisposable
+    [Collection(UiStaCollection.Name)]
+    public class AppBootstrapperIntegrationTests : TempDirectoryTestBase
     {
-        private readonly string _testDir;
         private readonly string _appSettingsFile;
         private readonly string _logFile;
         private readonly string _dbFile;
@@ -27,65 +27,51 @@ namespace Servy.UI.IntegrationTests.Bootstrapping
         public AppBootstrapperIntegrationTests()
         {
             // Arrange
-            _testDir = Path.Combine(Path.GetTempPath(), $"ServyBootstrapperTests_{Guid.NewGuid():N}");
-            Directory.CreateDirectory(_testDir);
-
-            _appSettingsFile = Path.Combine(_testDir, "appsettings.json");
+            _appSettingsFile = Path.Combine(TempDirectory, "appsettings.json");
             _logFile = $"BootstrapperTest_{Guid.NewGuid():N}.log";
-            _dbFile = Path.Combine(_testDir, "test.db");
-            _keyFile = Path.Combine(_testDir, "test.key");
-            _ivFile = Path.Combine(_testDir, "test.iv");
+            _dbFile = Path.Combine(TempDirectory, "test.db");
+            _keyFile = Path.Combine(TempDirectory, "test.key");
+            _ivFile = Path.Combine(TempDirectory, "test.iv");
 
             _mockProcessKiller = new Mock<IProcessKiller>();
 
-            // Scaffold appsettings configurations
-            var jsonConfig = $@"{{
-                ""ConnectionStrings"": {{
-                    ""DefaultConnection"": ""Data Source={_dbFile.Replace("\\", "\\\\")}""
-                }},
-                ""Security"": {{
-                    ""AESKeyFilePath"": ""{_keyFile.Replace("\\", "\\\\")}"",
-                    ""AESIVFilePath"": ""{_ivFile.Replace("\\", "\\\\")}""
-                }}
-            }}";
-            File.WriteAllText(_appSettingsFile, jsonConfig);
+            // The core settings are read-only in production (always the vault under ProgramData),
+            // so the temporary database and key are injected through the test-only override; the
+            // settings file itself carries nothing the bootstrapper needs.
+            File.WriteAllText(_appSettingsFile, "{}");
+            CoreSettingsLoader.TestOverride = new CoreSettingsLoader.CoreSettings($"Data Source={_dbFile}", _keyFile, _ivFile);
 
             // Seed raw cryptographic assets to avoid runtime validation errors
             File.WriteAllBytes(_keyFile, new byte[32]);
             File.WriteAllBytes(_ivFile, new byte[16]);
 
-            _options = new BootstrapperOptions
-            {
-                LogFileName = _logFile,
-                AppSettingsFileName = _appSettingsFile,
-                ResourcesNamespace = "Servy.UI.Bootstrapping.Tests",
-                SecurityWarningTitle = "Admin Check Fail",
-                SecurityWarningMessage = "Requires Administrative elevation.",
-                SqliteVersionWarningTitle = "SQLite Core Fail",
-                SqliteVersionWarningMessageFormat = "Detected: {0}, Required: {1}"
-            };
+            _options = CreateValidOptions();
+            _options.LogFileName = _logFile;
+            _options.AppSettingsFileName = _appSettingsFile;
 
             // Force static environmental resets
             Logger.Shutdown();
         }
 
-        public void Dispose()
+        public override void Dispose()
         {
             Logger.Shutdown();
+            CoreSettingsLoader.TestOverride = null;
+
+            // Clear SQLite connection pools so any open DB locks are released
+            SQLiteConnection.ClearAllPools();
 
             try
             {
-                if (Directory.Exists(_testDir))
-                {
-                    Directory.Delete(_testDir, true);
-                }
-                string globalLogPath = Path.Combine(Logger.LogsPath, _logFile);
+                string globalLogPath = Path.Combine(AppConfig.LogsFolderPath, _logFile);
                 if (File.Exists(globalLogPath))
                 {
                     File.Delete(globalLogPath);
                 }
             }
-            catch { /* Fail-silent on cleanup blocks */ }
+            catch { /* Fail-silent on log file cleanup */ }
+
+            base.Dispose(); // Retrying recursive delete of TempDirectory
         }
 
         #region Constructor Guard Tests
@@ -94,53 +80,197 @@ namespace Servy.UI.IntegrationTests.Bootstrapping
         public void Constructor_NullOptions_ThrowsArgumentNullException()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new AppBootstrapper(null!, _mockProcessKiller.Object));
+            var ex = Assert.Throws<ArgumentNullException>(() => new AppBootstrapper(null!, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
         }
 
         [Fact]
         public void Constructor_NullProcessKiller_ThrowsArgumentNullException()
         {
             // Arrange & Act & Assert
-            Assert.Throws<ArgumentNullException>(() => new AppBootstrapper(_options, null!));
+            var ex = Assert.Throws<ArgumentNullException>(() => new AppBootstrapper(_options, null!));
+            Assert.Equal("processKiller", ex.ParamName);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void Constructor_InvalidLogFileName_ThrowsArgumentException(string? invalidLogFileName)
+        {
+            // Arrange
+            var options = CreateValidOptions();
+            options.LogFileName = invalidLogFileName;
+
+            // Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => new AppBootstrapper(options, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
+            Assert.StartsWith("BootstrapperOptions.LogFileName is required.", ex.Message);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void Constructor_InvalidAppSettingsFileName_ThrowsArgumentException(string? invalidAppSettingsFileName)
+        {
+            // Arrange
+            var options = CreateValidOptions();
+            options.AppSettingsFileName = invalidAppSettingsFileName;
+
+            // Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => new AppBootstrapper(options, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
+            Assert.StartsWith("BootstrapperOptions.AppSettingsFileName is required.", ex.Message);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void Constructor_InvalidResourcesNamespace_ThrowsArgumentException(string? invalidResourcesNamespace)
+        {
+            // Arrange
+            var options = CreateValidOptions();
+            options.ResourcesNamespace = invalidResourcesNamespace;
+
+            // Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => new AppBootstrapper(options, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
+            Assert.StartsWith("BootstrapperOptions.ResourcesNamespace is required.", ex.Message);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void Constructor_InvalidSecurityWarningTitle_ThrowsArgumentException(string? invalidSecurityWarningTitle)
+        {
+            // Arrange
+            var options = CreateValidOptions();
+            options.SecurityWarningTitle = invalidSecurityWarningTitle;
+
+            // Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => new AppBootstrapper(options, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
+            Assert.StartsWith("BootstrapperOptions.SecurityWarningTitle is required.", ex.Message);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void Constructor_InvalidSecurityWarningMessage_ThrowsArgumentException(string? invalidSecurityWarningMessage)
+        {
+            // Arrange
+            var options = CreateValidOptions();
+            options.SecurityWarningMessage = invalidSecurityWarningMessage;
+
+            // Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => new AppBootstrapper(options, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
+            Assert.StartsWith("BootstrapperOptions.SecurityWarningMessage is required.", ex.Message);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void Constructor_InvalidSqliteVersionWarningTitle_ThrowsArgumentException(string? invalidSqliteVersionWarningTitle)
+        {
+            // Arrange
+            var options = CreateValidOptions();
+            options.SqliteVersionWarningTitle = invalidSqliteVersionWarningTitle;
+
+            // Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => new AppBootstrapper(options, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
+            Assert.StartsWith("BootstrapperOptions.SqliteVersionWarningTitle is required.", ex.Message);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("    ")]
+        public void Constructor_InvalidSqliteVersionWarningMessageFormat_ThrowsArgumentException(string? invalidFormat)
+        {
+            // Arrange
+            var options = CreateValidOptions();
+            options.SqliteVersionWarningMessageFormat = invalidFormat;
+
+            // Act & Assert
+            var ex = Assert.Throws<ArgumentException>(() => new AppBootstrapper(options, _mockProcessKiller.Object));
+            Assert.Equal("options", ex.ParamName);
+            Assert.StartsWith("BootstrapperOptions.SqliteVersionWarningMessageFormat is required.", ex.Message);
+        }
+
+        private BootstrapperOptions CreateValidOptions()
+        {
+            return new BootstrapperOptions
+            {
+                LogFileName = "test.log",
+                AppSettingsFileName = "appsettings.json",
+                ResourcesNamespace = "Servy.UI.Tests",
+                SecurityWarningTitle = "Admin Check Fail",
+                SecurityWarningMessage = "Requires Administrative elevation.",
+                SqliteVersionWarningTitle = "SQLite Core Fail",
+                SqliteVersionWarningMessageFormat = "Version {0} is required, found {1}"
+            };
         }
 
         #endregion
 
         #region Startup and Environmental Routing Tests
 
-        [Fact]
-        public async Task OnStartup_ValidEnvironment_ForcesSoftwareRenderingOnArg()
+        [Theory]
+        [InlineData(new[] { AppConfig.ForceSoftwareRenderingArg }, true)]
+        [InlineData(new[] { "--FORCE-SR" }, true)] // StringComparison.OrdinalIgnoreCase
+        [InlineData(new[] { "MyService" }, false)] // an unrelated positional argument
+        [InlineData(new string[0], false)] // no arguments at all
+        public async Task OnStartup_ValidEnvironment_SetsForceSoftwareRenderingOnlyFromTheArg(string[] args, bool expected)
         {
-            // Execute entirely within the persistent async STA context pump thread
-            // to ensure internal thread safety boundaries match Application.Current initialization rules.
+            // Run on an STA thread with its own dispatcher pump, which Helper.RunOnSTA spawns for this call.
+            // The shared Application is not created on that thread: Helper.EnsureApplication keeps it on a
+            // separate, persistent STA thread and only returns the instance here.
             await Helper.RunOnSTA(async () =>
             {
                 // Arrange
                 var app = Helper.EnsureApplication();
                 var bootstrapper = new AppBootstrapper(_options, _mockProcessKiller.Object);
 
-                // Use TrySetStaticField to dynamically intercept these configurations ONLY if the legacy
-                // core assemblies contain mock seams. If they don't exist on this version, it safely proceeds,
-                // relying on native environmental verification on local workstations.
-                bool hasAdminMock = TrySetStaticField(typeof(SecurityHelper), "_isAdministratorMockValue", true);
-                bool hasSqliteMock = TrySetStaticField(typeof(DatabaseValidator), "_isSqliteVersionSafeMockValue", true);
+                // Both environment gates OnStartup runs before the assertion are steered through their
+                // production seams, so "ValidEnvironment" is an arrangement of this test rather than a
+                // property of the host it happens to run on. The counters are what make that visible:
+                // production code that stops reading a seam fails here instead of silently passing
+                // because the runner is elevated and ships a recent SQLite. They are asserted as
+                // "consulted at all" rather than as an exact count because IsAdministrator is also
+                // read by the ACL hardening OnStartup performs on the key and database files.
+                var originalAdminSeam = SecurityHelper.IsAdministratorCore;
+                var originalSqliteSeam = DatabaseValidator.GetSqliteVersion;
+
+                int adminChecks = 0;
+                int sqliteChecks = 0;
+                SecurityHelper.IsAdministratorCore = () => { adminChecks++; return true; };
+                DatabaseValidator.GetSqliteVersion = () => { sqliteChecks++; return AppConfig.MinRequiredSqliteVersion.ToString(); };
 
                 try
                 {
-                    // Push Software Rendering command line switch parameter
-                    var startupArgs = CreateStartupEventArgs(new[] { AppConfig.ForceSoftwareRenderingArg });
+                    // Push the command line arguments under test
+                    var startupArgs = CreateStartupEventArgs(args);
 
                     // Act
                     bool proceed = bootstrapper.OnStartup(app, startupArgs);
 
                     // Assert
+                    Assert.True(adminChecks > 0, "The elevation check never read SecurityHelper.IsAdministratorCore, so this test measured the host instead of its arrangement.");
+                    Assert.True(sqliteChecks > 0, "The SQLite version check never read DatabaseValidator.GetSqliteVersion, so this test measured the host instead of its arrangement.");
                     Assert.True(proceed);
-                    Assert.True(bootstrapper.ForceSoftwareRendering);
+                    Assert.Equal(expected, bootstrapper.ForceSoftwareRendering);
                 }
                 finally
                 {
-                    if (hasAdminMock) TestReflection.SetFieldStatic(typeof(SecurityHelper), "_isAdministratorMockValue", false);
-                    if (hasSqliteMock) TestReflection.SetFieldStatic(typeof(DatabaseValidator), "_isSqliteVersionSafeMockValue", false);
+                    SecurityHelper.IsAdministratorCore = originalAdminSeam;
+                    DatabaseValidator.GetSqliteVersion = originalSqliteSeam;
                 }
 
                 await Task.CompletedTask;
@@ -178,23 +308,6 @@ namespace Servy.UI.IntegrationTests.Bootstrapping
             }
 
             return startupEventArgs;
-        }
-
-        /// <summary>
-        /// Attempts to configure a static boolean field, returning false instead of crashing if the target field is missing.
-        /// Useful for optional environment-dependent integration test configurations.
-        /// </summary>
-        private bool TrySetStaticField(Type targetType, string fieldName, bool value)
-        {
-            try
-            {
-                TestReflection.SetFieldStatic(targetType, fieldName, value);
-                return true;
-            }
-            catch (ArgumentException)
-            {
-                return false;
-            }
         }
 
         #endregion

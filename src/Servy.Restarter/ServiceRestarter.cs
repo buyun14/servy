@@ -1,4 +1,7 @@
 using Servy.Core.Config;
+using Servy.Core.Logging;
+using Servy.Core.Native;
+using Servy.Core.Services;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.ServiceProcess;
@@ -6,19 +9,60 @@ using System.ServiceProcess;
 namespace Servy.Restarter
 {
     /// <summary>
-    /// Implements service restart functionality using <see cref="IServiceController"/> abstraction.
+    /// Implements service restart functionality using <see cref="IServiceControllerWrapper"/> abstraction.
     /// </summary>
     public class ServiceRestarter : IServiceRestarter
     {
-        private readonly Func<string, IServiceController> _controllerFactory;
+        private readonly Func<string, IServiceControllerWrapper> _controllerFactory;
+        private readonly IServyLogger? _logger;
 
         /// <summary>
         /// Initializes a new instance of <see cref="ServiceRestarter"/>.
         /// </summary>
-        public ServiceRestarter(Func<string, IServiceController>? controllerFactory = null)
+        /// <param name="controllerFactory">Factory method to create <see cref="IServiceControllerWrapper"/> instances for a service name.</param>
+        /// <param name="logger">Optional logger instance for operational telemetry and diagnostic auditing.</param>
+        public ServiceRestarter(Func<string, IServiceControllerWrapper>? controllerFactory = null, IServyLogger? logger = null)
         {
-            _controllerFactory = controllerFactory ?? (name => new ServiceController(name));
+            _controllerFactory = controllerFactory ?? (name => new ServiceControllerWrapper(name));
+            _logger = logger;
         }
+
+        #region Helper Methods
+
+        /// <summary>
+        /// Extracts the native Win32 error code from an exception if available.
+        /// </summary>
+        /// <param name="ex">The exception to inspect.</param>
+        /// <returns>The native error code if found; otherwise, <c>null</c>.</returns>
+        private static int? ScmErrorCode(Exception ex)
+            => (ex as Win32Exception ?? ex.InnerException as Win32Exception)?.NativeErrorCode;
+
+        /// <summary>
+        /// Determines whether an exception represents a transient or transitional state SCM error where retrying may succeed.
+        /// </summary>
+        /// <param name="ex">The exception to evaluate.</param>
+        /// <returns><c>true</c> if the error is transitional; otherwise, <c>false</c>.</returns>
+        private static bool IsTransitional(Exception ex)
+        {
+            var code = ScmErrorCode(ex);
+            return ex is System.ServiceProcess.TimeoutException
+                || code == Errors.ERROR_SERVICE_CANNOT_ACCEPT_CTRL
+                || code == Errors.ERROR_SERVICE_ALREADY_RUNNING
+                || code == Errors.ERROR_SERVICE_NOT_ACTIVE;
+        }
+
+        /// <summary>
+        /// Determines whether an exception represents a permanent condition indicating that the service does not exist or is marked for deletion.
+        /// </summary>
+        /// <param name="ex">The exception to evaluate.</param>
+        /// <returns><c>true</c> if the service is missing or marked for deletion; otherwise, <c>false</c>.</returns>
+        private static bool IsGone(Exception ex)
+        {
+            var code = ScmErrorCode(ex);
+            return code == Errors.ERROR_SERVICE_DOES_NOT_EXIST || code == Errors.ERROR_SERVICE_MARKED_FOR_DELETE;
+        }
+
+        #endregion
 
         /// <inheritdoc />
         public RestartResult RestartService(string serviceName, TimeSpan timeout)
@@ -35,16 +79,26 @@ namespace Servy.Restarter
                     {
                         current = controller.Status;
                         if (!IsPendingState(current)) break;
+
+                        _logger?.Debug($"Service '{serviceName}' is currently in pending state '{current}'; waiting to settle.");
                     }
                     catch (Exception ex) when (ex is InvalidOperationException || ex is Win32Exception)
                     {
-                        // ROBUSTNESS: Service was uninstalled, marked for deletion, or native SCM handle was dropped.
-                        return RestartResult.ServiceNotFound;
+                        if (IsGone(ex))
+                        {
+                            // ROBUSTNESS: Service was uninstalled or marked for deletion.
+                            _logger?.Warn($"Settle-phase status read failed for '{serviceName}'; treating as uninstalled.", ex);
+                            return RestartResult.ServiceNotFound;
+                        }
+                        throw;
                     }
 
                     var remaining = timeout - stopwatch.Elapsed;
                     if (remaining <= TimeSpan.Zero)
+                    {
+                        _logger?.Error($"Timeout expired while waiting for service '{serviceName}' to leave pending state '{current}'.");
                         throw new System.TimeoutException($"Service '{serviceName}' stuck in {current} state.");
+                    }
 
                     var sleepFor = (int)Math.Min(AppConfig.ServiceRestarterPollIntervalMs, remaining.TotalMilliseconds);
                     if (sleepFor > 0) Thread.Sleep(sleepFor);
@@ -55,8 +109,13 @@ namespace Servy.Restarter
                     }
                     catch (Exception ex) when (ex is InvalidOperationException || ex is Win32Exception)
                     {
-                        // ROBUSTNESS: Handle disappearance or native SCM teardown during the refresh cycle.
-                        return RestartResult.ServiceNotFound;
+                        if (IsGone(ex))
+                        {
+                            // ROBUSTNESS: Handle the service being uninstalled or marked for deletion during the refresh cycle.
+                            _logger?.Warn($"Settle-phase controller refresh failed for '{serviceName}'; treating as uninstalled.", ex);
+                            return RestartResult.ServiceNotFound;
+                        }
+                        throw;
                     }
                 }
 
@@ -70,36 +129,60 @@ namespace Servy.Restarter
                 }
                 catch (Exception ex) when (ex is InvalidOperationException || ex is Win32Exception)
                 {
-                    // Clean exit if the service vanished or SCM handle dropped between the settle phase and this query
-                    return RestartResult.ServiceNotFound;
+                    if (IsGone(ex))
+                    {
+                        // Clean exit if the service was uninstalled or marked for deletion between the settle phase and this query
+                        _logger?.Warn($"Stop-phase entry status check failed for '{serviceName}'; treating as uninstalled.", ex);
+                        return RestartResult.ServiceNotFound;
+                    }
+                    throw;
                 }
 
                 if (stopEntryStatus != ServiceControllerStatus.Stopped)
                 {
                     try
                     {
+                        _logger?.Debug($"Issuing Stop command for service '{serviceName}' (current status: {stopEntryStatus}).");
                         controller.Stop();
                         var stopRemaining = timeout - stopwatch.Elapsed;
                         if (stopRemaining <= TimeSpan.Zero)
+                        {
+                            _logger?.Error($"Timeout expired before wait could begin for service '{serviceName}' to reach Stopped state.");
                             throw new System.TimeoutException(
-                                $"Timeout expired while waiting for service '{serviceName}' to reach Stopped. " +
+                                $"Timeout expired before the wait for service '{serviceName}' to reach Stopped could begin. " +
                                 "The Stop command was issued; the service is stopping and will not be restarted by this run.");
+                        }
 
                         try
                         {
                             controller.WaitForStatus(ServiceControllerStatus.Stopped, stopRemaining);
+                            _logger?.Debug($"Service '{serviceName}' successfully reached Stopped state.");
                         }
                         catch (System.ServiceProcess.TimeoutException ex)
                         {
+                            _logger?.Error($"Service '{serviceName}' failed to reach Stopped state within {stopRemaining}.");
                             throw new System.TimeoutException(
                                 $"Service '{serviceName}' did not reach Stopped within {stopRemaining}.", ex);
                         }
                     }
                     catch (Exception ex) when (ex is InvalidOperationException || ex is Win32Exception)
                     {
-                        // Fallback: If it transitioned to Pending or experienced SCM access blocks between our check and the call
-                        HandleTransitionalError(serviceName, controller, ServiceControllerStatus.Stopped, timeout - stopwatch.Elapsed);
+                        if (IsGone(ex))
+                        {
+                            _logger?.Warn($"Stop command failed for '{serviceName}'; treating as uninstalled.", ex);
+                            return RestartResult.ServiceNotFound;
+                        }
+                        if (!IsTransitional(ex)) throw;
+
+                        // Fallback: the SCM returned a transitional error code (the service entered or left a pending state between our check and the call)
+                        _logger?.Warn($"Direct Stop operation failed for '{serviceName}'; entering transitional error recovery.", ex);
+                        var transitionalResult = HandleTransitionalError(serviceName, controller, ServiceControllerStatus.Stopped, timeout - stopwatch.Elapsed);
+                        if (transitionalResult.HasValue) return transitionalResult.Value;
                     }
+                }
+                else
+                {
+                    _logger?.Debug($"Service '{serviceName}' is already Stopped; skipping stop phase.");
                 }
 
                 // 3. Start phase
@@ -107,28 +190,42 @@ namespace Servy.Restarter
                 {
                     controller.Refresh();
                     if (controller.Status == ServiceControllerStatus.Running)
+                    {
+                        _logger?.Info($"Service '{serviceName}' is already Running; no start required.");
                         return RestartResult.Restarted; // already running, nothing left to do
+                    }
                 }
                 catch (Exception ex) when (ex is InvalidOperationException || ex is Win32Exception)
                 {
-                    return RestartResult.ServiceNotFound;
+                    if (IsGone(ex))
+                    {
+                        _logger?.Warn($"Start-phase initial status check failed for '{serviceName}'; treating as uninstalled.", ex);
+                        return RestartResult.ServiceNotFound;
+                    }
+                    throw;
                 }
 
                 try
                 {
+                    _logger?.Debug($"Issuing Start command for service '{serviceName}'.");
                     controller.Start();
                     var remaining = timeout - stopwatch.Elapsed;
                     if (remaining <= TimeSpan.Zero)
+                    {
+                        _logger?.Error($"Timeout expired before wait could begin for service '{serviceName}' to reach Running state.");
                         throw new System.TimeoutException(
-                            $"Timeout expired while waiting for service '{serviceName}' to reach Running. " +
+                            $"Timeout expired before the wait for service '{serviceName}' to reach Running could begin. " +
                             "The Start command was issued; the service may still complete the transition.");
+                    }
 
                     try
                     {
                         controller.WaitForStatus(ServiceControllerStatus.Running, remaining);
+                        _logger?.Debug($"Service '{serviceName}' successfully reached Running state.");
                     }
                     catch (System.ServiceProcess.TimeoutException ex)
                     {
+                        _logger?.Error($"Service '{serviceName}' failed to reach Running state within {remaining}.");
                         throw new System.TimeoutException(
                             $"Service '{serviceName}' did not reach Running within {remaining}.", ex);
                     }
@@ -137,8 +234,17 @@ namespace Servy.Restarter
                 }
                 catch (Exception ex) when (ex is InvalidOperationException || ex is Win32Exception)
                 {
-                    // Fallback: If it transitioned to Pending or experienced SCM access blocks between our check and the call
-                    HandleTransitionalError(serviceName, controller, ServiceControllerStatus.Running, timeout - stopwatch.Elapsed);
+                    if (IsGone(ex))
+                    {
+                        _logger?.Warn($"Start command failed for '{serviceName}'; treating as uninstalled.", ex);
+                        return RestartResult.ServiceNotFound;
+                    }
+                    if (!IsTransitional(ex)) throw;
+
+                    // Fallback: the SCM returned a transitional error code (the service entered or left a pending state between our check and the call)
+                    _logger?.Warn($"Direct Start operation failed for '{serviceName}'; entering transitional error recovery.", ex);
+                    var transitionalResult = HandleTransitionalError(serviceName, controller, ServiceControllerStatus.Running, timeout - stopwatch.Elapsed);
+                    if (transitionalResult.HasValue) return transitionalResult.Value;
                     return RestartResult.Restarted;
                 }
             }
@@ -165,43 +271,105 @@ namespace Servy.Restarter
         /// a status check and a command execution.
         /// </summary>
         /// <param name="serviceName">Windows Service name.</param>
-        /// <param name="controller">The <see cref="IServiceController"/> instance to manage.</param>
+        /// <param name="controller">The <see cref="IServiceControllerWrapper"/> instance to manage.</param>
         /// <param name="targetStatus">The desired <see cref="ServiceControllerStatus"/> (typically Running or Stopped).</param>
         /// <param name="timeout">The maximum <see cref="TimeSpan"/> allowed for the entire recovery operation.</param>
+        /// <returns>
+        /// A <see cref="RestartResult"/> if the operation detected that the service was uninstalled or lost (<see cref="RestartResult.ServiceNotFound"/>);
+        /// otherwise, <c>null</c> when the target status is successfully reached.
+        /// </returns>
         /// <exception cref="System.TimeoutException">
         /// Thrown if the service fails to reach the <paramref name="targetStatus"/>
         /// before the <paramref name="timeout"/> expires.
         /// </exception>
         /// <remarks>
-        /// This method uses an interrogation loop with <see cref="ServiceController.Refresh"/>
-        /// to wait out <see cref="InvalidOperationException"/> errors caused by the Windows SCM
-        /// locking the service during state transitions.
+        /// This method uses an interrogation loop with <see cref="IServiceControllerWrapper.Refresh"/>
+        /// to wait out the <see cref="InvalidOperationException"/>, <see cref="Win32Exception"/>
+        /// and <see cref="System.ServiceProcess.TimeoutException"/> errors raised while the Windows SCM
+        /// holds the service in a state transition. A re-probe after each failure distinguishes a service
+        /// that is still transitioning from one that has been uninstalled.
         /// </remarks>
-        private void HandleTransitionalError(string serviceName, IServiceController controller, ServiceControllerStatus targetStatus, TimeSpan timeout)
+        private RestartResult? HandleTransitionalError(string serviceName, IServiceControllerWrapper controller, ServiceControllerStatus targetStatus, TimeSpan timeout)
         {
             var stopwatch = Stopwatch.StartNew();
+            _logger?.Debug($"Entering transitional recovery loop for service '{serviceName}' targeting state '{targetStatus}'.");
+
+            Exception? last = null;
+
             while (stopwatch.Elapsed < timeout)
             {
                 try
                 {
                     controller.Refresh();
-                    if (controller.Status == targetStatus) return;
+                    var status = controller.Status;
+                    if (status == targetStatus)
+                    {
+                        _logger?.Debug($"Transitional recovery loop confirmed service '{serviceName}' reached target state '{targetStatus}'.");
+                        return null;
+                    }
 
-                    // If it's still in a pending state, wait and retry the command
-                    if (targetStatus == ServiceControllerStatus.Stopped)
-                        controller.Stop();
-                    else if (targetStatus == ServiceControllerStatus.Running)
-                        controller.Start();
+                    // Only re-issue the command when the service is in a stable state that will accept it.
+                    // While pending, the SCM rejects the control request (ERROR_SERVICE_CANNOT_ACCEPT_CTRL) -
+                    // wait the transition out instead.
+                    if (!IsPendingState(status))
+                    {
+                        if (targetStatus == ServiceControllerStatus.Stopped)
+                        {
+                            _logger?.Debug($"Re-issuing Stop command for service '{serviceName}' during recovery poll.");
+                            controller.Stop();
+                        }
+                        else if (targetStatus == ServiceControllerStatus.Running)
+                        {
+                            _logger?.Debug($"Re-issuing Start command for service '{serviceName}' during recovery poll.");
+                            controller.Start();
+                        }
+                    }
+                    else
+                    {
+                        _logger?.Debug($"Service '{serviceName}' is currently in pending state '{status}'; waiting for transition to complete.");
+                    }
 
                     var remaining = timeout - stopwatch.Elapsed;
                     if (remaining <= TimeSpan.Zero)
-                        throw new System.TimeoutException($"Service '{serviceName}' failed to reach {targetStatus} within the timeout period.");
+                    {
+                        _logger?.Error($"Timeout expired while waiting for service '{serviceName}' to reach '{targetStatus}'.");
+                        throw new System.TimeoutException(
+                            $"Service '{serviceName}' failed to reach {targetStatus} within the timeout period. " +
+                            "The service is in transition and the budget expired before the wait could begin; " +
+                            "the transition may still complete.", last);
+                    }
 
                     controller.WaitForStatus(targetStatus, remaining);
-                    return;
+                    _logger?.Debug($"Service '{serviceName}' reached target state '{targetStatus}' after waiting.");
+                    return null;
                 }
                 catch (Exception ex) when (ex is InvalidOperationException || ex is Win32Exception || ex is System.ServiceProcess.TimeoutException)
                 {
+                    if (IsGone(ex))
+                    {
+                        _logger?.Warn($"Recovery poll failed for service '{serviceName}' while targeting '{targetStatus}'; treating as uninstalled.", ex);
+                        return RestartResult.ServiceNotFound;
+                    }
+                    if (!IsTransitional(ex)) throw;
+
+                    last = ex;
+                    _logger?.Warn($"Transitional error poll encountered exception while targeting '{targetStatus}' for '{serviceName}'.", ex);
+
+                    // ROBUSTNESS: Re-probe status to detect a mid-flight uninstall or deletion mark
+                    try
+                    {
+                        controller.Refresh();
+                        _ = controller.Status;
+                    }
+                    catch (Exception probeEx) when (probeEx is InvalidOperationException || probeEx is Win32Exception)
+                    {
+                        if (IsGone(probeEx))
+                        {
+                            _logger?.Warn($"Post-exception status probe failed for service '{serviceName}'; treating as uninstalled.", probeEx);
+                            return RestartResult.ServiceNotFound;
+                        }
+                    }
+
                     // Still transitional or experiencing transient SCM access blocks; wait before the next poll
                     var remaining = timeout - stopwatch.Elapsed;
                     if (remaining <= TimeSpan.Zero) break;
@@ -209,7 +377,10 @@ namespace Servy.Restarter
                 }
             }
 
-            throw new System.TimeoutException($"Service '{serviceName}' failed to reach {targetStatus} within the timeout period.");
+            _logger?.Error($"Transitional recovery loop exhausted full timeout waiting for service '{serviceName}' to reach '{targetStatus}'.");
+            throw new System.TimeoutException(
+                $"Service '{serviceName}' failed to reach {targetStatus} within the timeout period; " +
+                "the SCM did not accept a recovery command before the budget expired.", last);
         }
     }
 }

@@ -1,10 +1,11 @@
 using Servy.Core.Native;
+using Servy.Testing;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace Servy.Core.IntegrationTests.Native
 {
-    [Collection("CoreOsIntegration")]
+    [Collection(CoreOsIntegrationCollection.Name)]
     public class NativeMethodsIntegrationTests : IDisposable
     {
         private readonly ITestOutputHelper _output;
@@ -31,6 +32,7 @@ namespace Servy.Core.IntegrationTests.Native
         [Fact]
         public void Constants_ValueMatching_VerifyCorrectValues()
         {
+            // Arrange, Act & Assert
             Assert.Equal(0x0004, NativeMethods.SERVICE_QUERY_STATUS);
             Assert.Equal(3, NativeMethods.SERVICE_DEMAND_START);
             Assert.Equal(0xFFFFFFFFu, NativeMethods.SERVICE_NO_CHANGE);
@@ -39,7 +41,6 @@ namespace Servy.Core.IntegrationTests.Native
             Assert.Equal(1, NativeMethods.SERVICE_CONFIG_DESCRIPTION);
             Assert.Equal(0x0004u, NativeMethods.SC_MANAGER_ENUMERATE_SERVICE);
             Assert.Equal(0x0001u, NativeMethods.SERVICE_QUERY_CONFIG);
-            Assert.Equal(2, NativeMethods.LOGON32_LOGON_INTERACTIVE);
             Assert.Equal(3, NativeMethods.LOGON32_LOGON_NETWORK);
             Assert.Equal(0, NativeMethods.LOGON32_PROVIDER_DEFAULT);
             Assert.Equal(5, NativeMethods.LOGON32_LOGON_SERVICE);
@@ -54,15 +55,9 @@ namespace Servy.Core.IntegrationTests.Native
             Assert.Equal(0x00000001, NativeMethods.SERVICE_STOPPED);
             Assert.Equal(0x00000001, NativeMethods.SERVICE_ACCEPT_STOP);
             Assert.Equal(0x00000010, NativeMethods.SERVICE_WIN32_OWN_PROCESS);
-            Assert.Equal(0x00000001u, NativeMethods.FILE_SHARE_READ);
-            Assert.Equal(0x00000002u, NativeMethods.FILE_SHARE_WRITE);
-            Assert.Equal(0x00000004u, NativeMethods.FILE_SHARE_DELETE);
-            Assert.Equal(3u, NativeMethods.OPEN_EXISTING);
-            Assert.Equal(0x02000000u, NativeMethods.FILE_FLAG_BACKUP_SEMANTICS);
             Assert.Equal(0x0u, NativeMethods.VOLUME_NAME_DOS);
             Assert.Equal(0x01u, NativeMethods.MOVEFILE_REPLACE_EXISTING);
             Assert.Equal(0x08u, NativeMethods.MOVEFILE_WRITE_THROUGH);
-            Assert.Equal(122, NativeMethods.ERROR_INSUFFICIENT_BUFFER);
             Assert.Equal(0x0001u, NativeMethods.SC_MANAGER_CONNECT);
             Assert.Equal(0x0002u, NativeMethods.SC_MANAGER_CREATE_SERVICE);
             Assert.Equal(0x0002u, NativeMethods.SERVICE_CHANGE_CONFIG);
@@ -71,6 +66,96 @@ namespace Servy.Core.IntegrationTests.Native
             Assert.Equal(0x00010000u, NativeMethods.SERVICE_DELETE);
             Assert.Equal(0x00000001u, NativeMethods.SERVICE_ERROR_NORMAL);
             Assert.Equal(7, NativeMethods.SERVICE_CONFIG_PRESHUTDOWN_INFO);
+
+            // The LSA policy access mask that #586 narrowed from POLICY_ALL_ACCESS to minimum rights.
+            // A wrong bit here surfaces as an ordinary "Access is denied", so nothing else would catch it.
+            Assert.Equal(0x00000800u, NativeMethods.POLICY_ACCESS.POLICY_LOOKUP_NAMES);
+            Assert.Equal(0x00000010u, NativeMethods.POLICY_ACCESS.POLICY_CREATE_ACCOUNT);
+
+            // The service DACL grant opens its handle with WRITE_DAC and reads and writes only the DACL.
+            // Both failures are logged and swallowed, so a wrong bit would surface only as a logged
+            // "Access is denied" and every RestartService grant would stop working unnoticed.
+            Assert.Equal(0x00040000u, NativeMethods.SERVICE_WRITE_DAC);
+            Assert.Equal(0x00000004u, NativeMethods.DACL_SECURITY_INFORMATION);
+
+            // ToScmStartType's start-type anchors.
+            Assert.Equal(0x00000002, NativeMethods.SERVICE_AUTO_START);
+            Assert.Equal(0x00000004, NativeMethods.SERVICE_DISABLED);
+
+            // NetLocalGroupGetMembers and the SID_NAME_USE values the group-member walk keys on.
+            Assert.Equal(-1, NativeMethods.MAX_PREFERRED_LENGTH);
+            Assert.Equal(2, NativeMethods.SidTypeGroup);
+            Assert.Equal(4, NativeMethods.SidTypeAlias);
+            Assert.Equal(5, NativeMethods.SidTypeWellKnownGroup);
+
+            // FILE_INFO_BY_HANDLE_CLASS.FileDispositionInfo, which the verified-handle log delete passes
+            // to SetFileInformationByHandle.
+            Assert.Equal(4, NativeMethods.FileDispositionInfoClass);
+
+            // QueryServiceStatusEx's only info level. A wrong value makes GetServiceProcessId return 0,
+            // which reads as "the host service is not running".
+            Assert.Equal(0, NativeMethods.SC_STATUS_PROCESS_INFO);
+
+            // Restart Manager buffer sizes (RestartManager.h). The two name lengths size the inline
+            // strings of RM_PROCESS_INFO, so a wrong value shifts every field after them.
+            Assert.Equal(32, NativeMethods.CCH_RM_SESSION_KEY);
+            Assert.Equal(255, NativeMethods.CCH_RM_MAX_APP_NAME);
+            Assert.Equal(63, NativeMethods.CCH_RM_MAX_SVC_NAME);
+        }
+
+        // The Win32 error codes of Errors.cs, from winerror.h. Each one selects a branch on a native call's
+        // last error, so a wrong digit changes behaviour while every test that never meets the code stays green
+        // (#657 declared ERROR_INVALID_PARAMETER as 7 instead of 87). One row per code, so every wrong value
+        // fails its own row.
+        [Theory]
+        [InlineData(5, Errors.ERROR_ACCESS_DENIED)]
+        [InlineData(6, Errors.ERROR_INVALID_HANDLE)]
+        [InlineData(17, Errors.ERROR_NOT_SAME_DEVICE)]
+        [InlineData(24, Errors.ERROR_BAD_LENGTH)]
+        [InlineData(31, Errors.ERROR_GEN_FAILURE)]
+        [InlineData(87, Errors.ERROR_INVALID_PARAMETER)]
+        [InlineData(122, Errors.ERROR_INSUFFICIENT_BUFFER)]
+        [InlineData(229, Errors.ERROR_PIPE_LOCAL)]
+        [InlineData(233, Errors.ERROR_PIPE_NOT_CONNECTED)]
+        [InlineData(234, Errors.ERROR_MORE_DATA)]
+        [InlineData(1056, Errors.ERROR_SERVICE_ALREADY_RUNNING)]
+        [InlineData(1060, Errors.ERROR_SERVICE_DOES_NOT_EXIST)]
+        [InlineData(1061, Errors.ERROR_SERVICE_CANNOT_ACCEPT_CTRL)]
+        [InlineData(1062, Errors.ERROR_SERVICE_NOT_ACTIVE)]
+        [InlineData(1072, Errors.ERROR_SERVICE_MARKED_FOR_DELETE)]
+        [InlineData(1326, Errors.ERROR_LOGON_FAILURE)]
+        [InlineData(1327, Errors.ERROR_ACCOUNT_RESTRICTION)]
+        [InlineData(1385, Errors.ERROR_LOGON_TYPE_NOT_GRANTED)]
+        public void Errors_ValueMatching_VerifyWinErrorValues(int expected, int actual)
+        {
+            // Arrange, Act & Assert
+            Assert.Equal(expected, actual);
+        }
+
+        [Fact]
+        public void ServiceControlAndStatusAccess_CombinesTheEightRightsServiceControllerNeeds()
+        {
+            // Arrange
+            const uint expected = NativeMethods.SERVICE_QUERY_CONFIG
+                                | (uint)NativeMethods.SERVICE_QUERY_STATUS
+                                | NativeMethods.SERVICE_ENUMERATE_DEPENDENTS
+                                | NativeMethods.SERVICE_START
+                                | NativeMethods.SERVICE_STOP
+                                | NativeMethods.SERVICE_PAUSE_CONTINUE
+                                | NativeMethods.SERVICE_INTERROGATE
+                                | NativeMethods.SERVICE_READ_CONTROL;
+
+            // Act
+            uint actual = NativeMethods.SERVICE_CONTROL_AND_STATUS_ACCESS;
+
+            // Assert
+            // The literal is spelled out so a dropped term in the composite fails here rather than
+            // surfacing as an ordinary "Access is denied" from ServiceController.Stop().
+            Assert.Equal(0x000200FDu, actual);
+            Assert.Equal(expected, actual);
+            Assert.Equal(0x0008u, NativeMethods.SERVICE_ENUMERATE_DEPENDENTS);
+            Assert.Equal(0x0040u, NativeMethods.SERVICE_PAUSE_CONTINUE);
+            Assert.Equal(0x0080u, NativeMethods.SERVICE_INTERROGATE);
         }
 
         #endregion
@@ -175,31 +260,16 @@ namespace Servy.Core.IntegrationTests.Native
         }
 
         [Fact]
-        public void NtQueryInformationProcess_CurrentProcessHandle_ReturnsBasicInformation()
+        public void OpenProcess_CurrentProcessId_ReturnsValidHandle()
         {
             // Arrange
             using (var currentProcess = Process.GetCurrentProcess())
             {
-                IntPtr processHandle = currentProcess.Handle;
-
-                var pbi = new NativeMethods.PROCESS_BASIC_INFORMATION();
-                int size = Marshal.SizeOf<NativeMethods.PROCESS_BASIC_INFORMATION>();
-
-                // Act & Assert
-                int status = NativeMethods.NtQueryInformationProcess(
-                    processHandle,
-                    (int)NativeMethods.ProcessInfoClass.ProcessBasicInformation,
-                    ref pbi,
-                    (uint)size,
-                    out uint returnLength);
-
-                // NTSTATUS 0 == STATUS_SUCCESS
-                Assert.Equal(0, status);
-                Assert.Equal((uint)size, returnLength);
-                Assert.NotEqual(IntPtr.Zero, pbi.PebBaseAddress);
-                using (var h = NativeMethods.OpenProcess(NativeMethods.ProcessAccess.QueryInformation, false, currentProcess.Id))
+                // Act
+                using (var handle = NativeMethods.OpenProcess(NativeMethods.ProcessAccess.QueryLimitedInformation, false, currentProcess.Id))
                 {
-                    Assert.False(h.IsInvalid);
+                    // Assert
+                    Assert.False(handle.IsInvalid);
                 }
             }
         }
@@ -208,7 +278,7 @@ namespace Servy.Core.IntegrationTests.Native
         public void OpenProcess_InvalidProcessId_ReturnsInvalidHandle()
         {
             // Act
-            using (var handle = NativeMethods.OpenProcess(NativeMethods.ProcessAccess.QueryLimitedInformation, false, 999999))
+            using (var handle = NativeMethods.OpenProcess(NativeMethods.ProcessAccess.QueryLimitedInformation, false, TestProcessIds.NeverValid))
             {
                 // Assert
                 Assert.True(handle.IsInvalid);
@@ -218,87 +288,6 @@ namespace Servy.Core.IntegrationTests.Native
         #endregion
 
         #region File Tracking & Security Utilities
-
-        [Fact]
-        public void FileIdentity_FileTrackingStructures_ValidatesEqualityAndRotationDifferences()
-        {
-            // Arrange
-            var idA = new NativeMethods.FILE_IDENTITY
-            {
-                FileIndex = 12345,
-                VolumeSerialNumber = 98765,
-                PrefixDigest = "ABCDE",
-                IsValidHandleInfo = true
-            };
-
-            var idB = new NativeMethods.FILE_IDENTITY
-            {
-                FileIndex = 12345,
-                VolumeSerialNumber = 98765,
-                PrefixDigest = "ABCDE",
-                IsValidHandleInfo = true
-            };
-
-            var idC = new NativeMethods.FILE_IDENTITY
-            {
-                FileIndex = 54321, // Differs by index path
-                VolumeSerialNumber = 98765,
-                PrefixDigest = "ABCDE",
-                IsValidHandleInfo = true
-            };
-
-            // Assert behavior when VolumeSerialNumber differs independently
-            var idVolumeMismatch = new NativeMethods.FILE_IDENTITY
-            {
-                FileIndex = 12345,
-                VolumeSerialNumber = 11111, // Differs by serial path
-                PrefixDigest = "ABCDE",
-                IsValidHandleInfo = true
-            };
-
-            // Act & Assert
-            Assert.False(idA.IsDifferentFrom(idB), "Identical primary handles must evaluate as the same file object.");
-            Assert.True(idA.IsDifferentFrom(idC), "Varying FileIndex should indicate a rotation event.");
-            Assert.True(idA.IsDifferentFrom(idVolumeMismatch), "Varying VolumeSerialNumber should indicate a volume/rotation move event.");
-        }
-
-        [Fact]
-        public void FileIdentity_HandleValidityMismatch_ReturnsTrue()
-        {
-            // Arrange
-            // Branch (1) Probe: Validation status asymmetry must trigger immediate difference flag
-            var idValid = new NativeMethods.FILE_IDENTITY { IsValidHandleInfo = true, PrefixDigest = "SAME" };
-            var idInvalid = new NativeMethods.FILE_IDENTITY { IsValidHandleInfo = false, PrefixDigest = "SAME" };
-
-            // Act & Assert
-            Assert.True(idValid.IsDifferentFrom(idInvalid), "Handle info status inequality must evaluate as structurally different file tracks.");
-        }
-
-        [Fact]
-        public void FileIdentity_SecondaryProbeFAT32Fallback_ValidatesDigestEquality()
-        {
-            // Arrange
-            // Branch (3) Probe: Both handle checks fail (e.g. FAT32 volume layers). Compare contents using PrefixDigest
-            var baseId = new NativeMethods.FILE_IDENTITY { IsValidHandleInfo = false, PrefixDigest = "MD5_HASH_A" };
-            var matchingId = new NativeMethods.FILE_IDENTITY { IsValidHandleInfo = false, PrefixDigest = "MD5_HASH_A" };
-            var differingId = new NativeMethods.FILE_IDENTITY { IsValidHandleInfo = false, PrefixDigest = "MD5_HASH_B" };
-
-            // Act & Assert
-            Assert.False(baseId.IsDifferentFrom(matchingId), "Identical content hashes on invalid handle states must evaluate as unchanged.");
-            Assert.True(baseId.IsDifferentFrom(differingId), "Differing content hashes on invalid handle states must trigger a rotation switch signal.");
-        }
-
-        [Fact]
-        public void FileIdentity_UndeterminableStateFallback_DefaultsToTrue()
-        {
-            // Arrange
-            // Branch (3) Fallback: No robust identifiers available on either side. Should report 'true' as a safe default.
-            var blindIdA = new NativeMethods.FILE_IDENTITY { IsValidHandleInfo = false, PrefixDigest = null! };
-            var blindIdB = new NativeMethods.FILE_IDENTITY { IsValidHandleInfo = false, PrefixDigest = null! };
-
-            // Act & Assert
-            Assert.True(blindIdA.IsDifferentFrom(blindIdB), "Undeterminable file identities must fall back to 'true' to safely force metadata loop updates.");
-        }
 
         [Fact]
         public void MoveFileEx_ValidPaths_ExecutesAtomicFileRelocation()
@@ -336,7 +325,7 @@ namespace Servy.Core.IntegrationTests.Native
             // Assert
             Assert.False(loggedOn);
             Assert.Equal(IntPtr.Zero, token);
-            Assert.NotEqual(0, lastError);                 // e.g. ERROR_LOGON_FAILURE (1326)
+            Assert.Equal(Errors.ERROR_LOGON_FAILURE, lastError);
         }
 
         #endregion
@@ -368,9 +357,7 @@ namespace Servy.Core.IntegrationTests.Native
 
                     // Assert
                     Assert.True(serviceHandle.IsInvalid);
-
-                    // 1060 == ERROR_SERVICE_DOES_NOT_EXIST
-                    Assert.Equal(1060, lastError);
+                    Assert.Equal(Errors.ERROR_SERVICE_DOES_NOT_EXIST, lastError);
                 }
                 finally
                 {
@@ -387,6 +374,8 @@ namespace Servy.Core.IntegrationTests.Native
             int sizeAutoStart = Marshal.SizeOf<NativeMethods.SERVICE_DELAYED_AUTO_START_INFO>();
             int sizePreshutdown = Marshal.SizeOf<NativeMethods.SERVICE_PRE_SHUTDOWN_INFO>();
             int sizeStatus = Marshal.SizeOf<NativeMethods.SERVICE_STATUS>();
+            int sizeRmProcessInfo = Marshal.SizeOf<NativeMethods.RM_PROCESS_INFO>();
+            int sizeStatusProcess = Marshal.SizeOf<NativeMethods.SERVICE_STATUS_PROCESS>();
 
             // Assert
             // WIN32 ABI MARSHALING: Pin exact structure byte lengths required by the OS kernel.
@@ -406,6 +395,58 @@ namespace Servy.Core.IntegrationTests.Native
             // SERVICE_STATUS contains 7 DWORD fields (7 * 4 bytes) -> 28 bytes total
             const int ExpectedStatusSize = 28;
             Assert.Equal(ExpectedStatusSize, sizeStatus);
+
+            // RM_PROCESS_INFO: RM_UNIQUE_PROCESS (DWORD + FILETIME = 12) + WCHAR[256] (512) + WCHAR[64] (128)
+            // + four 4-byte fields (16) -> 668 bytes.
+            const int ExpectedRmProcessInfoSize = 668;
+            Assert.Equal(ExpectedRmProcessInfoSize, sizeRmProcessInfo);
+
+            // SERVICE_STATUS_PROCESS contains 9 DWORD fields (9 * 4 bytes) -> 36 bytes total
+            const int ExpectedStatusProcessSize = 36;
+            Assert.Equal(ExpectedStatusProcessSize, sizeStatusProcess);
+        }
+
+        [Fact]
+        public void BufferReadStructs_Marshaling_PinSizesAndFieldOffsets()
+        {
+            // Arrange
+            int ptr = IntPtr.Size;
+            bool is64 = ptr == 8;
+
+            // Act
+            int sizeMember = Marshal.SizeOf<NativeMethods.LOCALGROUP_MEMBERS_INFO_1>();
+            int sizeConfig = Marshal.SizeOf<NativeMethods.QUERY_SERVICE_CONFIG>();
+            int sizeFileInfo = Marshal.SizeOf<NativeMethods.BY_HANDLE_FILE_INFORMATION>();
+
+            int offMemberUsage = (int)Marshal.OffsetOf<NativeMethods.LOCALGROUP_MEMBERS_INFO_1>(nameof(NativeMethods.LOCALGROUP_MEMBERS_INFO_1.lgrmi1_sidusage));
+            int offMemberName = (int)Marshal.OffsetOf<NativeMethods.LOCALGROUP_MEMBERS_INFO_1>(nameof(NativeMethods.LOCALGROUP_MEMBERS_INFO_1.lgrmi1_name));
+
+            int offConfigBinaryPath = (int)Marshal.OffsetOf<NativeMethods.QUERY_SERVICE_CONFIG>(nameof(NativeMethods.QUERY_SERVICE_CONFIG.lpBinaryPathName));
+            int offConfigDependencies = (int)Marshal.OffsetOf<NativeMethods.QUERY_SERVICE_CONFIG>(nameof(NativeMethods.QUERY_SERVICE_CONFIG.lpDependencies));
+            int offConfigStartName = (int)Marshal.OffsetOf<NativeMethods.QUERY_SERVICE_CONFIG>(nameof(NativeMethods.QUERY_SERVICE_CONFIG.lpServiceStartName));
+
+            int offFileVolume = (int)Marshal.OffsetOf<NativeMethods.BY_HANDLE_FILE_INFORMATION>(nameof(NativeMethods.BY_HANDLE_FILE_INFORMATION.VolumeSerialNumber));
+            int offFileIndexHigh = (int)Marshal.OffsetOf<NativeMethods.BY_HANDLE_FILE_INFORMATION>(nameof(NativeMethods.BY_HANDLE_FILE_INFORMATION.FileIndexHigh));
+            int offFileIndexLow = (int)Marshal.OffsetOf<NativeMethods.BY_HANDLE_FILE_INFORMATION>(nameof(NativeMethods.BY_HANDLE_FILE_INFORMATION.FileIndexLow));
+
+            // Assert
+            // LOCALGROUP_MEMBERS_INFO_1: PSID, SID_NAME_USE (padded to pointer size), LPWSTR -> 3 pointers.
+            // The hardener walks the NetLocalGroupGetMembers buffer in strides of this size.
+            Assert.Equal(3 * ptr, sizeMember);
+            Assert.Equal(ptr, offMemberUsage);
+            Assert.Equal(2 * ptr, offMemberName);
+
+            // QUERY_SERVICE_CONFIGW: 3 DWORD, 2 pointers, DWORD, 3 pointers -> 36 bytes on x86, 64 on x64.
+            Assert.Equal(is64 ? 64 : 36, sizeConfig);
+            Assert.Equal(is64 ? 16 : 12, offConfigBinaryPath);
+            Assert.Equal(is64 ? 40 : 24, offConfigDependencies);
+            Assert.Equal(is64 ? 48 : 28, offConfigStartName);
+
+            // BY_HANDLE_FILE_INFORMATION: DWORD + 3 FILETIME + 6 DWORD -> 52 bytes on every architecture.
+            Assert.Equal(52, sizeFileInfo);
+            Assert.Equal(28, offFileVolume);
+            Assert.Equal(44, offFileIndexHigh);
+            Assert.Equal(48, offFileIndexLow);
         }
 
         #endregion
@@ -415,64 +456,24 @@ namespace Servy.Core.IntegrationTests.Native
         [Fact]
         public void SetConsoleCtrlHandler_NullCallbackReference_SucceedsValidly()
         {
-            // Passing null removes or sets default configuration components depending on the trailing boolean flag state parameters.
-            bool success = NativeMethods.SetConsoleCtrlHandler(null, true);
+            // Act
+            // With a null handler the flag is not add/remove: TRUE makes this process ignore CTRL+C and
+            // FALSE restores normal CTRL+C processing, which is what the finally below puts back.
+            bool success = NativeMethods.SetConsoleCtrlHandler(IntPtr.Zero, true);
             try
             {
-                Assert.True(success, "Registering the default Ctrl handler (null callback, add=true) should succeed.");
+                // Assert
+                Assert.True(success, "SetConsoleCtrlHandler(null, TRUE) - making this process ignore CTRL+C - should succeed.");
             }
             finally
             {
-                NativeMethods.SetConsoleCtrlHandler(null, false); // restore process-global state regardless
+                NativeMethods.SetConsoleCtrlHandler(IntPtr.Zero, false); // restore process-global state regardless
             }
         }
 
         #endregion
 
         #region LSA & Security Token Policies
-
-        [Fact]
-        public void ProcessSnapshot_Enumeration_IncludesCurrentProcess()
-        {
-            // Arrange
-            int currentPid;
-            using (var currentProcess = Process.GetCurrentProcess())
-            {
-                currentPid = currentProcess.Id;
-            }
-            bool foundCurrentProcess = false;
-
-            IntPtr snapshotHandle = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPPROCESS, 0);
-            Assert.NotEqual(IntPtr.Zero, snapshotHandle);
-            Assert.NotEqual(new IntPtr(-1), snapshotHandle);
-
-            try
-            {
-                var procEntry = new NativeMethods.PROCESSENTRY32
-                {
-                    dwSize = (uint)Marshal.SizeOf<NativeMethods.PROCESSENTRY32>()
-                };
-
-                if (NativeMethods.Process32First(snapshotHandle, ref procEntry))
-                {
-                    do
-                    {
-                        if ((int)procEntry.th32ProcessID == currentPid)
-                        {
-                            foundCurrentProcess = true;
-                            break;
-                        }
-                    }
-                    while (NativeMethods.Process32Next(snapshotHandle, ref procEntry));
-                }
-            }
-            finally
-            {
-                NativeMethods.CloseHandle(snapshotHandle);
-            }
-
-            Assert.True(foundCurrentProcess, $"The current process PID ({currentPid}) was not found in the Toolhelp32 snapshot.");
-        }
 
         [Fact]
         public void LsaPolicy_OpenAndClose_SucceedsOrReturnsAccessDenied()
@@ -502,8 +503,7 @@ namespace Servy.Core.IntegrationTests.Native
 
                 // STATUS_ACCESS_DENIED -> ERROR_ACCESS_DENIED (5) is the only valid non-zero outcome for a
                 // least-privilege token context. Any other Win32 error signals a P/Invoke or struct layout failure.
-                const int ERROR_ACCESS_DENIED = 5;
-                Assert.Equal(ERROR_ACCESS_DENIED, win32Error);
+                Assert.Equal(Errors.ERROR_ACCESS_DENIED, win32Error);
             }
         }
 
@@ -513,8 +513,10 @@ namespace Servy.Core.IntegrationTests.Native
             // Act & Assert
             int result = NativeMethods.LsaFreeMemory(IntPtr.Zero);
 
-            // LsaFreeMemory returns status codes; verifying zero-pointers are swallowed without memory segmentation faults
-            Assert.True(result >= 0);
+            // LsaFreeMemory returns status codes; verifying zero-pointers are swallowed without memory segmentation faults.
+            // STATUS_SUCCESS, matching the exact-zero NTSTATUS checks elsewhere in this file: >= 0 would also
+            // accept the informational 0x4xxxxxxx range, which is not "swallowed without a fault".
+            Assert.Equal(0, result);
         }
 
         #endregion

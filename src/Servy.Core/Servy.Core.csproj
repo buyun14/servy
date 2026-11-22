@@ -1,14 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0-windows</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
-
-  <PropertyGroup>
     <AssemblyTitle>Servy.Core</AssemblyTitle>
-    <AssemblyDescription>Shared functionality, utilities, and data models</AssemblyDescription>
+    <Description>Shared functionality, utilities, and data models</Description>
     <Product>Servy.Core</Product>
   </PropertyGroup>
 
@@ -22,15 +16,16 @@
   </ItemGroup>
 
   <ItemGroup>
-    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
-      <_Parameter1>BuiltWithFramework</_Parameter1>
-      <_Parameter2>$(TargetFramework)</_Parameter2>
-    </AssemblyAttribute>
+    <AssemblyMetadata Include="BuiltWithFramework" Value="$(TargetFramework)" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Servy.Core.UnitTests" />
     <InternalsVisibleTo Include="Servy.Core.IntegrationTests" />
+    <InternalsVisibleTo Include="Servy.CLI.UnitTests" />
+    <InternalsVisibleTo Include="Servy.Restarter.UnitTests" />
+    <InternalsVisibleTo Include="Servy.UI.IntegrationTests" />
+    <InternalsVisibleTo Include="Servy.Service" />
   </ItemGroup>
 
   <ItemGroup>

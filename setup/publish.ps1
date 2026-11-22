@@ -1,4 +1,5 @@
-#Requires -Version 5.0
+﻿#Requires -Version 5.0
+
 <#
 .SYNOPSIS
     Main build script for generating the Servy self-contained installer.
@@ -28,6 +29,7 @@
 #>
 # publish.ps1
 # Main setup bundle script for building the self-contained installer.
+[CmdletBinding()]
 param(
     [string]$Tfm     = "",
     [string]$Version = ""
@@ -37,7 +39,7 @@ $ErrorActionPreference = "Stop"
 
 # Load central defaults
 $configPath = Join-Path $PSScriptRoot "build-config.ps1"
-if (Test-Path $configPath) {
+if (Test-Path -LiteralPath $configPath) {
     $buildConfig = & $configPath
     if (-not $Tfm) { $Tfm = $buildConfig.Tfm }
     if (-not $Version) { $Version = $buildConfig.Version }
@@ -66,7 +68,7 @@ try {
 
         $fullPath = Join-Path $scriptDir $ScriptPath
 
-        if (-not (Test-Path $fullPath)) {
+        if (-not (Test-Path -LiteralPath $fullPath)) {
             Write-Error "Script not found: $fullPath"
         }
 
@@ -122,6 +124,10 @@ finally {
         try {
             [void][System.Console]::ReadKey($true)
         }
+        # ReadKey throws InvalidOperationException when standard input is redirected, a case the
+        # $isInteractive guard above is meant to exclude already, so this catch is a second net.
+        # The pause is cosmetic: a failure here is swallowed deliberately and the exit 1 below
+        # still enforces the build result.
         catch { }
     }
     else {

@@ -5,7 +5,9 @@ using Servy.Core.Resources;
 namespace Servy.Core.Validation
 {
     /// <summary>
-    /// Provides shared validation logic for importing and exporting configuration files.
+    /// Provides the shared import-side gate for configuration files: path security,
+    /// size threshold, and content read from the validated stream.
+    /// (The path-security gate shared with export lives in <see cref="PathSecurityGuard"/>.)
     /// </summary>
     public static class ImportGuard
     {
@@ -23,14 +25,13 @@ namespace Servy.Core.Validation
             // Invoke the shared security gate using read intent semantics
             var securityCheck = PathSecurityGuard.ValidatePath(path, FileMode.Open, FileAccess.Read, FileShare.Read, out var fileStream);
             if (!securityCheck.IsValid) return securityCheck;
-            if (fileStream == null)
-                return PathSecurityResult.Fail(PathSecurityFailureKind.InvalidArgument, Strings.Msg_ImportReadFailure);
 
-            using (fileStream)
+            using (fileStream) // guaranteed non-null when IsValid; see PathSecurityGuard.ValidatePath
             {
-                if (fileStream.Length > AppConfig.MaxConfigFileSizeBytes)
+                if (fileStream!.Length > AppConfig.MaxConfigFileSizeBytes)
                 {
-                    var errorMsg = string.Format(Strings.Msg_ConfigSizeLimitReached, securityCheck.ValidPath.ResolvedPath, AppConfig.MaxConfigFileSizeMB);
+                    double actualSizeMb = (double)fileStream.Length / AppConfig.BytesInMegabyte;
+                    var errorMsg = string.Format(Strings.Msg_ConfigSizeLimitReached, securityCheck.ValidPath.ResolvedPath, actualSizeMb, AppConfig.MaxConfigFileSizeMB);
                     Logger.Error(errorMsg);
                     return PathSecurityResult.Fail(PathSecurityFailureKind.InvalidArgument, errorMsg);
                 }

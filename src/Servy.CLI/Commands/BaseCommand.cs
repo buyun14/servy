@@ -36,10 +36,33 @@ namespace Servy.CLI.Commands
             };
 
         /// <summary>
+        /// Resolves the invariant status token of a service: the SCM value, then
+        /// <see cref="ServiceStatus.Unknown"/> for an installed service whose status cannot be read, then
+        /// <see cref="ServiceStatus.NotInstalled"/>.
+        /// </summary>
+        /// <remarks>
+        /// The single fallback ladder shared by the <c>status</c> and <c>show</c> verbs, so both print the
+        /// same machine-readable token for the same service. The token is never localized.
+        /// </remarks>
+        /// <param name="serviceManager">The <see cref="IServiceManager"/> used to query the service.</param>
+        /// <param name="serviceName">The service name to query.</param>
+        /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
+        /// <returns>The status token.</returns>
+        protected static string ResolveStatusToken(IServiceManager serviceManager, string? serviceName, CancellationToken cancellationToken)
+        {
+            var status = serviceManager.GetServiceStatus(serviceName, cancellationToken: cancellationToken);
+
+            return status?.ToString()
+                ?? (serviceManager.IsServiceInstalled(serviceName, cancellationToken)
+                        ? nameof(ServiceStatus.Unknown)
+                        : nameof(ServiceStatus.NotInstalled));
+        }
+
+        /// <summary>
         /// Executes a synchronous command action with common error handling: <see cref="OperationCanceledException"/>
         /// is translated to a clean cancellation result, and all other exceptions are routed through <see cref="HandleException"/>.
         /// </summary>
-        /// <param name="commandName">The name of the command executing (e.g., "install", "start"), used for logging scopes.</param>
+        /// <param name="commandName">The name of the command executing (e.g., "install", "start"), used in the cancellation message and in the administrator-privileges-required message.</param>
         /// <param name="action">Human-readable description of the attempted operation, used in error messages.</param>
         /// <param name="suggestion">Actionable advice for the user if the command fails.</param>
         /// <param name="task">The synchronous command logic to execute.</param>
@@ -64,7 +87,7 @@ namespace Servy.CLI.Commands
         /// Executes an asynchronous command action with common error handling: <see cref="OperationCanceledException"/>
         /// is translated to a clean cancellation result, and all other exceptions are routed through <see cref="HandleException"/>.
         /// </summary>
-        /// <param name="commandName">The name of the command executing (e.g., "install", "start"), used for logging scopes.</param>
+        /// <param name="commandName">The name of the command executing (e.g., "install", "start"), used in the cancellation message and in the administrator-privileges-required message.</param>
         /// <param name="action">Human-readable description of the attempted operation, used in error messages.</param>
         /// <param name="suggestion">Actionable advice for the user if the command fails.</param>
         /// <param name="task">The asynchronous command logic to execute.</param>
@@ -88,7 +111,7 @@ namespace Servy.CLI.Commands
         /// <summary>
         /// Centralizes shared service management pre-flight validation, installation assertions, and operation logging.
         /// </summary>
-        /// <param name="commandName">The name of the command executing, used for logging scopes.</param>
+        /// <param name="commandName">The name of the command executing (e.g., "start", "uninstall"), used in the cancellation message, the administrator-privileges-required message, and as the prefix of the post-success-sync warning and the failure log line.</param>
         /// <param name="action">Human-readable description of the attempted operation, used in error messages.</param>
         /// <param name="suggestion">Remediation suggestion provided to the user on failure.</param>
         /// <param name="serviceName">The name of the target Windows service.</param>
@@ -97,6 +120,7 @@ namespace Servy.CLI.Commands
         /// <param name="successMessageFormatter">Function used to format the success message string.</param>
         /// <param name="preCheck">Optional delegate performing pre-flight checks before the main operation runs.</param>
         /// <param name="onSuccess">Optional asynchronous callback executed after a successful operation to synchronize repository state (e.g. DB upsert). Failures are caught and logged as a warning without failing the command.</param>
+        /// <param name="skipInstalledCheck">Optional flag to bypass the <see cref="IServiceManager.IsServiceInstalled"/> pre-flight check, allowing operations (like uninstall) to clean up orphan database records when the SCM service is gone.</param>
         /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
         /// <returns>A task returning a <see cref="CommandResult"/> representing the operation outcome.</returns>
         protected async Task<CommandResult> ExecuteServiceOperationAsync(
@@ -109,6 +133,7 @@ namespace Servy.CLI.Commands
             Func<string, string> successMessageFormatter,
             Func<CancellationToken, CommandResult?>? preCheck = null,
             Func<CancellationToken, Task>? onSuccess = null,
+            bool skipInstalledCheck = false,
             CancellationToken cancellationToken = default)
         {
             return await ExecuteWithHandlingAsync(commandName, action, suggestion, async () =>
@@ -121,10 +146,13 @@ namespace Servy.CLI.Commands
                     SecurityHelper.EnsureAdministrator();
                 }
 
-                var exists = serviceManager.IsServiceInstalled(serviceName, cancellationToken: cancellationToken);
-                if (!exists)
+                if (!skipInstalledCheck)
                 {
-                    return CommandResult.Fail(Core.Resources.Strings.Msg_ServiceNotFound);
+                    var exists = serviceManager.IsServiceInstalled(serviceName, cancellationToken: cancellationToken);
+                    if (!exists)
+                    {
+                        return CommandResult.Fail(Core.Resources.Strings.Msg_ServiceNotFound);
+                    }
                 }
 
                 if (preCheck != null)
@@ -155,7 +183,7 @@ namespace Servy.CLI.Commands
                 else
                 {
                     var reason = string.IsNullOrWhiteSpace(res.ErrorMessage) ? Strings.Msg_UnknownError : res.ErrorMessage;
-                    Logger.Error(string.Format(Strings.Msg_ServiceOperationFailed, commandName, action, serviceName, reason));
+                    Logger.Error(string.Format(Strings.Msg_ServiceOperationFailed, commandName, action, reason));
                     return res.ToFailure();
                 }
             });
@@ -165,7 +193,7 @@ namespace Servy.CLI.Commands
         /// Centralizes exception logging and CommandResult formatting for both synchronous and asynchronous command executions.
         /// </summary>
         /// <param name="ex">The thrown exception to process.</param>
-        /// <param name="commandName">The name of the command executing, used for logging scopes and formatting messages.</param>
+        /// <param name="commandName">The name of the command executing, used to format the administrator-privileges-required message.</param>
         /// <param name="action">Human-readable description of the attempted operation, used in error messages.</param>
         /// <param name="suggestion">Actionable remediation suggestion provided to the user upon command failure.</param>
         /// <returns>A <see cref="CommandResult"/> detailing the failure.</returns>

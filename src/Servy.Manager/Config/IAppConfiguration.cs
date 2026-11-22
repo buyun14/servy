@@ -20,7 +20,7 @@ namespace Servy.Manager.Config
         /// <summary>
         /// Gets the polling interval, in milliseconds, for retrieving process performance metrics such as CPU and RAM usage.
         /// </summary>
-        int PerformanceRefreshIntervalInMs { get; }
+        int PerformanceRefreshIntervalMs { get; }
 
         /// <summary>
         /// Gets the maximum number of log lines to retain in the live console viewer buffer.
@@ -30,12 +30,12 @@ namespace Servy.Manager.Config
         /// <summary>
         /// Gets the polling interval, in milliseconds, for fetching new standard output and standard error logs.
         /// </summary>
-        int ConsoleRefreshIntervalInMs { get; }
+        int ConsoleRefreshIntervalMs { get; }
 
         /// <summary>
         /// Gets the polling interval, in milliseconds, for refreshing the service dependencies tree.
         /// </summary>
-        int DependenciesRefreshIntervalInMs { get; }
+        int DependenciesRefreshIntervalMs { get; }
 
         /// <summary>
         /// Gets the file path to the published Servy Desktop application executable.
@@ -67,5 +67,38 @@ namespace Servy.Manager.Config
         /// throttled by a hardware-aware ceiling: <c>Math.Max(1, Math.Min(Environment.ProcessorCount * 2, MaxBulkOperationParallelism))</c>.
         /// </remarks>
         int MaxBulkOperationParallelism { get; }
+
+        /// <summary>
+        /// Gets the comma-separated list of column names that are hidden in the services table.
+        /// </summary>
+        string ServicesHiddenColumns { get; }
+
+        /// <summary>
+        /// Gets the comma-separated list of column names that are hidden in the logs table.
+        /// </summary>
+        string LogsHiddenColumns { get; }
+
+        /// <summary>
+        /// Gets a value indicating whether the display name column visibility migration has been executed.
+        /// </summary>
+        bool IsDisplayNameColumnMigrated { get; }
+
+        /// <summary>
+        /// Gets the persisted position, size and state of the main window, in the
+        /// <c>Left,Top,Width,Height,State</c> form, or an empty string when the default placement applies.
+        /// </summary>
+        string MainWindowPlacement { get; }
+
+        /// <summary>
+        /// Gets the persisted column widths of the services table, as a comma-separated list of
+        /// <c>Header=Width</c> entries, or an empty string when the default widths apply.
+        /// </summary>
+        string ServicesColumnWidths { get; }
+
+        /// <summary>
+        /// Gets the persisted column widths of the logs table, as a comma-separated list of
+        /// <c>Header=Width</c> entries, or an empty string when the default widths apply.
+        /// </summary>
+        string LogsColumnWidths { get; }
     }
 }

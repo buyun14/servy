@@ -1,12 +1,15 @@
 using Servy.Core.Config;
 using Servy.Core.Data;
+using Servy.Core.DTOs;
 using Servy.Core.Logging;
 using Servy.Core.Native;
+using Servy.Core.Services;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
+using static Servy.Core.Native.Errors;
 
 namespace Servy.Core.Helpers
 {
@@ -15,7 +18,18 @@ namespace Servy.Core.Helpers
     /// </summary>
     public class ServiceHelper : IServiceHelper
     {
+        /// <summary>
+        /// The file names of the service wrappers of the .NET 10 and the .NET Framework 4.8 build. After a switch between
+        /// the two builds, the services the other build installed still run its wrappers, and they are Servy services too:
+        /// they are stopped while the binaries are replaced and must be started again afterwards (#7941).
+        /// </summary>
+        internal static readonly string[] WrapperExecutableNames =
+        {
+            AppConfig.ServyServiceUIExe, AppConfig.ServyServiceCLIExe, AppConfig.OtherBuildServiceUIExe, AppConfig.OtherBuildServiceCLIExe
+        };
+
         private readonly IServiceRepository _serviceRepository;
+        private readonly IServiceControllerProvider _serviceControllerProvider;
 
         /// <summary>
         /// Initializes a new instance of the ServiceHelper class using the specified service repository.
@@ -23,50 +37,56 @@ namespace Servy.Core.Helpers
         /// <param name="serviceRepository">The service repository used to access and manage service-related resources. Cannot be null.</param>
         [ExcludeFromCodeCoverage]
         public ServiceHelper(IServiceRepository serviceRepository)
+            : this(serviceRepository, new ServiceControllerProvider())
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the ServiceHelper class using the specified service repository and service controller provider.
+        /// </summary>
+        /// <param name="serviceRepository">The service repository used to access and manage service-related resources. Cannot be null.</param>
+        /// <param name="serviceControllerProvider">The provider used to resolve service controller instances. Cannot be null.</param>
+        public ServiceHelper(IServiceRepository serviceRepository, IServiceControllerProvider serviceControllerProvider)
         {
             _serviceRepository = serviceRepository ?? throw new ArgumentNullException(nameof(serviceRepository));
+            _serviceControllerProvider = serviceControllerProvider ?? throw new ArgumentNullException(nameof(serviceControllerProvider));
         }
+
+        /// <summary>
+        /// Creates the elapsed-time source that the SCM wait loops evaluate their deadline against.
+        /// Each call returns a fresh source, started at the moment of the call, exactly as the
+        /// <see cref="Stopwatch"/> it replaces was started where the loop begins.
+        /// </summary>
+        /// <remarks>
+        /// The deadline a wait loop compares against is floored at
+        /// <see cref="AppConfig.DefaultServiceStartTimeoutSeconds"/> + <see cref="AppConfig.ScmTimeoutBufferSeconds"/>
+        /// for a start and <see cref="AppConfig.DefaultStopTimeout"/> + <see cref="AppConfig.ScmTimeoutBufferSeconds"/>
+        /// for a stop, and the check is the first statement of each loop body, before any poll delay is
+        /// awaited. Substituting the poll delay therefore cannot bring the deadline closer - only the
+        /// elapsed-time source can - which is why this is the seam the timeout tests drive.
+        /// </remarks>
+        internal Func<Func<TimeSpan>> ElapsedSourceFactory { get; set; } = () =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            return () => stopwatch.Elapsed;
+        };
 
         #region Public Methods
 
         /// <inheritdoc />
         [ExcludeFromCodeCoverage]
-        public List<string> GetRunningServyUIServices()
-        {
-            var wrapperExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                AppConfig.ServyServiceUIExe
-            };
-            return GetRunningServices(wrapperExes);
-        }
-
-        /// <inheritdoc />
-        [ExcludeFromCodeCoverage]
-        public List<string> GetRunningServyCLIServices()
-        {
-            var wrapperExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                AppConfig.ServyServiceCLIExe
-            };
-            return GetRunningServices(wrapperExes);
-        }
-
-        /// <inheritdoc />
-        [ExcludeFromCodeCoverage]
         public List<string> GetRunningServyServices()
         {
-            var wrapperExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                AppConfig.ServyServiceUIExe,
-                AppConfig.ServyServiceCLIExe
-            };
+            var wrapperExes = new HashSet<string>(WrapperExecutableNames, StringComparer.OrdinalIgnoreCase);
             return GetRunningServices(wrapperExes);
         }
 
         /// <inheritdoc />
-        [ExcludeFromCodeCoverage]
         public async Task StartServicesAsync(IEnumerable<string> services, CancellationToken cancellationToken = default)
         {
+            if (services == null)
+                throw new ArgumentNullException(nameof(services));
+
             // Create a bucket to collect any errors that occur
             var exceptions = new List<Exception>();
 
@@ -77,7 +97,7 @@ namespace Servy.Core.Helpers
 
                 try
                 {
-                    using (var sc = new ServiceController(serviceName))
+                    using (var sc = _serviceControllerProvider.GetService(serviceName))
                     {
                         sc.Refresh();
 
@@ -91,9 +111,7 @@ namespace Servy.Core.Helpers
                         }
 
                         // ROBUSTNESS: Leverage the symmetric helper method instead of nested ternary operations
-                        int preLaunchTimeout = string.IsNullOrEmpty(service.PreLaunchExecutablePath)
-                            ? 0
-                            : (service.PreLaunchTimeoutSeconds ?? AppConfig.DefaultPreLaunchTimeoutSeconds);
+                        int preLaunchTimeout = ResolvePreLaunchTimeout(service);
 
                         int timeout = CalculateStartTimeout(service.StartTimeout, preLaunchTimeout, service.PreLaunchRetryAttempts ?? 0);
                         var waitTime = TimeSpan.FromSeconds(timeout);
@@ -101,13 +119,13 @@ namespace Servy.Core.Helpers
                         // --- ROBUSTNESS: Settle In-Flight Transitional Pending States ---
                         // If a service is transitioning (e.g., StopPending from a prior failure/command),
                         // wait for it to land on a terminal state before deciding whether to issue Start or Continue.
-                        var stopwatch = Stopwatch.StartNew();
+                        var elapsed = ElapsedSourceFactory();
                         while (sc.Status == ServiceControllerStatus.StopPending ||
                                sc.Status == ServiceControllerStatus.PausePending ||
                                sc.Status == ServiceControllerStatus.StartPending ||
                                sc.Status == ServiceControllerStatus.ContinuePending)
                         {
-                            if (stopwatch.Elapsed > waitTime)
+                            if (elapsed() > waitTime)
                                 throw new System.ServiceProcess.TimeoutException();
 
                             cancellationToken.ThrowIfCancellationRequested();
@@ -155,7 +173,7 @@ namespace Servy.Core.Helpers
                             if (sc.Status == ServiceControllerStatus.Running)
                                 break;
 
-                            if (stopwatch.Elapsed > waitTime)
+                            if (elapsed() > waitTime)
                                 throw new System.ServiceProcess.TimeoutException();
 
                             // FAST FAIL: A service that successfully started would never re-enter Stopped.
@@ -203,9 +221,11 @@ namespace Servy.Core.Helpers
         }
 
         /// <inheritdoc />
-        [ExcludeFromCodeCoverage]
         public async Task StopServicesAsync(IEnumerable<string> services, CancellationToken cancellationToken = default)
         {
+            if (services == null)
+                throw new ArgumentNullException(nameof(services));
+
             // Create a bucket to collect any errors that occur during the batch operation
             var exceptions = new List<Exception>();
 
@@ -216,7 +236,7 @@ namespace Servy.Core.Helpers
 
                 try
                 {
-                    using (var sc = new ServiceController(serviceName))
+                    using (var sc = _serviceControllerProvider.GetService(serviceName))
                     {
                         // IMPORTANT: Always refresh to get the latest status from SCM
                         sc.Refresh();
@@ -234,16 +254,16 @@ namespace Servy.Core.Helpers
                         int timeout = CalculateStopTimeout(
                             service.StopTimeout,
                             service.PreviousStopTimeout,
-                            service.PreStopTimeoutSeconds ?? 0);
+                            ResolvePreStopTimeout(service));
                         var waitTime = TimeSpan.FromSeconds(timeout);
 
                         // --- ROBUSTNESS: Settle In-Flight Transitional Pending States ---
-                        var stopwatch = Stopwatch.StartNew();
+                        var elapsed = ElapsedSourceFactory();
                         while (sc.Status == ServiceControllerStatus.StartPending ||
                                sc.Status == ServiceControllerStatus.PausePending ||
                                sc.Status == ServiceControllerStatus.ContinuePending)
                         {
-                            if (stopwatch.Elapsed > waitTime)
+                            if (elapsed() > waitTime)
                                 throw new System.ServiceProcess.TimeoutException();
 
                             cancellationToken.ThrowIfCancellationRequested();
@@ -273,15 +293,33 @@ namespace Servy.Core.Helpers
                             // else: service is already stopped or stopping - no-op
                         }
 
+                        // Instantiate a dedicated stop-wait stopwatch to decouple the fast-fail interval validation
+                        // from the preceding transitional state settle loop timespan.
+                        var stopWaitTimer = Stopwatch.StartNew();
+
                         // This blocks until the service is Stopped or the waitTime expires
                         while (sc.Status != ServiceControllerStatus.Stopped)
                         {
-                            if (stopwatch.Elapsed > waitTime)
+                            sc.Refresh();
+
+                            if (sc.Status == ServiceControllerStatus.Stopped)
+                                break;
+
+                            if (elapsed() > waitTime)
                                 throw new System.ServiceProcess.TimeoutException();
+
+                            // FAST FAIL: A service that accepted the stop request would not re-enter Running.
+                            // Seeing Running here means something else restarted it while the stop was in flight.
+                            // First-iteration grace avoids false-positives before SCM applies StopPending status.
+                            if (sc.Status == ServiceControllerStatus.Running && stopWaitTimer.ElapsedMilliseconds > AppConfig.ScmPollIntervalMs)
+                            {
+                                throw new InvalidOperationException(
+                                    $"Service '{serviceName}' re-entered Running state during stop. " +
+                                    "Something else may have restarted it (a configured Recovery action, another caller, or health monitoring).");
+                            }
 
                             cancellationToken.ThrowIfCancellationRequested();
                             await Task.Delay(AppConfig.ScmPollIntervalMs, cancellationToken);
-                            sc.Refresh();
                         }
                     }
                 }
@@ -381,6 +419,32 @@ namespace Servy.Core.Helpers
             return total;
         }
 
+        /// <summary>
+        /// Resolves the pre-stop timeout in seconds for the specified service.
+        /// </summary>
+        /// <param name="service">The service instance to evaluate.</param>
+        /// <returns>
+        /// <c>0</c> if no pre-stop executable path is configured; otherwise, the configured
+        /// <see cref="ServiceDto.PreStopTimeoutSeconds"/> or <see cref="AppConfig.DefaultPreStopTimeoutSeconds"/> as fallback.
+        /// </returns>
+        public static int ResolvePreStopTimeout(ServiceDto? service) =>
+            string.IsNullOrEmpty(service?.PreStopExecutablePath)
+                ? 0
+                : (service?.PreStopTimeoutSeconds ?? AppConfig.DefaultPreStopTimeoutSeconds);
+
+        /// <summary>
+        /// Resolves the pre-launch timeout in seconds for the specified service.
+        /// </summary>
+        /// <param name="service">The service instance to evaluate.</param>
+        /// <returns>
+        /// <c>0</c> if no pre-launch executable path is configured; otherwise, the configured
+        /// <see cref="ServiceDto.PreLaunchTimeoutSeconds"/> or <see cref="AppConfig.DefaultPreLaunchTimeoutSeconds"/> as fallback.
+        /// </returns>
+        public static int ResolvePreLaunchTimeout(ServiceDto? service) =>
+            string.IsNullOrEmpty(service?.PreLaunchExecutablePath)
+                ? 0
+                : (service?.PreLaunchTimeoutSeconds ?? AppConfig.DefaultPreLaunchTimeoutSeconds);
+
         #endregion
 
         #region Private Methods
@@ -447,7 +511,7 @@ namespace Servy.Core.Helpers
                                     NativeMethods.QueryServiceConfig(serviceHandle, IntPtr.Zero, 0, out int bytesNeeded);
                                     int lastError = Marshal.GetLastWin32Error();
 
-                                    if (lastError != NativeMethods.ERROR_INSUFFICIENT_BUFFER)
+                                    if (lastError != ERROR_INSUFFICIENT_BUFFER)
                                         continue;
 
                                     IntPtr bufferPtr = Marshal.AllocHGlobal(bytesNeeded);
@@ -491,7 +555,7 @@ namespace Servy.Core.Helpers
                                             // 2c. Fallback and Comparison Logic
                                             if (exePath == null)
                                             {
-                                                exePath = expandedPath; // best-effort; Path.GetFileName below handles unquoted paths
+                                                exePath = expandedPath; // best-effort; matches below only when the ImagePath has no arguments
                                             }
 
                                             try

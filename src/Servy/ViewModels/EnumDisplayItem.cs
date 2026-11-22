@@ -3,17 +3,13 @@ namespace Servy.ViewModels
     /// <summary>
     /// Represents a generic item used to encapsulate an enumeration value alongside its localized text representation for UI binding.
     /// </summary>
-    /// <typeparam name="TEnum">The target enumeration type context constraint.</typeparam>
+    /// <typeparam name="TEnum">The enumeration type being wrapped for display.</typeparam>
     public class EnumDisplayItem<TEnum> where TEnum : struct, Enum
     {
-        /// <summary>
-        /// Gets or sets the target enumeration value.
-        /// </summary>
-        public TEnum Value { get; set; }
+        /// <summary>Gets the target enumeration value.</summary>
+        public required TEnum Value { get; init; }
 
-        /// <summary>
-        /// Gets or sets the localized display name for the enumeration value.
-        /// </summary>
-        public string? DisplayName { get; set; }
+        /// <summary>Gets the localized display name for the enumeration value.</summary>
+        public required string DisplayName { get; init; }
     }
 }

@@ -34,11 +34,6 @@ namespace Servy.Service.ProcessManagement
         bool HasExited { get; }
 
         /// <summary>
-        /// Gets the native handle for the associated process.
-        /// </summary>
-        IntPtr Handle { get; }
-
-        /// <summary>
         /// Gets the exit code of the associated process.
         /// </summary>
         int ExitCode { get; }
@@ -54,27 +49,12 @@ namespace Servy.Service.ProcessManagement
         DateTime StartTime { get; }
 
         /// <summary>
-        /// Gets the standard output stream of the associated process.
-        /// </summary>
-        StreamReader StandardOutput { get; }
-
-        /// <summary>
-        /// Gets the standard error stream of the associated process.
-        /// </summary>
-        StreamReader StandardError { get; }
-
-        /// <summary>
-        /// Gets the window handle of the main window for the associated process.
-        /// </summary>
-        IntPtr MainWindowHandle { get; }
-
-        /// <summary>
         /// Gets or sets the overall priority category for the associated process.
         /// </summary>
         ProcessPriorityClass PriorityClass { get; set; }
 
         /// <summary>
-        /// Get or sets the logical CPUs the process may run on.
+        /// Gets or sets the logical CPUs the process may run on.
         /// </summary>
         IntPtr ProcessorAffinity { get; set; }
 
@@ -135,21 +115,26 @@ namespace Servy.Service.ProcessManagement
         /// Stops all descendant processes of the associated process.
         /// </summary>
         /// <param name="parentPid">Parent process PID.</param>
-        /// <param name="parentStartTime">Parent process start time</param>
+        /// <param name="parentStartTime">Parent process start time.</param>
         /// <param name="timeoutMs">The timeout in milliseconds to wait for the descendant processes to stop.</param>
         void StopDescendants(int parentPid, DateTime parentStartTime, int timeoutMs);
 
         /// <summary>
         /// Formats the process information as a string.
         /// </summary>
-        /// <returns>A human-readable description of the process, formatted as "ProcessName (Id)".</returns>
+        /// <returns>
+        /// A human-readable description of the process, formatted as "ProcessName (Id)"; "(PID Id)" when the
+        /// name cannot be read, and "(Exited Process)" or "(Inaccessible Process)" when the ID cannot be read
+        /// either (see <see cref="ProcessExtensions.Format(System.Diagnostics.Process)"/>).
+        /// </returns>
         string Format();
 
         /// <summary>
-        /// Immediately stops the associated process and optionally its child/descendent processes.
+        /// Immediately stops the associated process and optionally its child/descendant processes.
         /// </summary>
         /// <param name="entireProcessTree">Kill entire process tree.</param>
-        void Kill(bool entireProcessTree = false);
+        /// <returns><c>true</c> if the process was successfully killed; otherwise, <c>false</c>.</returns>
+        bool Kill(bool entireProcessTree = false);
 
         /// <summary>
         /// Instructs the process to wait for exit for a specified time.
@@ -166,12 +151,6 @@ namespace Servy.Service.ProcessManagement
         /// responsive: if the child process never exits (hang or infinite loop), the calling thread is blocked forever.
         /// </remarks>
         void WaitForExit();
-
-        /// <summary>
-        /// Closes the main window of the associated process.
-        /// </summary>
-        /// <returns><c>true</c> if the main window has been successfully closed; otherwise, <c>false</c>.</returns>
-        bool CloseMainWindow();
 
         /// <summary>
         /// Begins asynchronous read operations on the redirected standard output stream of the application.

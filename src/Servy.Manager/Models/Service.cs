@@ -10,6 +10,7 @@ namespace Servy.Manager.Models
     public class Service : ViewModelBase
     {
         private string? _name;
+        private string? _displayName;
         private string? _description;
         private ServiceStatus? _status;
         private bool _isInstalled;
@@ -17,7 +18,6 @@ namespace Servy.Manager.Models
         private ServiceStartType? _startupType;
         private string? _logOnAs;
         private int? _pid;
-        private bool _isPidEnabled;
         private double? _cpuUsage;
         private long? _ramUsage;
         private string? _stdoutPath;
@@ -32,6 +32,15 @@ namespace Servy.Manager.Models
         {
             get => _name;
             set => Set(ref _name, value);
+        }
+
+        /// <summary>
+        /// Gets or sets the service display name.
+        /// </summary>
+        public string? DisplayName
+        {
+            get => _displayName;
+            set => Set(ref _displayName, value);
         }
 
         /// <summary>
@@ -94,17 +103,20 @@ namespace Servy.Manager.Models
         public int? Pid
         {
             get => _pid;
-            set => Set(ref _pid, value);
+            set
+            {
+                if (Set(ref _pid, value))
+                {
+                    OnPropertyChanged(nameof(IsPidEnabled));
+                }
+            }
         }
 
         /// <summary>
-        /// Gets or sets a value indicating whether PID is available.
+        /// Gets a value indicating whether PID is available. Derived from <see cref="Pid"/>, so no
+        /// producer has to keep a copy of the rule in step.
         /// </summary>
-        public bool IsPidEnabled
-        {
-            get => _isPidEnabled;
-            set => Set(ref _isPidEnabled, value);
-        }
+        public bool IsPidEnabled => _pid != null;
 
         /// <summary>
         /// Gets or sets the aggregate CPU usage in percentage of whole-machine capacity.

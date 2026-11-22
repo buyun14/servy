@@ -1,17 +1,24 @@
 using Servy.Core.Native;
+using Servy.Core.Security;
 using Servy.Testing;
+using System.Diagnostics;
 using System.DirectoryServices.AccountManagement;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 
 namespace Servy.Core.IntegrationTests.Native
 {
-    [Collection("CoreOsIntegration")]
+    [Collection(CoreOsIntegrationCollection.Name)]
     public class LogonAsServiceGrantIntegrationTests : IDisposable
     {
+        private const string NoLsaAccessSkipReason =
+            "Skipping test: the run is not elevated or has no LSA policy access.";
+
         private readonly string _testAccountName;
         private readonly bool _canModifyLsaPolicy;
-        private readonly bool _accountCreatedLocally;
+        private bool _provisioningAttempted;
+        private bool _accountCreatedLocally;
+        private string? _accountProvisioningError;
 
         // P/Invoke definition necessary to tear down matching LSA security descriptors before user purging
         [DllImport("advapi32.dll", PreserveSig = true)]
@@ -25,40 +32,63 @@ namespace Servy.Core.IntegrationTests.Native
         public LogonAsServiceGrantIntegrationTests()
         {
             // 1. Verify administrative execution level
-            bool isAdministrator = Helper.IsAdministrator();
+            bool isAdministrator = SecurityHelper.IsAdministrator();
 
             // 2. CI GUARD: Verify if the current context has actual operational permissions to call LSA APIs.
             // On standard GitHub Actions cloud agents, this prevents cascading Access Denied (0xC0000022) runtime breaks.
             _canModifyLsaPolicy = isAdministrator && Helper.CheckLsaPolicyAccess();
 
-            // Create a temporary, unique local user name
+            // Create a temporary, unique local user name. The account itself is provisioned lazily by
+            // TryEnsureTestAccount, so the tests that never touch it pay neither the SAM round-trip nor
+            // the commit wait - xUnit builds a fresh instance of this class for every test method.
             _testAccountName = "ServyTest_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        }
 
-            if (_canModifyLsaPolicy)
+        /// <summary>
+        /// Creates the transient local account on first use and waits for the SAM subsystem to commit it.
+        /// </summary>
+        /// <returns><c>true</c> when the account exists and the test may proceed.</returns>
+        private bool TryEnsureTestAccount()
+        {
+            if (!_canModifyLsaPolicy || _provisioningAttempted) return _accountCreatedLocally;
+
+            _provisioningAttempted = true;
+
+            try
             {
-                try
+                using (var context = new PrincipalContext(ContextType.Machine))
+                using (var user = new UserPrincipal(context))
                 {
-                    // DYNAMIC PROVISIONING: Use transactional principal management instead of legacy process forks.
-                    // This forces immediate, deterministic commitment into the Windows SAM database registry tables.
-                    using (var context = new PrincipalContext(ContextType.Machine))
-                    using (var user = new UserPrincipal(context))
-                    {
-                        user.Name = _testAccountName;
-                        user.SetPassword(Guid.NewGuid().ToString("P") + "A1!");
-                        user.Description = "Transient account for Servy LSA integration unit testing.";
-                        user.Save();
-                        _accountCreatedLocally = true;
-                    }
+                    user.Name = _testAccountName;
+                    user.SetPassword(Guid.NewGuid().ToString("P") + "A1!");
+                    user.Description = "Transient account for Servy LSA integration unit testing.";
+                    user.Save();
+                    _accountCreatedLocally = true;
                 }
-                catch
-                {
-                    _accountCreatedLocally = false;
-                }
+            }
+            catch (Exception ex)
+            {
+                // Keep the reason: a skip that only says "access or creation failure" cannot tell a
+                // permissions problem from a provisioning one.
+                _accountProvisioningError = ex.Message;
+                _accountCreatedLocally = false;
+            }
 
+            if (_accountCreatedLocally)
+            {
                 // Introduce a synchronization window to let the Windows SAM subsystem fully commit
                 Thread.Sleep(500);
             }
+
+            return _accountCreatedLocally;
         }
+
+        /// <summary>
+        /// The skip reason for a run that may modify the LSA policy but could not provision the account.
+        /// </summary>
+        private string AccountProvisioningSkipReason() =>
+            "Skipping test: the transient local account could not be created " +
+            $"({_accountProvisioningError ?? "no exception reported"}).";
 
         #region Account Parsing & SID Resolution Failure Branches
 
@@ -96,15 +126,13 @@ namespace Servy.Core.IntegrationTests.Native
         public void Ensure_ShorthandLocalNotation_CorrectlyTranslatesMachinePrefix()
         {
             // Arrange
-            if (!_canModifyLsaPolicy || !_accountCreatedLocally) Assert.Skip("Skipping test due to insufficient LSA policy access or account creation failure.");
+            Assert.SkipUnless(_canModifyLsaPolicy, NoLsaAccessSkipReason);
+            Assert.SkipUnless(TryEnsureTestAccount(), AccountProvisioningSkipReason());
 
             string shorthandAccount = $".\\{_testAccountName}";
-            string fullyQualifiedAccount = $"{Environment.MachineName}\\{_testAccountName}";
 
             // Resolve the SID via the fully-qualified name - this is the target identity the shorthand must expand to.
-            var sid = (SecurityIdentifier)new NTAccount(fullyQualifiedAccount).Translate(typeof(SecurityIdentifier));
-            byte[] sidBytes = new byte[sid.BinaryLength];
-            sid.GetBinaryForm(sidBytes, 0);
+            byte[] sidBytes = ResolveSidBytes(FullAccountName);
 
             Assert.DoesNotContain("SeServiceLogonRight", GetAccountRightsViaNativeMethods(sidBytes));
 
@@ -123,17 +151,13 @@ namespace Servy.Core.IntegrationTests.Native
         public void Ensure_FreshAccountWithoutAnyRights_TriggersNotFoundBranchAndGrantsPrivilege()
         {
             // Arrange
-            if (!_canModifyLsaPolicy || !_accountCreatedLocally) Assert.Skip("Skipping test due to insufficient LSA policy access or account creation failure.");
+            Assert.SkipUnless(_canModifyLsaPolicy, NoLsaAccessSkipReason);
+            Assert.SkipUnless(TryEnsureTestAccount(), AccountProvisioningSkipReason());
 
-            string fullAccountName = $"{Environment.MachineName}\\{_testAccountName}";
+            string fullAccountName = FullAccountName;
 
             // Resolve the account name to a SecurityIdentifier (SID) to query LSA
-            var ntAccount = new NTAccount(fullAccountName);
-            var sid = (SecurityIdentifier)ntAccount.Translate(typeof(SecurityIdentifier));
-
-            // Allocate the buffer and use GetBinaryForm instead of GetBinaryBytes
-            byte[] sidBytes = new byte[sid.BinaryLength];
-            sid.GetBinaryForm(sidBytes, 0);
+            byte[] sidBytes = ResolveSidBytes(fullAccountName);
 
             // Assert baseline - The freshly created account must not hold the logon right prior to execution
             var initialRights = GetAccountRightsViaNativeMethods(sidBytes);
@@ -147,7 +171,7 @@ namespace Servy.Core.IntegrationTests.Native
             var postGrantRights = GetAccountRightsViaNativeMethods(sidBytes);
             Assert.Contains("SeServiceLogonRight", postGrantRights);
 
-            // Act 2 - Execute second pass: must hit the cached 'found' match pipeline loop branch as an early exit no-op
+            // Act 2 - Second call: the right is already present, so Ensure must return without granting again
             Exception? ex2 = Record.Exception(() => LogonAsServiceGrant.Ensure(fullAccountName));
 
             // Assert 2 - Verify no exceptions were raised, the privilege wasn't stripped, and structure remains unmodified
@@ -155,13 +179,128 @@ namespace Servy.Core.IntegrationTests.Native
             var postIdempotentRights = GetAccountRightsViaNativeMethods(sidBytes);
             Assert.Contains("SeServiceLogonRight", postIdempotentRights);
 
-            // Verify idempotency payload metrics: collection sizes must align perfectly without row duplications
+            // A second Ensure must not add a duplicate entry
             Assert.Equal(postGrantRights.Count, postIdempotentRights.Count);
+        }
+
+        [Fact]
+        public void RevokeLsaPrivilegeBeforeDeletion_RemovesTheGrantItWasGiven()
+        {
+            // Arrange
+            Assert.SkipUnless(_canModifyLsaPolicy, NoLsaAccessSkipReason);
+            Assert.SkipUnless(TryEnsureTestAccount(), AccountProvisioningSkipReason());
+
+            byte[] sidBytes = ResolveSidBytes(FullAccountName);
+
+            // Act 1 - grant the right, so there is something to revoke
+            LogonAsServiceGrant.Ensure(FullAccountName);
+
+            // Assert 1 - baseline: the grant the teardown is responsible for removing is present
+            Assert.Contains("SeServiceLogonRight", GetAccountRightsViaNativeMethods(sidBytes));
+
+            // Act 2 - run the teardown step Dispose relies on
+            RevokeLsaPrivilegeBeforeDeletion(_testAccountName, "SeServiceLogonRight");
+
+            // Assert 2 - the grant is gone from the host LSA policy. Without this the revocation could be
+            // reduced to an empty body and the suite would stay green, while the orphaned SID grants this
+            // teardown was added to prevent would silently accumulate on whichever machine runs elevated.
+            Assert.DoesNotContain("SeServiceLogonRight", GetAccountRightsViaNativeMethods(sidBytes));
+        }
+
+        [Fact]
+        public void Ensure_AccountHoldingOnlyAnotherRight_StillGrantsTheLogonRight()
+        {
+            // Arrange
+            Assert.SkipUnless(_canModifyLsaPolicy, NoLsaAccessSkipReason);
+            Assert.SkipUnless(TryEnsureTestAccount(), AccountProvisioningSkipReason());
+            const string otherRight = "SeBatchLogonRight";
+            byte[] sidBytes = ResolveSidBytes(FullAccountName);
+
+            try
+            {
+                // The account gets an LSA entry that lists one right, and it is not the service logon right
+                GrantAccountRight(sidBytes, otherRight);
+                var before = GetAccountRightsViaNativeMethods(sidBytes);
+                Assert.Contains(otherRight, before);
+                Assert.DoesNotContain("SeServiceLogonRight", before);
+
+                // Act
+                LogonAsServiceGrant.Ensure(FullAccountName);
+
+                // Assert
+                var after = GetAccountRightsViaNativeMethods(sidBytes);
+                Assert.Contains("SeServiceLogonRight", after);
+                Assert.Contains(otherRight, after);
+            }
+            finally
+            {
+                // Dispose revokes SeServiceLogonRight only; the extra right must not outlive the account either
+                RevokeLsaPrivilegeBeforeDeletion(_testAccountName, otherRight);
+            }
         }
 
         #endregion
 
         #region Native Methods LSA Inspection Helper
+
+        /// <summary>
+        /// The machine-qualified name of the transient test account.
+        /// </summary>
+        private string FullAccountName => $"{Environment.MachineName}\\{_testAccountName}";
+
+        /// <summary>
+        /// Resolves an account name to the binary SID form the LSA APIs take.
+        /// </summary>
+        private static byte[] ResolveSidBytes(string accountName)
+        {
+            var sid = (SecurityIdentifier)new NTAccount(accountName).Translate(typeof(SecurityIdentifier));
+            var sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+            return sidBytes;
+        }
+
+        /// <summary>
+        /// Copies a binary SID into a freshly allocated unmanaged buffer. The caller owns the buffer.
+        /// </summary>
+        private static IntPtr AllocSidBuffer(byte[] sidBytes)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(sidBytes.Length);
+            Marshal.Copy(sidBytes, 0, buffer, sidBytes.Length);
+            return buffer;
+        }
+
+        /// <summary>
+        /// Adds one account right to the SID through the LSA policy, so a test can start from an account
+        /// that already holds a right.
+        /// </summary>
+        private static void GrantAccountRight(byte[] sidBytes, string right)
+        {
+            var objectAttributes = new NativeMethods.LSA_OBJECT_ATTRIBUTES { Length = Marshal.SizeOf<NativeMethods.LSA_OBJECT_ATTRIBUTES>() };
+            uint access = NativeMethods.POLICY_ACCESS.POLICY_LOOKUP_NAMES | NativeMethods.POLICY_ACCESS.POLICY_CREATE_ACCOUNT;
+            Assert.Equal(0, NativeMethods.LsaOpenPolicy(IntPtr.Zero, ref objectAttributes, access, out IntPtr policyHandle));
+
+            IntPtr sidBuffer = AllocSidBuffer(sidBytes);
+            IntPtr rightBuffer = Marshal.StringToHGlobalUni(right);
+            try
+            {
+                var rights = new[]
+                {
+                    new NativeMethods.LSA_UNICODE_STRING
+                    {
+                        Buffer = rightBuffer,
+                        Length = (ushort)(right.Length * 2),
+                        MaximumLength = (ushort)((right.Length + 1) * 2),
+                    },
+                };
+                Assert.Equal(0, NativeMethods.LsaAddAccountRights(policyHandle, sidBuffer, rights, 1));
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(rightBuffer);
+                Marshal.FreeHGlobal(sidBuffer);
+                NativeMethods.LsaClose(policyHandle);
+            }
+        }
 
         private static List<string> GetAccountRightsViaNativeMethods(byte[] sidBytes)
         {
@@ -170,21 +309,21 @@ namespace Servy.Core.IntegrationTests.Native
             var objectAttributes = new NativeMethods.LSA_OBJECT_ATTRIBUTES { Length = Marshal.SizeOf<NativeMethods.LSA_OBJECT_ATTRIBUTES>() };
             IntPtr policyHandle;
 
-            // Access permission combination required to inspect the account privilege definitions safely
-            uint desiredAccess = 0x00010000 /* STANDARD_RIGHTS_REQUIRED */ | NativeMethods.POLICY_ACCESS.POLICY_LOOKUP_NAMES;
+            // POLICY_LOOKUP_NAMES is the only access LsaEnumerateAccountRights needs. Requesting more
+            // than that on the policy handle is what a hardened host is most likely to refuse, and a
+            // refused LsaOpenPolicy is reported below as an empty rights list.
+            uint desiredAccess = NativeMethods.POLICY_ACCESS.POLICY_LOOKUP_NAMES;
 
             int openStatus = NativeMethods.LsaOpenPolicy(IntPtr.Zero, ref objectAttributes, desiredAccess, out policyHandle);
-            if (openStatus != 0) return rightsList; // Abort if context window mapping fails
+            if (openStatus != 0) return rightsList; // LsaOpenPolicy failed; report no rights
 
-            IntPtr rawSidAllocationPtr = Marshal.AllocHGlobal(sidBytes.Length);
+            IntPtr rawSidAllocationPtr = AllocSidBuffer(sidBytes);
             try
             {
-                Marshal.Copy(sidBytes, 0, rawSidAllocationPtr, sidBytes.Length);
-
                 IntPtr outUserRightsBufferPtr;
                 uint countOfRights;
 
-                // Query the operating system directly for the explicit privileges mapped to this SID allocation string
+                // Enumerate the privileges assigned to this SID
                 int enumStatus = NativeMethods.LsaEnumerateAccountRights(policyHandle, rawSidAllocationPtr, out outUserRightsBufferPtr, out countOfRights);
 
                 // If status is 0 (STATUS_SUCCESS) and buffer is allocated, unmarshal the string values sequentially
@@ -231,18 +370,12 @@ namespace Servy.Core.IntegrationTests.Native
         {
             IntPtr policyHandle = IntPtr.Zero;
             IntPtr sidBuffer = IntPtr.Zero;
+            IntPtr nativeStringAlloc = IntPtr.Zero;
 
             try
             {
                 // Resolve user domain string back to an active NT Security Identifier structure
-                var ntAccount = new NTAccount(accountName);
-                var sid = (SecurityIdentifier)ntAccount.Translate(typeof(SecurityIdentifier));
-
-                byte[] sidBytes = new byte[sid.BinaryLength];
-                sid.GetBinaryForm(sidBytes, 0);
-
-                sidBuffer = Marshal.AllocHGlobal(sidBytes.Length);
-                Marshal.Copy(sidBytes, 0, sidBuffer, sidBytes.Length);
+                sidBuffer = AllocSidBuffer(ResolveSidBytes(accountName));
 
                 var objectAttributes = new NativeMethods.LSA_OBJECT_ATTRIBUTES
                 {
@@ -252,13 +385,13 @@ namespace Servy.Core.IntegrationTests.Native
                 int lsaOpenStatus = NativeMethods.LsaOpenPolicy(
                     IntPtr.Zero,
                     ref objectAttributes,
-                    NativeMethods.POLICY_ACCESS.POLICY_LOOKUP_NAMES | NativeMethods.POLICY_ACCESS.POLICY_ASSIGN_PRIVILEGE,
+                    NativeMethods.POLICY_ACCESS.POLICY_LOOKUP_NAMES,
                     out policyHandle);
 
                 if (lsaOpenStatus == 0)
                 {
                     var privilegeString = new NativeMethods.LSA_UNICODE_STRING();
-                    IntPtr nativeStringAlloc = Marshal.StringToHGlobalUni(privilege);
+                    nativeStringAlloc = Marshal.StringToHGlobalUni(privilege);
 
                     privilegeString.Buffer = nativeStringAlloc;
                     privilegeString.Length = (ushort)(privilege.Length * 2);
@@ -266,10 +399,22 @@ namespace Servy.Core.IntegrationTests.Native
 
                     var rightsArray = new NativeMethods.LSA_UNICODE_STRING[] { privilegeString };
 
-                    // Revoke assigned system access parameters safely before SAM subsystem disconnect calls
-                    LsaRemoveAccountRights(policyHandle, sidBuffer, false, rightsArray, 1);
+                    // Remove the privilege before the account is deleted, so no orphaned SID grant is left in LSA
+                    int removeStatus = LsaRemoveAccountRights(policyHandle, sidBuffer, false, rightsArray, 1);
 
-                    Marshal.FreeHGlobal(nativeStringAlloc);
+                    // Every other LSA call in this file branches on its status. Report a failure here too:
+                    // a silent one deletes the account anyway and leaves the grant attached to a SID that no
+                    // longer resolves to a name, which is the host leakage this method exists to prevent.
+                    if (removeStatus != 0)
+                    {
+                        Trace.WriteLine($"Warning: failed to revoke {privilege} from {accountName} " +
+                                        $"(NTSTATUS 0x{removeStatus:X8}); the grant may be left orphaned in the LSA policy.");
+                    }
+                }
+                else
+                {
+                    Trace.WriteLine($"Warning: could not open the LSA policy to revoke {privilege} from {accountName} " +
+                                    $"(NTSTATUS 0x{lsaOpenStatus:X8}); the grant may be left orphaned in the LSA policy.");
                 }
             }
             catch
@@ -280,6 +425,7 @@ namespace Servy.Core.IntegrationTests.Native
             {
                 if (policyHandle != IntPtr.Zero) NativeMethods.LsaClose(policyHandle);
                 if (sidBuffer != IntPtr.Zero) Marshal.FreeHGlobal(sidBuffer);
+                if (nativeStringAlloc != IntPtr.Zero) Marshal.FreeHGlobal(nativeStringAlloc);
             }
         }
 
