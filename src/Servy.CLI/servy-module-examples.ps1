@@ -1,9 +1,9 @@
 ﻿<#
 .SYNOPSIS
-    Example scripts demonstrating the usage of the Servy PowerShell module to manage Windows services.
+    演示如何使用 Servy PowerShell 模块管理 Windows 服务的示例脚本。
 
 .DESCRIPTION
-    Example scripts demonstrating usage of the Servy PowerShell module.
+    演示 Servy PowerShell 模块用法的示例脚本。
 
 .NOTES
     Author: Akram El Assas
@@ -13,35 +13,35 @@
 #>
 
 # ----------------------------------------------------------------
-# Import the Servy PowerShell module (force reload if already imported)
+# 导入 Servy PowerShell 模块（如果已导入则强制重新加载）
 # ----------------------------------------------------------------
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Import-Module (Join-Path $scriptDir "Servy.psm1") -Force
 
 # ----------------------------------------------------------------
-# Tune module-level execution settings (optional)
+# 调整模块级执行设置（可选）
 # ----------------------------------------------------------------
 Set-ServyConfig -TimeoutSeconds 1200
 
 # ----------------------------------------------------------------
-# Display CLI help
+# 显示 CLI 帮助
 # ----------------------------------------------------------------
 # Get-ServyHelp -Command "install" -Quiet
 # Get-ServyHelp -Quiet
 
 # ----------------------------------------------------------------
-# Display the current version of Servy CLI
+# 显示 Servy CLI 的当前版本
 # ----------------------------------------------------------------
 Get-ServyVersion -Quiet
 
 # ----------------------------------------------------------------
-# Install a new Windows service using Servy (splatting)
+# 使用 Servy 安装新的 Windows 服务（splatting）
 # ----------------------------------------------------------------
 $installParams = @{
     Quiet                      = $true
     Name                       = "DummyService"
-    DisplayName                = "Dummy Service"
-    Description                = "Dummy Service"
+    DisplayName                = "示例服务"
+    Description                = "示例服务"
     Path                       = "C:\Windows\System32\notepad.exe"
     StartupDir                 = "C:\Windows\Temp"
     Params                     = "--param 2000"
@@ -114,29 +114,29 @@ Install-ServyService @installParams
 # Remove-Item Env:SERVY_PASSWORD
 
 # ----------------------------------------------------------------
-# Show the full configuration of one service (human-readable).
-# Encrypted fields are masked by default.
+# 显示单个服务的完整配置（人类可读）。
+# 加密字段默认以掩码显示。
 # ----------------------------------------------------------------
 Show-ServyService -Name "DummyService" -Quiet
 
 # ----------------------------------------------------------------
-# Same, with the parameters, environment variables and heartbeat URL in clear text.
-# The stored password stays masked.
+# 同上，但以明文显示参数、环境变量和心跳 URL。
+# 已存储的密码仍保持掩码。
 # ----------------------------------------------------------------
 Show-ServyService -Name "DummyService" -Decrypt -Quiet
 
 # ----------------------------------------------------------------
-# List every service stored in the Servy database
+# 列出 Servy 数据库中存储的所有服务
 # ----------------------------------------------------------------
 Show-ServyServices -Quiet
 
 # ----------------------------------------------------------------
-# List only the services whose name or description matches a keyword
+# 仅列出名称或描述匹配关键词的服务
 # ----------------------------------------------------------------
 Show-ServyServices -Search "Dummy" -Quiet
 
 # ----------------------------------------------------------------
-# Export the service configuration (XML)
+# 导出服务配置（XML）
 # ----------------------------------------------------------------
 $exportXmlParams = @{
     Quiet          = $true
@@ -148,7 +148,7 @@ $exportXmlParams = @{
 Export-ServyServiceConfig @exportXmlParams
 
 # ----------------------------------------------------------------
-# Export the service configuration (JSON)
+# 导出服务配置（JSON）
 # ----------------------------------------------------------------
 $exportJsonParams = @{
     Quiet          = $true
@@ -160,7 +160,7 @@ $exportJsonParams = @{
 Export-ServyServiceConfig @exportJsonParams
 
 # ----------------------------------------------------------------
-# Import previously exported service configurations
+# 导入之前导出的服务配置
 # ----------------------------------------------------------------
 $importXmlParams = @{
     Quiet          = $true
@@ -180,7 +180,7 @@ $importJsonParams = @{
 Import-ServyServiceConfig @importJsonParams
 
 # ----------------------------------------------------------------
-# Service lifecycle
+# 服务生命周期
 # ----------------------------------------------------------------
 Start-ServyService    -Name "DummyService" -Quiet
 Get-ServyServiceStatus -Name "DummyService" -Quiet
@@ -188,6 +188,6 @@ Stop-ServyService     -Name "DummyService" -Quiet
 Restart-ServyService  -Name "DummyService" -Quiet
 
 # ----------------------------------------------------------------
-# Uninstall the service
+# 卸载服务
 # ----------------------------------------------------------------
 Uninstall-ServyService -Name "DummyService" -Quiet

@@ -16,21 +16,21 @@ namespace Servy.CLI.Options
     /// The two options are mutually exclusive: <c>--search</c> narrows the list, and there is nothing
     /// for it to narrow once a single service has been named.
     /// </remarks>
-    [Verb("show", HelpText = "Show a Servy Windows service configuration in a human-readable form, or list all services when no name is given.")]
+    [Verb("show", HelpText = "以人类可读的形式显示 Servy Windows 服务配置；未指定名称时列出所有服务。")]
     public class ShowServiceOptions : GlobalOptionsBase
     {
         /// <summary>
         /// Gets or sets the name of the service to show.
         /// When omitted, the command lists every service in the database instead.
         /// </summary>
-        [Option('n', "name", Required = false, HelpText = "Name of the service to show. When omitted, all services are listed.")]
+        [Option('n', "name", Required = false, HelpText = "要显示的服务名称。省略时列出所有服务。")]
         public string? ServiceName { get; set; }
 
         /// <summary>
         /// Gets or sets the keyword used to narrow the service list by name or description.
         /// Only meaningful in list mode; it cannot be combined with <see cref="ServiceName"/>.
         /// </summary>
-        [Option('s', "search", Required = false, HelpText = "Filter the service list by a keyword matched against the service name or description. Cannot be combined with --name.")]
+        [Option('s', "search", Required = false, HelpText = "按与服务名称或描述匹配的关键词筛选服务列表。不能与 --name 一起使用。")]
         public string? SearchKeyword { get; set; }
 
         /// <summary>
@@ -41,7 +41,7 @@ namespace Servy.CLI.Options
         /// Only meaningful with <see cref="ServiceName"/>: the service list renders no encrypted column,
         /// so the flag has nothing to reveal there and is refused rather than silently ignored.
         /// </remarks>
-        [Option('d', "decrypt", Required = false, HelpText = "Show the encrypted fields (parameters, environment variables and the heartbeat URL) in clear text instead of masked. Requires --name. The stored password stays masked.")]
+        [Option('d', "decrypt", Required = false, HelpText = "以明文而非掩码显示加密字段（参数、环境变量和心跳 URL）。需要 --name。已存储的密码仍保持掩码。")]
         public bool Decrypt { get; set; }
     }
 }

@@ -50,7 +50,7 @@ namespace Servy.CLI
         /// <summary>
         /// The message written to standard error when the first Ctrl+C or Ctrl+Break starts a graceful cancellation.
         /// </summary>
-        internal const string CancellingMessage = "Cancelling... press Ctrl+C again to force exit.";
+        internal const string CancellingMessage = "正在取消... 再次按 Ctrl+C 强制退出。";
 
         /// <summary>
         /// Parses command-line arguments, invokes the appropriate command handlers,
@@ -98,7 +98,7 @@ namespace Servy.CLI
                     {
                         // Detect a mistyped or unrecognized command that does not start with a global flag dash
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Error.WriteLine($"Error: Unknown command '{firstArg}'. See '--help' for available options.");
+                        Console.Error.WriteLine(string.Format(Strings.Msg_UnknownCommand, firstArg));
                         Console.ResetColor();
 
                         return (int)CliExitCode.Error;
@@ -131,8 +131,8 @@ namespace Servy.CLI
                                      $"Minimum required: {AppConfig.MinRequiredSqliteVersion} (CVE-2025-6965 mitigation).");
 
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Error.WriteLine($"[CRITICAL] Vulnerable SQLite version detected: {detectedVersion}");
-                        Console.Error.WriteLine($"This version of Servy requires SQLite {AppConfig.MinRequiredSqliteVersion}+.");
+                        Console.Error.WriteLine(string.Format(Strings.Msg_VulnerableSqliteDetected, detectedVersion));
+                        Console.Error.WriteLine(string.Format(Strings.Msg_VulnerableSqliteRequired, AppConfig.MinRequiredSqliteVersion));
                         Console.ResetColor();
 
                         // Exit with a CLI-specific sentinel instead of a SCM Win32 error code
@@ -260,13 +260,13 @@ namespace Servy.CLI
                 }
                 catch (OperationCanceledException)
                 {
-                    Console.Error.WriteLine("\nOperation cancelled by user.");
+                    Console.Error.WriteLine("\n" + Strings.Msg_OperationCancelledByUser);
                     return (int)CliExitCode.Error;
                 }
                 catch (Exception ex)
                 {
                     Logger.Error("An unexpected error occurred in the main execution flow.", ex);
-                    Console.Error.WriteLine($"An unexpected error occurred: {ex.Message}");
+                    Console.Error.WriteLine(string.Format(Strings.Msg_UnexpectedError, ex.Message));
                     return (int)CliExitCode.Error;
                 }
                 finally

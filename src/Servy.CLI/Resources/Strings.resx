@@ -383,4 +383,19 @@
   <data name="Msg_Show_DecryptRequiresName" xml:space="preserve">
     <value>The --decrypt option requires --name. The service list shows no encrypted field, so there is nothing to decrypt.</value>
   </data>
+  <data name="Msg_OperationCancelledByUser" xml:space="preserve">
+    <value>Operation cancelled by user.</value>
+  </data>
+  <data name="Msg_UnexpectedError" xml:space="preserve">
+    <value>An unexpected error occurred: {0}</value>
+  </data>
+  <data name="Msg_UnknownCommand" xml:space="preserve">
+    <value>Error: Unknown command '{0}'. See '--help' for available options.</value>
+  </data>
+  <data name="Msg_VulnerableSqliteDetected" xml:space="preserve">
+    <value>[CRITICAL] Vulnerable SQLite version detected: {0}</value>
+  </data>
+  <data name="Msg_VulnerableSqliteRequired" xml:space="preserve">
+    <value>This version of Servy requires SQLite {0}+.</value>
+  </data>
 </root>

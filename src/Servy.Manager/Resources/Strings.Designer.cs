@@ -2705,5 +2705,32 @@ namespace Servy.Manager.Resources {
                 return ResourceManager.GetString("Tooltip_ServiceStopped", resourceCulture);
             }
         }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Failed to start selected services.
+        /// </summary>
+        public static string Msg_FailedToStartSelectedServices {
+            get {
+                return ResourceManager.GetString("Msg_FailedToStartSelectedServices", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Failed to stop selected services.
+        /// </summary>
+        public static string Msg_FailedToStopSelectedServices {
+            get {
+                return ResourceManager.GetString("Msg_FailedToStopSelectedServices", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Failed to restart selected services.
+        /// </summary>
+        public static string Msg_FailedToRestartSelectedServices {
+            get {
+                return ResourceManager.GetString("Msg_FailedToRestartSelectedServices", resourceCulture);
+            }
+        }
     }
 }

@@ -16,183 +16,385 @@
   <data name="Msg_PreparingEnvironment" xml:space="preserve">
     <value>正在准备环境...</value>
   </data>
-
   <data name="Msg_AdminPrivilegesRequired" xml:space="preserve">
     <value>拒绝访问。请以管理员身份重新启动 Shell 后运行 '{0}' 命令。</value>
   </data>
-
   <data name="Msg_UnknownError" xml:space="preserve">
     <value>发生未知错误。</value>
   </data>
-
   <data name="Msg_InvalidExecutablePath" xml:space="preserve">
     <value>可执行文件路径无效：{0}。请确保文件存在且可访问。</value>
   </data>
-
   <data name="Msg_WrapperNotFound" xml:space="preserve">
     <value>未在以下位置找到包装可执行文件：{0}。请确保 Servy 已正确安装。</value>
   </data>
-
   <data name="Msg_PathRequired" xml:space="preserve">
     <value>需要提供文件路径。</value>
   </data>
-
   <data name="Msg_ConfigFileTypeRequired" xml:space="preserve">
     <value>需要提供配置文件类型（XML 或 JSON）。</value>
   </data>
-
   <data name="Msg_UnsupportedFileType" xml:space="preserve">
     <value>不支持的配置文件类型：{0}</value>
   </data>
-
   <data name="Msg_ImportFormatInvalid" xml:space="preserve">
     <value>{0} 文件无效：{1}</value>
   </data>
-
   <data name="Msg_ImportRepoFailure" xml:space="preserve">
     <value>未能将 {0} 配置导入存储库。</value>
   </data>
-
   <data name="Msg_ImportDeserializationFailure" xml:space="preserve">
     <value>服务配置已导入，但无法反序列化以进行安装。</value>
   </data>
-
   <data name="Msg_ImportInstallSuccess" xml:space="preserve">
     <value>{0} 配置已保存，服务 '{1}' 安装成功。</value>
   </data>
-
   <data name="Msg_ImportInstallLookupFailure" xml:space="preserve">
     <value>服务配置已保存，但无法定位服务 '{0}' 以进行安装。</value>
   </data>
-
-  <data name="Msg_ImportInstallGeneralFailure" xml:space="preserve">
-    <value>服务配置已保存，但服务 '{0}' 安装失败。</value>
-  </data>
-
   <data name="Msg_ExportSuccess" xml:space="preserve">
     <value>{0} 配置已成功导出到：{1}</value>
   </data>
-
   <data name="Msg_ImportSuccessNoInstall" xml:space="preserve">
     <value>{0} 配置导入成功。</value>
   </data>
-
   <data name="Msg_InstallSuccess" xml:space="preserve">
     <value>服务 '{0}' 安装成功。</value>
   </data>
-
   <data name="Msg_RestartSuccess" xml:space="preserve">
     <value>服务 '{0}' 重启成功。</value>
   </data>
-
   <data name="Msg_ServiceStatusResult" xml:space="preserve">
     <value>服务 '{0}' 的状态：{1}</value>
   </data>
-
   <data name="Msg_StartSuccess" xml:space="preserve">
     <value>服务 '{0}' 启动成功。</value>
   </data>
-
   <data name="Msg_StopSuccess" xml:space="preserve">
     <value>服务 '{0}' 停止成功。</value>
   </data>
-
-  <data name="Msg_UninstallServiceNotInstalled" xml:space="preserve">
-    <value>服务 '{0}' 未在 Windows 服务控制管理器（SCM）中安装；已删除残留的数据库配置。</value>
-  </data>
-
   <data name="Msg_UninstallSuccess" xml:space="preserve">
     <value>服务 '{0}' 卸载成功。</value>
   </data>
-
   <data name="Msg_ServiceDisabledError" xml:space="preserve">
     <value>指定的服务已被禁用。</value>
   </data>
-
   <data name="Msg_CommandCancelled" xml:space="preserve">
     <value>操作 '{0}' 已被用户取消。</value>
   </data>
-
   <data name="Msg_CommandFailedTemplate" xml:space="preserve">
-    <comment>Generic template for command failures. {0} is the localized action description, {1} is the exception message.</comment>
     <value>执行 {0} 失败：{1}</value>
   </data>
-
   <data name="Msg_SuggestionTemplate" xml:space="preserve">
-    <comment>Prefix for actionable troubleshooting suggestions. {0} is the localized suggestion text.</comment>
     <value>建议：{0}</value>
   </data>
-
   <data name="Msg_InvalidIntegerFormat" xml:space="preserve">
     <value>{0} 的整数格式无效：'{1}'</value>
   </data>
-
   <data name="Msg_InvalidEnumValue" xml:space="preserve">
     <value>{0} 的值无效：'{1}'。有效选项：{2}</value>
   </data>
-
   <data name="Msg_InstallServiceAction" xml:space="preserve">
     <value>安装服务 '{0}'</value>
   </data>
-
   <data name="Msg_InstallServiceSuggestion" xml:space="preserve">
     <value>请确保可执行文件路径正确、服务名称未被占用，并且您以管理员权限运行。</value>
   </data>
-
   <data name="Msg_StartServiceAction" xml:space="preserve">
     <value>启动服务 '{0}'</value>
   </data>
-
   <data name="Msg_StartServiceSuggestion" xml:space="preserve">
     <value>请确保服务已安装、可执行文件路径有效，并且服务账户具有“作为服务登录”权限。</value>
   </data>
-
   <data name="Msg_StopServiceAction" xml:space="preserve">
     <value>停止服务 '{0}'</value>
   </data>
-
   <data name="Msg_StopServiceSuggestion" xml:space="preserve">
     <value>请确保您拥有管理员权限。如果服务无响应，您可能需要通过任务管理器手动终止其进程。</value>
   </data>
-
   <data name="Msg_RestartServiceAction" xml:space="preserve">
     <value>重启服务 '{0}'</value>
   </data>
-
   <data name="Msg_RestartServiceSuggestion" xml:space="preserve">
     <value>请确保服务当前已安装，并且您的账户具有足够的权限来停止和启动服务。</value>
   </data>
-
   <data name="Msg_UninstallServiceAction" xml:space="preserve">
     <value>卸载服务 '{0}'</value>
   </data>
-
   <data name="Msg_UninstallServiceSuggestion" xml:space="preserve">
     <value>请确保在卸载前停止服务，并且您以管理员身份运行此命令。</value>
   </data>
-
   <data name="Msg_ServiceStatusAction" xml:space="preserve">
     <value>查询服务 '{0}' 的状态</value>
   </data>
-
   <data name="Msg_ServiceStatusSuggestion" xml:space="preserve">
     <value>请确认服务名称拼写正确，并且该服务当前已安装在此系统上。</value>
   </data>
-
   <data name="Msg_ExportServiceAction" xml:space="preserve">
     <value>导出服务 '{0}' 的配置</value>
   </data>
-
   <data name="Msg_ExportServiceSuggestion" xml:space="preserve">
     <value>请确保服务存在于数据库中，并且您对目标路径具有写入权限。</value>
   </data>
-
   <data name="Msg_ImportServiceAction" xml:space="preserve">
     <value>从 '{0}' 导入配置</value>
   </data>
-
   <data name="Msg_ImportServiceSuggestion" xml:space="preserve">
     <value>请检查文件路径是否正确、文件格式是否为有效的 JSON 或 XML，并且您具有读取权限。</value>
   </data>
-
+  <data name="Msg_PostSuccessSyncFailed" xml:space="preserve">
+    <value>{0}：服务操作已成功完成，但对“{1}”的后置成功仓储同步失败：{2}</value>
+  </data>
+  <data name="Msg_ServiceOperationFailed" xml:space="preserve">
+    <value>{0}：无法{1}：{2}</value>
+  </data>
+  <data name="Msg_LogFailedUnauthorized" xml:space="preserve">
+    <value>无法{0}（未授权）</value>
+  </data>
+  <data name="Msg_LogFailed" xml:space="preserve">
+    <value>无法{0}</value>
+  </data>
+  <data name="Msg_ShowServiceAction" xml:space="preserve">
+    <value>显示服务“{0}”的配置</value>
+  </data>
+  <data name="Msg_ShowServicesAction" xml:space="preserve">
+    <value>列出服务</value>
+  </data>
+  <data name="Msg_ShowServiceSuggestion" xml:space="preserve">
+    <value>请确保该服务存在于 Servy 数据库中，并且你的 shell 以管理员身份运行。</value>
+  </data>
+  <data name="Msg_ShowServiceLogged" xml:space="preserve">
+    <value>已显示服务“{0}”的配置。</value>
+  </data>
+  <data name="Msg_ShowServicesLogged" xml:space="preserve">
+    <value>已列出 {0} 个服务。</value>
+  </data>
+  <data name="Msg_Show_NameAndSearchNotAllowed" xml:space="preserve">
+    <value>--search 选项不能与 --name 一起使用。使用 --name 显示单个服务，或使用 --search 筛选服务列表。</value>
+  </data>
+  <data name="Msg_Show_NoServices" xml:space="preserve">
+    <value>未找到服务。</value>
+  </data>
+  <data name="Msg_Show_ServiceCount" xml:space="preserve">
+    <value>{0} 个服务。</value>
+  </data>
+  <data name="Msg_Show_ValueNotSet" xml:space="preserve">
+    <value>-</value>
+  </data>
+  <data name="Msg_Show_Yes" xml:space="preserve">
+    <value>是</value>
+  </data>
+  <data name="Msg_Show_No" xml:space="preserve">
+    <value>否</value>
+  </data>
+  <data name="Msg_Show_Seconds" xml:space="preserve">
+    <value>{0}秒</value>
+  </data>
+  <data name="Msg_Show_Megabytes" xml:space="preserve">
+    <value>{0} MB</value>
+  </data>
+  <data name="Msg_Show_Group_Account" xml:space="preserve">
+    <value>账户</value>
+  </data>
+  <data name="Msg_Show_Group_Logs" xml:space="preserve">
+    <value>日志</value>
+  </data>
+  <data name="Msg_Show_Group_Timeouts" xml:space="preserve">
+    <value>超时</value>
+  </data>
+  <data name="Msg_Show_Group_Recovery" xml:space="preserve">
+    <value>恢复</value>
+  </data>
+  <data name="Msg_Show_Group_FailureProgram" xml:space="preserve">
+    <value>失败处理程序</value>
+  </data>
+  <data name="Msg_Show_Group_Environment" xml:space="preserve">
+    <value>环境</value>
+  </data>
+  <data name="Msg_Show_Group_PreLaunch" xml:space="preserve">
+    <value>预启动</value>
+  </data>
+  <data name="Msg_Show_Group_PostLaunch" xml:space="preserve">
+    <value>启动后</value>
+  </data>
+  <data name="Msg_Show_Group_PreStop" xml:space="preserve">
+    <value>停止前</value>
+  </data>
+  <data name="Msg_Show_Group_PostStop" xml:space="preserve">
+    <value>停止后</value>
+  </data>
+  <data name="Msg_Show_Group_Other" xml:space="preserve">
+    <value>其他</value>
+  </data>
+  <data name="Msg_Show_Label_Name" xml:space="preserve">
+    <value>名称</value>
+  </data>
+  <data name="Msg_Show_Label_Status" xml:space="preserve">
+    <value>状态</value>
+  </data>
+  <data name="Msg_Show_Label_Pid" xml:space="preserve">
+    <value>PID</value>
+  </data>
+  <data name="Msg_Show_Label_DisplayName" xml:space="preserve">
+    <value>显示名称</value>
+  </data>
+  <data name="Msg_Show_Label_Description" xml:space="preserve">
+    <value>描述</value>
+  </data>
+  <data name="Msg_Show_Label_StartupType" xml:space="preserve">
+    <value>启动类型</value>
+  </data>
+  <data name="Msg_Show_Label_Priority" xml:space="preserve">
+    <value>优先级</value>
+  </data>
+  <data name="Msg_Show_Label_CpuAffinity" xml:space="preserve">
+    <value>CPU 亲和性</value>
+  </data>
+  <data name="Msg_Show_Label_Executable" xml:space="preserve">
+    <value>可执行文件</value>
+  </data>
+  <data name="Msg_Show_Label_StartupDir" xml:space="preserve">
+    <value>启动目录</value>
+  </data>
+  <data name="Msg_Show_Label_Parameters" xml:space="preserve">
+    <value>参数</value>
+  </data>
+  <data name="Msg_Show_Label_RunAsLocalSystem" xml:space="preserve">
+    <value>本地系统</value>
+  </data>
+  <data name="Msg_Show_Label_UserAccount" xml:space="preserve">
+    <value>用户账户</value>
+  </data>
+  <data name="Msg_Show_Label_Stdout" xml:space="preserve">
+    <value>标准输出</value>
+  </data>
+  <data name="Msg_Show_Label_Stderr" xml:space="preserve">
+    <value>标准错误</value>
+  </data>
+  <data name="Msg_Show_Label_ActiveStdout" xml:space="preserve">
+    <value>当前标准输出</value>
+  </data>
+  <data name="Msg_Show_Label_ActiveStderr" xml:space="preserve">
+    <value>当前标准错误</value>
+  </data>
+  <data name="Msg_Show_Label_SizeRotation" xml:space="preserve">
+    <value>按大小轮转</value>
+  </data>
+  <data name="Msg_Show_Label_RotationSize" xml:space="preserve">
+    <value>轮转大小</value>
+  </data>
+  <data name="Msg_Show_Label_DateRotation" xml:space="preserve">
+    <value>按日期轮转</value>
+  </data>
+  <data name="Msg_Show_Label_RotationPeriod" xml:space="preserve">
+    <value>轮转周期</value>
+  </data>
+  <data name="Msg_Show_Label_MaxFiles" xml:space="preserve">
+    <value>最大文件数</value>
+  </data>
+  <data name="Msg_Show_Label_LocalTimeRotation" xml:space="preserve">
+    <value>本地时间</value>
+  </data>
+  <data name="Msg_Show_Label_Start" xml:space="preserve">
+    <value>启动</value>
+  </data>
+  <data name="Msg_Show_Label_Stop" xml:space="preserve">
+    <value>停止</value>
+  </data>
+  <data name="Msg_Show_Label_HealthCheck" xml:space="preserve">
+    <value>运行状况检查</value>
+  </data>
+  <data name="Msg_Show_Label_Heartbeat" xml:space="preserve">
+    <value>心跳</value>
+  </data>
+  <data name="Msg_Show_Label_MaxFailedChecks" xml:space="preserve">
+    <value>最大失败检查次数</value>
+  </data>
+  <data name="Msg_Show_Label_Recovery" xml:space="preserve">
+    <value>恢复</value>
+  </data>
+  <data name="Msg_Show_Label_OnCleanExit" xml:space="preserve">
+    <value>正常退出时</value>
+  </data>
+  <data name="Msg_Show_Label_MaxAttempts" xml:space="preserve">
+    <value>最大尝试次数</value>
+  </data>
+  <data name="Msg_Show_Label_HeartbeatUrl" xml:space="preserve">
+    <value>心跳 URL</value>
+  </data>
+  <data name="Msg_Show_Label_UrlTimeout" xml:space="preserve">
+    <value>URL 超时</value>
+  </data>
+  <data name="Msg_Show_Label_UrlFlags" xml:space="preserve">
+    <value>URL 标志</value>
+  </data>
+  <data name="Msg_Show_Label_EnvironmentVariables" xml:space="preserve">
+    <value>环境变量</value>
+  </data>
+  <data name="Msg_Show_Label_AllowOverriddenRuntimeVars" xml:space="preserve">
+    <value>允许覆盖运行时变量</value>
+  </data>
+  <data name="Msg_Show_Label_Dependencies" xml:space="preserve">
+    <value>依赖项</value>
+  </data>
+  <data name="Msg_Show_Label_Timeout" xml:space="preserve">
+    <value>超时</value>
+  </data>
+  <data name="Msg_Show_Label_RetryAttempts" xml:space="preserve">
+    <value>重试次数</value>
+  </data>
+  <data name="Msg_Show_Label_IgnoreFailure" xml:space="preserve">
+    <value>忽略失败</value>
+  </data>
+  <data name="Msg_Show_Label_LogAsError" xml:space="preserve">
+    <value>记录为错误</value>
+  </data>
+  <data name="Msg_Show_Label_ConsoleUI" xml:space="preserve">
+    <value>控制台界面</value>
+  </data>
+  <data name="Msg_Show_Label_DebugLogs" xml:space="preserve">
+    <value>调试日志</value>
+  </data>
+  <data name="Msg_Show_Column_Name" xml:space="preserve">
+    <value>名称</value>
+  </data>
+  <data name="Msg_Show_Column_DisplayName" xml:space="preserve">
+    <value>显示名称</value>
+  </data>
+  <data name="Msg_Show_Column_Description" xml:space="preserve">
+    <value>描述</value>
+  </data>
+  <data name="Msg_Show_Column_StartupType" xml:space="preserve">
+    <value>启动类型</value>
+  </data>
+  <data name="Msg_Show_Column_Status" xml:space="preserve">
+    <value>状态</value>
+  </data>
+  <data name="Msg_Show_Column_Pid" xml:space="preserve">
+    <value>PID</value>
+  </data>
+  <data name="Msg_Show_Label_Password" xml:space="preserve">
+    <value>密码</value>
+  </data>
+  <data name="Msg_Show_Masked" xml:space="preserve">
+    <value>********</value>
+  </data>
+  <data name="Msg_Show_DecryptRequiresName" xml:space="preserve">
+    <value>--decrypt 选项需要配合 --name 使用。服务列表不显示任何加密字段，因此没有可解密的内容。</value>
+  </data>
+  <data name="Msg_OperationCancelledByUser" xml:space="preserve">
+    <value>操作已被用户取消。</value>
+  </data>
+  <data name="Msg_UnexpectedError" xml:space="preserve">
+    <value>发生意外错误：{0}</value>
+  </data>
+  <data name="Msg_UnknownCommand" xml:space="preserve">
+    <value>错误：未知命令 '{0}'。运行 '--help' 查看可用选项。</value>
+  </data>
+  <data name="Msg_VulnerableSqliteDetected" xml:space="preserve">
+    <value>[严重] 检测到存在漏洞的 SQLite 版本：{0}</value>
+  </data>
+  <data name="Msg_VulnerableSqliteRequired" xml:space="preserve">
+    <value>此版本的 Servy 需要 SQLite {0} 或更高版本。</value>
+  </data>
 </root>

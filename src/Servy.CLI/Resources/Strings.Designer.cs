@@ -1166,5 +1166,50 @@ namespace Servy.CLI.Resources {
                 return ResourceManager.GetString("Msg_WrapperNotFound", resourceCulture);
             }
         }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Operation cancelled by user..
+        /// </summary>
+        public static string Msg_OperationCancelledByUser {
+            get {
+                return ResourceManager.GetString("Msg_OperationCancelledByUser", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to An unexpected error occurred: {0}.
+        /// </summary>
+        public static string Msg_UnexpectedError {
+            get {
+                return ResourceManager.GetString("Msg_UnexpectedError", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Error: Unknown command &apos;{0}&apos;. See &apos;--help&apos; for available options..
+        /// </summary>
+        public static string Msg_UnknownCommand {
+            get {
+                return ResourceManager.GetString("Msg_UnknownCommand", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to [CRITICAL] Vulnerable SQLite version detected: {0}.
+        /// </summary>
+        public static string Msg_VulnerableSqliteDetected {
+            get {
+                return ResourceManager.GetString("Msg_VulnerableSqliteDetected", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to This version of Servy requires SQLite {0}+..
+        /// </summary>
+        public static string Msg_VulnerableSqliteRequired {
+            get {
+                return ResourceManager.GetString("Msg_VulnerableSqliteRequired", resourceCulture);
+            }
+        }
     }
 }

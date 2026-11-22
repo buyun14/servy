@@ -577,7 +577,7 @@ namespace Servy.Manager.ViewModels
                     return ServiceCommands.StartServiceAsync(s, showMessageBox: false, cancellationToken: token);
                 },
                 Strings.Confirm_StartSelectedServices,
-                "Failed to start selected services",
+                Strings.Msg_FailedToStartSelectedServices,
                 _cts?.Token ?? CancellationToken.None);
 
         /// <summary>
@@ -590,7 +590,7 @@ namespace Servy.Manager.ViewModels
                     return ServiceCommands.StopServiceAsync(s, showMessageBox: false, cancellationToken: token);
                 },
                 Strings.Confirm_StopSelectedServices,
-                "Failed to stop selected services",
+                Strings.Msg_FailedToStopSelectedServices,
                 _cts?.Token ?? CancellationToken.None);
 
         /// <summary>
@@ -603,7 +603,7 @@ namespace Servy.Manager.ViewModels
                     return ServiceCommands.RestartServiceAsync(s, showMessageBox: false, cancellationToken: token);
                 },
                 Strings.Confirm_RestartSelectedServices,
-                "Failed to restart selected services",
+                Strings.Msg_FailedToRestartSelectedServices,
                 _cts?.Token ?? CancellationToken.None);
 
         #endregion

@@ -16,34 +16,40 @@
   <data name="Msg_DocumentationOpenFailed" xml:space="preserve">
     <value>无法打开文档。请确保已安装 Web 浏览器。详细信息：{0}</value>
   </data>
-
   <data name="Msg_NoUpdatesAvailable" xml:space="preserve">
     <value>当前没有可用的更新。</value>
   </data>
-
   <data name="Msg_UpdateCheckInvalidTag" xml:space="preserve">
-    <comment>Displayed when the remote tag_name cannot be parsed into a deterministic .NET Version sequence.</comment>
     <value>更新检查已完成，但最新版本标识符的格式无法安全处理：'{0}'。请手动查看项目发布页面。</value>
   </data>
-
   <data name="Msg_UpdateAvailablePrompt" xml:space="preserve">
     <value>发现 Servy 新版本。是否要下载？</value>
   </data>
-
+  <data name="Msg_UpdateCheckCanceled" xml:space="preserve">
+    <value>更新检查已取消。</value>
+  </data>
   <data name="Msg_UpdateCheckTimeout" xml:space="preserve">
     <value>更新检查超时。请稍后重试。</value>
   </data>
-
   <data name="Msg_UpdateCheckFailed" xml:space="preserve">
     <value>检查更新失败：{0}</value>
   </data>
-
-  <data name="Msg_InvalidPath" xml:space="preserve">
-    <value>指定的路径无效。</value>
+  <data name="Msg_ReleaseLinkOpenFailed" xml:space="preserve">
+    <value>无法打开发布链接：{0}</value>
   </data>
-
   <data name="Msg_FailedCopyingEmbeddedResource" xml:space="preserve">
     <value>复制嵌入资源失败：{0}</value>
   </data>
-
+  <data name="Msg_ResourceExtractionWarningTitle" xml:space="preserve">
+    <value>资源提取警告</value>
+  </data>
+  <data name="Msg_ServyHostUnavailableTitle" xml:space="preserve">
+    <value>Servy 主机不可用</value>
+  </data>
+  <data name="Msg_StartupWarningsTitle" xml:space="preserve">
+    <value>Servy 启动警告</value>
+  </data>
+  <data name="Msg_ServyHostUnavailable" xml:space="preserve">
+    <value>无法安装或启动 Servy 主机服务：{0} 在它运行之前，Servy 服务无法启动。详细信息请参阅文件日志。</value>
+  </data>
 </root>
